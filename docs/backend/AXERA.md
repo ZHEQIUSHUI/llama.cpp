@@ -1,9 +1,11 @@
 # Axera NPU Backend for llama.cpp
 
 > [!NOTE]
-> Early stage: only the matrix products of BF16 GGUF models run on the NPU so far; every other op falls back to the
-> CPU backend. On an AX8860 board, Qwen3.5-0.8B BF16 generates the same text as the CPU backend at 101 ms per token
-> (CPU only: 473 ms).
+> Early stage. Two modes:
+> - **Per op** (default): the matrix products of BF16 GGUF models run on the NPU, everything else on the CPU.
+> - **Graph template** (`GGML_AXERA_TEMPLATE=qwen35`): whole Qwen3.5 graphs run as one NPU kernel per layer.
+>
+> AX8860, Qwen3.5-0.8B BF16, single core: CPU only 473 ms per token, per op 101 ms, template 39.7 ms (25 tokens/s).
 
 The Axera backend ([`ggml/src/ggml-axera`](../../ggml/src/ggml-axera)) runs GGML ops on the NPU of Axera SoCs (AX8860)
 with precompiled kernels, and leaves everything else to the CPU backend.
@@ -25,6 +27,27 @@ with precompiled kernels, and leaves everything else to the CPU backend.
 `C` is the weight row count `N` itself, or the largest available `C` that divides `N`: a vocabulary-sized output
 projection runs as `N / C` calls. Several activation rows (prompt processing) run row by row and reread the weights
 each time, until a batched kernel exists.
+
+## Graph template: Qwen3.5
+
+With `GGML_AXERA_TEMPLATE=qwen35` the backend claims the whole graph and does not run it op by op. Per token, it runs
+one AXDSL kernel per layer, either a gated delta net layer or a gated attention layer, and reads the weights straight
+from the GGUF tensors in CMM. Two weights are converted once at load: `ssm_a` to `log(-ssm_a)`, and the conv1d taps
+are reversed and stored as bf16. Then the CPU applies the final norm and the GEMV kernels compute the output
+projection.
+
+Kernels in `GGML_AXERA_KERNEL_DIR`: `qwen35_gdn.axmodel`, `qwen35_attn.axmodel`, `qwen35.txt` (`LMAX BC ROT THETA`),
+plus the `mul_mat` kernel for the output projection.
+
+Limits of the template:
+- The recurrent state and the KV cache live in the backend, not in the llama.cpp memory. So it runs a single
+  sequence with consecutive positions, restarting at position 0; anything else aborts with a message.
+- The context is limited to the kernels' `LMAX` (4096).
+- Prompt tokens go through the decode kernels one at a time.
+
+```bash
+GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-completion -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 4096 -p "..." -n 128
+```
 
 ## Build
 

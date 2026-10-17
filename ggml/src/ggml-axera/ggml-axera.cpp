@@ -12,6 +12,7 @@
 //   activation rows (prompt processing) run row by row, rereading the weights each time, until a batched kernel exists.
 // - Single-core kernels only: the current NPU driver does not run tasks on several cores concurrently.
 //
+// GGML_AXERA_TEMPLATE=qwen35 runs whole Qwen3.5 graphs with per-layer kernels instead (see "graph template" below).
 // GGML_AXERA_DEBUG=1 logs every missing kernel once.
 
 #include "ggml-axera.h"
@@ -24,7 +25,9 @@
 
 #include <dirent.h>
 
+#include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -338,27 +341,17 @@ static bool ggml_backend_buffer_is_axera(ggml_backend_buffer_t buffer) {
 // backend
 //
 
-struct ggml_backend_axera_context {
-    // bf16 activation staging in CMM
-    ggml_backend_buffer_t staging = nullptr;
-
-    ~ggml_backend_axera_context() {
-        if (staging) {
-            ggml_backend_buffer_free(staging);
-        }
+// CMM owned by the backend (staging, template state); same cache rules as the buffers above
+static std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_alloc(size_t size) {
+    auto b  = std::make_unique<ggml_backend_axera_buffer_context>();
+    b->size = GGML_PAD(std::max<size_t>(size, 1), AXERA_ALIGNMENT);
+    if (AX_SYS_MemAllocCached(&b->phy, &b->vir, (AX_U32) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera") != 0) {
+        GGML_ABORT("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
     }
-
-    ggml_backend_axera_buffer_context * staging_for(size_t size) {
-        if (!staging || ggml_backend_buffer_get_size(staging) < size) {
-            if (staging) {
-                ggml_backend_buffer_free(staging);
-            }
-            staging = ggml_backend_buft_alloc_buffer(ggml_backend_axera_buffer_type(), size);
-            GGML_ASSERT(staging != nullptr);
-        }
-        return (ggml_backend_axera_buffer_context *) staging->context;
-    }
-};
+    memset(b->vir, 0, b->size);
+    b->flush(b->vir, b->size);
+    return b;
+}
 
 static AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint32_t size) {
     AX_ENGINE_IO_BUFFER_T b;
@@ -369,26 +362,80 @@ static AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * 
     return b;
 }
 
-static void ggml_backend_axera_mul_mat(ggml_backend_axera_context * ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-    const int64_t       K    = src0->ne[0];
-    const int64_t       N    = src0->ne[1];
-    const int64_t       M    = src1->ne[1];
-    const int64_t       C    = axera_kernels().mul_mat_chunk(N, K);
+//
+// Qwen3.5 graph template (GGML_AXERA_TEMPLATE=qwen35)
+//
+// The backend claims the whole graph and runs it with the AXDSL layer kernels instead of op by op: per token, 24
+// calls (gated delta net layer / gated attention layer, weights straight from the GGUF tensors in CMM), then the final
+// norm on the CPU and the output projection with the GEMV kernels. The kernels' recurrent state and KV cache live in
+// the backend, not in the llama.cpp memory: a single sequence with consecutive positions, restarted at position 0.
+// Kernels in GGML_AXERA_KERNEL_DIR: qwen35_gdn.axmodel, qwen35_attn.axmodel, qwen35.txt ("LMAX BC ROT THETA"), and the
+// mul_mat GEMV kernel for the output projection.
+//
+
+static bool axera_template_qwen35() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_AXERA_TEMPLATE");
+        return e != nullptr && strcmp(e, "qwen35") == 0;
+    }();
+    return on;
+}
+
+using axera_cmm = std::unique_ptr<ggml_backend_axera_buffer_context>;
+
+struct axera_q35_layer {
+    bool                               gdn = false;
+    std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
+    int                                si = -1, so = -1, ci = -1, co = -1;  // GDN state in/out, swapped every step
+    std::vector<axera_cmm>             own;                                // converted weights, state, KV cache
+    std::vector<ggml_backend_axera_buffer_context *> state;                // state buffers to clear on restart
+};
+
+struct axera_q35 {
+    bool                  ready = false;
+    const void *          bound = nullptr;  // data of blk.0.attn_norm.weight the layers were bound to
+    int                   L = 0, H = 0, LMAX = 0, BC = 0, ROT = 0;
+    double                THETA = 0;
+    ggml_axera_kernel *   gdn = nullptr, *attn = nullptr;
+    axera_cmm             A, B, POS, NBLK, MASK, COS, SIN;  // A/B: layer input/output ping-pong
+    std::vector<axera_q35_layer> layers;
+    std::vector<float>    inv_freq;
+    int64_t               next_pos = 0;
+};
+
+struct ggml_backend_axera_context {
+    axera_cmm staging;  // bf16 activation row
+    axera_q35 q35;
+
+    ggml_backend_axera_buffer_context * staging_for(size_t size) {
+        if (!staging || staging->size < size) {
+            staging = axera_cmm_alloc(size);
+        }
+        return staging.get();
+    }
+};
+
+// out[0:N] (f32, inside a CMM tensor) = W[N, K] (bf16, CMM) . x[0:K] (f32 host), in N / C GEMV calls
+static void axera_gemv(ggml_backend_axera_context * ctx, const ggml_tensor * w, const float * x, ggml_tensor * dst,
+                       float * out) {
+    const int64_t K = w->ne[0];
+    const int64_t N = w->ne[1];
+    const int64_t C = axera_kernels().mul_mat_chunk(N, K);
     GGML_ASSERT(C > 0);
 
     ggml_axera_kernel * k  = axera_kernels().get(axera_mul_mat_kernel_name(C, K));
     const int           ix = k->input("x"), iw = k->input("w"), io = k->output("out");
     GGML_ASSERT(ix >= 0 && iw >= 0 && io >= 0 && k->info->nInputSize == 2 && k->info->nOutputSize == 1);
     GGML_ASSERT(k->info->pInputs[ix].nSize == K * sizeof(ggml_bf16_t) &&
-                k->info->pInputs[iw].nSize == C * src0->nb[1] && k->info->pOutputs[io].nSize == C * sizeof(float));
+                k->info->pInputs[iw].nSize == C * w->nb[1] && k->info->pOutputs[io].nSize == C * sizeof(float));
 
-    auto * st   = ctx->staging_for(GGML_PAD(K * sizeof(ggml_bf16_t), AXERA_ALIGNMENT));
+    auto * st   = ctx->staging_for(K * sizeof(ggml_bf16_t));
     auto * xb   = (ggml_bf16_t *) st->vir;
-    auto * wctx = (ggml_backend_axera_buffer_context *) src0->buffer->context;
+    auto * wctx = (ggml_backend_axera_buffer_context *) w->buffer->context;
     auto * dctx = (ggml_backend_axera_buffer_context *) dst->buffer->context;
-    dctx->flush(dst->data, ggml_nbytes(dst));
+    ggml_fp32_to_bf16_row(x, xb, K);
+    st->flush(xb, K * sizeof(ggml_bf16_t));
+    dctx->flush(out, N * sizeof(float));
 
     AX_ENGINE_IO_BUFFER_T inputs[2], outputs[1];
     AX_ENGINE_IO_T        io_set;
@@ -398,22 +445,356 @@ static void ggml_backend_axera_mul_mat(ggml_backend_axera_context * ctx, ggml_te
     io_set.pOutputs    = outputs;
     io_set.nOutputSize = 1;
     inputs[ix]         = axera_io(st, xb, K * sizeof(ggml_bf16_t));
-
-    for (int64_t m = 0; m < M; ++m) {
-        // activation row f32 -> bf16 into staging
-        ggml_fp32_to_bf16_row((const float *) ((const char *) src1->data + m * src1->nb[1]), xb, K);
-        st->flush(xb, K * sizeof(ggml_bf16_t));
-        for (int64_t c0 = 0; c0 < N; c0 += C) {
-            inputs[iw]    = axera_io(wctx, (char *) src0->data + c0 * src0->nb[1], C * src0->nb[1]);
-            outputs[io]   = axera_io(dctx, (char *) dst->data + m * dst->nb[1] + c0 * sizeof(float), C * sizeof(float));
-            const int ret = AX_ENGINE_RunSync(k->handle, &io_set);
-            if (ret != 0) {
-                GGML_ABORT("%s: RunSync failed (0x%x) for %s, n=%" PRId64 " k=%" PRId64 " row %" PRId64 "\n", __func__,
-                           ret, dst->name, N, K, m);
-            }
+    for (int64_t c0 = 0; c0 < N; c0 += C) {
+        inputs[iw]    = axera_io(wctx, (char *) w->data + c0 * w->nb[1], C * w->nb[1]);
+        outputs[io]   = axera_io(dctx, out + c0, C * sizeof(float));
+        const int ret = AX_ENGINE_RunSync(k->handle, &io_set);
+        if (ret != 0) {
+            GGML_ABORT("%s: RunSync failed (0x%x) for %s, n=%" PRId64 " k=%" PRId64 "\n", __func__, ret, dst->name, N, K);
         }
     }
-    dctx->invalidate(dst->data, ggml_nbytes(dst));
+    dctx->invalidate(out, N * sizeof(float));
+}
+
+static void ggml_backend_axera_mul_mat(ggml_backend_axera_context * ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    // one activation row at a time: the weights are reread per row until a batched kernel exists
+    for (int64_t m = 0; m < src1->ne[1]; ++m) {
+        axera_gemv(ctx, src0, (const float *) ((const char *) src1->data + m * src1->nb[1]), dst,
+                   (float *) ((char *) dst->data + m * dst->nb[1]));
+    }
+}
+
+static float axera_rms_eps(const ggml_tensor * rms_norm) {
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    return eps;
+}
+
+// binds one layer's kernel IO: GGUF tensors in CMM directly where the layout matches, converted copies otherwise
+static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::string, ggml_tensor *> & t) {
+    auto get = [&](const char * name) -> ggml_tensor * {
+        char key[96];
+        snprintf(key, sizeof(key), "blk.%d.%s", il, name);
+        auto it = t.find(key);
+        if (it == t.end()) {
+            GGML_ABORT("qwen35 template: tensor %s not in the graph\n", key);
+        }
+        return it->second;
+    };
+    axera_q35_layer & ly = m.layers[il];
+    ly.gdn               = t.count("blk." + std::to_string(il) + ".ssm_a") > 0;
+    ggml_axera_kernel * k = ly.gdn ? m.gdn : m.attn;
+    ly.in.assign(k->info->nInputSize, {});
+    ly.out.assign(k->info->nOutputSize, {});
+    ly.own.clear();
+    ly.state.clear();
+
+    static const std::map<std::string, const char *> direct = {
+        { "ln1", "attn_norm.weight" },    { "ln2", "post_attention_norm.weight" }, { "w_qkv", "attn_qkv.weight" },
+        { "w_z", "attn_gate.weight" },    { "w_b", "ssm_beta.weight" },            { "w_a", "ssm_alpha.weight" },
+        { "dt_bias", "ssm_dt.bias" },     { "norm_w", "ssm_norm.weight" },         { "w_out", "ssm_out.weight" },
+        { "w_gate", "ffn_gate.weight" },  { "w_up", "ffn_up.weight" },             { "w_down", "ffn_down.weight" },
+        { "w_q", "attn_q.weight" },       { "w_k", "attn_k.weight" },              { "w_v", "attn_v.weight" },
+        { "q_norm", "attn_q_norm.weight" }, { "k_norm", "attn_k_norm.weight" },    { "w_o", "attn_output.weight" },
+    };
+    // layer input/output ping-pong: even layers read A and write B, odd layers the other way round
+    auto * xin  = (il % 2 == 0 ? m.A : m.B).get();
+    auto * xout = (il % 2 == 0 ? m.B : m.A).get();
+    auto own = [&](uint32_t size) {
+        ly.own.push_back(axera_cmm_alloc(size));
+        return ly.own.back().get();
+    };
+
+    for (uint32_t i = 0; i < k->info->nInputSize; ++i) {
+        const std::string n    = k->info->pInputs[i].pName;
+        const uint32_t    size = k->info->pInputs[i].nSize;
+        ggml_backend_axera_buffer_context * b = nullptr;
+        void *                              p = nullptr;
+        if (n == "x") {
+            b = xin;
+        } else if (n == "pos") {
+            b = m.POS.get();
+        } else if (n == "nblk") {
+            b = m.NBLK.get();
+        } else if (n == "mask") {
+            b = m.MASK.get();
+        } else if (n == "cos") {
+            b = m.COS.get();
+        } else if (n == "sin") {
+            b = m.SIN.get();
+        } else if (n == "state_in" || n == "conv_in") {
+            b = own(size);
+            ly.state.push_back(b);
+            (n == "state_in" ? ly.si : ly.ci) = (int) i;
+        } else if (n == "a_log") {  // GGUF ssm_a = -exp(A_log)
+            const ggml_tensor * a = get("ssm_a");
+            GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_nbytes(a) == size);
+            b = own(size);
+            for (int64_t j = 0; j < ggml_nelements(a); ++j) {
+                ((float *) b->vir)[j] = logf(-((const float *) a->data)[j]);
+            }
+            b->flush(b->vir, size);
+        } else if (n == "conv_w") {  // GGUF f32 [channels][taps] -> bf16, taps reversed (kernel tap 0 = current token)
+            const ggml_tensor * c = get("ssm_conv1d.weight");
+            const int64_t       taps = c->ne[0], ch = c->ne[1];
+            GGML_ASSERT(c->type == GGML_TYPE_F32 && ch * taps * (int64_t) sizeof(ggml_bf16_t) == size);
+            b = own(size);
+            for (int64_t r = 0; r < ch; ++r) {
+                for (int64_t j = 0; j < taps; ++j) {
+                    ((ggml_bf16_t *) b->vir)[r * taps + j] =
+                        ggml_fp32_to_bf16(((const float *) c->data)[r * taps + taps - 1 - j]);
+                }
+            }
+            b->flush(b->vir, size);
+        } else {
+            auto it = direct.find(n);
+            if (it == direct.end()) {
+                GGML_ABORT("qwen35 template: kernel input %s has no GGUF tensor\n", n.c_str());
+            }
+            ggml_tensor * w = get(it->second);
+            if (ggml_nbytes(w) != size) {
+                GGML_ABORT("qwen35 template: %s is %zu bytes, kernel input %s wants %u\n", w->name, ggml_nbytes(w),
+                           n.c_str(), size);
+            }
+            if (ggml_backend_buffer_is_axera(w->buffer)) {
+                b = (ggml_backend_axera_buffer_context *) w->buffer->context;
+                p = w->data;
+            } else {  // not in CMM (layer kept on the CPU): copy
+                b = own(size);
+                memcpy(b->vir, w->data, size);
+                b->flush(b->vir, size);
+            }
+        }
+        if (b->size < size && p == nullptr) {
+            GGML_ABORT("qwen35 template: buffer for %s too small\n", n.c_str());
+        }
+        ly.in[i] = axera_io(b, p ? p : b->vir, size);
+    }
+    for (uint32_t i = 0; i < k->info->nOutputSize; ++i) {
+        const std::string n    = k->info->pOutputs[i].pName;
+        const uint32_t    size = k->info->pOutputs[i].nSize;
+        ggml_backend_axera_buffer_context * b;
+        if (n == "out") {
+            b = xout;
+        } else {  // state_out / conv_out, or the resident kc / vc
+            b = own(size);
+            if (n == "state_out" || n == "conv_out") {
+                ly.state.push_back(b);
+                (n == "state_out" ? ly.so : ly.co) = (int) i;
+            }
+        }
+        ly.out[i] = axera_io(b, b->vir, size);
+    }
+}
+
+static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggml_tensor *> & t) {
+    std::ifstream f(axera_kernels().dir + "/qwen35.txt");
+    if (!(f >> m.LMAX >> m.BC >> m.ROT >> m.THETA)) {
+        GGML_ABORT("qwen35 template: missing %s/qwen35.txt\n", axera_kernels().dir.c_str());
+    }
+    m.L    = L;
+    m.H    = H;
+    m.gdn  = axera_kernels().get("qwen35_gdn");
+    m.attn = axera_kernels().get("qwen35_attn");
+    auto size_of = [](ggml_axera_kernel * k, const char * name) {
+        const int i = k->input(name);
+        GGML_ASSERT(i >= 0);
+        return k->info->pInputs[i].nSize;
+    };
+    GGML_ASSERT(size_of(m.gdn, "x") == (uint32_t) H * sizeof(ggml_bf16_t));
+    m.A    = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
+    m.B    = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
+    m.POS  = axera_cmm_alloc(size_of(m.attn, "pos"));
+    m.NBLK = axera_cmm_alloc(size_of(m.attn, "nblk"));
+    m.MASK = axera_cmm_alloc(size_of(m.attn, "mask"));
+    m.COS  = axera_cmm_alloc(size_of(m.attn, "cos"));
+    m.SIN  = axera_cmm_alloc(size_of(m.attn, "sin"));
+    GGML_ASSERT(m.MASK->size >= (size_t) m.LMAX * sizeof(ggml_bf16_t));
+    m.inv_freq.resize(m.ROT / 2);
+    for (int i = 0; i < m.ROT / 2; ++i) {
+        m.inv_freq[i] = (float) (1.0 / std::pow(m.THETA, (double) (2 * i) / m.ROT));
+    }
+    m.layers.clear();
+    m.layers.resize(L);
+    for (int il = 0; il < L; ++il) {
+        axera_q35_bind_layer(m, il, t);
+    }
+    m.ready = true;
+    GGML_LOG_INFO("%s: Axera qwen35 template: %d layers, context %d\n", __func__, L, m.LMAX);
+}
+
+static void axera_q35_restart(axera_q35 & m) {
+    for (auto & ly : m.layers) {
+        for (auto * s : ly.state) {
+            memset(s->vir, 0, s->size);
+            s->flush(s->vir, s->size);
+        }
+    }
+    auto * mask = (ggml_bf16_t *) m.MASK->vir;
+    for (int j = 0; j < m.LMAX; ++j) {
+        mask[j] = ggml_fp32_to_bf16(-3e38f);
+    }
+    m.MASK->flush(m.MASK->vir, m.MASK->size);
+    m.next_pos = 0;
+}
+
+// the scheduler names its copies of another backend's tensors "<backend>#<name>#<copy>"
+static std::string axera_base_name(const char * name) {
+    const char * a = strchr(name, '#');
+    const char * b = a ? strrchr(name, '#') : nullptr;
+    return a && b > a ? std::string(a + 1, b) : std::string(name);
+}
+
+static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph) {
+    std::map<std::string, ggml_tensor *> t;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        t.emplace(axera_base_name(node->name), node);
+        for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+            t.emplace(axera_base_name(node->src[s]->name), node->src[s]);
+        }
+    }
+    auto find = [&](const char * name) -> ggml_tensor * {
+        auto it = t.find(name);
+        return it == t.end() ? nullptr : it->second;
+    };
+    ggml_tensor * norm0  = find("attn_norm-0");
+    ggml_tensor * logits = find("result_output");
+    ggml_tensor * inp_pos = find("inp_pos");
+    if (!norm0 || !logits || !inp_pos) {
+        GGML_LOG_ERROR("qwen35 template: split of %d nodes (%s ... %s) lacks:%s%s%s\n", cgraph->n_nodes,
+                       cgraph->n_nodes ? cgraph->nodes[0]->name : "", cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1]->name : "",
+                       norm0 ? "" : " attn_norm-0", logits ? "" : " result_output", inp_pos ? "" : " inp_pos");
+        GGML_ABORT("qwen35 template: the graph split does not hold the whole model; is the model Qwen3.5 and are all "
+                   "layers offloaded (-ngl 99)?\n");
+    }
+
+    // layer 0 input: the source of the first RMS norm
+    ggml_tensor * x0 = norm0;
+    while (x0 && x0->op != GGML_OP_RMS_NORM) {
+        x0 = x0->src[0];
+    }
+    GGML_ASSERT(x0 && x0->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(x0->src[0]));
+    x0 = x0->src[0];
+    const int H = (int) x0->ne[0];
+    const int T = (int) x0->ne[1];
+
+    // final norm: the lm head input is [get_rows(] rms_norm(h) * output_norm [, inp_out_ids)]
+    ggml_tensor * hnext = logits->src[1];
+    while (hnext->op == GGML_OP_GET_ROWS || hnext->op == GGML_OP_VIEW || hnext->op == GGML_OP_RESHAPE) {
+        hnext = hnext->src[0];
+    }
+    GGML_ASSERT(hnext->op == GGML_OP_MUL);
+    ggml_tensor * rms = hnext->src[0]->op == GGML_OP_RMS_NORM ? hnext->src[0] : hnext->src[1];
+    ggml_tensor * onw = hnext->src[0] == rms ? hnext->src[1] : hnext->src[0];
+    GGML_ASSERT(rms->op == GGML_OP_RMS_NORM && onw->type == GGML_TYPE_F32 && onw->ne[0] == H);
+    const float eps = axera_rms_eps(rms);
+    ggml_tensor * lm = logits->src[0];
+    GGML_ASSERT(logits->op == GGML_OP_MUL_MAT && lm->type == GGML_TYPE_BF16 && lm->ne[0] == H &&
+                ggml_backend_buffer_is_axera(lm->buffer) && ggml_backend_buffer_is_axera(logits->buffer));
+
+    int L = 0;
+    while (t.count("blk." + std::to_string(L) + ".attn_norm.weight")) {
+        ++L;
+    }
+    axera_q35 & m = ctx->q35;
+    ggml_tensor * w0 = find("blk.0.attn_norm.weight");
+    if (!m.ready || m.L != L || m.bound != w0->data) {
+        axera_q35_init(m, L, H, t);
+        m.bound = w0->data;
+        axera_q35_restart(m);
+    }
+
+    // the layers, token by token
+    const int32_t *    pos = (const int32_t *) inp_pos->data;
+    std::vector<float> h((size_t) T * H);
+    auto *             fin = (L % 2 == 0 ? m.A : m.B).get();  // where the last layer writes
+    for (int it = 0; it < T; ++it) {
+        const int64_t p = pos[it];
+        if (p == 0) {
+            axera_q35_restart(m);
+        }
+        if (p != m.next_pos || p >= m.LMAX) {
+            GGML_ABORT("qwen35 template: position %" PRId64 " (expected %" PRId64 ", context %d); the template runs a "
+                       "single sequence with consecutive positions\n", p, m.next_pos, m.LMAX);
+        }
+        ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + it * x0->nb[1]), (ggml_bf16_t *) m.A->vir, H);
+        m.A->flush(m.A->vir, H * sizeof(ggml_bf16_t));
+        auto * c = (ggml_bf16_t *) m.COS->vir;
+        auto * s = (ggml_bf16_t *) m.SIN->vir;
+        for (int i = 0; i < m.ROT / 2; ++i) {
+            const float a = (float) p * m.inv_freq[i];
+            c[i]          = ggml_fp32_to_bf16(std::cos(a));
+            s[i]          = ggml_fp32_to_bf16(std::sin(a));
+        }
+        *(int32_t *) m.POS->vir  = (int32_t) p;
+        *(int32_t *) m.NBLK->vir = (int32_t) (p / m.BC + 1);
+        ((ggml_bf16_t *) m.MASK->vir)[p] = ggml_fp32_to_bf16(0.0f);
+        m.COS->flush(m.COS->vir, m.COS->size);
+        m.SIN->flush(m.SIN->vir, m.SIN->size);
+        m.POS->flush(m.POS->vir, m.POS->size);
+        m.NBLK->flush(m.NBLK->vir, m.NBLK->size);
+        m.MASK->flush(m.MASK->vir, m.MASK->size);
+
+        for (int il = 0; il < L; ++il) {
+            axera_q35_layer & ly = m.layers[il];
+            AX_ENGINE_IO_T    io;
+            memset(&io, 0, sizeof(io));
+            io.pInputs     = ly.in.data();
+            io.nInputSize  = (uint32_t) ly.in.size();
+            io.pOutputs    = ly.out.data();
+            io.nOutputSize = (uint32_t) ly.out.size();
+            const int ret  = AX_ENGINE_RunSync((ly.gdn ? m.gdn : m.attn)->handle, &io);
+            if (ret != 0) {
+                GGML_ABORT("qwen35 template: RunSync failed (0x%x) at layer %d, position %" PRId64 "\n", ret, il, p);
+            }
+            if (ly.si >= 0) {
+                std::swap(ly.in[ly.si], ly.out[ly.so]);
+                std::swap(ly.in[ly.ci], ly.out[ly.co]);
+            }
+        }
+        fin->invalidate(fin->vir, H * sizeof(ggml_bf16_t));
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) fin->vir, h.data() + (size_t) it * H, H);
+        m.next_pos = p + 1;
+    }
+
+    // final norm and output projection for the requested rows: the row ids are the GET_ROWS index that crops the
+    // last layer or the final norm to the outputs (by structure: the scheduler may have renamed inp_out_ids)
+    ggml_tensor *   rnorm   = find("result_norm");
+    const int       n_out   = (int) logits->ne[1];
+    ggml_tensor *   out_ids = nullptr;
+    for (int i = 0; i < cgraph->n_nodes && n_out < T; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_GET_ROWS && node->src[1] && node->src[1]->type == GGML_TYPE_I32 &&
+            node->src[1]->ne[0] == n_out && node->src[0]->ne[1] == T) {
+            out_ids = node->src[1];
+        }
+    }
+    if (n_out < T && !out_ids) {
+        GGML_ABORT("qwen35 template: %d of %d rows requested but no output row index in the graph\n", n_out, T);
+    }
+    std::vector<float> hn(H);
+    const float *   g = (const float *) onw->data;
+    for (int r = 0; r < n_out; ++r) {
+        const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : r;
+        GGML_ASSERT(row >= 0 && row < T);
+        const float * x  = h.data() + (size_t) row * H;
+        double        ss = 0;
+        for (int i = 0; i < H; ++i) {
+            ss += (double) x[i] * x[i];
+        }
+        const float scale = 1.0f / sqrtf((float) (ss / H) + eps);
+        for (int i = 0; i < H; ++i) {
+            hn[i] = x[i] * scale * g[i];
+        }
+        if (rnorm && rnorm->type == GGML_TYPE_F32 && rnorm->ne[0] == H && rnorm->ne[1] == n_out) {
+            memcpy((char *) rnorm->data + r * rnorm->nb[1], hn.data(), H * sizeof(float));
+        }
+        axera_gemv(ctx, lm, hn.data(), logits, (float *) ((char *) logits->data + r * logits->nb[1]));
+    }
+    return GGML_STATUS_SUCCESS;
 }
 
 static const char * ggml_backend_axera_get_name(ggml_backend_t backend) {
@@ -428,6 +809,10 @@ static void ggml_backend_axera_free(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * ctx = (ggml_backend_axera_context *) backend->context;
+
+    if (axera_template_qwen35()) {
+        return axera_q35_compute(ctx, cgraph);
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -547,6 +932,10 @@ static ggml_backend_buffer_type_t ggml_backend_axera_device_get_buffer_type(ggml
 }
 
 static bool ggml_backend_axera_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    if (axera_template_qwen35()) {
+        // the template runs the whole graph; weights must still be in CMM to be offloaded
+        return true;
+    }
     switch (op->op) {
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
