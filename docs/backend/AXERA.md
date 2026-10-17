@@ -41,8 +41,8 @@ Kernels in `GGML_AXERA_KERNEL_DIR`: `qwen35_gdn.axmodel`, `qwen35_attn.axmodel`,
 plus the `mul_mat` kernel for the output projection.
 
 Limits of the template:
-- The recurrent state and the KV cache live in the backend, not in the llama.cpp memory. So it runs a single
-  sequence with consecutive positions, restarting at position 0; anything else aborts with a message.
+- One sequence. Positions continue, restart at 0, or go back to a context checkpoint; the recurrent state lives in
+  the llama.cpp recurrent cache, while the KV cache lives in the backend.
 - The context is limited to the kernels' `LMAX` (4096).
 - Prompt tokens go through the decode kernels one at a time.
 
@@ -52,19 +52,24 @@ GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-completion -m qwen3.5-0.8b-bf
 
 ### llama-server
 
-The template keeps its own state, so the server must not run several slots, restore context checkpoints or reload
-prompts from its RAM cache:
-
 ```bash
 GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-server -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 4096 \
-    -np 1 --ctx-checkpoints 0 --cache-ram 0 --host 0.0.0.0 --port 8080
+    -np 1 --cache-ram 0 --host 0.0.0.0 --port 8080
 ```
 
-A request that continues the previous conversation keeps the state; any other request (a new conversation, or a
-history that changed, as when the chat template drops the thinking of earlier turns) is processed again from position
-0. Without these flags, the request after a checkpoint restore fails with an HTTP 500 error and a log line naming the
-flags; the server keeps running and the next request works. On AX8860 with BF16 weights, the OpenAI chat endpoint
-streams at 42.5 ms per token and takes 25-27 ms per prompt token.
+The delta-net layers keep their recurrent state in place in the llama.cpp recurrent cache tensors (`cache_s_l*`,
+`cache_r_l*`, in CMM). So the server's context checkpoints save and restore exactly the kernels' state, and a
+request that shares a prefix with the previous one resumes from the last checkpoint. The attention layers then mask
+the dropped positions. A conversation's later turns only process the new messages: on AX8860, a third turn took 33
+prompt tokens and 1.4 s instead of 162 tokens and 4.5 s, with the same answer.
+
+Still needed:
+- `-np 1`: one sequence.
+- `--cache-ram 0`: the RAM prompt cache restores KV cache rows, whose layout the attention kernel does not share.
+
+A request the template cannot continue from fails with an HTTP 500 error and a log line naming the flags; the server
+keeps running, and a request starting at position 0 works again. With BF16 weights, the chat endpoint streams at
+42.5 ms per token and takes 25-28 ms per prompt token.
 
 ### MXFP8 weights
 

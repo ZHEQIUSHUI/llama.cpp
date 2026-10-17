@@ -270,9 +270,13 @@ static void ggml_backend_axera_buffer_set_tensor(ggml_backend_buffer_t buffer, g
 
 static void ggml_backend_axera_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
                                                  size_t offset, size_t size) {
-    // NPU outputs are invalidated right after each run, so the cached view is current
-    memcpy(data, (const char *) tensor->data + offset, size);
-    GGML_UNUSED(buffer);
+    // the range may hold NPU results not invalidated yet (template state read for a checkpoint) or CPU writes not
+    // flushed yet (CPU backend ops on CMM): write back, then drop the cached lines, then read
+    auto * ctx = (ggml_backend_axera_buffer_context *) buffer->context;
+    char * p   = (char *) tensor->data + offset;
+    ctx->flush(p, size);
+    ctx->invalidate(p, size);
+    memcpy(data, p, size);
 }
 
 static bool ggml_backend_axera_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src,
@@ -427,6 +431,13 @@ struct axera_q35_layer {
     bool                               gdn = false;
     std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
     int                                si = -1, so = -1, ci = -1, co = -1;  // GDN state in/out, swapped every step
+    bool                               in_place = false;  // state updated in the llama.cpp recurrent cache tensors
+    struct region {
+        ggml_backend_axera_buffer_context * b;
+        void *                              p;
+        size_t                              size;
+    };
+    std::vector<region>                cache_state;  // those cache ranges, cleared on restart
     std::vector<axera_cmm>             own;                                // converted weights, state, KV cache
     std::map<std::string, std::pair<ggml_backend_axera_buffer_context *, ggml_backend_axera_buffer_context *>> mx;
     std::vector<ggml_backend_axera_buffer_context *> state;                // state buffers to clear on restart
@@ -444,6 +455,7 @@ struct axera_q35 {
     std::vector<axera_q35_layer> layers;
     std::vector<float>    inv_freq;
     int64_t               next_pos = 0;
+    bool                  rollback = false;  // all GDN state lives in the llama.cpp cache: earlier positions resumable
 };
 
 struct ggml_backend_axera_context {
@@ -566,6 +578,15 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
         }
         return it->second;
     };
+    // llama.cpp recurrent cache of this layer (cache_r_l<il> / cache_s_l<il>), if one sequence row in CMM holds the state
+    auto cache = [&](const char * which, uint32_t size) -> ggml_tensor * {
+        auto it = t.find("cache_" + std::string(which) + "_l" + std::to_string(il));
+        if (it == t.end() || !ggml_backend_buffer_is_axera(it->second->buffer) || it->second->ne[1] != 1 ||
+            ggml_nbytes(it->second) < size) {
+            return nullptr;
+        }
+        return it->second;
+    };
     axera_q35_layer & ly = m.layers[il];
     ly.gdn               = t.count("blk." + std::to_string(il) + ".ssm_a") > 0;
     ggml_axera_kernel * k = ly.gdn ? m.gdn : m.attn;
@@ -574,6 +595,8 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
     ly.own.clear();
     ly.state.clear();
     ly.mx.clear();
+    ly.in_place = false;
+    ly.cache_state.clear();
 
     static const std::map<std::string, const char *> direct = {
         { "ln1", "attn_norm.weight" },    { "ln2", "post_attention_norm.weight" }, { "w_qkv", "attn_qkv.weight" },
@@ -608,6 +631,13 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
             b = m.COS.get();
         } else if (n == "sin") {
             b = m.SIN.get();
+        } else if ((n == "state_in" || n == "conv_in") && cache(n == "state_in" ? "s" : "r", size)) {
+            // in place in the llama.cpp recurrent cache: its checkpoints save and restore exactly this state
+            ggml_tensor * c = cache(n == "state_in" ? "s" : "r", size);
+            b               = (ggml_backend_axera_buffer_context *) c->buffer->context;
+            p               = c->data;
+            ly.in_place     = true;
+            ly.cache_state.push_back({ b, p, size });
         } else if (n == "state_in" || n == "conv_in") {
             b = own(size);
             ly.state.push_back(b);
@@ -681,6 +711,10 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
         ggml_backend_axera_buffer_context * b;
         if (n == "out") {
             b = xout;
+        } else if (ly.in_place && (n == "state_out" || n == "conv_out")) {
+            const int j = k->input(n == "state_out" ? "state_in" : "conv_in");
+            ly.out[i]   = ly.in[j];  // same buffer as the input
+            continue;
         } else {  // state_out / conv_out, or the resident kc / vc
             b = own(size);
             if (n == "state_out" || n == "conv_out") {
@@ -729,12 +763,16 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
     }
     m.layers.clear();
     m.layers.resize(L);
+    m.rollback = true;
     for (int il = 0; il < L; ++il) {
         axera_q35_bind_layer(m, il, t);
+        if (m.layers[il].gdn && !m.layers[il].in_place) {
+            m.rollback = false;
+        }
     }
     m.ready = true;
-    GGML_LOG_INFO("%s: Axera qwen35 template: %d layers, context %d, %s weights\n", __func__, L, m.LMAX,
-                  mx8 ? "MXFP8" : "BF16");
+    GGML_LOG_INFO("%s: Axera qwen35 template: %d layers, context %d, %s weights, recurrent state %s\n", __func__, L,
+                  m.LMAX, mx8 ? "MXFP8" : "BF16", m.rollback ? "in the llama.cpp cache (checkpoints work)" : "private");
 }
 
 static void axera_q35_restart(axera_q35 & m) {
@@ -742,6 +780,10 @@ static void axera_q35_restart(axera_q35 & m) {
         for (auto * s : ly.state) {
             memset(s->vir, 0, s->size);
             s->flush(s->vir, s->size);
+        }
+        for (auto & c : ly.cache_state) {  // state kept in the llama.cpp cache tensors
+            memset(c.p, 0, c.size);
+            c.b->flush(c.p, c.size);
         }
     }
     auto * mask = (ggml_bf16_t *) m.MASK->vir;
@@ -765,7 +807,11 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
         ggml_tensor * node = cgraph->nodes[i];
         t.emplace(axera_base_name(node->name), node);
         for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
-            t.emplace(axera_base_name(node->src[s]->name), node->src[s]);
+            ggml_tensor * src = node->src[s];
+            t.emplace(axera_base_name(src->name), src);
+            for (ggml_tensor * v = src->view_src; v; v = v->view_src) {  // e.g. the cache tensors behind their views
+                t.emplace(axera_base_name(v->name), v);
+            }
         }
     }
     auto find = [&](const char * name) -> ggml_tensor * {
@@ -827,12 +873,20 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
         const int64_t p = pos[it];
         if (p == 0) {
             axera_q35_restart(m);
+        } else if (m.rollback && p < m.next_pos) {
+            // back to an earlier position: llama.cpp has restored the recurrent cache (a context checkpoint) to the
+            // state after position p - 1, and dropped the later attention cells; hide them from the attention kernel
+            auto * mask = (ggml_bf16_t *) m.MASK->vir;
+            for (int64_t j = p; j < m.next_pos; ++j) {
+                mask[j] = ggml_fp32_to_bf16(-3e38f);
+            }
+            m.next_pos = p;
         }
         if (p != m.next_pos || p >= m.LMAX) {
             // fail the batch, not the process: the next request starting at position 0 recovers
             GGML_LOG_ERROR("qwen35 template: position %" PRId64 " (expected %" PRId64 ", context %d). The template runs a "
-                           "single sequence with consecutive positions; with llama-server use -np 1 --ctx-checkpoints 0 "
-                           "--cache-ram 0\n", p, m.next_pos, m.LMAX);
+                           "single sequence with consecutive positions; with llama-server use -np 1 --cache-ram 0%s\n",
+                           p, m.next_pos, m.LMAX, m.rollback ? "" : " --ctx-checkpoints 0");
             m.next_pos = -1;  // only a restart at position 0 is accepted now
             return GGML_STATUS_FAILED;
         }
