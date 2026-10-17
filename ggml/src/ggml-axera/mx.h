@@ -39,21 +39,21 @@ static inline uint8_t axera_f32_to_e4m3(float x) {
     return sign | (uint8_t) (E << 3) | (uint8_t) q;
 }
 
-// one row of K bf16 values -> K e4m3 bytes and K / 32 e8m0 scales
-static inline void axera_quantize_row_mxfp8(const uint16_t * src, uint8_t * q, uint8_t * scale, int64_t K) {
+// one row of K float values -> K e4m3 bytes and K / 32 e8m0 scales
+static inline void axera_quantize_row_mxfp8_f32(const float * src, uint8_t * q, uint8_t * scale, int64_t K) {
     for (int64_t g = 0; g < K / AXERA_MX_GROUP; ++g) {
-        const uint16_t * s    = src + g * AXERA_MX_GROUP;
-        float            amax = 0.0f;
+        const float * s    = src + g * AXERA_MX_GROUP;
+        float         amax = 0.0f;
         for (int i = 0; i < AXERA_MX_GROUP; ++i) {
-            amax = std::fmax(amax, std::fabs(axera_bf16_to_f32(s[i])));
+            amax = std::fmax(amax, std::fabs(s[i]));
         }
         amax  = std::fmax(amax, std::ldexp(1.0f, -126));
         int e = (int) std::ceil(std::log2(amax / 448.0f));
         e     = e < -127 ? -127 : (e > 127 ? 127 : e);
-        scale[g]          = (uint8_t) (e + 127);
-        const float inv   = std::ldexp(1.0f, -e);
+        scale[g]        = (uint8_t) (e + 127);
+        const float inv = std::ldexp(1.0f, -e);
         for (int i = 0; i < AXERA_MX_GROUP; ++i) {
-            q[g * AXERA_MX_GROUP + i] = axera_f32_to_e4m3(axera_bf16_to_f32(s[i]) * inv);
+            q[g * AXERA_MX_GROUP + i] = axera_f32_to_e4m3(s[i] * inv);
         }
     }
 }

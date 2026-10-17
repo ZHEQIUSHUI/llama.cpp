@@ -5,6 +5,8 @@
 > - **Per op** (default): the matrix products of BF16 GGUF models run on the NPU, everything else on the CPU.
 > - **Graph template** (`GGML_AXERA_TEMPLATE=qwen35`): whole Qwen3.5 graphs run as one NPU kernel per layer.
 >
+> Any GGUF weight type (BF16, Q8_0, Q4_K_M, ...) works with the template; see below.
+>
 > AX8860, Qwen3.5-0.8B BF16 GGUF, single core: CPU only 473 ms per token, per op 101 ms, template 39.7 ms
 > (25 tokens/s), template with MXFP8 weights 30.5 ms (33 tokens/s).
 
@@ -79,6 +81,23 @@ Still needed:
 A request the template cannot continue from fails with an HTTP 500 error and a log line naming the flags; the server
 keeps running, and a request starting at position 0 works again. With BF16 weights, the chat endpoint streams at
 42.5 ms per token and takes 25-28 ms per prompt token.
+
+### Quantized GGUF (Q8_0, Q4_K_M, Q4_0, ...)
+
+The template accepts GGUF files of any weight type that ggml can dequantize. At load it converts each projection to
+the kernels' format, BF16 or (with `GGML_AXERA_WEIGHTS=mxfp8`) MXFP8, using ggml's own `to_float`, and keeps the copy
+in CMM. The speed is therefore that of BF16 / MXFP8, and the accuracy is that of the GGUF. Qwen3.5-0.8B,
+`llama-perplexity` (English / Chinese), against the llama.cpp CPU backend on the same file:
+
+| GGUF | CPU backend | template BF16 | template MXFP8 | decode ms per token (BF16 / MXFP8) |
+|---|---|---|---|---|
+| Q8_0 | 2.476 / 40.13 | 2.440 / 40.21 | 2.428 / 40.30 | 40.5 / 31.0 |
+| Q4_K_M | 3.571 / 42.14 | 3.557 / 41.94 | 3.544 / 42.11 | 40.6 / 30.9 |
+| Q4_0 | 5.593 / 46.89 | 5.558 / 46.95 | 5.548 / 47.34 | 40.6 / 31.0 |
+
+The NPU's 4-bit formats do not help here. Re-quantizing a Q4_K_M model to MXFP4 or NVFP4 by rounding loses far more
+than Q4_K_M itself; in transformers, 900-token Chinese / English texts give Q4_K_M 38.1 / 3.11, MXFP4 51.9 / 10.7,
+and NVFP4 46.1 / 6.76. 4-bit NPU weights would need a calibrated quantization, not a format conversion.
 
 ### MXFP8 weights
 
