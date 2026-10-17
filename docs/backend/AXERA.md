@@ -5,7 +5,8 @@
 > - **Per op** (default): the matrix products of BF16 GGUF models run on the NPU, everything else on the CPU.
 > - **Graph template** (`GGML_AXERA_TEMPLATE=qwen35`): whole Qwen3.5 graphs run as one NPU kernel per layer.
 >
-> AX8860, Qwen3.5-0.8B BF16, single core: CPU only 473 ms per token, per op 101 ms, template 39.7 ms (25 tokens/s).
+> AX8860, Qwen3.5-0.8B BF16 GGUF, single core: CPU only 473 ms per token, per op 101 ms, template 39.7 ms
+> (25 tokens/s), template with MXFP8 weights 30.5 ms (33 tokens/s).
 
 The Axera backend ([`ggml/src/ggml-axera`](../../ggml/src/ggml-axera)) runs GGML ops on the NPU of Axera SoCs (AX8860)
 with precompiled kernels, and leaves everything else to the CPU backend.
@@ -48,6 +49,22 @@ Limits of the template:
 ```bash
 GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-completion -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 4096 -p "..." -n 128
 ```
+
+### MXFP8 weights
+
+With `GGML_AXERA_WEIGHTS=mxfp8` the template quantizes the bf16 GGUF weights to MXFP8 at load: E4M3 elements and one
+E8M0 scale per 32 inputs, with the exponent chosen so that nothing saturates. This roughly halves the bytes read per
+token. It needs the kernels `qwen35_gdn_mx8.axmodel`, `qwen35_attn_mx8.axmodel` and `mul_mat_mx8_n<C>_k<K>.axmodel`.
+
+Qwen3.5-0.8B, `llama-perplexity`, 2 x 512 tokens:
+
+| Weights | ms per token | English (GPL text) | Chinese (technical prose) |
+|---|---|---|---|
+| BF16 | 39.7 | 2.427 | 40.24 |
+| MXFP8 | 30.5 | 2.582 (+6.4%) | 40.40 (+0.4%) |
+
+The loss is spread over the MLP and the delta-net projections and is the same for other exponent rules (OCP floor,
+best of two), so keeping single tensors in bf16 does not recover it. Use MXFP8 when the speed matters more.
 
 ## Build
 

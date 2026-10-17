@@ -16,6 +16,7 @@
 // GGML_AXERA_DEBUG=1 logs every missing kernel once.
 
 #include "ggml-axera.h"
+#include "mx.h"
 
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
@@ -37,6 +38,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 static constexpr size_t AXERA_ALIGNMENT = 128;
@@ -135,7 +137,8 @@ struct ggml_axera_kernel {
 struct ggml_axera_kernel_registry {
     std::mutex                                                mutex;
     std::string                                               dir;
-    std::map<int64_t, std::set<int64_t>>                      mul_mat;  // K -> available weight-row counts C
+    std::map<int64_t, std::set<int64_t>>                      mul_mat;      // bf16: K -> available weight-row counts C
+    std::map<int64_t, std::set<int64_t>>                      mul_mat_mx8;  // MXFP8 weights (x, w, s -> out)
     std::set<std::string>                                     reported;
     std::map<std::string, std::unique_ptr<ggml_axera_kernel>> loaded;
 
@@ -149,6 +152,9 @@ struct ggml_axera_kernel_registry {
                 if (sscanf(f->d_name, "mul_mat_bf16_n%lld_k%lld%15s", &c, &k, tail) == 3 && strcmp(tail, ".axmodel") == 0) {
                     mul_mat[k].insert(c);
                 }
+                if (sscanf(f->d_name, "mul_mat_mx8_n%lld_k%lld%15s", &c, &k, tail) == 3 && strcmp(tail, ".axmodel") == 0) {
+                    mul_mat_mx8[k].insert(c);
+                }
             }
             closedir(d);
         }
@@ -157,10 +163,11 @@ struct ggml_axera_kernel_registry {
     std::string path(const std::string & name) const { return dir + "/" + name + ".axmodel"; }
 
     // weight rows per call for a [N, K] weight: N itself, else the largest available C dividing N; 0 if none
-    int64_t mul_mat_chunk(int64_t n, int64_t k) {
+    int64_t mul_mat_chunk(int64_t n, int64_t k, bool mx8 = false) {
         std::lock_guard<std::mutex> lock(mutex);
-        auto it = mul_mat.find(k);
-        if (it != mul_mat.end()) {
+        auto & kernels = mx8 ? mul_mat_mx8 : mul_mat;
+        auto   it      = kernels.find(k);
+        if (it != kernels.end()) {
             for (auto c = it->second.rbegin(); c != it->second.rend(); ++c) {
                 if (*c <= n && n % *c == 0) {
                     return *c;
@@ -168,9 +175,9 @@ struct ggml_axera_kernel_registry {
             }
         }
         char key[64];
-        snprintf(key, sizeof(key), "n%" PRId64 "_k%" PRId64, n, k);
+        snprintf(key, sizeof(key), "%s_n%" PRId64 "_k%" PRId64, mx8 ? "mx8" : "bf16", n, k);
         if (axera_debug() && reported.insert(key).second) {
-            GGML_LOG_INFO("%s: no kernel mul_mat_bf16_%s in %s\n", __func__, key, dir.c_str());
+            GGML_LOG_INFO("%s: no kernel mul_mat_%s in %s\n", __func__, key, dir.c_str());
         }
         return 0;
     }
@@ -203,9 +210,9 @@ static ggml_axera_kernel_registry & axera_kernels() {
     return registry;
 }
 
-static std::string axera_mul_mat_kernel_name(int64_t c, int64_t k) {
+static std::string axera_mul_mat_kernel_name(int64_t c, int64_t k, bool mx8 = false) {
     char name[96];
-    snprintf(name, sizeof(name), "mul_mat_bf16_n%" PRId64 "_k%" PRId64, c, k);
+    snprintf(name, sizeof(name), "mul_mat_%s_n%" PRId64 "_k%" PRId64, mx8 ? "mx8" : "bf16", c, k);
     return name;
 }
 
@@ -381,13 +388,47 @@ static bool axera_template_qwen35() {
     return on;
 }
 
+// GGML_AXERA_WEIGHTS=mxfp8: the template quantizes the bf16 GGUF weights to MXFP8 at load (about half the bytes per
+// token; see docs/backend/AXERA.md for the accuracy cost)
+static bool axera_weights_mx8() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_AXERA_WEIGHTS");
+        return e != nullptr && strcmp(e, "mxfp8") == 0;
+    }();
+    return on;
+}
+
 using axera_cmm = std::unique_ptr<ggml_backend_axera_buffer_context>;
+
+// bf16 [N, K] tensor -> MXFP8 elements [N, K] and scales [N, K / 32] in new CMM buffers, on all cores
+static void axera_quantize_mxfp8(const ggml_tensor * w, axera_cmm & q, axera_cmm & s) {
+    GGML_ASSERT(w->type == GGML_TYPE_BF16 && ggml_is_contiguous(w) && w->ne[0] % AXERA_MX_GROUP == 0);
+    const int64_t K = w->ne[0], N = ggml_nrows(w);
+    q = axera_cmm_alloc(N * K);
+    s = axera_cmm_alloc(N * K / AXERA_MX_GROUP);
+    const int                n_threads = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::thread> pool;
+    for (int t = 0; t < n_threads; ++t) {
+        pool.emplace_back([&, t] {
+            for (int64_t r = t; r < N; r += n_threads) {
+                axera_quantize_row_mxfp8((const uint16_t *) w->data + r * K, (uint8_t *) q->vir + r * K,
+                                         (uint8_t *) s->vir + r * (K / AXERA_MX_GROUP), K);
+            }
+        });
+    }
+    for (auto & th : pool) {
+        th.join();
+    }
+    q->flush(q->vir, q->size);
+    s->flush(s->vir, s->size);
+}
 
 struct axera_q35_layer {
     bool                               gdn = false;
     std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
     int                                si = -1, so = -1, ci = -1, co = -1;  // GDN state in/out, swapped every step
     std::vector<axera_cmm>             own;                                // converted weights, state, KV cache
+    std::map<std::string, std::pair<ggml_backend_axera_buffer_context *, ggml_backend_axera_buffer_context *>> mx;
     std::vector<ggml_backend_axera_buffer_context *> state;                // state buffers to clear on restart
 };
 
@@ -398,6 +439,8 @@ struct axera_q35 {
     double                THETA = 0;
     ggml_axera_kernel *   gdn = nullptr, *attn = nullptr;
     axera_cmm             A, B, POS, NBLK, MASK, COS, SIN;  // A/B: layer input/output ping-pong
+    axera_cmm             lm_q, lm_s;                       // MXFP8 output projection
+    const ggml_tensor *   lm = nullptr;
     std::vector<axera_q35_layer> layers;
     std::vector<float>    inv_freq;
     int64_t               next_pos = 0;
@@ -456,6 +499,46 @@ static void axera_gemv(ggml_backend_axera_context * ctx, const ggml_tensor * w, 
     dctx->invalidate(out, N * sizeof(float));
 }
 
+// out[0:N] (f32, inside a CMM tensor) = MXFP8 W[N, K] (elements q, scales s) . x[0:K], in N / C GEMV calls
+static void axera_gemv_mx8(ggml_backend_axera_context * ctx, const ggml_backend_axera_buffer_context * q,
+                           const ggml_backend_axera_buffer_context * sc, int64_t N, int64_t K, const float * x,
+                           ggml_tensor * dst, float * out) {
+    const int64_t C = axera_kernels().mul_mat_chunk(N, K, true);
+    GGML_ASSERT(C > 0);
+    ggml_axera_kernel * k  = axera_kernels().get(axera_mul_mat_kernel_name(C, K, true));
+    const int           ix = k->input("x"), iw = k->input("w"), is = k->input("s"), io = k->output("out");
+    GGML_ASSERT(ix >= 0 && iw >= 0 && is >= 0 && io >= 0 && k->info->nInputSize == 3 && k->info->nOutputSize == 1);
+    const int64_t gs = K / AXERA_MX_GROUP;
+    GGML_ASSERT(k->info->pInputs[iw].nSize == C * K && k->info->pInputs[is].nSize == C * gs &&
+                k->info->pOutputs[io].nSize == C * sizeof(float));
+
+    auto * st   = ctx->staging_for(K * sizeof(ggml_bf16_t));
+    auto * xb   = (ggml_bf16_t *) st->vir;
+    auto * dctx = (ggml_backend_axera_buffer_context *) dst->buffer->context;
+    ggml_fp32_to_bf16_row(x, xb, K);
+    st->flush(xb, K * sizeof(ggml_bf16_t));
+    dctx->flush(out, N * sizeof(float));
+
+    AX_ENGINE_IO_BUFFER_T inputs[3], outputs[1];
+    AX_ENGINE_IO_T        io_set;
+    memset(&io_set, 0, sizeof(io_set));
+    io_set.pInputs     = inputs;
+    io_set.nInputSize  = 3;
+    io_set.pOutputs    = outputs;
+    io_set.nOutputSize = 1;
+    inputs[ix]         = axera_io(st, xb, K * sizeof(ggml_bf16_t));
+    for (int64_t c0 = 0; c0 < N; c0 += C) {
+        inputs[iw]    = axera_io(q, (char *) q->vir + c0 * K, C * K);
+        inputs[is]    = axera_io(sc, (char *) sc->vir + c0 * gs, C * gs);
+        outputs[io]   = axera_io(dctx, out + c0, C * sizeof(float));
+        const int ret = AX_ENGINE_RunSync(k->handle, &io_set);
+        if (ret != 0) {
+            GGML_ABORT("%s: RunSync failed (0x%x), n=%" PRId64 " k=%" PRId64 "\n", __func__, ret, N, K);
+        }
+    }
+    dctx->invalidate(out, N * sizeof(float));
+}
+
 static void ggml_backend_axera_mul_mat(ggml_backend_axera_context * ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -490,6 +573,7 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
     ly.out.assign(k->info->nOutputSize, {});
     ly.own.clear();
     ly.state.clear();
+    ly.mx.clear();
 
     static const std::map<std::string, const char *> direct = {
         { "ln1", "attn_norm.weight" },    { "ln2", "post_attention_norm.weight" }, { "w_qkv", "attn_qkv.weight" },
@@ -548,6 +632,25 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
                 }
             }
             b->flush(b->vir, size);
+        } else if ((n.rfind("w_", 0) == 0 || n.rfind("s_", 0) == 0) && k->input(("s_" + n.substr(2)).c_str()) >= 0) {
+            // MXFP8 kernel: w_<x> elements and s_<x> scales, quantized from the bf16 GGUF tensor of w_<x>
+            const std::string wn = "w_" + n.substr(2);
+            auto              mx = ly.mx.find(wn);
+            if (mx == ly.mx.end()) {
+                auto d = direct.find(wn);
+                if (d == direct.end()) {
+                    GGML_ABORT("qwen35 template: kernel input %s has no GGUF tensor\n", wn.c_str());
+                }
+                axera_cmm q, sc;
+                axera_quantize_mxfp8(get(d->second), q, sc);
+                mx = ly.mx.emplace(wn, std::make_pair(q.get(), sc.get())).first;
+                ly.own.push_back(std::move(q));
+                ly.own.push_back(std::move(sc));
+            }
+            b = n[0] == 'w' ? mx->second.first : mx->second.second;
+            if (b->size < size) {
+                GGML_ABORT("qwen35 template: %s is %zu bytes, kernel wants %u\n", n.c_str(), b->size, size);
+            }
         } else {
             auto it = direct.find(n);
             if (it == direct.end()) {
@@ -589,15 +692,23 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
     }
 }
 
-static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggml_tensor *> & t) {
+static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggml_tensor *> & t,
+                           const ggml_tensor * lm) {
     std::ifstream f(axera_kernels().dir + "/qwen35.txt");
     if (!(f >> m.LMAX >> m.BC >> m.ROT >> m.THETA)) {
         GGML_ABORT("qwen35 template: missing %s/qwen35.txt\n", axera_kernels().dir.c_str());
     }
     m.L    = L;
     m.H    = H;
-    m.gdn  = axera_kernels().get("qwen35_gdn");
-    m.attn = axera_kernels().get("qwen35_attn");
+    const bool mx8 = axera_weights_mx8();
+    m.gdn  = axera_kernels().get(mx8 ? "qwen35_gdn_mx8" : "qwen35_gdn");
+    m.attn = axera_kernels().get(mx8 ? "qwen35_attn_mx8" : "qwen35_attn");
+    m.lm   = lm;
+    m.lm_q.reset();
+    m.lm_s.reset();
+    if (mx8) {
+        axera_quantize_mxfp8(lm, m.lm_q, m.lm_s);
+    }
     auto size_of = [](ggml_axera_kernel * k, const char * name) {
         const int i = k->input(name);
         GGML_ASSERT(i >= 0);
@@ -622,7 +733,8 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
         axera_q35_bind_layer(m, il, t);
     }
     m.ready = true;
-    GGML_LOG_INFO("%s: Axera qwen35 template: %d layers, context %d\n", __func__, L, m.LMAX);
+    GGML_LOG_INFO("%s: Axera qwen35 template: %d layers, context %d, %s weights\n", __func__, L, m.LMAX,
+                  mx8 ? "MXFP8" : "BF16");
 }
 
 static void axera_q35_restart(axera_q35 & m) {
@@ -701,8 +813,8 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
     }
     axera_q35 & m = ctx->q35;
     ggml_tensor * w0 = find("blk.0.attn_norm.weight");
-    if (!m.ready || m.L != L || m.bound != w0->data) {
-        axera_q35_init(m, L, H, t);
+    if (!m.ready || m.L != L || m.bound != w0->data || m.lm != lm) {
+        axera_q35_init(m, L, H, t, lm);
         m.bound = w0->data;
         axera_q35_restart(m);
     }
@@ -792,7 +904,12 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
         if (rnorm && rnorm->type == GGML_TYPE_F32 && rnorm->ne[0] == H && rnorm->ne[1] == n_out) {
             memcpy((char *) rnorm->data + r * rnorm->nb[1], hn.data(), H * sizeof(float));
         }
-        axera_gemv(ctx, lm, hn.data(), logits, (float *) ((char *) logits->data + r * logits->nb[1]));
+        float * dst = (float *) ((char *) logits->data + r * logits->nb[1]);
+        if (m.lm_q) {
+            axera_gemv_mx8(ctx, m.lm_q.get(), m.lm_s.get(), lm->ne[1], H, hn.data(), logits, dst);
+        } else {
+            axera_gemv(ctx, lm, hn.data(), logits, dst);
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
