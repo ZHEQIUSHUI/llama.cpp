@@ -260,6 +260,8 @@ set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
                                             "ggml: sycl device architecture")
 
 option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
+option(GGML_AXERA                           "ggml: use Axera NPU"                             OFF)
+set   (GGML_AXERA_BSP_DIR "" CACHE PATH       "ggml: Axera BSP directory (include/ and lib/)")
 option(GGML_ET                              "ggml: use ET backend"                            OFF)
 option(GGML_ET_SYSEMU                       "ggml: use ET backend via sysemu"                 OFF)
 
@@ -342,6 +344,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-webgpu.h
     include/ggml-zendnn.h
     include/ggml-openvino.h
+    include/ggml-axera.h
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
