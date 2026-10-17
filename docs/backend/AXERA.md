@@ -50,6 +50,22 @@ Limits of the template:
 GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-completion -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 4096 -p "..." -n 128
 ```
 
+### llama-server
+
+The template keeps its own state, so the server must not run several slots, restore context checkpoints or reload
+prompts from its RAM cache:
+
+```bash
+GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-server -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 4096 \
+    -np 1 --ctx-checkpoints 0 --cache-ram 0 --host 0.0.0.0 --port 8080
+```
+
+A request that continues the previous conversation keeps the state; any other request (a new conversation, or a
+history that changed, as when the chat template drops the thinking of earlier turns) is processed again from position
+0. Without these flags, the request after a checkpoint restore fails with an HTTP 500 error and a log line naming the
+flags; the server keeps running and the next request works. On AX8860 with BF16 weights, the OpenAI chat endpoint
+streams at 42.5 ms per token and takes 25-27 ms per prompt token.
+
 ### MXFP8 weights
 
 With `GGML_AXERA_WEIGHTS=mxfp8` the template quantizes the bf16 GGUF weights to MXFP8 at load: E4M3 elements and one

@@ -829,8 +829,12 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
             axera_q35_restart(m);
         }
         if (p != m.next_pos || p >= m.LMAX) {
-            GGML_ABORT("qwen35 template: position %" PRId64 " (expected %" PRId64 ", context %d); the template runs a "
-                       "single sequence with consecutive positions\n", p, m.next_pos, m.LMAX);
+            // fail the batch, not the process: the next request starting at position 0 recovers
+            GGML_LOG_ERROR("qwen35 template: position %" PRId64 " (expected %" PRId64 ", context %d). The template runs a "
+                           "single sequence with consecutive positions; with llama-server use -np 1 --ctx-checkpoints 0 "
+                           "--cache-ram 0\n", p, m.next_pos, m.LMAX);
+            m.next_pos = -1;  // only a restart at position 0 is accepted now
+            return GGML_STATUS_FAILED;
         }
         ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + it * x0->nb[1]), (ggml_bf16_t *) m.A->vir, H);
         m.A->flush(m.A->vir, H * sizeof(ggml_bf16_t));
