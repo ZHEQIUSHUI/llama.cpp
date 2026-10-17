@@ -40,11 +40,17 @@ projection.
 Kernels in `GGML_AXERA_KERNEL_DIR`: `qwen35_gdn.axmodel`, `qwen35_attn.axmodel`, `qwen35.txt` (`LMAX BC ROT THETA`),
 plus the `mul_mat` kernel for the output projection.
 
+Optional prefill kernels `qwen35_gdn_prefill<P>.axmodel` / `qwen35_attn_prefill<P>.axmodel` (P = 16, 8, 4) process P
+consecutive prompt tokens per call. The projections and the MLP read every weight once per chunk; the delta rule
+still runs token by token inside the kernel. The backend splits a batch greedily into the largest chunks that fit and
+runs the rest through the decode kernels. On AX8860 (BF16) the prompt costs 4.6-11 ms per token instead of 26-30 ms.
+
 Limits of the template:
 - One sequence. Positions continue, restart at 0, or go back to a context checkpoint; the recurrent state lives in
   the llama.cpp recurrent cache, while the KV cache lives in the backend.
 - The context is limited to the kernels' `LMAX` (4096).
-- Prompt tokens go through the decode kernels one at a time.
+- Prompt tokens go through the prefill kernels in chunks of 16 / 8 / 4, if present, and through the decode kernels
+  otherwise.
 
 ```bash
 GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-completion -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 4096 -p "..." -n 128
@@ -81,8 +87,10 @@ Qwen3.5-0.8B, `llama-perplexity`, 2 x 512 tokens:
 
 | Weights | ms per token | English (GPL text) | Chinese (technical prose) |
 |---|---|---|---|
-| BF16 | 39.7 | 2.427 | 40.24 |
-| MXFP8 | 30.5 | 2.582 (+6.4%) | 40.40 (+0.4%) |
+| BF16 | 39.7 | 2.431 | 40.18 |
+| MXFP8 | 30.5 | 2.598 (+6.9%) | 40.57 (+1.0%) |
+
+(PPL with the prefill kernels; decode only it was 2.427 / 40.24 for BF16 and 2.582 / 40.40 for MXFP8.)
 
 The loss is spread over the MLP and the delta-net projections and is the same for other exponent rules (OCP floor,
 best of two), so keeping single tensors in bf16 does not recover it. Use MXFP8 when the speed matters more.
