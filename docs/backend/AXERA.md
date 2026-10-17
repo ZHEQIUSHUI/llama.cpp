@@ -40,17 +40,20 @@ projection.
 Kernels in `GGML_AXERA_KERNEL_DIR`: `qwen35_gdn.axmodel`, `qwen35_attn.axmodel`, `qwen35.txt` (`LMAX BC ROT THETA`),
 plus the `mul_mat` kernel for the output projection.
 
-Optional prefill kernels `qwen35_gdn_prefill<P>.axmodel` / `qwen35_attn_prefill<P>.axmodel` (P = 16, 8, 4) process P
-consecutive prompt tokens per call. The projections and the MLP read every weight once per chunk; the delta rule
-still runs token by token inside the kernel. The backend splits a batch greedily into the largest chunks that fit and
-runs the rest through the decode kernels. On AX8860 (BF16) the prompt costs 4.6-11 ms per token instead of 26-30 ms.
+Optional prefill kernels `qwen35_gdn_prefill<P>.axmodel` / `qwen35_attn_prefill<P>.axmodel` (P = 64, 32, 16, 8, 4)
+process P consecutive prompt tokens per call. The projections and the MLP read every weight once per chunk. For
+P >= 16 the delta rule runs in the chunked form (the triangular solve of `gdn_stable_chunk`, 32 tokens per solve,
+8 heads batched), so a chunk is mostly matrix products; for P = 8 / 4 it runs token by token. The backend splits a
+batch greedily into the largest chunks that fit and runs the rest through the decode kernels. On AX8860 (BF16) a
+1708-token prompt takes 1.0 s (0.58 ms per token, 1712 tokens/s; token by token through the decode kernels it was
+26-30 ms per token).
 
 Limits of the template:
 - One sequence. Positions continue, restart at 0, or go back to a context checkpoint; the recurrent state lives in
   the llama.cpp recurrent cache, while the KV cache lives in the backend.
 - The context is limited to the kernels' `LMAX` (4096).
-- Prompt tokens go through the prefill kernels in chunks of 16 / 8 / 4, if present, and through the decode kernels
-  otherwise.
+- Prompt tokens go through the prefill kernels in chunks of 64 / 32 / 16 / 8 / 4, if present, and through the decode
+  kernels otherwise.
 
 ```bash
 GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-completion -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 4096 -p "..." -n 128

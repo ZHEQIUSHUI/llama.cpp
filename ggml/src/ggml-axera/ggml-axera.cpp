@@ -832,7 +832,7 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
     }
     // prefill kernels, if built for this weight format (every chunk size found, largest first)
     m.pre.clear();
-    for (int P : { 32, 16, 8, 4 }) {
+    for (int P : { 64, 32, 16, 8, 4 }) {
         const std::string sfx = std::to_string(P) + (mx8 ? "_mx8" : "");
         if (!std::ifstream(axera_kernels().path("qwen35_gdn_prefill" + sfx)).good() ||
             !std::ifstream(axera_kernels().path("qwen35_attn_prefill" + sfx)).good()) {
