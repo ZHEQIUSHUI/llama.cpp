@@ -6,8 +6,10 @@
 //   line may be evicted over the result) and invalidates it afterwards.
 // - Kernels are precompiled axmodels (AXDSL), looked up by name in GGML_AXERA_KERNEL_DIR (default ./axera_kernels).
 //   An op is supported only if the kernel for its shape exists; everything else falls back to the CPU backend.
-// - Ops: MUL_MAT with BF16 weights and one F32 activation row (decode). Kernel "mul_mat_bf16_n<N>_k<K>.axmodel",
-//   inputs x [1, K] bf16, w [N, K] bf16, output out [1, N] f32.
+// - Ops: MUL_MAT with BF16 weights and F32 activations. Kernel "mul_mat_bf16_n<C>_k<K>.axmodel" (x [1, K] bf16,
+//   w [C, K] bf16 -> out [1, C] f32) computes one activation row against C weight rows; N is covered by N / C calls
+//   (C = N, or the largest kernel C that divides N, e.g. a vocabulary-sized output projection in chunks). Several
+//   activation rows (prompt processing) run row by row, rereading the weights each time, until a batched kernel exists.
 // - Single-core kernels only: the current NPU driver does not run tasks on several cores concurrently.
 //
 // GGML_AXERA_DEBUG=1 logs every missing kernel once.
@@ -20,7 +22,7 @@
 #include <ax_engine_api.h>
 #include <ax_sys_api.h>
 
-#include <sys/stat.h>
+#include <dirent.h>
 
 #include <cinttypes>
 #include <cstdio>
@@ -130,29 +132,44 @@ struct ggml_axera_kernel {
 struct ggml_axera_kernel_registry {
     std::mutex                                                mutex;
     std::string                                               dir;
-    std::map<std::string, bool>                               exists;
+    std::map<int64_t, std::set<int64_t>>                      mul_mat;  // K -> available weight-row counts C
+    std::set<std::string>                                     reported;
     std::map<std::string, std::unique_ptr<ggml_axera_kernel>> loaded;
 
     ggml_axera_kernel_registry() {
         const char * e = std::getenv("GGML_AXERA_KERNEL_DIR");
         dir = e ? e : "./axera_kernels";
+        if (DIR * d = opendir(dir.c_str())) {
+            while (dirent * f = readdir(d)) {
+                long long c, k;
+                char      tail[16];
+                if (sscanf(f->d_name, "mul_mat_bf16_n%lld_k%lld%15s", &c, &k, tail) == 3 && strcmp(tail, ".axmodel") == 0) {
+                    mul_mat[k].insert(c);
+                }
+            }
+            closedir(d);
+        }
     }
 
     std::string path(const std::string & name) const { return dir + "/" + name + ".axmodel"; }
 
-    bool has(const std::string & name) {
+    // weight rows per call for a [N, K] weight: N itself, else the largest available C dividing N; 0 if none
+    int64_t mul_mat_chunk(int64_t n, int64_t k) {
         std::lock_guard<std::mutex> lock(mutex);
-        auto it = exists.find(name);
-        if (it != exists.end()) {
-            return it->second;
+        auto it = mul_mat.find(k);
+        if (it != mul_mat.end()) {
+            for (auto c = it->second.rbegin(); c != it->second.rend(); ++c) {
+                if (*c <= n && n % *c == 0) {
+                    return *c;
+                }
+            }
         }
-        struct stat st;
-        const bool found = stat(path(name).c_str(), &st) == 0;
-        exists[name] = found;
-        if (!found && axera_debug()) {
-            GGML_LOG_INFO("%s: no kernel %s\n", __func__, path(name).c_str());
+        char key[64];
+        snprintf(key, sizeof(key), "n%" PRId64 "_k%" PRId64, n, k);
+        if (axera_debug() && reported.insert(key).second) {
+            GGML_LOG_INFO("%s: no kernel mul_mat_bf16_%s in %s\n", __func__, key, dir.c_str());
         }
-        return found;
+        return 0;
     }
 
     ggml_axera_kernel * get(const std::string & name) {
@@ -183,9 +200,9 @@ static ggml_axera_kernel_registry & axera_kernels() {
     return registry;
 }
 
-static std::string axera_mul_mat_kernel_name(const ggml_tensor * op) {
+static std::string axera_mul_mat_kernel_name(int64_t c, int64_t k) {
     char name[96];
-    snprintf(name, sizeof(name), "mul_mat_bf16_n%" PRId64 "_k%" PRId64, op->src[0]->ne[1], op->src[0]->ne[0]);
+    snprintf(name, sizeof(name), "mul_mat_bf16_n%" PRId64 "_k%" PRId64, c, k);
     return name;
 }
 
@@ -357,38 +374,44 @@ static void ggml_backend_axera_mul_mat(ggml_backend_axera_context * ctx, ggml_te
     const ggml_tensor * src1 = dst->src[1];
     const int64_t       K    = src0->ne[0];
     const int64_t       N    = src0->ne[1];
+    const int64_t       M    = src1->ne[1];
+    const int64_t       C    = axera_kernels().mul_mat_chunk(N, K);
+    GGML_ASSERT(C > 0);
 
-    ggml_axera_kernel * k  = axera_kernels().get(axera_mul_mat_kernel_name(dst));
+    ggml_axera_kernel * k  = axera_kernels().get(axera_mul_mat_kernel_name(C, K));
     const int           ix = k->input("x"), iw = k->input("w"), io = k->output("out");
     GGML_ASSERT(ix >= 0 && iw >= 0 && io >= 0 && k->info->nInputSize == 2 && k->info->nOutputSize == 1);
+    GGML_ASSERT(k->info->pInputs[ix].nSize == K * sizeof(ggml_bf16_t) &&
+                k->info->pInputs[iw].nSize == C * src0->nb[1] && k->info->pOutputs[io].nSize == C * sizeof(float));
 
-    // activation row f32 -> bf16 into staging
-    auto *       st = ctx->staging_for(GGML_PAD(K * sizeof(ggml_bf16_t), AXERA_ALIGNMENT));
-    auto *       xb = (ggml_bf16_t *) st->vir;
-    const float * x = (const float *) src1->data;
-    ggml_fp32_to_bf16_row(x, xb, K);
-    st->flush(xb, K * sizeof(ggml_bf16_t));
-
+    auto * st   = ctx->staging_for(GGML_PAD(K * sizeof(ggml_bf16_t), AXERA_ALIGNMENT));
+    auto * xb   = (ggml_bf16_t *) st->vir;
     auto * wctx = (ggml_backend_axera_buffer_context *) src0->buffer->context;
     auto * dctx = (ggml_backend_axera_buffer_context *) dst->buffer->context;
     dctx->flush(dst->data, ggml_nbytes(dst));
 
     AX_ENGINE_IO_BUFFER_T inputs[2], outputs[1];
-    inputs[ix]  = axera_io(st, xb, K * sizeof(ggml_bf16_t));
-    inputs[iw]  = axera_io(wctx, src0->data, ggml_nbytes(src0));
-    outputs[io] = axera_io(dctx, dst->data, ggml_nbytes(dst));
-    GGML_ASSERT(inputs[ix].nSize == k->info->pInputs[ix].nSize && inputs[iw].nSize == k->info->pInputs[iw].nSize &&
-                outputs[io].nSize == k->info->pOutputs[io].nSize);
-
-    AX_ENGINE_IO_T io_set;
+    AX_ENGINE_IO_T        io_set;
     memset(&io_set, 0, sizeof(io_set));
     io_set.pInputs     = inputs;
     io_set.nInputSize  = 2;
     io_set.pOutputs    = outputs;
     io_set.nOutputSize = 1;
-    const int ret      = AX_ENGINE_RunSync(k->handle, &io_set);
-    if (ret != 0) {
-        GGML_ABORT("%s: RunSync failed (0x%x) for %s, n=%" PRId64 " k=%" PRId64 "\n", __func__, ret, dst->name, N, K);
+    inputs[ix]         = axera_io(st, xb, K * sizeof(ggml_bf16_t));
+
+    for (int64_t m = 0; m < M; ++m) {
+        // activation row f32 -> bf16 into staging
+        ggml_fp32_to_bf16_row((const float *) ((const char *) src1->data + m * src1->nb[1]), xb, K);
+        st->flush(xb, K * sizeof(ggml_bf16_t));
+        for (int64_t c0 = 0; c0 < N; c0 += C) {
+            inputs[iw]    = axera_io(wctx, (char *) src0->data + c0 * src0->nb[1], C * src0->nb[1]);
+            outputs[io]   = axera_io(dctx, (char *) dst->data + m * dst->nb[1] + c0 * sizeof(float), C * sizeof(float));
+            const int ret = AX_ENGINE_RunSync(k->handle, &io_set);
+            if (ret != 0) {
+                GGML_ABORT("%s: RunSync failed (0x%x) for %s, n=%" PRId64 " k=%" PRId64 " row %" PRId64 "\n", __func__,
+                           ret, dst->name, N, K, m);
+            }
+        }
     }
     dctx->invalidate(dst->data, ggml_nbytes(dst));
 }
@@ -536,11 +559,12 @@ static bool ggml_backend_axera_device_supports_op(ggml_backend_dev_t dev, const 
         {
             const ggml_tensor * src0 = op->src[0];
             const ggml_tensor * src1 = op->src[1];
-            // decode GEMV: one activation row, bf16 weights resident in CMM
+            // bf16 weights resident in CMM, f32 activation rows (any count: llama.cpp probes weight placement with a
+            // batch of rows, and the weights must be in CMM for decode)
             return ggml_backend_buffer_is_axera(src0->buffer) && src0->type == GGML_TYPE_BF16 &&
                    src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) &&
-                   ggml_is_contiguous(src1) && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[1] == 1 &&
-                   src1->ne[2] == 1 && src1->ne[3] == 1 && axera_kernels().has(axera_mul_mat_kernel_name(op));
+                   ggml_is_contiguous(src1) && ggml_is_contiguous(op) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                   src1->ne[2] == 1 && src1->ne[3] == 1 && axera_kernels().mul_mat_chunk(src0->ne[1], src0->ne[0]) > 0;
         }
 
         default:

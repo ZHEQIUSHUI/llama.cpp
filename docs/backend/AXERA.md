@@ -1,8 +1,9 @@
 # Axera NPU Backend for llama.cpp
 
 > [!NOTE]
-> Early stage: only the decode matrix-vector products of BF16 GGUF models run on the NPU so far; every other op falls
-> back to the CPU backend. Not yet validated on hardware.
+> Early stage: only the matrix products of BF16 GGUF models run on the NPU so far; every other op falls back to the
+> CPU backend. On an AX8860 board, Qwen3.5-0.8B BF16 generates the same text as the CPU backend at 101 ms per token
+> (CPU only: 473 ms).
 
 The Axera backend ([`ggml/src/ggml-axera`](../../ggml/src/ggml-axera)) runs GGML ops on the NPU of Axera SoCs (AX8860)
 with precompiled kernels, and leaves everything else to the CPU backend.
@@ -19,9 +20,11 @@ with precompiled kernels, and leaves everything else to the CPU backend.
 
 | Op | Condition | Kernel |
 |---|---|---|
-| `MUL_MAT` | BF16 weights in CMM, one F32 activation row (decode) | `mul_mat_bf16_n<N>_k<K>.axmodel`: inputs `x` [1, K] bf16, `w` [N, K] bf16; output `out` [1, N] f32 |
+| `MUL_MAT` | BF16 weights in CMM, F32 activations | `mul_mat_bf16_n<C>_k<K>.axmodel`: inputs `x` [1, K] bf16, `w` [C, K] bf16; output `out` [1, C] f32 |
 
-Prompt processing (more than one row) and the output projection (vocabulary-sized `N`) stay on the CPU for now.
+`C` is the weight row count `N` itself, or the largest available `C` that divides `N`: a vocabulary-sized output
+projection runs as `N / C` calls. Several activation rows (prompt processing) run row by row and reread the weights
+each time, until a batched kernel exists.
 
 ## Build
 
@@ -54,6 +57,6 @@ missing, i.e. the kernels to compile next.
 
 ## Kernels
 
-The kernels are generated from the GGUF itself: every BF16 2-D weight shape gets one GEMV kernel, checked on the NPU
-simulator against PyTorch. The generator needs the Axera `axnn` toolchain and is kept with the AXDSL kernel sources,
+The kernels are generated from the GGUF itself: every BF16 2-D weight shape gets one GEMV kernel (in chunks for
+vocabulary-sized shapes), checked on the NPU simulator against PyTorch. The generator needs the Axera `axnn` toolchain and is kept with the AXDSL kernel sources,
 outside this repository.
