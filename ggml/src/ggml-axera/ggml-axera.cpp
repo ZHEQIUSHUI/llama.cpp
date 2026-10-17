@@ -578,6 +578,16 @@ static float axera_rms_eps(const ggml_tensor * rms_norm) {
     return eps;
 }
 
+// kernel input -> GGUF tensor of the layer, for the inputs taken as they are
+static const std::map<std::string, const char *> axera_q35_direct = {
+    { "ln1", "attn_norm.weight" },    { "ln2", "post_attention_norm.weight" }, { "w_qkv", "attn_qkv.weight" },
+    { "w_z", "attn_gate.weight" },    { "w_b", "ssm_beta.weight" },            { "w_a", "ssm_alpha.weight" },
+    { "dt_bias", "ssm_dt.bias" },     { "norm_w", "ssm_norm.weight" },         { "w_out", "ssm_out.weight" },
+    { "w_gate", "ffn_gate.weight" },  { "w_up", "ffn_up.weight" },             { "w_down", "ffn_down.weight" },
+    { "w_q", "attn_q.weight" },       { "w_k", "attn_k.weight" },              { "w_v", "attn_v.weight" },
+    { "q_norm", "attn_q_norm.weight" }, { "k_norm", "attn_k_norm.weight" },    { "w_o", "attn_output.weight" },
+};
+
 // binds one layer's kernel IO: GGUF tensors in CMM directly where the layout matches, converted copies otherwise
 static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::string, ggml_tensor *> & t) {
     auto get = [&](const char * name) -> ggml_tensor * {
@@ -609,14 +619,6 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
     ly.in_place = false;
     ly.cache_state.clear();
 
-    static const std::map<std::string, const char *> direct = {
-        { "ln1", "attn_norm.weight" },    { "ln2", "post_attention_norm.weight" }, { "w_qkv", "attn_qkv.weight" },
-        { "w_z", "attn_gate.weight" },    { "w_b", "ssm_beta.weight" },            { "w_a", "ssm_alpha.weight" },
-        { "dt_bias", "ssm_dt.bias" },     { "norm_w", "ssm_norm.weight" },         { "w_out", "ssm_out.weight" },
-        { "w_gate", "ffn_gate.weight" },  { "w_up", "ffn_up.weight" },             { "w_down", "ffn_down.weight" },
-        { "w_q", "attn_q.weight" },       { "w_k", "attn_k.weight" },              { "w_v", "attn_v.weight" },
-        { "q_norm", "attn_q_norm.weight" }, { "k_norm", "attn_k_norm.weight" },    { "w_o", "attn_output.weight" },
-    };
     // layer input/output ping-pong: even layers read A and write B, odd layers the other way round
     auto * xin  = (il % 2 == 0 ? m.A : m.B).get();
     auto * xout = (il % 2 == 0 ? m.B : m.A).get();
@@ -678,8 +680,8 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
             const std::string wn = "w_" + n.substr(2);
             auto              mx = ly.mx.find(wn);
             if (mx == ly.mx.end()) {
-                auto d = direct.find(wn);
-                if (d == direct.end()) {
+                auto d = axera_q35_direct.find(wn);
+                if (d == axera_q35_direct.end()) {
                     GGML_ABORT("qwen35 template: kernel input %s has no GGUF tensor\n", wn.c_str());
                 }
                 axera_cmm q, sc;
@@ -693,8 +695,8 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
                 GGML_ABORT("qwen35 template: %s is %zu bytes, kernel wants %u\n", n.c_str(), b->size, size);
             }
         } else {
-            auto it = direct.find(n);
-            if (it == direct.end()) {
+            auto it = axera_q35_direct.find(n);
+            if (it == axera_q35_direct.end()) {
                 GGML_ABORT("qwen35 template: kernel input %s has no GGUF tensor\n", n.c_str());
             }
             ggml_tensor * w = get(it->second);
@@ -739,7 +741,7 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
 
 // prefill IO of one layer for chunk size v: the decode IO entries of the same names (weights, recurrent state, KV
 // cache), with P-row activations, the chunk mask and the chunk's RoPE tables
-static void axera_q35_bind_prefill(axera_q35 & m, int il, size_t v) {
+static void axera_q35_bind_prefill(axera_q35 & m, int il, size_t v, const std::map<std::string, ggml_tensor *> & t) {
     axera_q35_layer &        ly = m.layers[il];
     axera_q35::prefill &     pf = m.pre[v];
     ggml_axera_kernel *      k  = ly.gdn ? pf.gdn : pf.attn;
@@ -760,7 +762,15 @@ static void axera_q35_bind_prefill(axera_q35 & m, int il, size_t v) {
         }
         const int j = kd->input(n.c_str());
         if (j < 0 || kd->info->pInputs[j].nSize != size) {
-            GGML_ABORT("qwen35 template: prefill input %s does not match the decode kernel\n", n.c_str());
+            // a bf16 prefill weight next to MXFP8 decode kernels: the GGUF tensor itself
+            auto d  = axera_q35_direct.find(n);
+            auto it = d == axera_q35_direct.end() ? t.end() : t.find("blk." + std::to_string(il) + "." + d->second);
+            if (it == t.end() || ggml_nbytes(it->second) != size || !ggml_backend_buffer_is_axera(it->second->buffer)) {
+                GGML_ABORT("qwen35 template: prefill input %s matches neither the decode kernel nor a GGUF tensor in CMM\n",
+                           n.c_str());
+            }
+            io.in[i] = axera_io((ggml_backend_axera_buffer_context *) it->second->buffer->context, it->second->data, size);
+            continue;
         }
         io.in[i] = ly.in[j];
         if (n == "state_in") {
@@ -830,10 +840,13 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
             m.rollback = false;
         }
     }
-    // prefill kernels, if built for this weight format (every chunk size found, largest first)
+    // prefill kernels (every chunk size found, largest first). Prefill is compute bound, so with MXFP8 decode it uses
+    // the bf16 GGUF weights unless GGML_AXERA_PREFILL_WEIGHTS=mxfp8
+    const char * pw     = std::getenv("GGML_AXERA_PREFILL_WEIGHTS");
+    const bool   pre_mx = mx8 && pw != nullptr && strcmp(pw, "mxfp8") == 0;
     m.pre.clear();
     for (int P : { 64, 32, 16, 8, 4 }) {
-        const std::string sfx = std::to_string(P) + (mx8 ? "_mx8" : "");
+        const std::string sfx = std::to_string(P) + (pre_mx ? "_mx8" : "");
         if (!std::ifstream(axera_kernels().path("qwen35_gdn_prefill" + sfx)).good() ||
             !std::ifstream(axera_kernels().path("qwen35_attn_prefill" + sfx)).good()) {
             continue;
@@ -852,12 +865,15 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
     }
     for (size_t v = 0; v < m.pre.size(); ++v) {
         for (int il = 0; il < L; ++il) {
-            axera_q35_bind_prefill(m, il, v);
+            axera_q35_bind_prefill(m, il, v, t);
         }
     }
     std::string chunks;
     for (auto & pf : m.pre) {
         chunks += (chunks.empty() ? "" : "/") + std::to_string(pf.P);
+    }
+    if (!chunks.empty()) {
+        chunks += pre_mx ? " (MXFP8)" : " (BF16)";
     }
     m.ready = true;
     GGML_LOG_INFO("%s: Axera qwen35 template: %d layers, context %d, %s weights, recurrent state %s, prefill chunks %s\n",

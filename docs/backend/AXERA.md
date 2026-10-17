@@ -98,6 +98,13 @@ Qwen3.5-0.8B, `llama-perplexity`, 2 x 512 tokens:
 The loss is spread over the MLP and the delta-net projections and is the same for other exponent rules (OCP floor,
 best of two), so keeping single tensors in bf16 does not recover it. Use MXFP8 when the speed matters more.
 
+MXFP8 helps decode only, where the weights are read once per token and bandwidth bounds the time. In prefill a chunk
+reads each weight once for up to 64 tokens, so it is compute bound and MXFP8 only adds dequantization (1708-token
+prompt: 0.75 ms per token with MXFP8 prefill kernels, 0.58 ms with BF16). With `GGML_AXERA_WEIGHTS=mxfp8` the prefill
+kernels therefore use the bf16 GGUF tensors (already in CMM) and share the recurrent state and KV cache with the MXFP8
+decode kernels: prompts at 0.58 ms per token, decode at 31.5 ms per token. `GGML_AXERA_PREFILL_WEIGHTS=mxfp8` selects
+the MXFP8 prefill kernels instead.
+
 ## Build
 
 Cross-compile on an x86-64 host with the Arm GNU toolchain 13.2 (the BSP libraries need glibc 2.38) and the AX8860
