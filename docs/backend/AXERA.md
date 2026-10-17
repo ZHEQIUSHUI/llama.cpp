@@ -51,9 +51,9 @@ batch greedily into the largest chunks that fit and runs the rest through the de
 26-30 ms per token).
 
 Limits of the template:
-- One sequence. Positions continue, restart at 0, or go back to a context checkpoint; the recurrent state lives in
-  the llama.cpp recurrent cache, while the KV cache lives in the backend.
-- The context is limited to the kernels' `LMAX` (4096).
+- One sequence. The recurrent state and the KV cache live in the llama.cpp memory, so its checkpoints, prompt cache and
+  sequence edits apply.
+- The context is the kernels' `LMAX` (4096); run with `-c 4096`.
 - Prompt tokens go through the prefill kernels in chunks of 64 / 32 / 16 / 8 / 4, if present, and through the decode
   kernels otherwise.
 
@@ -64,23 +64,29 @@ GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-completion -m qwen3.5-0.8b-bf
 ### llama-server
 
 ```bash
-GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-server -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 4096 \
-    -np 1 --cache-ram 0 --host 0.0.0.0 --port 8080
+GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-server -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 4096 -np 1 \
+    --host 0.0.0.0 --port 8080
 ```
 
-The delta-net layers keep their recurrent state in place in the llama.cpp recurrent cache tensors (`cache_s_l*`,
-`cache_r_l*`, in CMM). So the server's context checkpoints save and restore exactly the kernels' state, and a
-request that shares a prefix with the previous one resumes from the last checkpoint. The attention layers then mask
-the dropped positions. A conversation's later turns only process the new messages: on AX8860, a third turn took 33
-prompt tokens and 1.4 s instead of 162 tokens and 4.5 s, with the same answer.
+The kernels work on llama.cpp's own memory:
+- The delta-net layers update their recurrent state in place in the recurrent cache tensors (`cache_s_l*`,
+  `cache_r_l*`).
+- The attention layers write and read the llama.cpp KV cache (`cache_k_l*`, `cache_v_l*`) in its layout: one f16 row
+  per cell, holding all KV heads. They write at the cells llama.cpp assigns (`attn_inp_k_idxs`) and attend through
+  its KQ mask (`attn_inp_kq_mask`).
 
-Still needed:
-- `-np 1`: one sequence.
-- `--cache-ram 0`: the RAM prompt cache restores KV cache rows, whose layout the attention kernel does not share.
+So every server feature that saves and restores memory works unchanged: context checkpoints, the RAM prompt cache, and
+removing tokens from a sequence. On AX8860, a three-turn chat's third turn processed 33 prompt tokens in 0.7 s. After
+an unrelated conversation in between, returning to the first one processed 4 prompt tokens instead of 132, with the
+same answer as without the detour.
 
-A request the template cannot continue from fails with an HTTP 500 error and a log line naming the flags; the server
-keeps running, and a request starting at position 0 works again. With BF16 weights, the chat endpoint streams at
-42.5 ms per token and takes 25-28 ms per prompt token.
+The llama.cpp KV cache is used if it is f16 (the default) with as many cells as the kernels' context (`-c 4096`), V is
+not transposed (flash attention, chosen automatically), and the `qwen35_attn*_kvc` kernels exist. Otherwise the
+template keeps a private KV cache, and the server then needs `--cache-ram 0`.
+
+`-np 1` is still required: the template runs one sequence. A request the template cannot continue from fails with an
+HTTP 500 error and a log line; the server keeps running. With BF16 weights, the chat endpoint streams at 43 ms per
+token.
 
 ### Quantized GGUF (Q8_0, Q4_K_M, Q4_0, ...)
 
