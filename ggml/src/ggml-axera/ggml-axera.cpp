@@ -411,6 +411,20 @@ static bool axera_template_qwen35() {
     return on;
 }
 
+// GGML_AXERA_FLASH=1: split attention (flash decoding) even when a fused attention kernel holds the KV cache
+static bool axera_flash_forced() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_AXERA_FLASH");
+        return e != nullptr && strcmp(e, "1") == 0;
+    }();
+    return on;
+}
+
+// KV segment (cells) of the split attention kernels qwen35_attn_fd_seg<R>_c<S>, 0 if there are none
+static int64_t axera_flash_seg() {
+    return axera_kernels().ctx_for("qwen35_attn_fd_seg1", 0);
+}
+
 // GGML_AXERA_WEIGHTS=mxfp8: the template quantizes the bf16 GGUF weights to MXFP8 at load (about half the bytes per
 // token; see docs/backend/AXERA.md for the accuracy cost)
 static bool axera_weights_mx8() {
@@ -494,7 +508,8 @@ struct axera_q35_layer {
         char *                              base;    // stream 0
         size_t                              size;    // the kernel's IO size (LMAX cells)
         size_t                              stride;  // bytes per stream
-        int                                 out = -1;
+        size_t                              row = 0;  // bytes per cell
+        int                                 out = -1;  // -1: split attention (host writes, segment IO)
         bool                                v = false;
     };
     std::vector<kv_region>             kv;
@@ -505,6 +520,11 @@ struct axera_q35_layer {
         bool                               batch = false;  // state IO over P consecutive cache rows
     };
     std::vector<prefill_io>            pre;  // one per prefill chunk size
+    struct fd_io {  // split attention IO of one run kind: head, segment and tail kernels
+        std::vector<AX_ENGINE_IO_BUFFER_T> hin, hout, sin, sout, tin, tout;
+        int                                kc = -1, vc = -1, mask = -1;  // segment inputs, rebound per call
+    };
+    std::vector<fd_io>                 fd;  // [0]: decode, [1 + v]: m.pre[v]
     std::vector<axera_cmm>             own;                                // converted weights, state, KV cache
     std::map<std::string, std::pair<ggml_backend_axera_buffer_context *, ggml_backend_axera_buffer_context *>> mx;
     std::vector<ggml_backend_axera_buffer_context *> state;                // state buffers to clear on restart
@@ -537,6 +557,17 @@ struct axera_q35 {
     bool                  rollback = false;  // all GDN state lives in the llama.cpp cache: earlier positions resumable
     bool                  kv_llama = false;  // attention kernels on the llama.cpp KV cache (cells, f16) and its KQ mask
     std::string           ctx_sfx;           // attention kernel name suffix: "_kvc_c<LMAX>" on the llama.cpp KV cache
+    bool                  flash = false;     // attention as head / per-segment / tail kernels (flash decoding)
+    int64_t               S     = 0;         // their KV segment, cells
+    struct fd_kernels {  // split attention kernels for R rows
+        ggml_axera_kernel *    head = nullptr, *seg = nullptr, *tail = nullptr;
+        int                    hkv = 0, gr = 0, d = 0;  // segment outputs [hkv][gr][d]: KV head, row g * R + token
+        axera_cmm              Q, GATE, K, V, M, Lsum, O, ATT;
+        std::vector<axera_cmm> MASK;  // per segment [S / BC][R][BC], filled once per batch for all layers
+        std::vector<int32_t>   nblk;  // per segment: blocks to scan, 0 if no token sees a cell of it
+        std::vector<uint8_t>   seen;  // [segment][token]
+    };
+    std::map<int, fd_kernels> fd;  // by rows R
 };
 
 struct ggml_backend_axera_context {
@@ -731,6 +762,39 @@ static AX_ENGINE_IO_BUFFER_T axera_q35_weight_bf16(axera_q35 & m, const ggml_ten
     return axera_io(it->second.get(), it->second->vir, size);
 }
 
+static uint32_t axera_input_size(ggml_axera_kernel * k, const char * name) {
+    const int i = k->input(name);
+    GGML_ASSERT(i >= 0);
+    return k->info->pInputs[i].nSize;
+}
+
+static uint32_t axera_output_size(ggml_axera_kernel * k, const char * name) {
+    const int i = k->output(name);
+    GGML_ASSERT(i >= 0);
+    return k->info->pOutputs[i].nSize;
+}
+
+// kernel input n of `size` bytes from GGUF tensor w: in CMM as it is, a bf16 copy of a quantized / f16 weight, or a
+// CMM copy (owned by the layer) of a tensor kept on the CPU
+static AX_ENGINE_IO_BUFFER_T axera_q35_gguf_input(axera_q35 & m, axera_q35_layer & ly, const ggml_tensor * w,
+                                                  const std::string & n, uint32_t size) {
+    if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_BF16) {  // quantized / f16 GGUF weight
+        return axera_q35_weight_bf16(m, w, size);
+    }
+    if (ggml_nbytes(w) != size) {
+        GGML_ABORT("qwen35 template: %s is %zu bytes, kernel input %s wants %u\n", w->name, ggml_nbytes(w), n.c_str(),
+                   size);
+    }
+    if (ggml_backend_buffer_is_axera(w->buffer)) {
+        return axera_io((ggml_backend_axera_buffer_context *) w->buffer->context, w->data, size);
+    }
+    ly.own.push_back(axera_cmm_alloc(size));  // not in CMM (layer kept on the CPU): copy
+    auto * b = ly.own.back().get();
+    memcpy(b->vir, w->data, size);
+    b->flush(b->vir, size);
+    return axera_io(b, b->vir, size);
+}
+
 // binds one layer's kernel IO: GGUF tensors in CMM directly where the layout matches, converted copies otherwise
 static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::string, ggml_tensor *> & t) {
     auto get = [&](const char * name) -> ggml_tensor * {
@@ -752,9 +816,6 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
     };
     axera_q35_layer & ly = m.layers[il];
     ly.gdn               = t.count("blk." + std::to_string(il) + ".ssm_a") > 0;
-    ggml_axera_kernel * k = ly.gdn ? m.gdn : m.attn;
-    ly.in.assign(k->info->nInputSize, {});
-    ly.out.assign(k->info->nOutputSize, {});
     ly.own.clear();
     ly.state.clear();
     ly.mx.clear();
@@ -763,6 +824,15 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
     ly.row = 0;
     ly.kv.clear();
     ly.stream = 0;
+    ly.fd.clear();
+    if (!ly.gdn && m.flash) {  // split attention: axera_q35_bind_flash
+        ly.in.clear();
+        ly.out.clear();
+        return;
+    }
+    ggml_axera_kernel * k = ly.gdn ? m.gdn : m.attn;
+    ly.in.assign(k->info->nInputSize, {});
+    ly.out.assign(k->info->nOutputSize, {});
 
     // layer input/output ping-pong: even layers read A and write B, odd layers the other way round
     auto * xin  = (il % 2 == 0 ? m.A : m.B).get();
@@ -851,23 +921,8 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
             if (it == axera_q35_direct.end()) {
                 GGML_ABORT("qwen35 template: kernel input %s has no GGUF tensor\n", n.c_str());
             }
-            ggml_tensor * w = get(it->second);
-            if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_BF16) {  // quantized / f16 GGUF weight
-                ly.in[i] = axera_q35_weight_bf16(m, w, size);
-                continue;
-            }
-            if (ggml_nbytes(w) != size) {
-                GGML_ABORT("qwen35 template: %s is %zu bytes, kernel input %s wants %u\n", w->name, ggml_nbytes(w),
-                           n.c_str(), size);
-            }
-            if (ggml_backend_buffer_is_axera(w->buffer)) {
-                b = (ggml_backend_axera_buffer_context *) w->buffer->context;
-                p = w->data;
-            } else {  // not in CMM (layer kept on the CPU): copy
-                b = own(size);
-                memcpy(b->vir, w->data, size);
-                b->flush(b->vir, size);
-            }
+            ly.in[i] = axera_q35_gguf_input(m, ly, get(it->second), n, size);
+            continue;
         }
         if (b->size < size && p == nullptr) {
             GGML_ABORT("qwen35 template: buffer for %s too small\n", n.c_str());
@@ -922,6 +977,11 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
 static void axera_q35_bind_prefill(axera_q35 & m, int il, size_t v, const std::map<std::string, ggml_tensor *> & t) {
     axera_q35_layer &        ly = m.layers[il];
     axera_q35::prefill &     pf = m.pre[v];
+    if (!ly.gdn && m.flash) {  // split attention: axera_q35_bind_flash
+        ly.pre.resize(m.pre.size());
+        ly.pre[v].batch = pf.batch;
+        return;
+    }
     ggml_axera_kernel *      k  = ly.gdn ? pf.gdn : pf.attn;
     ggml_axera_kernel *      kd = ly.gdn ? m.gdn : m.attn;
     auto *                   xin  = (il % 2 == 0 ? pf.A : pf.B).get();
@@ -1011,6 +1071,110 @@ static void axera_q35_context(ggml_axera_kernel * k, int & LMAX, int & BC) {
     BC   = mt.pShape[1];
 }
 
+// the split attention kernels for R rows (qwen35_attn_fd_head<R>, _seg<R>_c<S>, _tail<R>) and their buffers
+static bool axera_q35_load_flash(axera_q35 & m, int R) {
+    if (m.fd.count(R)) {
+        return true;
+    }
+    const std::string r  = std::to_string(R);
+    const std::string hn = "qwen35_attn_fd_head" + r, sn = "qwen35_attn_fd_seg" + r + "_c" + std::to_string(m.S),
+                      tn = "qwen35_attn_fd_tail" + r;
+    for (const auto & n : { hn, sn, tn }) {
+        if (!std::ifstream(axera_kernels().path(n)).good()) {
+            return false;
+        }
+    }
+    axera_q35::fd_kernels fk;
+    fk.head = axera_kernels().get(hn);
+    fk.seg  = axera_kernels().get(sn);
+    fk.tail = axera_kernels().get(tn);
+    const AX_ENGINE_IOMETA_T & o = fk.seg->info->pOutputs[fk.seg->output("o_out")];
+    GGML_ASSERT(o.nShapeSize == 3);
+    fk.hkv  = o.pShape[0];
+    fk.gr   = o.pShape[1];
+    fk.d    = o.pShape[2];
+    fk.Q    = axera_cmm_alloc(axera_output_size(fk.head, "q_out"));
+    fk.GATE = axera_cmm_alloc(axera_output_size(fk.head, "gate_out"));
+    fk.K    = axera_cmm_alloc(axera_output_size(fk.head, "k_out"));
+    fk.V    = axera_cmm_alloc(axera_output_size(fk.head, "v_out"));
+    fk.M    = axera_cmm_alloc(axera_output_size(fk.seg, "m_out"));
+    fk.Lsum = axera_cmm_alloc(axera_output_size(fk.seg, "l_out"));
+    fk.O    = axera_cmm_alloc(axera_output_size(fk.seg, "o_out"));
+    fk.ATT  = axera_cmm_alloc(axera_input_size(fk.tail, "attn"));
+    m.fd.emplace(R, std::move(fk));
+    return true;
+}
+
+// split attention IO of attention layer il for run kind v (-1: decode, else m.pre[v]): head and tail on the run's
+// activations and RoPE tables and the GGUF weights; the segment kernel's KV and mask inputs are rebound per call
+static void axera_q35_bind_flash(axera_q35 & m, int il, int v, const std::map<std::string, ggml_tensor *> & t) {
+    axera_q35_layer &       ly = m.layers[il];
+    const int               R  = v < 0 ? 1 : m.pre[v].P;
+    axera_q35::fd_kernels & fk = m.fd.at(R);
+    auto & A   = v < 0 ? m.A : m.pre[v].A;
+    auto & B   = v < 0 ? m.B : m.pre[v].B;
+    auto * xin = (il % 2 == 0 ? A : B).get(), *xout = (il % 2 == 0 ? B : A).get();
+    ly.fd.resize(m.pre.size() + 1);
+    axera_q35_layer::fd_io & io = ly.fd[v + 1];
+    if (ly.kv.empty()) {  // the layer's KV cache: the host writes new cells, the segment kernel reads S cells
+        for (const char * kv : { "k", "v" }) {
+            const ggml_tensor * c = t.at("cache_" + std::string(kv) + "_l" + std::to_string(il));
+            const int64_t       n = (m.N + m.S - 1) / m.S * m.S;
+            GGML_ASSERT(ggml_backend_buft_get_alloc_size(c->buffer->buft, c) >= (c->ne[2] - 1) * c->nb[2] + n * c->nb[1]);
+            axera_q35_layer::kv_region kr;
+            kr.b      = (ggml_backend_axera_buffer_context *) c->buffer->context;
+            kr.base   = (char *) c->data;
+            kr.size   = m.S * c->nb[1];
+            kr.stride = c->nb[2];
+            kr.row    = c->nb[1];
+            kr.v      = kv[0] == 'v';
+            ly.kv.push_back(kr);
+        }
+    }
+    using buf = std::pair<ggml_backend_axera_buffer_context *, char *>;
+    auto bind = [&](ggml_axera_kernel * k, std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_IO_BUFFER_T> & out,
+                    const std::map<std::string, buf> & bufs) {
+        in.assign(k->info->nInputSize, {});
+        out.assign(k->info->nOutputSize, {});
+        for (uint32_t i = 0; i < k->info->nInputSize; ++i) {
+            const std::string n    = k->info->pInputs[i].pName;
+            const uint32_t    size = k->info->pInputs[i].nSize;
+            auto              b    = bufs.find(n);
+            if (b != bufs.end()) {
+                in[i] = axera_io(b->second.first, b->second.second, size);
+                continue;
+            }
+            auto d  = axera_q35_direct.find(n);
+            auto it = d == axera_q35_direct.end() ? t.end() : t.find("blk." + std::to_string(il) + "." + d->second);
+            if (it == t.end()) {
+                GGML_ABORT("qwen35 template: kernel input %s has no GGUF tensor\n", n.c_str());
+            }
+            in[i] = axera_q35_gguf_input(m, ly, it->second, n, size);
+        }
+        for (uint32_t i = 0; i < k->info->nOutputSize; ++i) {
+            const auto & b = bufs.at(k->info->pOutputs[i].pName);
+            out[i]         = axera_io(b.first, b.second, k->info->pOutputs[i].nSize);
+        }
+    };
+    auto at   = [](const axera_cmm & c) { return buf(c.get(), (char *) c->vir); };
+    auto & cs = v < 0 ? m.COS : m.pre[v].COS;
+    auto & sn = v < 0 ? m.SIN : m.pre[v].SIN;
+    bind(fk.head, io.hin, io.hout,
+         { { "x", buf(xin, (char *) xin->vir) }, { "cos", at(cs) }, { "sin", at(sn) }, { "q_out", at(fk.Q) },
+           { "gate_out", at(fk.GATE) }, { "k_out", at(fk.K) }, { "v_out", at(fk.V) } });
+    const auto & kk = ly.kv[0].v ? ly.kv[1] : ly.kv[0];
+    const auto & vv = ly.kv[0].v ? ly.kv[0] : ly.kv[1];
+    bind(fk.seg, io.sin, io.sout,
+         { { "qs", at(fk.Q) }, { "kc", buf(kk.b, kk.base) }, { "vc", buf(vv.b, vv.base) }, { "nblk", at(m.NBLK) },
+           { "mask", at(fk.Q) }, { "m_out", at(fk.M) }, { "l_out", at(fk.Lsum) }, { "o_out", at(fk.O) } });
+    io.kc   = fk.seg->input("kc");
+    io.vc   = fk.seg->input("vc");
+    io.mask = fk.seg->input("mask");
+    bind(fk.tail, io.tin, io.tout,
+         { { "x", buf(xin, (char *) xin->vir) }, { "attn", at(fk.ATT) }, { "gate", at(fk.GATE) },
+           { "out", buf(xout, (char *) xout->vir) } });
+}
+
 static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggml_tensor *> & t,
                            const ggml_tensor * lm, const ggml_tensor * rope) {
     m.L    = L;
@@ -1050,19 +1214,31 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
             m.N = m.kv_llama ? it->second->ne[1] : m.N;
         }
     }
+    // a KV cache no fused attention kernel holds (or GGML_AXERA_FLASH=1): split attention over S-cell segments
     const int64_t ctx = m.kv_llama ? axera_kernels().ctx_for(attn_name + "_kvc", m.N) : 0;
-    if (m.kv_llama && ctx == 0) {
-        GGML_LOG_WARN("%s: no %s_kvc_c<LMAX> kernel holds the %" PRId64 "-cell KV cache; lower -c\n", __func__,
-                      attn_name.c_str(), m.N);
+    m.fd.clear();
+    m.S     = axera_flash_seg();
+    m.flash = m.kv_llama && m.S > 0 && (ctx == 0 || axera_flash_forced()) && axera_q35_load_flash(m, 1);
+    if (m.kv_llama && ctx == 0 && !m.flash) {
+        GGML_LOG_WARN("%s: no %s_kvc_c<LMAX> kernel holds the %" PRId64 "-cell KV cache and no split attention "
+                      "kernels qwen35_attn_fd_*; lower -c\n", __func__, attn_name.c_str(), m.N);
     }
-    m.kv_llama = m.kv_llama && ctx > 0;
-    m.ctx_sfx  = m.kv_llama ? "_kvc_c" + std::to_string(ctx) : "";
+    m.kv_llama = m.kv_llama && (ctx > 0 || m.flash);
+    m.ctx_sfx  = m.kv_llama && !m.flash ? "_kvc_c" + std::to_string(ctx) : "";
     m.gdn  = axera_kernels().get(mx8 ? "qwen35_gdn_mx8" : "qwen35_gdn");
-    m.attn = axera_kernels().get(attn_name + m.ctx_sfx);
-    axera_q35_context(m.attn, m.LMAX, m.BC);
-    if (m.kv_llama) {
-        GGML_ASSERT(m.LMAX == ctx && m.N % m.BC == 0);
+    m.attn = m.flash ? nullptr : axera_kernels().get(attn_name + m.ctx_sfx);
+    if (m.flash) {  // segment mask [S / BC][R][BC]
+        ggml_axera_kernel *        sk = m.fd.at(1).seg;
+        const AX_ENGINE_IOMETA_T & mt = sk->info->pInputs[sk->input("mask")];
+        GGML_ASSERT(mt.nShapeSize == 3 && (int64_t) mt.pShape[0] * mt.pShape[2] == m.S);
+        m.LMAX = (int) m.S;
+        m.BC   = mt.pShape[2];
     } else {
+        axera_q35_context(m.attn, m.LMAX, m.BC);
+    }
+    if (m.kv_llama && !m.flash) {
+        GGML_ASSERT(m.LMAX == ctx && m.N % m.BC == 0);
+    } else if (!m.kv_llama) {
         m.N = m.LMAX;
     }
     m.lm   = lm;
@@ -1075,23 +1251,24 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
     } else if (lm->type != GGML_TYPE_BF16) {
         m.lm_bf = axera_to_bf16(lm);
     }
-    auto size_of = [](ggml_axera_kernel * k, const char * name) {
-        const int i = k->input(name);
-        GGML_ASSERT(i >= 0);
-        return k->info->pInputs[i].nSize;
-    };
+    auto size_of = axera_input_size;
     GGML_ASSERT(size_of(m.gdn, "x") == (uint32_t) H * sizeof(ggml_bf16_t));
+    ggml_axera_kernel * rope_k = m.flash ? m.fd.at(1).head : m.attn;  // decode cos / sin [1, ROT / 2]
     m.A    = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
     m.B    = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
-    m.POS  = axera_cmm_alloc(size_of(m.attn, "pos"));
-    m.NBLK = axera_cmm_alloc(size_of(m.attn, "nblk"));
-    m.MASK = axera_cmm_alloc(size_of(m.attn, "mask"));
-    m.COS  = axera_cmm_alloc(size_of(m.attn, "cos"));
-    m.SIN  = axera_cmm_alloc(size_of(m.attn, "sin"));
-    GGML_ASSERT(m.MASK->size >= (size_t) m.LMAX * sizeof(ggml_bf16_t));
-    if (size_of(m.attn, "cos") != (uint32_t) (m.ROT / 2) * sizeof(ggml_bf16_t)) {
+    m.NBLK = axera_cmm_alloc(sizeof(int32_t));
+    m.COS  = axera_cmm_alloc(size_of(rope_k, "cos"));
+    m.SIN  = axera_cmm_alloc(size_of(rope_k, "sin"));
+    m.POS.reset();
+    m.MASK.reset();
+    if (!m.flash) {
+        m.POS  = axera_cmm_alloc(size_of(m.attn, "pos"));
+        m.MASK = axera_cmm_alloc(size_of(m.attn, "mask"));
+        GGML_ASSERT(m.MASK->size >= (size_t) m.LMAX * sizeof(ggml_bf16_t));
+    }
+    if (size_of(rope_k, "cos") != (uint32_t) (m.ROT / 2) * sizeof(ggml_bf16_t)) {
         GGML_ABORT("qwen35 template: the graph rotates %d dims, the attention kernel %zu\n", m.ROT,
-                   2 * size_of(m.attn, "cos") / sizeof(ggml_bf16_t));
+                   2 * size_of(rope_k, "cos") / sizeof(ggml_bf16_t));
     }
     m.inv_freq.resize(m.ROT / 2);
     for (int i = 0; i < m.ROT / 2; ++i) {
@@ -1115,22 +1292,25 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
         const std::string sfx  = std::to_string(P) + (pre_mx ? "_mx8" : "");
         const std::string asfx = sfx + m.ctx_sfx;
         if (!std::ifstream(axera_kernels().path("qwen35_gdn_prefill" + sfx)).good() ||
-            !std::ifstream(axera_kernels().path("qwen35_attn_prefill" + asfx)).good()) {
+            !(m.flash ? axera_q35_load_flash(m, P) : std::ifstream(axera_kernels().path("qwen35_attn_prefill" + asfx)).good())) {
             continue;
         }
         axera_q35::prefill pf;
         pf.P    = P;
         pf.gdn  = axera_kernels().get("qwen35_gdn_prefill" + sfx);
-        pf.attn = axera_kernels().get("qwen35_attn_prefill" + asfx);
+        pf.attn = m.flash ? nullptr : axera_kernels().get("qwen35_attn_prefill" + asfx);
         GGML_ASSERT(size_of(pf.gdn, "x") == (uint32_t) P * H * sizeof(ggml_bf16_t));
-        // chunk mask [LMAX / BC][R][BC] (R = P rows, or G * P in older kernels)
-        pf.R = (int64_t) (size_of(pf.attn, "mask") / sizeof(ggml_bf16_t)) / m.LMAX;
-        GGML_ASSERT(pf.R % P == 0 && (size_t) pf.R * m.LMAX * sizeof(ggml_bf16_t) == size_of(pf.attn, "mask"));
+        ggml_axera_kernel * rk = m.flash ? m.fd.at(P).head : pf.attn;
+        if (!m.flash) {
+            // chunk mask [LMAX / BC][R][BC] (R = P rows, or G * P in older kernels)
+            pf.R = (int64_t) (size_of(pf.attn, "mask") / sizeof(ggml_bf16_t)) / m.LMAX;
+            GGML_ASSERT(pf.R % P == 0 && (size_t) pf.R * m.LMAX * sizeof(ggml_bf16_t) == size_of(pf.attn, "mask"));
+            pf.MASK = axera_cmm_alloc(size_of(pf.attn, "mask"));
+        }
         pf.A    = axera_cmm_alloc(P * H * sizeof(ggml_bf16_t));
         pf.B    = axera_cmm_alloc(P * H * sizeof(ggml_bf16_t));
-        pf.MASK = axera_cmm_alloc(size_of(pf.attn, "mask"));
-        pf.COS  = axera_cmm_alloc(size_of(pf.attn, "cos"));
-        pf.SIN  = axera_cmm_alloc(size_of(pf.attn, "sin"));
+        pf.COS  = axera_cmm_alloc(size_of(rk, "cos"));
+        pf.SIN  = axera_cmm_alloc(size_of(rk, "sin"));
         m.pre.push_back(std::move(pf));
     }
     // batched decode kernels (P = B tokens of B sequences, largest first): with the recurrent state and the KV cache
@@ -1138,28 +1318,36 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
     for (int Bn : { 8, 4, 2 }) {
         const std::string gn = "qwen35_gdn_batch" + std::to_string(Bn), an = "qwen35_attn_batch" + std::to_string(Bn);
         if (!m.kv_llama || !m.rollback || !std::ifstream(axera_kernels().path(gn)).good() ||
-            !std::ifstream(axera_kernels().path(an + m.ctx_sfx)).good()) {
+            !(m.flash ? axera_q35_load_flash(m, Bn) : std::ifstream(axera_kernels().path(an + m.ctx_sfx)).good())) {
             continue;
         }
         axera_q35::prefill pf;
         pf.P     = Bn;
         pf.batch = true;
         pf.gdn   = axera_kernels().get(gn);
-        pf.attn  = axera_kernels().get(an + m.ctx_sfx);
+        pf.attn  = m.flash ? nullptr : axera_kernels().get(an + m.ctx_sfx);
         GGML_ASSERT(size_of(pf.gdn, "x") == (uint32_t) Bn * H * sizeof(ggml_bf16_t));
-        pf.R    = (int64_t) (size_of(pf.attn, "mask") / sizeof(ggml_bf16_t)) / m.LMAX;
-        GGML_ASSERT(pf.R == Bn);
+        ggml_axera_kernel * rk = m.flash ? m.fd.at(Bn).head : pf.attn;
+        if (!m.flash) {
+            pf.R = (int64_t) (size_of(pf.attn, "mask") / sizeof(ggml_bf16_t)) / m.LMAX;
+            GGML_ASSERT(pf.R == Bn);
+            pf.MASK = axera_cmm_alloc(size_of(pf.attn, "mask"));
+            pf.POS  = axera_cmm_alloc(size_of(pf.attn, "pos"));
+        }
         pf.A    = axera_cmm_alloc(Bn * H * sizeof(ggml_bf16_t));
         pf.B    = axera_cmm_alloc(Bn * H * sizeof(ggml_bf16_t));
-        pf.MASK = axera_cmm_alloc(size_of(pf.attn, "mask"));
-        pf.COS  = axera_cmm_alloc(size_of(pf.attn, "cos"));
-        pf.SIN  = axera_cmm_alloc(size_of(pf.attn, "sin"));
-        pf.POS  = axera_cmm_alloc(size_of(pf.attn, "pos"));
+        pf.COS  = axera_cmm_alloc(size_of(rk, "cos"));
+        pf.SIN  = axera_cmm_alloc(size_of(rk, "sin"));
         m.pre.push_back(std::move(pf));
     }
     for (size_t v = 0; v < m.pre.size(); ++v) {
         for (int il = 0; il < L; ++il) {
             axera_q35_bind_prefill(m, il, v, t);
+        }
+    }
+    for (int il = 0; il < L && m.flash; ++il) {
+        for (int v = -1; v < (int) m.pre.size() && !m.layers[il].gdn; ++v) {
+            axera_q35_bind_flash(m, il, v, t);
         }
     }
     std::string chunks, batches;
@@ -1175,6 +1363,7 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
                   "state %s, KV cache %s, prefill chunks %s, batched decode %s\n", __func__, L, m.N, m.LMAX,
                   mx8 ? "MXFP8" : "BF16",
                   m.rollback ? "in the llama.cpp cache (checkpoints work)" : "private",
+                  m.flash ? "the llama.cpp cache, attention split over segments (flash decoding)" :
                   m.kv_llama ? "the llama.cpp cache (prompt cache works)" : "private", chunks.empty() ? "none" : chunks.c_str(),
                   batches.empty() ? "none" : batches.c_str());
 }
@@ -1249,11 +1438,13 @@ static void axera_q35_restart(axera_q35 & m) {
             s->flush(s->vir, s->size);
         }
     }
-    auto * mask = (ggml_bf16_t *) m.MASK->vir;
-    for (int j = 0; j < m.LMAX; ++j) {
-        mask[j] = ggml_fp32_to_bf16(-3e38f);
+    if (m.MASK) {
+        auto * mask = (ggml_bf16_t *) m.MASK->vir;
+        for (int j = 0; j < m.LMAX; ++j) {
+            mask[j] = ggml_fp32_to_bf16(-3e38f);
+        }
+        m.MASK->flush(m.MASK->vir, m.MASK->size);
     }
-    m.MASK->flush(m.MASK->vir, m.MASK->size);
     m.next_pos = 0;
 }
 
@@ -1478,10 +1669,155 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
         cb->flush(cb->vir, cb->size);
         sb->flush(sb->vir, sb->size);
     };
-    auto run_layers = [&](int v, int64_t p) {  // v: prefill chunk size index, -1: decode
+    // split attention: the KQ mask rows of tokens t0 .. t0 + R - 1 cut into the segments' masks, and per segment the
+    // blocks to scan (0: no token sees a cell of it); the same for every attention layer of the batch
+    auto flash_prepare = [&](int R, int t0) {
+        axera_q35::fd_kernels & fk   = m.fd.at(R);
+        const int64_t           nseg = (W + m.S - 1) / m.S;
+        const ggml_bf16_t       ninf = ggml_fp32_to_bf16(-3e38f);
+        std::vector<ggml_bf16_t> rows((size_t) R * W);
+        for (int r = 0; r < R; ++r) {
+            mask_row(t0 + r, rows.data() + (size_t) r * W);
+        }
+        fk.nblk.assign(nseg, 0);
+        fk.seen.assign(nseg * R, 0);
+        if ((int64_t) fk.MASK.size() < nseg) {
+            fk.MASK.resize(nseg);
+        }
+        for (int64_t g = 0; g < nseg; ++g) {
+            const int64_t c0 = g * m.S, c1 = std::min<int64_t>(W, c0 + m.S);
+            int64_t       last = -1;
+            for (int r = 0; r < R; ++r) {
+                for (int64_t c = c0; c < c1; ++c) {
+                    if (rows[(size_t) r * W + c].bits != ninf.bits) {
+                        fk.seen[g * R + r] = 1;
+                        last               = std::max(last, c - c0);
+                    }
+                }
+            }
+            if (last < 0) {
+                continue;
+            }
+            fk.nblk[g] = (int32_t) (last / m.BC + 1);
+            if (!fk.MASK[g]) {
+                fk.MASK[g] = axera_cmm_alloc(axera_input_size(fk.seg, "mask"));
+            }
+            auto * mk = (ggml_bf16_t *) fk.MASK[g]->vir;
+            for (int64_t blk = 0; blk < fk.nblk[g]; ++blk) {
+                for (int r = 0; r < R; ++r) {
+                    for (int c = 0; c < m.BC; ++c) {
+                        const int64_t col = c0 + blk * m.BC + c;
+                        mk[(blk * R + r) * m.BC + c] = col < c1 ? rows[(size_t) r * W + col] : ninf;
+                    }
+                }
+            }
+            fk.MASK[g]->flush(mk, (size_t) fk.nblk[g] * R * m.BC * sizeof(ggml_bf16_t));
+        }
+    };
+    // split attention layer: head kernel, the new K / V rows to their cells, one segment kernel call per segment in
+    // use, merged on the CPU (m = max m_i, l = sum e^(m_i - m) l_i, o = sum e^(m_i - m) o_i / l), tail kernel
+    auto flash_attn = [&](int il, int v, int t0, int64_t p) {
+        axera_q35_layer &        ly = m.layers[il];
+        const int                R  = v < 0 ? 1 : m.pre[v].P;
+        axera_q35::fd_kernels &  fk = m.fd.at(R);
+        axera_q35_layer::fd_io & io = ly.fd[v + 1];
+        auto run = [&](ggml_axera_kernel * k, std::vector<AX_ENGINE_IO_BUFFER_T> & in,
+                       std::vector<AX_ENGINE_IO_BUFFER_T> & out, const char * what) {
+            AX_ENGINE_IO_T s;
+            memset(&s, 0, sizeof(s));
+            s.pInputs     = in.data();
+            s.nInputSize  = (uint32_t) in.size();
+            s.pOutputs    = out.data();
+            s.nOutputSize = (uint32_t) out.size();
+            const int ret = AX_ENGINE_RunSync(k->handle, &s);
+            if (ret != 0) {
+                GGML_ABORT("qwen35 template: RunSync failed (0x%x) at layer %d (%s), position %" PRId64 "\n", ret, il,
+                           what, p);
+            }
+        };
+        run(fk.head, io.hin, io.hout, "attention head");
+        const int64_t st = stream_of(t0);
+        fk.K->invalidate(fk.K->vir, fk.K->size);
+        fk.V->invalidate(fk.V->vir, fk.V->size);
+        for (auto & kr : ly.kv) {
+            const char * src = (const char *) (kr.v ? fk.V : fk.K)->vir;
+            for (int r = 0; r < R; ++r) {
+                char * dst = kr.base + st * kr.stride + cell_of(t0 + r) * kr.row;
+                memcpy(dst, src + r * kr.row, kr.row);
+                kr.b->flush(dst, kr.row);
+            }
+        }
+        const auto & kk  = ly.kv[0].v ? ly.kv[1] : ly.kv[0];
+        const auto & vv  = ly.kv[0].v ? ly.kv[0] : ly.kv[1];
+        const int    nr  = fk.hkv * fk.gr;  // rows: KV head hk, row gq * R + token
+        std::vector<float>   am(nr, 0.0f), al(nr, 0.0f), ao((size_t) nr * fk.d, 0.0f);
+        std::vector<uint8_t> started(nr, 0);
+        for (size_t g = 0; g < fk.nblk.size(); ++g) {
+            if (fk.nblk[g] == 0) {
+                continue;
+            }
+            io.sin[io.kc]   = axera_io(kk.b, kk.base + st * kk.stride + g * m.S * kk.row, (uint32_t) kk.size);
+            io.sin[io.vc]   = axera_io(vv.b, vv.base + st * vv.stride + g * m.S * vv.row, (uint32_t) vv.size);
+            io.sin[io.mask] = axera_io(fk.MASK[g].get(), fk.MASK[g]->vir, (uint32_t) axera_input_size(fk.seg, "mask"));
+            *(int32_t *) m.NBLK->vir = fk.nblk[g];
+            m.NBLK->flush(m.NBLK->vir, m.NBLK->size);
+            run(fk.seg, io.sin, io.sout, "attention segment");
+            fk.M->invalidate(fk.M->vir, fk.M->size);
+            fk.Lsum->invalidate(fk.Lsum->vir, fk.Lsum->size);
+            fk.O->invalidate(fk.O->vir, fk.O->size);
+            const auto * mi = (const ggml_bf16_t *) fk.M->vir;
+            const auto * li = (const float *) fk.Lsum->vir;
+            const auto * oi = (const ggml_bf16_t *) fk.O->vir;
+            for (int j = 0; j < nr; ++j) {
+                if (!fk.seen[g * R + (j % fk.gr) % R]) {
+                    continue;
+                }
+                const float  mj = ggml_bf16_to_fp32(mi[j]);
+                float *      o  = ao.data() + (size_t) j * fk.d;
+                const auto * oj = oi + (size_t) j * fk.d;
+                if (!started[j]) {
+                    started[j] = 1;
+                    am[j]      = mj;
+                    al[j]      = li[j];
+                    for (int i = 0; i < fk.d; ++i) {
+                        o[i] = ggml_bf16_to_fp32(oj[i]);
+                    }
+                    continue;
+                }
+                const float mn = std::max(am[j], mj), a = std::exp(am[j] - mn), b = std::exp(mj - mn);
+                am[j] = mn;
+                al[j] = a * al[j] + b * li[j];
+                for (int i = 0; i < fk.d; ++i) {
+                    o[i] = a * o[i] + b * ggml_bf16_to_fp32(oj[i]);
+                }
+            }
+        }
+        // attention output [R][HQ][D]: query head hk * G + gq of token t is row gq * R + t of KV head hk
+        const int G   = fk.gr / R;
+        auto *    att = (ggml_bf16_t *) fk.ATT->vir;
+        for (int hk = 0; hk < fk.hkv; ++hk) {
+            for (int gq = 0; gq < G; ++gq) {
+                for (int tt = 0; tt < R; ++tt) {
+                    const int     j   = hk * fk.gr + gq * R + tt;
+                    const float   inv = al[j] > 0.0f ? 1.0f / al[j] : 0.0f;
+                    ggml_bf16_t * dst = att + ((size_t) tt * fk.hkv * G + hk * G + gq) * fk.d;
+                    for (int i = 0; i < fk.d; ++i) {
+                        dst[i] = ggml_fp32_to_bf16(ao[(size_t) j * fk.d + i] * inv);
+                    }
+                }
+            }
+        }
+        fk.ATT->flush(fk.ATT->vir, fk.ATT->size);
+        run(fk.tail, io.tin, io.tout, "attention tail");
+    };
+    auto run_layers = [&](int v, int t0, int64_t p) {  // v: prefill chunk size index, -1: decode
         const bool prefill = v >= 0;
         for (int il = 0; il < L; ++il) {
             axera_q35_layer & ly = m.layers[il];
+            if (m.flash && !ly.gdn) {
+                flash_attn(il, v, t0, p);
+                continue;
+            }
             auto & in  = prefill ? ly.pre[v].in : ly.in;
             auto & out = prefill ? ly.pre[v].out : ly.out;
             if (prefill && ly.si >= 0) {  // private ping-pong state: take the current buffers
@@ -1514,7 +1850,7 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
         if (s0) {
             axera_q35_set_row(m, row_of(it));
         }
-        if (m.kv_llama) {
+        if (m.kv_llama && !m.flash) {
             axera_q35_set_stream(m, stream_of(it));
         }
         if (!begin(p)) {
@@ -1523,7 +1859,8 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
         int v = -1;  // the largest prefill chunk that fits the remaining consecutive positions
         for (size_t c = 0; c < m.pre.size() && v < 0; ++c) {
             const int P  = m.pre[c].P;
-            bool      ok = !m.pre[c].batch && it + P <= T && p + P <= m.LMAX && it % n_seq_tokens + P <= n_seq_tokens;
+            bool      ok = !m.pre[c].batch && it + P <= T && (m.kv_llama || p + P <= m.LMAX) &&
+                      it % n_seq_tokens + P <= n_seq_tokens;
             for (int j = 1; ok && j < P; ++j) {
                 ok = pos[it + j] == p + j && (!m.kv_llama || (stream_of(it + j) == stream_of(it) &&
                                                               cell_of(it + j) == cell_of(it) + j));
@@ -1550,10 +1887,12 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
                         axera_q35_zero_row(m, row_of(it + r));
                     }
                 }
-                for (int r = 0; r < P; ++r) {
+                for (int r = 0; r < P && !m.flash; ++r) {
                     ((int32_t *) pf.POS->vir)[r] = (int32_t) cell_of(it + r);
                 }
-                pf.POS->flush(pf.POS->vir, pf.POS->size);
+                if (!m.flash) {
+                    pf.POS->flush(pf.POS->vir, pf.POS->size);
+                }
             }
             for (int r = 0; r < P; ++r) {
                 ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (it + r) * x0->nb[1]),
@@ -1561,13 +1900,18 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
             }
             pf.A->flush(pf.A->vir, (size_t) P * H * sizeof(ggml_bf16_t));
             rope_rows(it, P, pf.COS.get(), pf.SIN.get());
+            if (m.flash) {
+                flash_prepare(P, it);
+            }
             int nblk = (int) ((p + P - 1) / m.BC + 1);
             // chunk mask [N / BC][R][BC], row r = token r % P (of head r / P in older kernels): positions up to
             // p + token, or with the llama.cpp KV cache that token's KQ mask row over the cells
             const int64_t R    = pf.R;
-            auto *        mask = (ggml_bf16_t *) pf.MASK->vir;
+            auto *        mask = pf.MASK ? (ggml_bf16_t *) pf.MASK->vir : nullptr;  // none with split attention
             const ggml_bf16_t zero = ggml_fp32_to_bf16(0.0f), ninf = ggml_fp32_to_bf16(-3e38f);
-            if (m.kv_llama) {
+            if (m.flash) {
+                // the segments' masks: flash_prepare
+            } else if (m.kv_llama) {
                 std::vector<ggml_bf16_t> rows((size_t) P * W);
                 nblk = 1;
                 for (int r = 0; r < P; ++r) {
@@ -1590,18 +1934,20 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
                     }
                 }
             }
-            *(int32_t *) m.POS->vir  = (int32_t) (m.kv_llama ? cell_of(it) : p);
-            *(int32_t *) m.NBLK->vir = nblk;
-            if (!m.kv_llama) {
-                for (int r = 0; r < P; ++r) {
-                    ((ggml_bf16_t *) m.MASK->vir)[p + r] = zero;  // for the decode steps after the chunk
+            if (!m.flash) {
+                *(int32_t *) m.POS->vir  = (int32_t) (m.kv_llama ? cell_of(it) : p);
+                *(int32_t *) m.NBLK->vir = nblk;
+                if (!m.kv_llama) {
+                    for (int r = 0; r < P; ++r) {
+                        ((ggml_bf16_t *) m.MASK->vir)[p + r] = zero;  // for the decode steps after the chunk
+                    }
+                    m.MASK->flush(m.MASK->vir, m.MASK->size);
                 }
-                m.MASK->flush(m.MASK->vir, m.MASK->size);
+                pf.MASK->flush(pf.MASK->vir, (size_t) nblk * R * m.BC * sizeof(ggml_bf16_t));
+                m.POS->flush(m.POS->vir, m.POS->size);
+                m.NBLK->flush(m.NBLK->vir, m.NBLK->size);
             }
-            pf.MASK->flush(pf.MASK->vir, (size_t) nblk * R * m.BC * sizeof(ggml_bf16_t));
-            m.POS->flush(m.POS->vir, m.POS->size);
-            m.NBLK->flush(m.NBLK->vir, m.NBLK->size);
-            run_layers(v, p);
+            run_layers(v, it, p);
             auto * fin = (L % 2 == 0 ? pf.A : pf.B).get();
             fin->invalidate(fin->vir, (size_t) P * H * sizeof(ggml_bf16_t));
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) fin->vir, h.data() + (size_t) it * H, (int64_t) P * H);
@@ -1612,18 +1958,22 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
         ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + it * x0->nb[1]), (ggml_bf16_t *) m.A->vir, H);
         m.A->flush(m.A->vir, H * sizeof(ggml_bf16_t));
         rope_rows(it, 1, m.COS.get(), m.SIN.get());
-        if (m.kv_llama) {
-            *(int32_t *) m.NBLK->vir = mask_row(it, (ggml_bf16_t *) m.MASK->vir);
-            *(int32_t *) m.POS->vir  = (int32_t) cell_of(it);
+        if (m.flash) {
+            flash_prepare(1, it);
         } else {
-            *(int32_t *) m.POS->vir                = (int32_t) p;
-            *(int32_t *) m.NBLK->vir               = (int32_t) (p / m.BC + 1);
-            ((ggml_bf16_t *) m.MASK->vir)[p]       = ggml_fp32_to_bf16(0.0f);
+            if (m.kv_llama) {
+                *(int32_t *) m.NBLK->vir = mask_row(it, (ggml_bf16_t *) m.MASK->vir);
+                *(int32_t *) m.POS->vir  = (int32_t) cell_of(it);
+            } else {
+                *(int32_t *) m.POS->vir                = (int32_t) p;
+                *(int32_t *) m.NBLK->vir               = (int32_t) (p / m.BC + 1);
+                ((ggml_bf16_t *) m.MASK->vir)[p]       = ggml_fp32_to_bf16(0.0f);
+            }
+            m.POS->flush(m.POS->vir, m.POS->size);
+            m.NBLK->flush(m.NBLK->vir, m.NBLK->size);
+            m.MASK->flush(m.MASK->vir, (size_t) *(int32_t *) m.NBLK->vir * m.BC * sizeof(ggml_bf16_t));  // blocks read
         }
-        m.POS->flush(m.POS->vir, m.POS->size);
-        m.NBLK->flush(m.NBLK->vir, m.NBLK->size);
-        m.MASK->flush(m.MASK->vir, (size_t) *(int32_t *) m.NBLK->vir * m.BC * sizeof(ggml_bf16_t));  // blocks read
-        run_layers(-1, p);
+        run_layers(-1, it, p);
         auto * fin = (L % 2 == 0 ? m.A : m.B).get();  // where the last layer writes
         fin->invalidate(fin->vir, H * sizeof(ggml_bf16_t));
         ggml_bf16_to_fp32_row((const ggml_bf16_t *) fin->vir, h.data() + (size_t) it * H, H);
@@ -1902,7 +2252,9 @@ static size_t ggml_backend_axera_buffer_type_get_alloc_size(ggml_backend_buffer_
         return n;
     }
     const int64_t ctx = axera_kernels().ctx_for(axera_weights_mx8() ? "qwen35_attn_mx8_kvc" : "qwen35_attn_kvc", t->ne[1]);
-    return std::max(n, (size_t) (t->ne[2] - 1) * t->nb[2] + (size_t) ctx * t->nb[1]);  // ne[2]: per-sequence streams
+    const int64_t S   = axera_flash_seg();  // split attention: whole segments
+    const int64_t c   = S > 0 && (ctx == 0 || axera_flash_forced()) ? (t->ne[1] + S - 1) / S * S : ctx;
+    return std::max(n, (size_t) (t->ne[2] - 1) * t->nb[2] + (size_t) c * t->nb[1]);  // ne[2]: per-sequence streams
     GGML_UNUSED(buft);
 }
 

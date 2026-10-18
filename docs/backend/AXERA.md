@@ -55,7 +55,7 @@ batch greedily into the largest chunks that fit and runs the rest through the de
 Limits of the template:
 - The recurrent state and the KV cache live in the llama.cpp memory, so its checkpoints, prompt cache, sequence edits
   and parallel sequences apply.
-- Contexts up to 32768 cells (see below).
+- Contexts up to 32768 cells with the fused attention kernels, beyond that split attention (flash decoding).
 - Prompt tokens go through the prefill kernels in chunks of 64 / 32 / 16 / 8 / 4, if present, and through the decode
   kernels otherwise.
 
@@ -69,10 +69,29 @@ For `-c N` the backend takes the smallest `LMAX >= N` and allocates the llama.cp
 96 MiB KV buffer instead of 72. The attention kernels' cost does not depend on `LMAX`: decode is 40.6 ms per token with
 `-c 4096` and 41.2 ms with `-c 32768`.
 
-The largest context is 32768 cells: the SDMA bounds register of a dynamically indexed tensor (`bytes_max`, 24 bits)
-limits one KV IO to 32 MiB, and a Qwen3.5-0.8B cell is 1 KiB (2 KV heads x 256 x f16). Longer contexts need the KV
-cache split over several IO, which the kernels do not do yet. With `-c` above the largest kernel the template warns
-and falls back to a private KV cache.
+The fused kernels end at 32768 cells: the SDMA bounds register of a dynamically indexed tensor (`bytes_max`, 24 bits)
+limits one KV IO to 32 MiB, and a Qwen3.5-0.8B cell is 1 KiB (2 KV heads x 256 x f16).
+
+### Long contexts: split attention (flash decoding)
+
+Softmax attention over N cells can be computed per segment and merged exactly: a segment i gives its running max
+`m_i`, sum `l_i = sum exp(s - m_i)` and unnormalized output `o_i = sum exp(s - m_i) v`, and
+`o = sum_i exp(m_i - m) o_i / sum_i exp(m_i - m) l_i` with `m = max_i m_i`. For a KV cache no fused kernel holds (or
+with `GGML_AXERA_FLASH=1`), every attention layer runs as three kernels per batch of R tokens (R = 1, 2, 4, ..., 64
+for decode, batched decode and prefill chunks):
+
+- `qwen35_attn_fd_head<R>`: norm, projections, q / k norm, RoPE; outputs q, the gate and the new K / V rows, which
+  the host copies to their cells.
+- `qwen35_attn_fd_seg<R>_c<S>`: the tokens' attention over one segment of S = 32768 cells, bound by address into the
+  llama.cpp KV cache; called once per segment in use, with that segment's slice of the KQ mask.
+- `qwen35_attn_fd_tail<R>`: the merged attention output (merged on the CPU) through the gate, `o_proj` and the MLP.
+
+The kernels do not depend on the context, so any `-c` works (the KV cache is allocated in whole segments). On AX8860,
+a 39666-token prompt (`-c 65536`, a number stated in its first line, then 30 copies of the GPL) was prefilled in
+116 s (2.9 ms per token; the attention grows with the context) and the model answered with the number; decode at that
+context took 106 ms per token. Below 32768 cells the fused kernels stay faster (the split costs two more kernel calls
+per attention layer): forced split attention at `-c 4096` decodes at 43.4 ms instead of 40.7 ms per token, with PPL
+2.4239 / 40.1532 instead of 2.4237 / 40.1693 (the final division happens on the CPU in f32).
 
 ```bash
 GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-completion -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 4096 -p "..." -n 128
