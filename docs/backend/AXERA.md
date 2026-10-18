@@ -107,8 +107,29 @@ batch runs with its sequence's row of the recurrent cache and its stream's KV ce
 sequence. `llama-perplexity -b 2048` (4 sequences per batch) gives the same PPL as `-b 512` (2.4237 / 40.1693). With
 `-np 4`, four chat requests sent at once return the same answers as one at a time (with `-kvu` a sequence's cells
 interleave with the others', which changes the bf16 summation order, and a long answer can flip a near-tie token).
-The tokens of the sequences still run one after another, so the aggregate speed is that of one sequence (4 requests,
-189 tokens: 9.0 s one by one, 8.6 s at once) until a batched decode kernel exists.
+### Batched decode
+
+With the unified KV cache (`-kvu`; llama-server's default `-np auto` sets it), a decode batch of several sequences
+runs through the batched kernels `qwen35_gdn_batch<B>.axmodel` / `qwen35_attn_batch<B>_kvc_c<LMAX>.axmodel` (B = 4, 2):
+one call per layer for one token of each of B sequences, so every weight is read once per B tokens. The delta-net
+kernel updates B consecutive rows of the recurrent cache in place, each sequence with its own conv and delta-rule
+state; the attention kernel writes each token's K/V at its own cell and attends through its own KQ mask row. The
+output projection runs B rows per call through `mul_mat_bf16_b<B>_n<C>_k<K>.axmodel` (also for the rows of
+`llama-perplexity`). Per-sequence KV streams (an explicit `-np` without `-kvu`) keep the token-by-token path.
+
+`llama-batched-bench -npp 128 -ntg 64 -kvu`, decode tokens per second:
+
+| Sequences | BF16 | MXFP8 |
+|---|---|---|
+| 1 | 24.4 | 31.7 |
+| 2 | 46.6 | 45.5 |
+| 4 | 84.3 | 67.5 |
+
+The batched kernels are bf16; with `GGML_AXERA_WEIGHTS=mxfp8` they use the bf16 GGUF tensors and the output projection
+stays the row-by-row MXFP8 GEMV (MXFP8 batched kernels do not exist yet). PPL is unchanged (2.4237 / 40.1693). The
+delta-net batch kernel matches the decode kernel bit for bit on the simulator; with `-kvu` the cells of the sequences
+interleave, so a long greedy answer can still part from the one-at-a-time answer at a near tie (four chat requests at
+once: one of the four, from its 100th character on).
 
 A request the template cannot continue from fails with an HTTP 500 error and a log line; the server keeps running.
 With BF16 weights, the chat endpoint streams at 43 ms per token.

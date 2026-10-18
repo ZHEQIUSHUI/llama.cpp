@@ -499,9 +499,10 @@ struct axera_q35_layer {
     };
     std::vector<kv_region>             kv;
     int64_t                            stream = 0;  // the KV stream the IO points at
-    struct prefill_io {  // prefill kernel IO: same weights / state / KV as the decode IO
+    struct prefill_io {  // prefill / batched decode kernel IO: same weights / state / KV as the decode IO
         std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
         int                                si = -1, so = -1, ci = -1, co = -1, ko = -1, vo = -1;
+        bool                               batch = false;  // state IO over P consecutive cache rows
     };
     std::vector<prefill_io>            pre;  // one per prefill chunk size
     std::vector<axera_cmm>             own;                                // converted weights, state, KV cache
@@ -520,13 +521,14 @@ struct axera_q35 {
     axera_cmm             A, B, POS, NBLK, MASK, COS, SIN;  // A/B: layer input/output ping-pong
     axera_cmm             lm_q, lm_s;                       // MXFP8 output projection
     axera_cmm             lm_bf;                            // bf16 copy of a non-bf16 output projection
-    struct prefill {  // one prefill chunk size
+    struct prefill {  // one prefill chunk size, or (batch) one batched decode size
         int                 P = 0;
         int64_t             R = 0;  // mask rows per KV block
+        bool                batch = false;  // P tokens of P consecutive sequences (recurrent rows), one each
         ggml_axera_kernel * gdn = nullptr, *attn = nullptr;
-        axera_cmm           A, B, MASK, COS, SIN;
+        axera_cmm           A, B, MASK, COS, SIN, POS;  // POS: the batch's P cells
     };
-    std::vector<prefill>  pre;  // largest chunk first
+    std::vector<prefill>  pre;  // prefill chunks, then batched decode sizes, largest first
     const ggml_tensor *   lm = nullptr;
     std::map<const ggml_tensor *, axera_cmm> bf16_of;  // bf16 copies of non-bf16 GGUF weights (quantized GGUF)
     std::vector<axera_q35_layer> layers;
@@ -538,7 +540,8 @@ struct axera_q35 {
 };
 
 struct ggml_backend_axera_context {
-    axera_cmm staging;  // bf16 activation row
+    axera_cmm staging;    // bf16 activation row
+    axera_cmm batch_out;  // f32 output rows of a batched GEMV call
     axera_q35 q35;
 
     ggml_backend_axera_buffer_context * staging_for(size_t size) {
@@ -586,6 +589,56 @@ static void axera_gemv_raw(ggml_backend_axera_context * ctx, const ggml_backend_
         }
     }
     dctx->invalidate(out, N * sizeof(float));
+}
+
+// rows out[b][0:N] = W[N, K] (bf16 at wdata in the CMM buffer wctx) . x[b], b < Bn, through the batched GEMV
+// mul_mat_bf16_b<Bn>_n<C>_k<K> (x [Bn, K] bf16 -> out [Bn, C] f32), N / C calls; false if that kernel is missing
+static bool axera_gemv_batch(ggml_backend_axera_context * ctx, const ggml_backend_axera_buffer_context * wctx, void * wdata,
+                             int64_t N, int64_t K, const float * x, int Bn, float * const * out) {
+    const int64_t C = axera_kernels().mul_mat_chunk(N, K);
+    char          name[96];
+    snprintf(name, sizeof(name), "mul_mat_bf16_b%d_n%" PRId64 "_k%" PRId64, Bn, C, K);
+    static std::map<std::string, bool> found;
+    auto f = found.find(name);
+    if (f == found.end()) {
+        f = found.emplace(name, C > 0 && std::ifstream(axera_kernels().path(name)).good()).first;
+    }
+    if (!f->second) {
+        return false;
+    }
+    ggml_axera_kernel * k  = axera_kernels().get(name);
+    const int           ix = k->input("x"), iw = k->input("w"), io = k->output("out");
+    const int64_t       row = K * (int64_t) sizeof(ggml_bf16_t);
+    GGML_ASSERT(ix >= 0 && iw >= 0 && io >= 0 && k->info->pInputs[ix].nSize == Bn * row &&
+                k->info->pInputs[iw].nSize == C * row && k->info->pOutputs[io].nSize == Bn * C * sizeof(float));
+    auto * st = ctx->staging_for(Bn * row);
+    ggml_fp32_to_bf16_row(x, (ggml_bf16_t *) st->vir, Bn * K);
+    st->flush(st->vir, Bn * row);
+    if (!ctx->batch_out || ctx->batch_out->size < Bn * C * sizeof(float)) {
+        ctx->batch_out = axera_cmm_alloc(Bn * C * sizeof(float));
+    }
+    auto * bo = ctx->batch_out.get();
+    AX_ENGINE_IO_BUFFER_T inputs[2], outputs[1];
+    AX_ENGINE_IO_T        io_set;
+    memset(&io_set, 0, sizeof(io_set));
+    io_set.pInputs     = inputs;
+    io_set.nInputSize  = 2;
+    io_set.pOutputs    = outputs;
+    io_set.nOutputSize = 1;
+    inputs[ix]         = axera_io(st, st->vir, Bn * row);
+    outputs[io]        = axera_io(bo, bo->vir, Bn * C * sizeof(float));
+    for (int64_t c0 = 0; c0 < N; c0 += C) {
+        inputs[iw]    = axera_io(wctx, (char *) wdata + c0 * row, C * row);
+        const int ret = AX_ENGINE_RunSync(k->handle, &io_set);
+        if (ret != 0) {
+            GGML_ABORT("%s: RunSync failed (0x%x), n=%" PRId64 " k=%" PRId64 " rows=%d\n", __func__, ret, N, K, Bn);
+        }
+        bo->invalidate(bo->vir, Bn * C * sizeof(float));
+        for (int b = 0; b < Bn; ++b) {
+            memcpy(out[b] + c0, (const float *) bo->vir + (size_t) b * C, C * sizeof(float));
+        }
+    }
+    return true;
 }
 
 static void axera_gemv(ggml_backend_axera_context * ctx, const ggml_tensor * w, const float * x, ggml_tensor * dst,
@@ -877,12 +930,26 @@ static void axera_q35_bind_prefill(axera_q35 & m, int il, size_t v, const std::m
     axera_q35_layer::prefill_io & io = ly.pre[v];
     io.in.assign(k->info->nInputSize, {});
     io.out.assign(k->info->nOutputSize, {});
+    io.batch = pf.batch;
     for (uint32_t i = 0; i < k->info->nInputSize; ++i) {
         const std::string n    = k->info->pInputs[i].pName;
         const uint32_t    size = k->info->pInputs[i].nSize;
-        if (n == "x" || n == "mask" || n == "cos" || n == "sin") {
-            auto * b  = n == "x" ? xin : n == "mask" ? pf.MASK.get() : n == "cos" ? pf.COS.get() : pf.SIN.get();
+        if (n == "x" || n == "mask" || n == "cos" || n == "sin" || (pf.batch && n == "pos")) {
+            auto * b  = n == "x" ? xin : n == "mask" ? pf.MASK.get() : n == "cos" ? pf.COS.get() : n == "sin" ? pf.SIN.get() :
+                                                                                                    pf.POS.get();
             io.in[i]  = axera_io(b, b->vir, size);
+            continue;
+        }
+        if (pf.batch && (n == "state_in" || n == "conv_in")) {
+            // P consecutive rows of the llama.cpp recurrent cache, from row 0 until axera_q35_set_batch_rows
+            const int j = kd->input(n.c_str());
+            for (auto & rg : ly.cache_state) {
+                if (rg.in == j) {
+                    GGML_ASSERT(size == pf.P * rg.stride);
+                    io.in[i] = axera_io(rg.b, rg.base, size);
+                }
+            }
+            (n == "state_in" ? io.si : io.ci) = (int) i;
             continue;
         }
         const int j = kd->input(n.c_str());
@@ -908,6 +975,13 @@ static void axera_q35_bind_prefill(axera_q35 & m, int il, size_t v, const std::m
         const std::string n = k->info->pOutputs[i].pName;
         if (n == "out") {
             io.out[i] = axera_io(xout, xout->vir, k->info->pOutputs[i].nSize);
+            continue;
+        }
+        if (pf.batch && (n == "state_out" || n == "conv_out")) {  // in place
+            const int si = n == "state_out" ? io.si : io.ci;
+            GGML_ASSERT(si >= 0);
+            io.out[i] = io.in[si];
+            (n == "state_out" ? io.so : io.co) = (int) i;
             continue;
         }
         const int j = kd->output(n.c_str());
@@ -1059,23 +1133,50 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
         pf.SIN  = axera_cmm_alloc(size_of(pf.attn, "sin"));
         m.pre.push_back(std::move(pf));
     }
+    // batched decode kernels (P = B tokens of B sequences, largest first): with the recurrent state and the KV cache
+    // in the llama.cpp memory. bf16 kernels; next to MXFP8 decode kernels they use the bf16 GGUF tensors
+    for (int Bn : { 8, 4, 2 }) {
+        const std::string gn = "qwen35_gdn_batch" + std::to_string(Bn), an = "qwen35_attn_batch" + std::to_string(Bn);
+        if (!m.kv_llama || !m.rollback || !std::ifstream(axera_kernels().path(gn)).good() ||
+            !std::ifstream(axera_kernels().path(an + m.ctx_sfx)).good()) {
+            continue;
+        }
+        axera_q35::prefill pf;
+        pf.P     = Bn;
+        pf.batch = true;
+        pf.gdn   = axera_kernels().get(gn);
+        pf.attn  = axera_kernels().get(an + m.ctx_sfx);
+        GGML_ASSERT(size_of(pf.gdn, "x") == (uint32_t) Bn * H * sizeof(ggml_bf16_t));
+        pf.R    = (int64_t) (size_of(pf.attn, "mask") / sizeof(ggml_bf16_t)) / m.LMAX;
+        GGML_ASSERT(pf.R == Bn);
+        pf.A    = axera_cmm_alloc(Bn * H * sizeof(ggml_bf16_t));
+        pf.B    = axera_cmm_alloc(Bn * H * sizeof(ggml_bf16_t));
+        pf.MASK = axera_cmm_alloc(size_of(pf.attn, "mask"));
+        pf.COS  = axera_cmm_alloc(size_of(pf.attn, "cos"));
+        pf.SIN  = axera_cmm_alloc(size_of(pf.attn, "sin"));
+        pf.POS  = axera_cmm_alloc(size_of(pf.attn, "pos"));
+        m.pre.push_back(std::move(pf));
+    }
     for (size_t v = 0; v < m.pre.size(); ++v) {
         for (int il = 0; il < L; ++il) {
             axera_q35_bind_prefill(m, il, v, t);
         }
     }
-    std::string chunks;
+    std::string chunks, batches;
     for (auto & pf : m.pre) {
-        chunks += (chunks.empty() ? "" : "/") + std::to_string(pf.P);
+        auto & str = pf.batch ? batches : chunks;
+        str += (str.empty() ? "" : "/") + std::to_string(pf.P);
     }
     if (!chunks.empty()) {
         chunks += pre_mx ? " (MXFP8)" : " (BF16)";
     }
     m.ready = true;
     GGML_LOG_INFO("%s: Axera qwen35 template: %d layers, context %" PRId64 " (kernels up to %d), %s weights, recurrent "
-                  "state %s, KV cache %s, prefill chunks %s\n", __func__, L, m.N, m.LMAX, mx8 ? "MXFP8" : "BF16",
+                  "state %s, KV cache %s, prefill chunks %s, batched decode %s\n", __func__, L, m.N, m.LMAX,
+                  mx8 ? "MXFP8" : "BF16",
                   m.rollback ? "in the llama.cpp cache (checkpoints work)" : "private",
-                  m.kv_llama ? "the llama.cpp cache (prompt cache works)" : "private", chunks.empty() ? "none" : chunks.c_str());
+                  m.kv_llama ? "the llama.cpp cache (prompt cache works)" : "private", chunks.empty() ? "none" : chunks.c_str(),
+                  batches.empty() ? "none" : batches.c_str());
 }
 
 // point every delta-net layer's state IO (decode and prefill kernels) at recurrent-cache row `row` (a sequence)
@@ -1089,11 +1190,26 @@ static void axera_q35_set_row(axera_q35 & m, int64_t row) {
             ly.in[rg.in]                   = io;
             ly.out[rg.out]                 = io;
             for (auto & pre : ly.pre) {
-                pre.in[rg.conv ? pre.ci : pre.si]   = io;
-                pre.out[rg.conv ? pre.co : pre.so]  = io;
+                if (!pre.batch) {
+                    pre.in[rg.conv ? pre.ci : pre.si]  = io;
+                    pre.out[rg.conv ? pre.co : pre.so] = io;
+                }
             }
         }
         ly.row = row;
+    }
+}
+
+// point the batched decode IO v of every delta-net layer at the recurrent-cache rows row0 .. row0 + P - 1
+static void axera_q35_set_batch_rows(axera_q35 & m, size_t v, int64_t row0) {
+    for (auto & ly : m.layers) {
+        auto & pre = ly.pre[v];
+        for (auto & rg : ly.cache_state) {
+            const AX_ENGINE_IO_BUFFER_T io =
+                axera_io(rg.b, rg.base + row0 * rg.stride, (uint32_t) (m.pre[v].P * rg.stride));
+            pre.in[rg.conv ? pre.ci : pre.si]  = io;
+            pre.out[rg.conv ? pre.co : pre.so] = io;
+        }
     }
 }
 
@@ -1349,12 +1465,12 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
         }
         return true;
     };
-    auto rope_rows = [&](int64_t p0, int n, ggml_backend_axera_buffer_context * cb, ggml_backend_axera_buffer_context * sb) {
-        auto * c = (ggml_bf16_t *) cb->vir;
+    auto rope_rows = [&](int t0, int n, ggml_backend_axera_buffer_context * cb, ggml_backend_axera_buffer_context * sb) {
+        auto * c = (ggml_bf16_t *) cb->vir;  // rows: the positions of tokens t0 .. t0 + n - 1
         auto * s = (ggml_bf16_t *) sb->vir;
         for (int r = 0; r < n; ++r) {
             for (int i = 0; i < m.ROT / 2; ++i) {
-                const float a             = (float) (p0 + r) * m.freq_scale * m.inv_freq[i];
+                const float a             = (float) pos[t0 + r] * m.freq_scale * m.inv_freq[i];
                 c[r * (m.ROT / 2) + i]    = ggml_fp32_to_bf16(std::cos(a));
                 s[r * (m.ROT / 2) + i]    = ggml_fp32_to_bf16(std::sin(a));
             }
@@ -1407,7 +1523,7 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
         int v = -1;  // the largest prefill chunk that fits the remaining consecutive positions
         for (size_t c = 0; c < m.pre.size() && v < 0; ++c) {
             const int P  = m.pre[c].P;
-            bool      ok = it + P <= T && p + P <= m.LMAX && it % n_seq_tokens + P <= n_seq_tokens;
+            bool      ok = !m.pre[c].batch && it + P <= T && p + P <= m.LMAX && it % n_seq_tokens + P <= n_seq_tokens;
             for (int j = 1; ok && j < P; ++j) {
                 ok = pos[it + j] == p + j && (!m.kv_llama || (stream_of(it + j) == stream_of(it) &&
                                                               cell_of(it + j) == cell_of(it) + j));
@@ -1415,15 +1531,36 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
             ok = ok && (!m.kv_llama || cell_of(it) + P <= m.N);
             v = ok ? (int) c : -1;
         }
+        // else one token of each of the next P sequences (rows rs_head + it ..) in one KV stream: batched decode
+        for (size_t c = 0; c < m.pre.size() && v < 0 && n_seq_tokens == 1 && s0; ++c) {
+            const int P  = m.pre[c].P;
+            bool      ok = m.pre[c].batch && it + P <= T;
+            for (int j = 1; ok && j < P; ++j) {
+                ok = stream_of(it + j) == stream_of(it);
+            }
+            v = ok ? (int) c : -1;
+        }
         if (v >= 0) {
             axera_q35::prefill & pf = m.pre[v];
             const int            P  = pf.P;
+            if (pf.batch) {
+                axera_q35_set_batch_rows(m, v, row_of(it));
+                for (int r = 1; r < P; ++r) {  // token it's row was cleared by begin()
+                    if (pos[it + r] == 0) {
+                        axera_q35_zero_row(m, row_of(it + r));
+                    }
+                }
+                for (int r = 0; r < P; ++r) {
+                    ((int32_t *) pf.POS->vir)[r] = (int32_t) cell_of(it + r);
+                }
+                pf.POS->flush(pf.POS->vir, pf.POS->size);
+            }
             for (int r = 0; r < P; ++r) {
                 ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (it + r) * x0->nb[1]),
                                       (ggml_bf16_t *) pf.A->vir + (size_t) r * H, H);
             }
             pf.A->flush(pf.A->vir, (size_t) P * H * sizeof(ggml_bf16_t));
-            rope_rows(p, P, pf.COS.get(), pf.SIN.get());
+            rope_rows(it, P, pf.COS.get(), pf.SIN.get());
             int nblk = (int) ((p + P - 1) / m.BC + 1);
             // chunk mask [N / BC][R][BC], row r = token r % P (of head r / P in older kernels): positions up to
             // p + token, or with the llama.cpp KV cache that token's KQ mask row over the cells
@@ -1474,7 +1611,7 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
         }
         ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + it * x0->nb[1]), (ggml_bf16_t *) m.A->vir, H);
         m.A->flush(m.A->vir, H * sizeof(ggml_bf16_t));
-        rope_rows(p, 1, m.COS.get(), m.SIN.get());
+        rope_rows(it, 1, m.COS.get(), m.SIN.get());
         if (m.kv_llama) {
             *(int32_t *) m.NBLK->vir = mask_row(it, (ggml_bf16_t *) m.MASK->vir);
             *(int32_t *) m.POS->vir  = (int32_t) cell_of(it);
@@ -1509,31 +1646,57 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
     if (n_out < T && !out_ids) {
         GGML_ABORT("qwen35 template: %d of %d rows requested but no output row index in the graph\n", n_out, T);
     }
-    std::vector<float> hn(H);
+    std::vector<float> hn((size_t) n_out * H);
     const float *   g = (const float *) onw->data;
     for (int r = 0; r < n_out; ++r) {
         const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : r;
         GGML_ASSERT(row >= 0 && row < T);
         const float * x  = h.data() + (size_t) row * H;
+        float *       y  = hn.data() + (size_t) r * H;
         double        ss = 0;
         for (int i = 0; i < H; ++i) {
             ss += (double) x[i] * x[i];
         }
         const float scale = 1.0f / sqrtf((float) (ss / H) + eps);
         for (int i = 0; i < H; ++i) {
-            hn[i] = x[i] * scale * g[i];
+            y[i] = x[i] * scale * g[i];
         }
         if (rnorm && rnorm->type == GGML_TYPE_F32 && rnorm->ne[0] == H && rnorm->ne[1] == n_out) {
-            memcpy((char *) rnorm->data + r * rnorm->nb[1], hn.data(), H * sizeof(float));
+            memcpy((char *) rnorm->data + r * rnorm->nb[1], y, H * sizeof(float));
         }
-        float * dst = (float *) ((char *) logits->data + r * logits->nb[1]);
+    }
+    // several rows: the batched bf16 GEMV reads the output projection once per call (the bf16 GGUF tensor in CMM or
+    // its bf16 copy; MXFP8 weights keep the MXFP8 GEMV, row by row, so that the logits do not depend on the batching)
+    const ggml_backend_axera_buffer_context * lm_ctx =
+        m.lm_q ? nullptr : m.lm_bf ? m.lm_bf.get() :
+        lm->type == GGML_TYPE_BF16 && ggml_backend_buffer_is_axera(lm->buffer) ? (ggml_backend_axera_buffer_context *) lm->buffer->context :
+                                                                                  nullptr;
+    void * lm_data = m.lm_bf ? m.lm_bf->vir : lm->data;
+    auto   dst_of  = [&](int r) { return (float *) ((char *) logits->data + r * logits->nb[1]); };
+    for (int r = 0; r < n_out;) {
+        int done = 0;
+        for (int Bn : { 8, 4, 2 }) {
+            if (done == 0 && lm_ctx && r + Bn <= n_out) {
+                float * dsts[8];
+                for (int b = 0; b < Bn; ++b) {
+                    dsts[b] = dst_of(r + b);
+                }
+                done = axera_gemv_batch(ctx, lm_ctx, lm_data, lm->ne[1], H, hn.data() + (size_t) r * H, Bn, dsts) ? Bn : 0;
+            }
+        }
+        if (done > 0) {
+            r += done;
+            continue;
+        }
+        const float * y = hn.data() + (size_t) r * H;
         if (m.lm_q) {
-            axera_gemv_mx8(ctx, m.lm_q.get(), m.lm_s.get(), lm->ne[1], H, hn.data(), logits, dst);
+            axera_gemv_mx8(ctx, m.lm_q.get(), m.lm_s.get(), lm->ne[1], H, y, logits, dst_of(r));
         } else if (m.lm_bf) {
-            axera_gemv_raw(ctx, m.lm_bf.get(), m.lm_bf->vir, lm->ne[1], H, hn.data(), logits, dst);
+            axera_gemv_raw(ctx, m.lm_bf.get(), m.lm_bf->vir, lm->ne[1], H, y, logits, dst_of(r));
         } else {
-            axera_gemv(ctx, lm, hn.data(), logits, dst);
+            axera_gemv(ctx, lm, y, logits, dst_of(r));
         }
+        ++r;
     }
     return GGML_STATUS_SUCCESS;
 }
