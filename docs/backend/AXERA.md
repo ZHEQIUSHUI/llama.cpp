@@ -83,15 +83,18 @@ for decode, batched decode and prefill chunks):
 - `qwen35_attn_fd_head<R>`: norm, projections, q / k norm, RoPE; outputs q, the gate and the new K / V rows, which
   the host copies to their cells.
 - `qwen35_attn_fd_seg<R>_c<S>`: the tokens' attention over one segment of S = 32768 cells, bound by address into the
-  llama.cpp KV cache; called once per segment in use, with that segment's slice of the KQ mask.
+  llama.cpp KV cache; called once per segment in use, with that segment's slice of the KQ mask. Each block of 256
+  cells (512 for R = 1) is loaded and converted once for both KV heads; the block size is read from the kernel's mask
+  input.
 - `qwen35_attn_fd_tail<R>`: the merged attention output (merged on the CPU) through the gate, `o_proj` and the MLP.
 
 The kernels do not depend on the context, so any `-c` works (the KV cache is allocated in whole segments). On AX8860,
 a 39666-token prompt (`-c 65536`, a number stated in its first line, then 30 copies of the GPL) was prefilled in
-116 s (2.9 ms per token; the attention grows with the context) and the model answered with the number; decode at that
-context took 106 ms per token. Below 32768 cells the fused kernels stay faster (the split costs two more kernel calls
-per attention layer): forced split attention at `-c 4096` decodes at 43.4 ms instead of 40.7 ms per token, with PPL
-2.4239 / 40.1532 instead of 2.4237 / 40.1693 (the final division happens on the CPU in f32).
+81 s (2.0 ms per token; the attention grows with the context) and the model answered with the number; decode at that
+context took 65 ms per token (with 64-cell blocks, one loop per KV head: 116 s and 106 ms). Below 32768 cells the
+fused kernels stay faster (the split costs two more kernel calls per attention layer): forced split attention at
+`-c 4096` decodes at 43.2 ms instead of 40.7 ms per token, with PPL 2.4297 / 40.2034 instead of 2.4237 / 40.1693
+(other block sizes and the final division on the CPU in f32 change the bf16 rounding).
 
 ```bash
 GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-completion -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 4096 -p "..." -n 128
@@ -129,24 +132,26 @@ interleave with the others', which changes the bf16 summation order, and a long 
 ### Batched decode
 
 With the unified KV cache (`-kvu`; llama-server's default `-np auto` sets it), a decode batch of several sequences
-runs through the batched kernels `qwen35_gdn_batch<B>.axmodel` / `qwen35_attn_batch<B>_kvc_c<LMAX>.axmodel` (B = 4, 2):
+runs through the batched kernels `qwen35_gdn_batch<B>[_mx8].axmodel` / `qwen35_attn_batch<B>[_mx8]_kvc_c<LMAX>.axmodel`
+(B = 4, 2):
 one call per layer for one token of each of B sequences, so every weight is read once per B tokens. The delta-net
 kernel updates B consecutive rows of the recurrent cache in place, each sequence with its own conv and delta-rule
 state; the attention kernel writes each token's K/V at its own cell and attends through its own KQ mask row. The
-output projection runs B rows per call through `mul_mat_bf16_b<B>_n<C>_k<K>.axmodel` (also for the rows of
+output projection runs B rows per call through `mul_mat_<bf16|mx8>_b<B>_n<C>_k<K>.axmodel` (also for the rows of
 `llama-perplexity`). Per-sequence KV streams (an explicit `-np` without `-kvu`) keep the token-by-token path.
 
 `llama-batched-bench -npp 128 -ntg 64 -kvu`, decode tokens per second:
 
 | Sequences | BF16 | MXFP8 |
 |---|---|---|
-| 1 | 24.4 | 31.7 |
-| 2 | 46.6 | 45.5 |
-| 4 | 84.3 | 67.5 |
+| 1 | 24.4 | 31.9 |
+| 2 | 46.6 | 59.9 |
+| 4 | 84.3 | 106.4 |
 
-The batched kernels are bf16; with `GGML_AXERA_WEIGHTS=mxfp8` they use the bf16 GGUF tensors and the output projection
-stays the row-by-row MXFP8 GEMV (MXFP8 batched kernels do not exist yet). PPL is unchanged (2.4237 / 40.1693). The
-delta-net batch kernel matches the decode kernel bit for bit on the simulator; with `-kvu` the cells of the sequences
+With `GGML_AXERA_WEIGHTS=mxfp8` the batched kernels are the MXFP8 ones (bf16 batched kernels, if only those exist, use
+the bf16 GGUF tensors). PPL does not depend on the batching: BF16 2.4237 / 40.1693, MXFP8 2.4121 / 40.2833 for
+`-b 512` and `-b 2048` alike (the prompt rows go through the bf16 prefill kernels, the logits through the MXFP8 output
+projection). The delta-net batch kernels match the decode kernels bit for bit on the simulator; with `-kvu` the cells of the sequences
 interleave, so a long greedy answer can still part from the one-at-a-time answer at a near tie (four chat requests at
 once: one of the four, from its 100th character on).
 

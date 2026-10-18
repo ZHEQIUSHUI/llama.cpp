@@ -562,6 +562,7 @@ struct axera_q35 {
     struct fd_kernels {  // split attention kernels for R rows
         ggml_axera_kernel *    head = nullptr, *seg = nullptr, *tail = nullptr;
         int                    hkv = 0, gr = 0, d = 0;  // segment outputs [hkv][gr][d]: KV head, row g * R + token
+        int                    bc  = 0;  // cells per block of the segment kernel (its mask [S / bc][R][bc])
         axera_cmm              Q, GATE, K, V, M, Lsum, O, ATT;
         std::vector<axera_cmm> MASK;  // per segment [S / BC][R][BC], filled once per batch for all layers
         std::vector<int32_t>   nblk;  // per segment: blocks to scan, 0 if no token sees a cell of it
@@ -622,13 +623,16 @@ static void axera_gemv_raw(ggml_backend_axera_context * ctx, const ggml_backend_
     dctx->invalidate(out, N * sizeof(float));
 }
 
-// rows out[b][0:N] = W[N, K] (bf16 at wdata in the CMM buffer wctx) . x[b], b < Bn, through the batched GEMV
-// mul_mat_bf16_b<Bn>_n<C>_k<K> (x [Bn, K] bf16 -> out [Bn, C] f32), N / C calls; false if that kernel is missing
+// rows out[b][0:N] = W[N, K] . x[b], b < Bn, through the batched GEMV mul_mat_<bf16|mx8>_b<Bn>_n<C>_k<K> (x [Bn, K]
+// bf16 -> out [Bn, C] f32), N / C calls. W: bf16 at wdata in the CMM buffer wctx, or (sctx) MXFP8 elements wctx and
+// scales sctx. False if that kernel is missing
 static bool axera_gemv_batch(ggml_backend_axera_context * ctx, const ggml_backend_axera_buffer_context * wctx, void * wdata,
-                             int64_t N, int64_t K, const float * x, int Bn, float * const * out) {
-    const int64_t C = axera_kernels().mul_mat_chunk(N, K);
+                             const ggml_backend_axera_buffer_context * sctx, int64_t N, int64_t K, const float * x,
+                             int Bn, float * const * out) {
+    const bool    mx8 = sctx != nullptr;
+    const int64_t C   = axera_kernels().mul_mat_chunk(N, K, mx8);
     char          name[96];
-    snprintf(name, sizeof(name), "mul_mat_bf16_b%d_n%" PRId64 "_k%" PRId64, Bn, C, K);
+    snprintf(name, sizeof(name), "mul_mat_%s_b%d_n%" PRId64 "_k%" PRId64, mx8 ? "mx8" : "bf16", Bn, C, K);
     static std::map<std::string, bool> found;
     auto f = found.find(name);
     if (f == found.end()) {
@@ -637,11 +641,13 @@ static bool axera_gemv_batch(ggml_backend_axera_context * ctx, const ggml_backen
     if (!f->second) {
         return false;
     }
-    ggml_axera_kernel * k  = axera_kernels().get(name);
-    const int           ix = k->input("x"), iw = k->input("w"), io = k->output("out");
+    ggml_axera_kernel * k   = axera_kernels().get(name);
+    const int           ix  = k->input("x"), iw = k->input("w"), is = k->input("s"), io = k->output("out");
     const int64_t       row = K * (int64_t) sizeof(ggml_bf16_t);
-    GGML_ASSERT(ix >= 0 && iw >= 0 && io >= 0 && k->info->pInputs[ix].nSize == Bn * row &&
-                k->info->pInputs[iw].nSize == C * row && k->info->pOutputs[io].nSize == Bn * C * sizeof(float));
+    const int64_t       wr  = mx8 ? K : row, sr = K / AXERA_MX_GROUP;  // weight / scale bytes per row
+    GGML_ASSERT(ix >= 0 && iw >= 0 && io >= 0 && (is >= 0) == mx8 && k->info->pInputs[ix].nSize == Bn * row &&
+                k->info->pInputs[iw].nSize == C * wr && (!mx8 || k->info->pInputs[is].nSize == C * sr) &&
+                k->info->pOutputs[io].nSize == Bn * C * sizeof(float));
     auto * st = ctx->staging_for(Bn * row);
     ggml_fp32_to_bf16_row(x, (ggml_bf16_t *) st->vir, Bn * K);
     st->flush(st->vir, Bn * row);
@@ -649,17 +655,20 @@ static bool axera_gemv_batch(ggml_backend_axera_context * ctx, const ggml_backen
         ctx->batch_out = axera_cmm_alloc(Bn * C * sizeof(float));
     }
     auto * bo = ctx->batch_out.get();
-    AX_ENGINE_IO_BUFFER_T inputs[2], outputs[1];
+    AX_ENGINE_IO_BUFFER_T inputs[3], outputs[1];
     AX_ENGINE_IO_T        io_set;
     memset(&io_set, 0, sizeof(io_set));
     io_set.pInputs     = inputs;
-    io_set.nInputSize  = 2;
+    io_set.nInputSize  = mx8 ? 3 : 2;
     io_set.pOutputs    = outputs;
     io_set.nOutputSize = 1;
     inputs[ix]         = axera_io(st, st->vir, Bn * row);
     outputs[io]        = axera_io(bo, bo->vir, Bn * C * sizeof(float));
     for (int64_t c0 = 0; c0 < N; c0 += C) {
-        inputs[iw]    = axera_io(wctx, (char *) wdata + c0 * row, C * row);
+        inputs[iw] = axera_io(wctx, (char *) wdata + c0 * wr, C * wr);
+        if (mx8) {
+            inputs[is] = axera_io(sctx, (char *) sctx->vir + c0 * sr, C * sr);
+        }
         const int ret = AX_ENGINE_RunSync(k->handle, &io_set);
         if (ret != 0) {
             GGML_ABORT("%s: RunSync failed (0x%x), n=%" PRId64 " k=%" PRId64 " rows=%d\n", __func__, ret, N, K, Bn);
@@ -1093,6 +1102,9 @@ static bool axera_q35_load_flash(axera_q35 & m, int R) {
     fk.hkv  = o.pShape[0];
     fk.gr   = o.pShape[1];
     fk.d    = o.pShape[2];
+    const AX_ENGINE_IOMETA_T & mt = fk.seg->info->pInputs[fk.seg->input("mask")];
+    GGML_ASSERT(mt.nShapeSize == 3 && mt.pShape[1] == R && (int64_t) mt.pShape[0] * mt.pShape[2] == m.S);
+    fk.bc   = mt.pShape[2];
     fk.Q    = axera_cmm_alloc(axera_output_size(fk.head, "q_out"));
     fk.GATE = axera_cmm_alloc(axera_output_size(fk.head, "gate_out"));
     fk.K    = axera_cmm_alloc(axera_output_size(fk.head, "k_out"));
@@ -1227,12 +1239,9 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
     m.ctx_sfx  = m.kv_llama && !m.flash ? "_kvc_c" + std::to_string(ctx) : "";
     m.gdn  = axera_kernels().get(mx8 ? "qwen35_gdn_mx8" : "qwen35_gdn");
     m.attn = m.flash ? nullptr : axera_kernels().get(attn_name + m.ctx_sfx);
-    if (m.flash) {  // segment mask [S / BC][R][BC]
-        ggml_axera_kernel *        sk = m.fd.at(1).seg;
-        const AX_ENGINE_IOMETA_T & mt = sk->info->pInputs[sk->input("mask")];
-        GGML_ASSERT(mt.nShapeSize == 3 && (int64_t) mt.pShape[0] * mt.pShape[2] == m.S);
+    if (m.flash) {  // the KQ mask is cut per segment kernel (fd_kernels::bc); whole 64-cell blocks here
         m.LMAX = (int) m.S;
-        m.BC   = mt.pShape[2];
+        m.BC   = 64;
     } else {
         axera_q35_context(m.attn, m.LMAX, m.BC);
     }
@@ -1314,9 +1323,12 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
         m.pre.push_back(std::move(pf));
     }
     // batched decode kernels (P = B tokens of B sequences, largest first): with the recurrent state and the KV cache
-    // in the llama.cpp memory. bf16 kernels; next to MXFP8 decode kernels they use the bf16 GGUF tensors
+    // in the llama.cpp memory. In the decode weight format (_mx8); bf16 kernels next to MXFP8 decode kernels use the
+    // bf16 GGUF tensors
     for (int Bn : { 8, 4, 2 }) {
-        const std::string gn = "qwen35_gdn_batch" + std::to_string(Bn), an = "qwen35_attn_batch" + std::to_string(Bn);
+        const std::string b  = std::to_string(Bn);
+        const std::string bs = mx8 && std::ifstream(axera_kernels().path("qwen35_gdn_batch" + b + "_mx8")).good() ? "_mx8" : "";
+        const std::string gn = "qwen35_gdn_batch" + b + bs, an = "qwen35_attn_batch" + b + bs;
         if (!m.kv_llama || !m.rollback || !std::ifstream(axera_kernels().path(gn)).good() ||
             !(m.flash ? axera_q35_load_flash(m, Bn) : std::ifstream(axera_kernels().path(an + m.ctx_sfx)).good())) {
             continue;
@@ -1698,20 +1710,20 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
             if (last < 0) {
                 continue;
             }
-            fk.nblk[g] = (int32_t) (last / m.BC + 1);
+            fk.nblk[g] = (int32_t) (last / fk.bc + 1);
             if (!fk.MASK[g]) {
                 fk.MASK[g] = axera_cmm_alloc(axera_input_size(fk.seg, "mask"));
             }
             auto * mk = (ggml_bf16_t *) fk.MASK[g]->vir;
             for (int64_t blk = 0; blk < fk.nblk[g]; ++blk) {
                 for (int r = 0; r < R; ++r) {
-                    for (int c = 0; c < m.BC; ++c) {
-                        const int64_t col = c0 + blk * m.BC + c;
-                        mk[(blk * R + r) * m.BC + c] = col < c1 ? rows[(size_t) r * W + col] : ninf;
+                    for (int c = 0; c < fk.bc; ++c) {
+                        const int64_t col = c0 + blk * fk.bc + c;
+                        mk[(blk * R + r) * fk.bc + c] = col < c1 ? rows[(size_t) r * W + col] : ninf;
                     }
                 }
             }
-            fk.MASK[g]->flush(mk, (size_t) fk.nblk[g] * R * m.BC * sizeof(ggml_bf16_t));
+            fk.MASK[g]->flush(mk, (size_t) fk.nblk[g] * R * fk.bc * sizeof(ggml_bf16_t));
         }
     };
     // split attention layer: head kernel, the new K / V rows to their cells, one segment kernel call per segment in
@@ -2015,13 +2027,13 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
             memcpy((char *) rnorm->data + r * rnorm->nb[1], y, H * sizeof(float));
         }
     }
-    // several rows: the batched bf16 GEMV reads the output projection once per call (the bf16 GGUF tensor in CMM or
-    // its bf16 copy; MXFP8 weights keep the MXFP8 GEMV, row by row, so that the logits do not depend on the batching)
+    // several rows: the batched GEMV of the weight format reads the output projection once per call (MXFP8, the bf16
+    // GGUF tensor in CMM or its bf16 copy)
     const ggml_backend_axera_buffer_context * lm_ctx =
-        m.lm_q ? nullptr : m.lm_bf ? m.lm_bf.get() :
+        m.lm_q ? m.lm_q.get() : m.lm_bf ? m.lm_bf.get() :
         lm->type == GGML_TYPE_BF16 && ggml_backend_buffer_is_axera(lm->buffer) ? (ggml_backend_axera_buffer_context *) lm->buffer->context :
                                                                                   nullptr;
-    void * lm_data = m.lm_bf ? m.lm_bf->vir : lm->data;
+    void * lm_data = m.lm_q ? m.lm_q->vir : m.lm_bf ? m.lm_bf->vir : lm->data;
     auto   dst_of  = [&](int r) { return (float *) ((char *) logits->data + r * logits->nb[1]); };
     for (int r = 0; r < n_out;) {
         int done = 0;
@@ -2031,7 +2043,8 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
                 for (int b = 0; b < Bn; ++b) {
                     dsts[b] = dst_of(r + b);
                 }
-                done = axera_gemv_batch(ctx, lm_ctx, lm_data, lm->ne[1], H, hn.data() + (size_t) r * H, Bn, dsts) ? Bn : 0;
+                done = axera_gemv_batch(ctx, lm_ctx, lm_data, m.lm_q ? m.lm_s.get() : nullptr, lm->ne[1], H,
+                                        hn.data() + (size_t) r * H, Bn, dsts) ? Bn : 0;
             }
         }
         if (done > 0) {
