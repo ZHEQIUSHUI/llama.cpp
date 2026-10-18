@@ -39,8 +39,10 @@ from the GGUF tensors in CMM. Two weights are converted once at load: `ssm_a` to
 are reversed and stored as bf16. Then the CPU applies the final norm and the GEMV kernels compute the output
 projection.
 
-Kernels in `GGML_AXERA_KERNEL_DIR`: `qwen35_gdn.axmodel`, `qwen35_attn.axmodel`, `qwen35.txt` (`LMAX BC ROT THETA`),
-plus the `mul_mat` kernel for the output projection.
+Kernels in `GGML_AXERA_KERNEL_DIR`: `qwen35_gdn.axmodel`, the attention kernels `qwen35_attn_kvc_c<LMAX>.axmodel`
+(one per supported context, see below), plus the `mul_mat` kernel for the output projection. Nothing else is needed:
+the backend reads the context `LMAX` and the KV block size from the attention kernel's mask input, and the RoPE
+parameters (rotated dims, base, linear scale) from the graph's ROPE nodes.
 
 Optional prefill kernels `qwen35_gdn_prefill<P>.axmodel` / `qwen35_attn_prefill<P>.axmodel` (P = 64, 32, 16, 8, 4)
 process P consecutive prompt tokens per call. The projections and the MLP read every weight once per chunk. For
@@ -51,11 +53,26 @@ batch greedily into the largest chunks that fit and runs the rest through the de
 26-30 ms per token).
 
 Limits of the template:
-- One sequence. The recurrent state and the KV cache live in the llama.cpp memory, so its checkpoints, prompt cache and
-  sequence edits apply.
-- The context is the kernels' `LMAX` (4096); run with `-c 4096`.
+- The recurrent state and the KV cache live in the llama.cpp memory, so its checkpoints, prompt cache, sequence edits
+  and parallel sequences apply.
+- Contexts up to 32768 cells (see below).
 - Prompt tokens go through the prefill kernels in chunks of 64 / 32 / 16 / 8 / 4, if present, and through the decode
   kernels otherwise.
+
+### Context length
+
+An NPU kernel's IO sizes are fixed at compile time (the runtime rejects a smaller buffer), and the attention kernels
+take the whole KV cache of a layer as one IO. Kernels are therefore compiled per context and named by it:
+`qwen35_attn[_mx8]_kvc_c<LMAX>.axmodel` and `qwen35_attn_prefill<P>[_mx8]_kvc_c<LMAX>.axmodel`, several side by side.
+For `-c N` the backend takes the smallest `LMAX >= N` and allocates the llama.cpp KV cache tensors with room for
+`LMAX` cells (`get_alloc_size`); the kernels only scan the blocks in use. `-c 6000` runs on the 8192 kernels with a
+96 MiB KV buffer instead of 72. The attention kernels' cost does not depend on `LMAX`: decode is 40.6 ms per token with
+`-c 4096` and 41.2 ms with `-c 32768`.
+
+The largest context is 32768 cells: the SDMA bounds register of a dynamically indexed tensor (`bytes_max`, 24 bits)
+limits one KV IO to 32 MiB, and a Qwen3.5-0.8B cell is 1 KiB (2 KV heads x 256 x f16). Longer contexts need the KV
+cache split over several IO, which the kernels do not do yet. With `-c` above the largest kernel the template warns
+and falls back to a private KV cache.
 
 ```bash
 GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-completion -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 4096 -p "..." -n 128
@@ -64,7 +81,7 @@ GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-completion -m qwen3.5-0.8b-bf
 ### llama-server
 
 ```bash
-GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-server -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 4096 -np 1 \
+GGML_AXERA_TEMPLATE=qwen35 ./build-axera/bin/llama-server -m qwen3.5-0.8b-bf16.gguf -ngl 99 -c 16384 -np 4 \
     --host 0.0.0.0 --port 8080
 ```
 
@@ -80,13 +97,21 @@ removing tokens from a sequence. On AX8860, a three-turn chat's third turn proce
 an unrelated conversation in between, returning to the first one processed 4 prompt tokens instead of 132, with the
 same answer as without the detour.
 
-The llama.cpp KV cache is used if it is f16 (the default) with as many cells as the kernels' context (`-c 4096`), V is
-not transposed (flash attention, chosen automatically), and the `qwen35_attn*_kvc` kernels exist. Otherwise the
-template keeps a private KV cache, and the server then needs `--cache-ram 0`.
+The llama.cpp KV cache is used if it is f16 (the default), V is not transposed (flash attention, chosen
+automatically), and a `qwen35_attn*_kvc_c<LMAX>` kernel holds it. Otherwise the template keeps a private KV cache
+for a single sequence, and the server then needs `-np 1 --cache-ram 0`.
 
-`-np 1` is still required: the template runs one sequence. A request the template cannot continue from fails with an
-HTTP 500 error and a log line; the server keeps running. With BF16 weights, the chat endpoint streams at 43 ms per
-token.
+Parallel sequences (`-np N`, `llama-parallel`, `llama-perplexity` with several chunks per batch) work in both KV
+layouts: per-sequence streams (the default for an explicit `-np`) and the unified cache (`-kvu`). Each token of a
+batch runs with its sequence's row of the recurrent cache and its stream's KV cells; prompt chunks never cross a
+sequence. `llama-perplexity -b 2048` (4 sequences per batch) gives the same PPL as `-b 512` (2.4237 / 40.1693). With
+`-np 4`, four chat requests sent at once return the same answers as one at a time (with `-kvu` a sequence's cells
+interleave with the others', which changes the bf16 summation order, and a long answer can flip a near-tie token).
+The tokens of the sequences still run one after another, so the aggregate speed is that of one sequence (4 requests,
+189 tokens: 9.0 s one by one, 8.6 s at once) until a batched decode kernel exists.
+
+A request the template cannot continue from fails with an HTTP 500 error and a log line; the server keeps running.
+With BF16 weights, the chat endpoint streams at 43 ms per token.
 
 ### Quantized GGUF (Q8_0, Q4_K_M, Q4_0, ...)
 
