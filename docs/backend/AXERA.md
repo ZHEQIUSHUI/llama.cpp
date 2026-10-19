@@ -44,7 +44,7 @@ Kernels in `GGML_AXERA_KERNEL_DIR`: `qwen35_gdn.axmodel`, the attention kernels 
 the backend reads the context `LMAX` and the KV block size from the attention kernel's mask input, and the RoPE
 parameters (rotated dims, base, linear scale) from the graph's ROPE nodes.
 
-Optional prefill kernels `qwen35_gdn_prefill<P>.axmodel` / `qwen35_attn_prefill<P>.axmodel` (P = 64, 32, 16, 8, 4)
+Optional prefill kernels `qwen35_gdn_prefill<P>.axmodel` / `qwen35_attn_prefill<P>.axmodel` (P = 128, 64, 32, 16, 8, 4)
 process P consecutive prompt tokens per call. The projections and the MLP read every weight once per chunk. For
 P >= 16 the delta rule runs in the chunked form (the triangular solve of `gdn_stable_chunk`, 32 tokens per solve,
 8 heads batched), so a chunk is mostly matrix products; for P = 8 / 4 it runs token by token. The backend splits a
@@ -194,11 +194,13 @@ The loss is spread over the MLP and the delta-net projections and is the same fo
 best of two), so keeping single tensors in bf16 does not recover it. Use MXFP8 when the speed matters more.
 
 MXFP8 helps decode only, where the weights are read once per token and bandwidth bounds the time. In prefill a chunk
-reads each weight once for up to 64 tokens, so it is compute bound and MXFP8 only adds dequantization (1708-token
-prompt: 0.75 ms per token with MXFP8 prefill kernels, 0.58 ms with BF16). With `GGML_AXERA_WEIGHTS=mxfp8` the prefill
-kernels therefore use the bf16 GGUF tensors (already in CMM) and share the recurrent state and KV cache with the MXFP8
-decode kernels: prompts at 0.58 ms per token, decode at 31.5 ms per token. `GGML_AXERA_PREFILL_WEIGHTS=mxfp8` selects
-the MXFP8 prefill kernels instead.
+reads each weight once for up to 64 tokens, so for Qwen3.5-0.8B it is compute bound and MXFP8 only adds
+dequantization (1708-token prompt: 0.75 ms per token with MXFP8 prefill kernels, 0.58 ms with BF16). Larger models are
+bound by reading the weights in prefill too (9B, below). With `GGML_AXERA_WEIGHTS=mxfp8` the prefill kernels therefore
+take the MXFP8 weights if the kernel directory has MXFP8 prefill kernels (`qwen35_gdn_prefill<P>_mx8`, build them where
+they pay off), else the bf16 GGUF tensors (already in CMM), sharing the recurrent state and KV cache with the MXFP8
+decode kernels either way (0.8B: prompts at 0.58 ms per token, decode at 31.5 ms per token).
+`GGML_AXERA_PREFILL_WEIGHTS=mxfp8` / `bf16` overrides the choice.
 
 ### Long prompts
 
@@ -242,8 +244,14 @@ On AX8860 with the Q4_K_M GGUF (5.8 GB; the template converts the weights at loa
 | BF16 | 19 s | 277 ms per token | 19.0128 |
 | MXFP8 (`GGML_AXERA_WEIGHTS=mxfp8`) | 40 s | 164 ms per token | 19.0561 |
 
-The text matches llama.cpp on the CPU. The cat photo above (limited to 512 image tokens) encodes in 1.8 s on the NPU
-and is described as "A stylish gray-and-white cat wearing oversized round sunglasses and a shiny pink hooded jacket
+Prompts: at 64 tokens per chunk the 9B layers wait on the weights (about 48 GB/s), so the 9B kernel directory holds
+prefill kernels of 128 tokens with MXFP8 weights (`q35_prefill.py` with `PCHUNK=128 WFMT=mx8`; the MLP runs in passes
+over its intermediate channels to fit the on-chip memory). A 7962-token prompt (a number stated in its first line)
+takes 22.7 s instead of 41.0 s with BF16 chunks of 64 (2.9 ms per token), the answer names the number, and PPL is
+19.1367. Prompts beyond 8192 cells still run the split attention kernels with bf16 weights.
+
+The text matches llama.cpp on the CPU. The cat photo above (limited to 512 image tokens) encodes in 1.1 s on the NPU
+(attention in blocks of 512 query rows; 1.8 s before) and is described as "A stylish gray-and-white cat wearing oversized round sunglasses and a shiny pink hooded jacket
 with white drawstrings, set against a soft pink background."
 
 ### Multi-core kernels (experimental)

@@ -1647,10 +1647,16 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
             m.rollback = false;
         }
     }
-    // prefill kernels (every chunk size found, largest first). Prefill is compute bound, so with MXFP8 decode it uses
-    // the bf16 GGUF weights unless GGML_AXERA_PREFILL_WEIGHTS=mxfp8
+    // prefill kernels (every chunk size found, largest first). With MXFP8 decode, prefill takes MXFP8 weights too when
+    // the kernel directory has MXFP8 prefill kernels (built where prefill is bound by reading the weights, 9B: about
+    // half the cycles), else the bf16 GGUF weights (0.8B: compute bound, MXFP8 is slower);
+    // GGML_AXERA_PREFILL_WEIGHTS=mxfp8 / bf16 chooses
     const char * pw     = std::getenv("GGML_AXERA_PREFILL_WEIGHTS");
-    const bool   pre_mx = mx8 && pw != nullptr && strcmp(pw, "mxfp8") == 0;
+    bool         pre_mx = false;
+    for (int P : { 128, 64, 32, 16 }) {
+        pre_mx = pre_mx || std::ifstream(axera_kernels().path("qwen35_gdn_prefill" + std::to_string(P) + "_mx8")).good();
+    }
+    pre_mx = mx8 && (pw != nullptr ? strcmp(pw, "mxfp8") == 0 : pre_mx);
     m.pre.clear();
     // P = 1: decode on the multi-core chain (GGML_AXERA_MC_DECODE=0: the single-core decode kernels)
     const char * mcd    = std::getenv("GGML_AXERA_MC_DECODE");
