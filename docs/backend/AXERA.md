@@ -234,7 +234,7 @@ their own `GGML_AXERA_KERNEL_DIR`). Its delta-net layers have 32 value heads for
 reorders the value heads from the checkpoint's grouped order to a tiled one (value head j uses key head j % 16), and
 the kernels take that order (`VORDER=tiled`). A 9B cell is 2 KiB, so the fused attention kernels go up to 8192 cells
 and longer contexts use the split attention (8192-cell segments). The vision encoder (27 layers of 1152, head dim 72)
-has kernels up to 2048 patches (`--image-max-tokens 512`).
+has kernels up to 3072 patches (`--image-max-tokens 768`).
 
 On AX8860 with the Q4_K_M GGUF (5.8 GB; the template converts the weights at load), single-core:
 
@@ -248,10 +248,13 @@ Prompts: at 64 tokens per chunk the 9B layers wait on the weights (about 48 GB/s
 prefill kernels of 128 tokens with MXFP8 weights (`q35_prefill.py` with `PCHUNK=128 WFMT=mx8`; the MLP runs in passes
 over its intermediate channels to fit the on-chip memory). A 7962-token prompt (a number stated in its first line)
 takes 22.7 s instead of 41.0 s with BF16 chunks of 64 (2.9 ms per token), the answer names the number, and PPL is
-19.1367. Prompts beyond 8192 cells still run the split attention kernels with bf16 weights.
+19.1367. Beyond 8192 cells the split attention's head and tail kernels take the MXFP8 weights too
+(`qwen35_attn_fd_{head,tail}<R>_mx8`, `q35_flash.py` with `WFMT=mx8`, sharing the quantized weights of the decode
+kernels), with a 128-row segment kernel for the chunks of 128: 15888 tokens in 44.9 s instead of 82.8 s and 39666 tokens
+in 134 s instead of 229 s, the number found in both; decode at 40k context 209 ms per token instead of 248.
 
 The text matches llama.cpp on the CPU. The cat photo above (limited to 512 image tokens) encodes in 1.1 s on the NPU
-(attention in blocks of 512 query rows; 1.8 s before) and is described as "A stylish gray-and-white cat wearing oversized round sunglasses and a shiny pink hooded jacket
+(attention in blocks of 512 query rows; 1.8 s before; 2.0 s with up to 768 image tokens) and is described as "A stylish gray-and-white cat wearing oversized round sunglasses and a shiny pink hooded jacket
 with white drawstrings, set against a soft pink background."
 
 ### Multi-core kernels (experimental)
