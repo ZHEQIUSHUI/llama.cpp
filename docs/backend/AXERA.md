@@ -257,6 +257,25 @@ The text matches llama.cpp on the CPU. The cat photo above (limited to 512 image
 (attention in blocks of 512 query rows; 1.8 s before; 2.0 s with up to 768 image tokens) and is described as "A stylish gray-and-white cat wearing oversized round sunglasses and a shiny pink hooded jacket
 with white drawstrings, set against a soft pink background."
 
+### Qwen3.5-35B-A3B (MoE)
+
+The MoE models (`qwen35moe` GGUF) run with their routed experts in MXFP4, as `llama-quantize ... MXFP4_MOE` stores
+them (the rest Q8_0, converted at load to BF16 or MXFP8 like any GGUF). Each layer takes two kernel calls:
+`qwen35moe_gdn[_mx8]` / `qwen35moe_attn[_mx8]_kvc_c<LMAX>` run the layer up to the MLP and then its dense part (the
+shared expert with its sigmoid gate on the residual, and the router logits); the host takes softmax / top-K /
+renormalization of the 256 logits and binds the 8 chosen experts' weights, by address in the GGUF tensors, to
+`qwen35moe_experts8_mxfp4`, which adds them to the residual. At load the experts are repacked in place from ggml's
+MXFP4 blocks (scale byte + 16 bytes of codes) to the kernels' layout (codes [rows][K / 2], then the scales), so no
+copy of the 17 GB of experts is made. Kernels: `q35_moe.py` (MXFP4 inputs declared as uint8 for the board runtime,
+`board_io.py`); the output projection GEMV is the 2B one (`n31040_k2048`), the vision encoder the 9B one with its own
+merger (out 2048). Prompts go token by token through the decode kernels so far, contexts up to 4096 cells.
+
+On AX8860 (20 GB GGUF, loaded into CMM in 132 s): decode at 105 ms per token with MXFP8 (gdn layers 58 ms, attention
+17 ms, experts 29 ms) and 131 ms with BF16; PPL (zh, 2 x 512) 16.80 / 16.66 against 16.58 for llama.cpp on x86 with the
+same GGUF (en 1.0118 against 1.0087); the cat photo above at 768 image tokens in about 1.8 s, described as "A stylish
+cat with fluffy white and gray fur wears a shiny pink leather hoodie and oversized round sunglasses, posing
+confidently against a soft pink background."
+
 ### Multi-core kernels (experimental)
 
 With `GGML_AXERA_CORES=4` the kernels that have a four-core build (`<name>_x4`, AXDSL without synchronization

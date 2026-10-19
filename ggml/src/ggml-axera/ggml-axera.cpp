@@ -41,6 +41,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <numeric>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -682,6 +683,12 @@ struct axera_q35_layer {
         int                                kc = -1, vc = -1, mask = -1;  // segment inputs, rebound per call
     };
     std::vector<fd_io>                 fd;  // [0]: decode, [1 + v]: m.pre[v]
+    struct expert_w {  // routed experts of an MoE layer (gate, up, down): MXFP4 repacked in place (axera_repack_mxfp4)
+        ggml_backend_axera_buffer_context * b = nullptr;
+        char *                              base = nullptr;  // expert 0
+        size_t                              stride = 0, data = 0, scale = 0;  // bytes per expert, its elements, scales
+    };
+    expert_w                           exps[3];
     struct mc_io {  // multi-core prefill chain of this layer: [gdn | head, seg, tail] then mlp
         std::vector<AX_ENGINE_IO_BUFFER_T> ain, aout, sin, sout, tin, tout, min, mout;
         int si = -1, so = -1, ci = -1, co = -1;            // state IO of the gdn call (rebound to the current row)
@@ -751,6 +758,14 @@ struct axera_q35 {
     };
     std::map<int, mc_kernels> mc;  // by P
     std::map<int, fd_kernels> fd;  // by rows R
+    // MoE (Qwen3.5-35B-A3B): per layer the layer kernel (qwen35moe_*: up to the shared expert and the router logits),
+    // then the routed experts kernel on the top-K experts the host picks from the logits
+    bool                moe = false;
+    ggml_axera_kernel * experts = nullptr;  // qwen35moe_experts<K>_mxfp4
+    int                 n_expert = 0, top_k = 0;
+    axera_cmm           BASE, H2, LOGITS, RW;  // residual + gated shared expert, normed state, router logits, weights
+    std::vector<int>    e_w[3], e_s[3];        // experts kernel input indices of w_{g,u,d}<i> / s_{g,u,d}<i>
+    std::vector<AX_ENGINE_IO_BUFFER_T> ein, eout[2];  // its IO (weights rebound per token; out: the layer parity)
 };
 
 // the Qwen3.5 vision encoder (mtmd clip graph, projector qwen3vl) on the q35_vit.py kernels
@@ -948,6 +963,59 @@ static const std::map<std::string, const char *> axera_q35_direct = {
     { "q_norm", "attn_q_norm.weight" }, { "k_norm", "attn_k_norm.weight" },    { "w_o", "attn_output.weight" },
 };
 
+// MoE layers: the dense MLP inputs come from the shared expert, plus the router and the shared expert's gate
+static const std::map<std::string, const char *> axera_q35_moe_direct = {
+    { "w_gate", "ffn_gate_shexp.weight" }, { "w_up", "ffn_up_shexp.weight" }, { "w_down", "ffn_down_shexp.weight" },
+    { "w_router", "ffn_gate_inp.weight" }, { "w_shg", "ffn_gate_inp_shexp.weight" },
+};
+
+// GGUF tensor (name within the layer) of kernel input n, nullptr if none
+static const char * axera_q35_gguf_name(const axera_q35 & m, const std::string & n) {
+    if (m.moe) {
+        auto it = axera_q35_moe_direct.find(n);
+        if (it != axera_q35_moe_direct.end()) {
+            return it->second;
+        }
+    }
+    auto it = axera_q35_direct.find(n);
+    return it == axera_q35_direct.end() ? nullptr : it->second;
+}
+
+// ggml MXFP4 blocks (per 32 inputs: the E8M0 scale byte, then 16 bytes of E2M1 codes: low nibbles elements 0..15, high
+// nibbles 16..31) -> the kernels' layout, in place per expert (dim 2): the codes [rows][K / 2], two consecutive elements
+// per byte (the first in the low nibble), then the scales [rows][K / 32]. Once per tensor: the GGUF data is the
+// kernels' afterwards (the template runs every MoE layer)
+static void axera_repack_mxfp4(const ggml_tensor * w) {
+    static std::set<const void *> done;
+    if (!done.insert(w->data).second) {
+        return;
+    }
+    GGML_ASSERT(w->type == GGML_TYPE_MXFP4 && ggml_is_contiguous(w) && w->ne[0] % 32 == 0 && w->ne[3] == 1 &&
+                ggml_backend_buffer_is_axera(w->buffer));
+    const int64_t K = w->ne[0], rows = w->ne[1], nb = K / 32;
+    const size_t  stride = w->nb[2];
+    GGML_ASSERT(stride == (size_t) (rows * nb * 17));
+    std::vector<uint8_t> tmp(stride);
+    for (int64_t e = 0; e < w->ne[2]; ++e) {
+        uint8_t * src = (uint8_t *) w->data + e * stride;
+        uint8_t * dq  = tmp.data();
+        uint8_t * ds  = tmp.data() + rows * K / 2;
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t b = 0; b < nb; ++b) {
+                const uint8_t * blk = src + (r * nb + b) * 17;
+                uint8_t *       o   = dq + r * K / 2 + b * 16;
+                ds[r * nb + b]      = blk[0];
+                for (int j = 0; j < 8; ++j) {  // elements 2j, 2j + 1 (low nibbles), 16 + 2j, 17 + 2j (high nibbles)
+                    o[j]     = (uint8_t) ((blk[1 + 2 * j] & 15) | ((blk[2 + 2 * j] & 15) << 4));
+                    o[8 + j] = (uint8_t) ((blk[1 + 2 * j] >> 4) | (blk[2 + 2 * j] & 0xF0));
+                }
+            }
+        }
+        memcpy(src, tmp.data(), stride);
+    }
+    ((ggml_backend_axera_buffer_context *) w->buffer->context)->flush(w->data, ggml_nbytes(w));
+}
+
 // a bf16 view of a GGUF weight for a kernel input of `size` bytes: the tensor itself if it is bf16 in CMM, else a
 // cached bf16 copy (quantized GGUF: Q8_0, Q4_K, ...; f16; f32)
 static AX_ENGINE_IO_BUFFER_T axera_q35_weight_bf16(axera_q35 & m, const ggml_tensor * w, uint32_t size) {
@@ -981,7 +1049,8 @@ static uint32_t axera_output_size(ggml_axera_kernel * k, const char * name) {
 // CMM copy (owned by the layer) of a tensor kept on the CPU
 static AX_ENGINE_IO_BUFFER_T axera_q35_gguf_input(axera_q35 & m, axera_q35_layer & ly, const ggml_tensor * w,
                                                   const std::string & n, uint32_t size) {
-    if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_BF16) {  // quantized / f16 GGUF weight
+    if ((w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_BF16) ||
+        (w->type == GGML_TYPE_F32 && ggml_nbytes(w) == 2 * (size_t) size)) {  // quantized / f16 / f32 -> bf16 input
         return axera_q35_weight_bf16(m, w, size);
     }
     if (ggml_nbytes(w) != size) {
@@ -1122,18 +1191,18 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
             b->flush(b->vir, size);
         } else if ((n.rfind("w_", 0) == 0 || n.rfind("s_", 0) == 0) && k->input(("s_" + n.substr(2)).c_str()) >= 0) {
             // MXFP8 kernel: w_<x> elements and s_<x> scales, quantized from the GGUF tensor of w_<x>
-            auto d = axera_q35_direct.find("w_" + n.substr(2));
-            if (d == axera_q35_direct.end()) {
+            const char * g = axera_q35_gguf_name(m, "w_" + n.substr(2));
+            if (!g) {
                 GGML_ABORT("qwen35 template: kernel input %s has no GGUF tensor\n", n.c_str());
             }
-            ly.in[i] = axera_q35_mx_input(ly, get(d->second), n, size);
+            ly.in[i] = axera_q35_mx_input(ly, get(g), n, size);
             continue;
         } else {
-            auto it = axera_q35_direct.find(n);
-            if (it == axera_q35_direct.end()) {
+            const char * g = axera_q35_gguf_name(m, n);
+            if (!g) {
                 GGML_ABORT("qwen35 template: kernel input %s has no GGUF tensor\n", n.c_str());
             }
-            ly.in[i] = axera_q35_gguf_input(m, ly, get(it->second), n, size);
+            ly.in[i] = axera_q35_gguf_input(m, ly, get(g), n, size);
             continue;
         }
         if (b->size < size && p == nullptr) {
@@ -1146,7 +1215,9 @@ static void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::stri
         const uint32_t    size = k->info->pOutputs[i].nSize;
         ggml_backend_axera_buffer_context * b;
         if (n == "out") {
-            b = xout;
+            b = m.moe ? m.BASE.get() : xout;  // MoE: the experts kernel adds the routed experts and writes xout
+        } else if (n == "h2_out" || n == "logits_out") {
+            b = (n == "h2_out" ? m.H2 : m.LOGITS).get();
         } else if (m.kv_llama && (n == "kc" || n == "vc")) {
             // the llama.cpp KV cache of this layer: [cells][heads x dim] f16, the layout of the _kvc kernels
             // N cells per stream, allocated with room for LMAX after the last stream (the IO size must be the
@@ -1228,8 +1299,8 @@ static void axera_q35_bind_prefill(axera_q35 & m, int il, size_t v, const std::m
         const int j = kd->input(n.c_str());
         if (j < 0 || kd->info->pInputs[j].nSize != size) {
             // a bf16 prefill weight next to MXFP8 decode kernels: the GGUF tensor itself
-            auto d  = axera_q35_direct.find(n);
-            auto it = d == axera_q35_direct.end() ? t.end() : t.find("blk." + std::to_string(il) + "." + d->second);
+            const char * g  = axera_q35_gguf_name(m, n);
+            auto         it = !g ? t.end() : t.find("blk." + std::to_string(il) + "." + g);
             if (it == t.end()) {
                 GGML_ABORT("qwen35 template: prefill input %s matches neither the decode kernel nor a GGUF tensor\n",
                            n.c_str());
@@ -1377,8 +1448,8 @@ static void axera_q35_bind_flash(axera_q35 & m, int il, int v, const std::map<st
                 continue;
             }
             const bool mx = (n.rfind("w_", 0) == 0 || n.rfind("s_", 0) == 0) && k->input(("s_" + n.substr(2)).c_str()) >= 0;
-            auto       d  = axera_q35_direct.find(mx ? "w_" + n.substr(2) : n);
-            auto       it = d == axera_q35_direct.end() ? t.end() : t.find("blk." + std::to_string(il) + "." + d->second);
+            const char * g  = axera_q35_gguf_name(m, mx ? "w_" + n.substr(2) : n);
+            auto         it = !g ? t.end() : t.find("blk." + std::to_string(il) + "." + g);
             if (it == t.end()) {
                 GGML_ABORT("qwen35 template: kernel input %s has no GGUF tensor\n", n.c_str());
             }
@@ -1503,8 +1574,8 @@ static void axera_q35_bind_mc(axera_q35 & m, int il, size_t v, const std::map<st
                 }
                 continue;
             }
-            auto d  = axera_q35_direct.find(n);
-            auto it = d == axera_q35_direct.end() ? t.end() : t.find("blk." + std::to_string(il) + "." + d->second);
+            const char * g  = axera_q35_gguf_name(m, n);
+            auto         it = !g ? t.end() : t.find("blk." + std::to_string(il) + "." + g);
             if (it == t.end()) {
                 GGML_ABORT("qwen35 template: kernel input %s has no GGUF tensor\n", n.c_str());
             }
@@ -1555,6 +1626,8 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
     m.L    = L;
     m.H    = H;
     const bool mx8 = axera_weights_mx8();
+    m.moe          = t.count("blk.0.ffn_gate_inp.weight") > 0;  // Qwen3.5 MoE: qwen35moe_* kernels
+    const std::string kp = m.moe ? "qwen35moe" : "qwen35";
     // RoPE of the graph: rotated dims, base and linear position scale (YaRN is not implemented by the template)
     int32_t rp[16];
     memcpy(rp, rope->op_params, sizeof(rp));
@@ -1573,7 +1646,7 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
     // the llama.cpp KV cache is usable if every attention layer's cache is f16 cells of [kv heads x head dim] in CMM
     // (N cells, padded at allocation to the context LMAX of the smallest qwen35_attn*_kvc_c<LMAX> kernel that holds
     // them), V not transposed (flash-attention layout)
-    const std::string attn_name = mx8 ? "qwen35_attn_mx8" : "qwen35_attn";
+    const std::string attn_name = kp + (mx8 ? "_attn_mx8" : "_attn");
     {
         auto ki = t.find("attn_inp_k_idxs"), vi = t.find("attn_inp_v_idxs");
         m.kv_llama = ki != t.end() && vi != t.end() && ki->second->ne[0] == vi->second->ne[0];
@@ -1610,7 +1683,7 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
         m.S = m.S > 0 && ctx % m.S == 0 ? std::min<int64_t>(ctx, m.S) : ctx;  // the split kernels' segment
         axera_q35_load_flash(m, 1);
     }
-    m.gdn  = axera_kernels().get(mx8 ? "qwen35_gdn_mx8" : "qwen35_gdn");
+    m.gdn  = axera_kernels().get(kp + (mx8 ? "_gdn_mx8" : "_gdn"));
     m.attn = m.flash ? nullptr : axera_kernels().get(attn_name + m.ctx_sfx);
     if (m.flash) {  // the KQ mask is cut per segment kernel (fd_kernels::bc); whole 64-cell blocks here
         m.LMAX = (int) m.S;
@@ -1656,6 +1729,45 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
     for (int i = 0; i < m.ROT / 2; ++i) {
         m.inv_freq[i] = (float) (1.0 / std::pow(m.THETA, (double) (2 * i) / m.ROT));
     }
+    if (m.moe) {  // the routed experts kernel and its IO: the layer kernels write BASE / H2 / LOGITS
+        auto topk = t.find("ffn_moe_topk-0");
+        GGML_ASSERT(topk != t.end() && "qwen35 template: no ffn_moe_topk node in the MoE graph");
+        m.top_k    = (int) topk->second->ne[0];
+        m.n_expert = (int) t.at("blk.0.ffn_gate_inp.weight")->ne[1];
+        m.experts  = axera_kernels().get("qwen35moe_experts" + std::to_string(m.top_k) + "_mxfp4");
+        m.BASE     = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
+        m.H2       = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
+        m.LOGITS   = axera_cmm_alloc(m.n_expert * sizeof(float));
+        m.RW       = axera_cmm_alloc(m.top_k * sizeof(float));
+        ggml_axera_kernel * ke = m.experts;
+        GGML_ASSERT(size_of(ke, "rw") == m.top_k * sizeof(float) && size_of(ke, "h2") == H * sizeof(ggml_bf16_t));
+        m.ein.assign(ke->info->nInputSize, {});
+        for (int g = 0; g < 3; ++g) {
+            m.e_w[g].assign(m.top_k, -1);
+            m.e_s[g].assign(m.top_k, -1);
+        }
+        for (uint32_t i = 0; i < ke->info->nInputSize; ++i) {
+            const std::string n = ke->info->pInputs[i].pName;
+            const uint32_t    sz = ke->info->pInputs[i].nSize;
+            if (n == "h2" || n == "base" || n == "rw") {
+                auto & c  = n == "h2" ? m.H2 : n == "base" ? m.BASE : m.RW;
+                m.ein[i]  = axera_io(c.get(), c->vir, sz);
+                continue;
+            }
+            const char * kinds = "gud";  // w_<kind><expert> / s_<kind><expert>
+            const char * kc    = n.size() > 3 ? strchr(kinds, n[2]) : nullptr;
+            const int    e     = kc ? atoi(n.c_str() + 3) : -1;
+            if ((n[0] != 'w' && n[0] != 's') || n[1] != '_' || !kc || e < 0 || e >= m.top_k) {
+                GGML_ABORT("qwen35 template: unexpected experts kernel input %s\n", n.c_str());
+            }
+            (n[0] == 'w' ? m.e_w : m.e_s)[kc - kinds][e] = (int) i;
+        }
+        for (int par = 0; par < 2; ++par) {  // even layers write m.B, odd ones m.A
+            auto & x = par == 0 ? m.B : m.A;
+            m.eout[par].assign(ke->info->nOutputSize, {});
+            m.eout[par][ke->output("out")] = axera_io(x.get(), x->vir, H * sizeof(ggml_bf16_t));
+        }
+    }
     m.layers.clear();
     m.layers.resize(L);
     m.rollback = true;
@@ -1663,6 +1775,25 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
         axera_q35_bind_layer(m, il, t);
         if (m.layers[il].gdn && !m.layers[il].in_place) {
             m.rollback = false;
+        }
+    }
+    for (int il = 0; il < L && m.moe; ++il) {  // each layer's routed experts, repacked in place for the kernel
+        const char * names[3] = { "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight" };
+        for (int g = 0; g < 3; ++g) {
+            const ggml_tensor * w = t.at("blk." + std::to_string(il) + "." + names[g]);
+            if (w->type != GGML_TYPE_MXFP4 || !ggml_backend_buffer_is_axera(w->buffer)) {
+                GGML_ABORT("qwen35 template: %s is %s; the MoE kernels take MXFP4 experts in CMM (llama-quantize "
+                           "MXFP4_MOE, -ngl 99)\n", w->name, ggml_type_name(w->type));
+            }
+            axera_repack_mxfp4(w);
+            auto & e  = m.layers[il].exps[g];
+            e.b       = (ggml_backend_axera_buffer_context *) w->buffer->context;
+            e.base    = (char *) w->data;
+            e.stride  = w->nb[2];
+            e.data    = (size_t) (w->ne[0] * w->ne[1] / 2);
+            e.scale   = (size_t) (w->ne[0] / 32 * w->ne[1]);
+            GGML_ASSERT(e.data == m.experts->info->pInputs[m.e_w[g][0]].nSize &&
+                        e.scale == m.experts->info->pInputs[m.e_s[g][0]].nSize);
         }
     }
     // prefill kernels (every chunk size found, largest first). With MXFP8 decode, prefill takes MXFP8 weights too when
@@ -1681,6 +1812,9 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
     const char * mcd    = std::getenv("GGML_AXERA_MC_DECODE");
     const bool   mc_dec = mcd == nullptr || strcmp(mcd, "0") != 0;
     for (int P : { 128, 64, 32, 16, 8, 4, 1 }) {
+        if (m.moe) {  // MoE: decode kernels only so far (prompts token by token)
+            break;
+        }
         const std::string sfx  = std::to_string(P) + (pre_mx ? "_mx8" : "");
         const std::string asfx = sfx + m.ctx_sfx;
         // the multi-core chain (preferred), and / or the single-core layer kernels
@@ -1720,7 +1854,7 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
         const std::string b  = std::to_string(Bn);
         const std::string bs = mx8 && std::ifstream(axera_kernels().path("qwen35_gdn_batch" + b + "_mx8")).good() ? "_mx8" : "";
         const std::string gn = "qwen35_gdn_batch" + b + bs, an = "qwen35_attn_batch" + b + bs;
-        if (!m.kv_llama || !m.rollback || !std::ifstream(axera_kernels().path(gn)).good() ||
+        if (m.moe || !m.kv_llama || !m.rollback || !std::ifstream(axera_kernels().path(gn)).good() ||
             !(m.flash ? axera_q35_load_flash(m, Bn) : std::ifstream(axera_kernels().path(an + m.ctx_sfx)).good())) {
             continue;
         }
@@ -2362,6 +2496,50 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
     auto use_split = [&](int R) {
         return m.kv_llama && m.fd.count(R) && m.fd.at(R).head && (m.flash || W >= axera_split_min());
     };
+    // MoE layer il after its layer kernel: the top-K experts of the router logits (softmax, top-K, renormalized: as
+    // transformers' Qwen3_5MoeTopKRouter; the softmax over the top-K alone gives the same weights), their weights
+    // bound to the experts kernel, which adds them to the residual + shared expert (BASE) into the layer output
+    std::vector<int> e_ids(m.n_expert);
+    auto run_experts = [&](int il, int64_t p) {
+        axera_q35_layer & ly = m.layers[il];
+        m.LOGITS->invalidate(m.LOGITS->vir, m.LOGITS->size);
+        const float * lg = (const float *) m.LOGITS->vir;
+        std::iota(e_ids.begin(), e_ids.end(), 0);
+        std::partial_sort(e_ids.begin(), e_ids.begin() + m.top_k, e_ids.end(),
+                          [&](int a, int b) { return lg[a] > lg[b]; });
+        auto * rw  = (float *) m.RW->vir;
+        float  sum = 0.0f;
+        for (int i = 0; i < m.top_k; ++i) {
+            rw[i] = std::exp(lg[e_ids[i]] - lg[e_ids[0]]);
+            sum += rw[i];
+        }
+        for (int i = 0; i < m.top_k; ++i) {
+            rw[i] /= sum;
+        }
+        m.RW->flush(rw, m.top_k * sizeof(float));
+        for (int i = 0; i < m.top_k; ++i) {
+            for (int g = 0; g < 3; ++g) {
+                const auto & e = ly.exps[g];
+                char *       w = e.base + (size_t) e_ids[i] * e.stride;
+                m.ein[m.e_w[g][i]] = axera_io(e.b, w, (uint32_t) e.data);
+                m.ein[m.e_s[g][i]] = axera_io(e.b, w + e.data, (uint32_t) e.scale);
+            }
+        }
+        auto & out = m.eout[il % 2];
+        AX_ENGINE_IO_T io;
+        memset(&io, 0, sizeof(io));
+        io.pInputs     = m.ein.data();
+        io.nInputSize  = (uint32_t) m.ein.size();
+        io.pOutputs    = out.data();
+        io.nOutputSize = (uint32_t) out.size();
+        axera_timer tm("moe experts");
+        const int ret = AX_ENGINE_RunSync(m.experts->handle, &io);
+        if (ret != 0) {
+            GGML_ABORT("qwen35 template: RunSync failed (0x%x) in the experts of layer %d, position %" PRId64 "\n", ret,
+                       il, p);
+        }
+    };
+
     auto run_layers = [&](int v, int t0, int64_t p) {  // v: prefill chunk size index, -1: decode
         const bool prefill = v >= 0;
         const bool split   = use_split(prefill ? m.pre[v].P : 1);
@@ -2395,6 +2573,9 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
             if (ly.si >= 0) {
                 std::swap(ly.in[ly.si], ly.out[ly.so]);
                 std::swap(ly.in[ly.ci], ly.out[ly.co]);
+            }
+            if (m.moe) {
+                run_experts(il, p);
             }
         }
     };
@@ -3320,8 +3501,11 @@ static size_t ggml_backend_axera_buffer_type_get_alloc_size(ggml_backend_buffer_
         (strncmp(t->name, "cache_k_l", 9) != 0 && strncmp(t->name, "cache_v_l", 9) != 0)) {
         return n;
     }
-    const int64_t ctx = axera_kernels().ctx_for(axera_weights_mx8() ? "qwen35_attn_mx8_kvc" : "qwen35_attn_kvc", t->ne[1]);
-    const int64_t S   = axera_flash_seg();  // split attention: whole segments
+    // dense or MoE attention kernels (a kernel directory holds one model's; no graph yet to tell)
+    const std::string kv  = axera_weights_mx8() ? "_attn_mx8_kvc" : "_attn_kvc";
+    int64_t           ctx = axera_kernels().ctx_for("qwen35" + kv, t->ne[1]);
+    ctx                   = ctx > 0 ? ctx : axera_kernels().ctx_for("qwen35moe" + kv, t->ne[1]);
+    const int64_t S       = axera_flash_seg();  // split attention: whole segments
     const int64_t c   = S > 0 && (ctx == 0 || axera_flash_forced()) ? (t->ne[1] + S - 1) / S * S : ctx;
     return std::max(n, (size_t) (t->ne[2] - 1) * t->nb[2] + (size_t) c * t->nb[1]);  // ne[2]: per-sequence streams
     GGML_UNUSED(buft);
