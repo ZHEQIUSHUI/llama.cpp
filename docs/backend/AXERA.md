@@ -225,6 +225,27 @@ width; interleaved sections as `GGML_ROPE_TYPE_IMROPE`) and prompt chunks need c
 positions. On AX8860 a 1000 x 667 photo (2604 patches, 651 image tokens) encodes in 471 ms (the CPU: 138.6 s) and
 Qwen3.5-0.8B describes it with the same sentence as llama.cpp on x86.
 
+### Qwen3.5-9B
+
+The kernels follow the model's config, so the same scripts build them for 9B (`MODEL=<Qwen3.5-9B dir>`, kernels in
+their own `GGML_AXERA_KERNEL_DIR`). Its delta-net layers have 32 value heads for 16 key heads; llama.cpp's converter
+reorders the value heads from the checkpoint's grouped order to a tiled one (value head j uses key head j % 16), and
+the kernels take that order (`VORDER=tiled`). A 9B cell is 2 KiB, so the fused attention kernels go up to 8192 cells
+and longer contexts use the split attention (8192-cell segments). The vision encoder (27 layers of 1152, head dim 72)
+has kernels up to 2048 patches (`--image-max-tokens 512`).
+
+On AX8860 with the Q4_K_M GGUF (5.8 GB; the template converts the weights at load), single-core:
+
+| Weights | Load | Decode | PPL (zh, 2 x 512) |
+|---|---|---|---|
+| CPU llama.cpp (x86), same GGUF | | | 18.9679 |
+| BF16 | 19 s | 277 ms per token | 19.0128 |
+| MXFP8 (`GGML_AXERA_WEIGHTS=mxfp8`) | 40 s | 164 ms per token | 19.0561 |
+
+The text matches llama.cpp on the CPU. The cat photo above (limited to 512 image tokens) encodes in 1.8 s on the NPU
+and is described as "A stylish gray-and-white cat wearing oversized round sunglasses and a shiny pink hooded jacket
+with white drawstrings, set against a soft pink background."
+
 ### Multi-core kernels (experimental)
 
 With `GGML_AXERA_CORES=4` the kernels that have a four-core build (`<name>_x4`, AXDSL without synchronization
