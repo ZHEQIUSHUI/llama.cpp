@@ -200,6 +200,44 @@ kernels therefore use the bf16 GGUF tensors (already in CMM) and share the recur
 decode kernels: prompts at 0.58 ms per token, decode at 31.5 ms per token. `GGML_AXERA_PREFILL_WEIGHTS=mxfp8` selects
 the MXFP8 prefill kernels instead.
 
+### Long prompts
+
+A prompt chunk of P tokens prepares the KQ mask of every segment once for all attention layers: llama.cpp's mask rows
+are converted to bf16 on a host thread pool, and each row's first and last visible cell decide which blocks and which
+segment-kernel cores have work. With a fused kernel for the context, batches over masks of at least 4096 cells
+(`GGML_AXERA_SPLIT_MIN`, 0: always) take the split attention kernels too, which read only the blocks a token can see.
+On AX8860 the 39666-token prompt above takes 42.6 s instead of 81 s (decode 69 ms per token), PPL is unchanged
+(2.4237 / 40.1693).
+
+### Images (llama-mtmd-cli, llama-server --mmproj)
+
+Qwen3.5 checkpoints carry a vision encoder (a ViT: 12 layers of 768 for 0.8B, 24 x 1024 for 2B / 4B, 27 x 1152 for
+9B and up). Its mmproj GGUF (`convert_hf_to_gguf.py --mmproj`) runs on the NPU when the kernels
+`qwen35_vit_{embed,pre,attn,post,merge}<N>_h<hidden>.axmodel` exist (`q35_vit.py`; N = 256, 1024, 2048, 3072
+patches): the backend recognizes the clip graph by its `v.blk.*` weights, cuts the image into patches in the 2 x 2
+merge order, interpolates the learned position table and builds the 2-D RoPE tables on the host, and runs the patch
+projection, every layer (three kernels: norm / qkv / RoPE, bidirectional attention, output projection / MLP) and the
+merger on the NPU, the image padded to the next N with the padding masked. Images of more than 3072 patches need
+`--image-max-tokens 768`; `--no-mmproj-offload` runs the encoder on the CPU instead.
+
+The text kernels take M-RoPE positions (an image's tokens share their temporal position and differ in height and
+width; interleaved sections as `GGML_ROPE_TYPE_IMROPE`) and prompt chunks need consecutive cells, not consecutive
+positions. On AX8860 a 1000 x 667 photo (2604 patches, 651 image tokens) encodes in 471 ms (the CPU: 138.6 s) and
+Qwen3.5-0.8B describes it with the same sentence as llama.cpp on x86.
+
+### Multi-core kernels (experimental)
+
+With `GGML_AXERA_CORES=4` the kernels that have a four-core build (`<name>_x4`, AXDSL without synchronization
+between the cores: each core takes its share of heads or output channels and writes only its own outputs) replace
+the single-core ones: prefill chunks of 128 / 64 tokens and decode (`GGML_AXERA_MC_DECODE=0` keeps decode
+single-core) run as a chain of `qwen35_{gdn,mlp,attn_head,attn_tail}_mc<P>_x4` kernels that pass the residual as a
+base plus one fp32 partial per core, the segment kernels split their blocks over the cores and the tail merges the
+partial results on the NPU (more segments than its slots: merged on the CPU in between), and the output projection
+uses `mul_mat_bf16_n<C>_k<K>_x4`. On AX8860 the 39666-token prompt takes 19 s and decode 31 ms per token (43 ms at
+40k). It is off by default: inside llama.cpp the chain still gives NaN or drifting results and times out
+(`0x8006008a`) now and then, while the same kernels pass stress tests on their own; other NPU users at the same time
+always make the calls time out. `GGML_AXERA_PROF=1` prints per-kernel times at exit.
+
 ## Build
 
 Cross-compile on an x86-64 host with the Arm GNU toolchain 13.2 (the BSP libraries need glibc 2.38) and the AX8860
