@@ -308,6 +308,29 @@ gain is limited by the DRAM bandwidth those boards reach, about 84 GB/s for all 
 3.3 ms, 119k-token prompt 663 -> 539 s), bandwidth-bound ones barely (0.8B decode 42 -> 40 ms). `GGML_AXERA_PROF=1`
 prints per-kernel times at exit.
 
+## Source layout
+
+The backend separates what any model uses from the graph templates of one architecture:
+
+| File | Contents |
+|---|---|
+| `ggml-axera-impl.h` | internal declarations, CMM buffers, kernel registry, host thread pool, profiling timers |
+| `ggml-axera.cpp` | backend, device and registry interface; dispatch of a graph to the per-op path or a template |
+| `ggml-axera-util.cpp` | runtime init, CMM allocation, settings (`GGML_AXERA_*`), kernel IO helpers |
+| `ggml-axera-buffer.cpp` | the CMM buffer type |
+| `ggml-axera-weights.cpp` | weight formats (BF16 copies, MXFP8, MXFP4 repacking) and the GEMV calls, per-op `MUL_MAT` |
+| `ggml-axera-graph.cpp` | for templates: the graph's tensors by name, the output head (final norm, output projection, MTP's `h_nextn`) |
+| `ggml-axera-attn.h/.cpp` | for templates: the llama.cpp KV cache and KQ mask of a batch, split attention (segments, merge), RoPE / M-RoPE tables |
+| `ggml-axera-q35.h` | Qwen3.5 template: its state and per-graph run state |
+| `ggml-axera-q35-bind.cpp` | Qwen3.5: kernel loading, binding GGUF tensors and cache tensors to kernel IO |
+| `ggml-axera-q35-run.cpp` | Qwen3.5: one graph (recurrent-state bookkeeping, MTP input, chunks, layer calls) |
+| `ggml-axera-q35-moe.cpp` | Qwen3.5 MoE: expert routing and the experts / slots kernels |
+| `ggml-axera-q35-mc.cpp` | Qwen3.5: the multi-core prefill chain |
+| `ggml-axera-vit.cpp` | the Qwen3.5 vision encoder (mtmd) |
+
+A template for another architecture adds its layer kernels (AXDSL), a binding of its GGUF tensor names to their inputs
+and its layer loop; the KV cache handling, split attention, RoPE, the output head and the weight formats are shared.
+
 ## Build
 
 Cross-compile on an x86-64 host with the Arm GNU toolchain 13.2 (the BSP libraries need glibc 2.38) and the AX8860

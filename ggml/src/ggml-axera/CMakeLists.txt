@@ -10,6 +10,16 @@ message(STATUS "Axera BSP: ${GGML_AXERA_BSP_DIR}")
 
 ggml_add_backend_library(ggml-axera
                          ggml-axera.cpp
+                         ggml-axera-util.cpp
+                         ggml-axera-buffer.cpp
+                         ggml-axera-weights.cpp
+                         ggml-axera-graph.cpp
+                         ggml-axera-attn.cpp
+                         ggml-axera-q35-bind.cpp
+                         ggml-axera-q35-run.cpp
+                         ggml-axera-q35-moe.cpp
+                         ggml-axera-q35-mc.cpp
+                         ggml-axera-vit.cpp
                         )
 
 target_include_directories(ggml-axera PRIVATE ${AXERA_INCLUDE_DIR})
