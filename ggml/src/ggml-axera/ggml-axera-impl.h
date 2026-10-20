@@ -74,6 +74,8 @@ void axera_cmm_memory(size_t * free, size_t * total);
 ggml_axera_kernel_registry & axera_kernels();
 std::string axera_mul_mat_kernel_name(int64_t c, int64_t k, bool mx8 = false);
 bool ggml_backend_buffer_is_axera(ggml_backend_buffer_t buffer);
+ggml_backend_buffer_type_t ggml_backend_axera_mapped_buffer_type(void);
+ggml_backend_buffer_t axera_mapped_buffer(void * ptr, size_t size);
 std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_alloc(size_t size);
 std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_alloc_nc(size_t size);
 AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint32_t size);

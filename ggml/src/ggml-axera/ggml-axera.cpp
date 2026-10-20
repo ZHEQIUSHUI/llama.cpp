@@ -120,6 +120,23 @@ static enum ggml_backend_dev_type ggml_backend_axera_device_get_type(ggml_backen
     GGML_UNUSED(dev);
 }
 
+// weights left in the GGUF file mapping (llama.cpp mmap, unless --no-mmap) instead of a CMM copy: with a template,
+// which converts the weights it runs into CMM itself (MXFP8, bf16, copies) and so never reads the GGUF tensors on the
+// NPU. Without one, the bf16 MUL_MAT kernels read the weights in CMM, so they are loaded there. GGML_AXERA_MMAP=0/1
+// overrides.
+static bool axera_mmap() {
+    static const char * e  = getenv("GGML_AXERA_MMAP");
+    static const bool   on = e ? atoi(e) != 0 : axera_template_qwen35();
+    return on;
+}
+
+static ggml_backend_buffer_t ggml_backend_axera_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr,
+                                                                            size_t size, size_t max_tensor_size) {
+    return axera_mapped_buffer(ptr, size);
+    GGML_UNUSED(dev);
+    GGML_UNUSED(max_tensor_size);
+}
+
 static void ggml_backend_axera_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
     props->name        = ggml_backend_axera_device_get_name(dev);
     props->description = ggml_backend_axera_device_get_description(dev);
@@ -129,9 +146,9 @@ static void ggml_backend_axera_device_get_props(ggml_backend_dev_t dev, struct g
     props->caps = {
         /* .async                 = */ false,
         /* .host_buffer           = */ false,
-        /* .buffer_from_host_ptr  = */ false,
+        /* .buffer_from_host_ptr  = */ axera_mmap(),
         /* .events                = */ false,
-        /* .mmap_support          = */ false,
+        /* .mmap_support          = */ axera_mmap(),
     };
 }
 
@@ -179,9 +196,10 @@ static bool ggml_backend_axera_device_supports_op(ggml_backend_dev_t dev, const 
 }
 
 static bool ggml_backend_axera_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    // NPU kernels need physical addresses: only CMM buffers. Activations from other host buffers are copied in by the
+    // NPU kernels need physical addresses: CMM buffers, and the GGUF mapping whose weights the templates convert into
+    // CMM. Activations from other host buffers are copied in by the
     // scheduler; the CPU backend in turn uses CMM buffers directly (they are host buffers).
-    return buft == ggml_backend_axera_buffer_type();
+    return buft == ggml_backend_axera_buffer_type() || buft == ggml_backend_axera_mapped_buffer_type();
     GGML_UNUSED(dev);
 }
 
@@ -194,7 +212,7 @@ static const struct ggml_backend_device_i ggml_backend_axera_device_i = {
     /* .init_backend         = */ ggml_backend_axera_device_init_backend,
     /* .get_buffer_type      = */ ggml_backend_axera_device_get_buffer_type,
     /* .get_host_buffer_type = */ NULL,
-    /* .buffer_from_host_ptr = */ NULL,
+    /* .buffer_from_host_ptr = */ ggml_backend_axera_device_buffer_from_host_ptr,
     /* .supports_op          = */ ggml_backend_axera_device_supports_op,
     /* .supports_buft        = */ ggml_backend_axera_device_supports_buft,
     /* .offload_op           = */ NULL,

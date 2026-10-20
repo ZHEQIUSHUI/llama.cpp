@@ -139,3 +139,91 @@ ggml_backend_buffer_type_t ggml_backend_axera_buffer_type(void) {
     };
     return &buft;
 }
+
+// mapped buffers: the GGUF file mapping (llama.cpp mmap) wrapped as weights of this device, so the graph stays whole.
+// Not CMM: the NPU cannot read them, and ggml_backend_buffer_is_axera is false for them, so the templates take these
+// weights the way they take weights kept on the CPU (converted, or copied into CMM once). The mapping is read only.
+
+struct ggml_backend_axera_mapped_context {
+    void * base;
+    size_t size;
+};
+
+static void ggml_backend_axera_mapped_free_buffer(ggml_backend_buffer_t buffer) {
+    delete (ggml_backend_axera_mapped_context *) buffer->context;
+}
+
+static void * ggml_backend_axera_mapped_get_base(ggml_backend_buffer_t buffer) {
+    return ((ggml_backend_axera_mapped_context *) buffer->context)->base;
+}
+
+static void ggml_backend_axera_mapped_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value,
+                                                    size_t offset, size_t size) {
+    memset((char *) tensor->data + offset, value, size);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_axera_mapped_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
+                                                 size_t offset, size_t size) {
+    memcpy((char *) tensor->data + offset, data, size);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_axera_mapped_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
+                                                 size_t offset, size_t size) {
+    memcpy(data, (const char *) tensor->data + offset, size);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_axera_mapped_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    auto * ctx = (ggml_backend_axera_mapped_context *) buffer->context;
+    memset(ctx->base, value, ctx->size);
+}
+
+static const struct ggml_backend_buffer_i ggml_backend_axera_mapped_i = {
+    /* .free_buffer     = */ ggml_backend_axera_mapped_free_buffer,
+    /* .get_base        = */ ggml_backend_axera_mapped_get_base,
+    /* .init_tensor     = */ NULL,
+    /* .memset_tensor   = */ ggml_backend_axera_mapped_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_axera_mapped_set_tensor,
+    /* .get_tensor      = */ ggml_backend_axera_mapped_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ NULL,
+    /* .clear           = */ ggml_backend_axera_mapped_clear,
+    /* .reset           = */ NULL,
+};
+
+static const char * ggml_backend_axera_mapped_type_get_name(ggml_backend_buffer_type_t buft) {
+    return GGML_AXERA_NAME "_Mapped";
+    GGML_UNUSED(buft);
+}
+
+static ggml_backend_buffer_t ggml_backend_axera_mapped_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    GGML_LOG_ERROR("%s: mapped buffers wrap a file mapping, they are not allocated (%zu bytes)\n", __func__, size);
+    return nullptr;
+    GGML_UNUSED(buft);
+}
+
+ggml_backend_buffer_type_t ggml_backend_axera_mapped_buffer_type(void) {
+    static struct ggml_backend_buffer_type buft = {
+        /* .iface   = */ {
+            /* .get_name         = */ ggml_backend_axera_mapped_type_get_name,
+            /* .alloc_buffer     = */ ggml_backend_axera_mapped_type_alloc_buffer,
+            /* .alloc_buffer_n   = */ NULL,
+            /* .get_alignment    = */ ggml_backend_axera_buffer_type_get_alignment,
+            /* .get_max_size     = */ NULL,
+            /* .get_alloc_size   = */ NULL,
+            /* .get_alloc_size_n = */ NULL,
+            /* .is_host          = */ ggml_backend_axera_buffer_type_is_host,
+        },
+        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_axera_reg(), 0),
+        /* .context = */ NULL,
+    };
+    return &buft;
+}
+
+ggml_backend_buffer_t axera_mapped_buffer(void * ptr, size_t size) {
+    auto * ctx = new ggml_backend_axera_mapped_context{ ptr, size };
+    return ggml_backend_buffer_init(ggml_backend_axera_mapped_buffer_type(), ggml_backend_axera_mapped_i, ctx, size);
+}

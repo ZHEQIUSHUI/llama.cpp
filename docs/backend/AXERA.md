@@ -175,6 +175,23 @@ The NPU's 4-bit formats do not help here. Re-quantizing a Q4_K_M model to MXFP4 
 than Q4_K_M itself; in transformers, 900-token Chinese / English texts give Q4_K_M 38.1 / 3.11, MXFP4 51.9 / 10.7,
 and NVFP4 46.1 / 6.76. 4-bit NPU weights would need a calibrated quantization, not a format conversion.
 
+### Loading: the GGUF stays mapped
+
+With a template the backend takes llama.cpp's file mapping (mmap, the default) as weight buffers of the device
+(`buffer_from_host_ptr`): the GGUF is not copied into CMM, only the converted weights the kernels read are (MXFP8 /
+bf16 projections, small tensors, and for MoE the MXFP4 experts, which the kernels repack in place). The graph stays
+whole because the mapped weights count as the device's. CMM peak on a 48 GB AX8860 board (same outputs, bit for bit):
+
+| Model (GGUF) | weights copied into CMM | mapped |
+|---|---|---|
+| Qwen3.5-9B Q4_K_M | 13.4 GB | 8.6 GB |
+| Qwen3.5-35B-A3B MXFP4_MOE | 24.8 GB | 22.0 GB |
+| Qwen3.8-27B Q4_K_M | 41.3 GB | 26.3 GB |
+
+The mapping should be on local storage (eMMC): over NFS every load pages the file in again. `--no-mmap` or
+`GGML_AXERA_MMAP=0` loads the GGUF into CMM as before; without a template the per-op `MUL_MAT` kernels read bf16 weights
+in CMM, so there the default is off (`GGML_AXERA_MMAP=1` forces it).
+
 ### MXFP8 weights
 
 With `GGML_AXERA_WEIGHTS=mxfp8` the template quantizes the bf16 GGUF weights to MXFP8 at load: E4M3 elements and one
@@ -317,7 +334,7 @@ The backend separates what any model uses from the graph templates of one archit
 | `ggml-axera-impl.h` | internal declarations, CMM buffers, kernel registry, host thread pool, profiling timers |
 | `ggml-axera.cpp` | backend, device and registry interface; dispatch of a graph to the per-op path or a template |
 | `ggml-axera-util.cpp` | runtime init, CMM allocation, settings (`GGML_AXERA_*`), kernel IO helpers |
-| `ggml-axera-buffer.cpp` | the CMM buffer type |
+| `ggml-axera-buffer.cpp` | the CMM buffer type, and the mapped buffers (the GGUF file mapping as device weights) |
 | `ggml-axera-weights.cpp` | weight formats (BF16 copies, MXFP8, MXFP4 repacking) and the GEMV calls, per-op `MUL_MAT` |
 | `ggml-axera-graph.cpp` | for templates: the graph's tensors by name, the output head (final norm, output projection, MTP's `h_nextn`) |
 | `ggml-axera-attn.h/.cpp` | for templates: the llama.cpp KV cache and KQ mask of a batch, split attention (segments, merge), RoPE / M-RoPE tables |

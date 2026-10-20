@@ -593,6 +593,46 @@ bool axera_q35_load_mc(axera_q35 & m, int P) {
     return true;
 }
 
+// the MoE kernels read MXFP4 experts in place, repacked: experts in the GGUF file mapping (mmap, read only) get a CMM
+// copy, made once per tensor and shared by the model's contexts (kept like the repack bookkeeping, by address). A
+// layer's gate and up (or gate-up) go back to back into one buffer as llama.cpp allocates them, down into another
+static void axera_q35_experts_to_cmm(const ggml_tensor * w[3]) {
+    static std::mutex                                 mu;
+    static std::map<const ggml_tensor *, ggml_tensor> copy;
+    std::lock_guard<std::mutex>                       lock(mu);
+    for (auto [g0, g1] : { std::pair<int, int>{ 0, 2 }, std::pair<int, int>{ 2, 3 } }) {
+        if (w[g0]->buffer == nullptr || w[g0]->buffer->buft != ggml_backend_axera_mapped_buffer_type()) {
+            continue;
+        }
+        if (!copy.count(w[g0])) {
+            size_t bytes = 0;
+            for (int g = g0; g < g1; ++g) {
+                bytes += w[g] ? ggml_nbytes(w[g]) : 0;
+            }
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_axera_buffer_type(), bytes);
+            if (!buf) {
+                GGML_ABORT("qwen35 template: no CMM for a copy of %s (%zu bytes)\n", w[g0]->name, bytes);
+            }
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            char * p = (char *) ggml_backend_buffer_get_base(buf);
+            for (int g = g0; g < g1; ++g) {
+                if (w[g]) {
+                    ggml_tensor c = *w[g];
+                    c.buffer      = buf;
+                    c.data        = p;
+                    c.view_src    = nullptr;
+                    ggml_backend_tensor_set(&c, w[g]->data, 0, ggml_nbytes(w[g]));
+                    copy.emplace(w[g], c);
+                    p += ggml_nbytes(w[g]);
+                }
+            }
+        }
+        for (int g = g0; g < g1; ++g) {
+            w[g] = w[g] ? &copy.at(w[g]) : nullptr;
+        }
+    }
+}
+
 // the multi-core chain IO of layer il for chunk size v: the residual base / partials, the head's outputs into the
 // split attention buffers, the tail reading the merge slots, the weights from the GGUF, the GDN state in place
 void axera_q35_bind_mc(axera_q35 & m, int il, size_t v, const std::map<std::string, ggml_tensor *> & t) {
@@ -781,7 +821,7 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
             m.lm_s = std::move(sc);
             sh     = { m.lm_q, m.lm_s };
         }
-    } else if (lm->type != GGML_TYPE_BF16) {
+    } else if (lm->type != GGML_TYPE_BF16 || !ggml_backend_buffer_is_axera(lm->buffer)) {  // or in the GGUF mapping
         m.lm_bf = axera_to_bf16(lm);
     }
     auto size_of = axera_input_size;
@@ -926,6 +966,7 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         w[0] = gu != t.end() ? gu->second : t.at(b + "ffn_gate_exps.weight");
         w[1] = gu != t.end() ? nullptr : t.at(b + "ffn_up_exps.weight");
         w[2] = t.at(b + "ffn_down_exps.weight");
+        axera_q35_experts_to_cmm(w);
         for (const ggml_tensor * x : w) {
             if (x && (x->type != GGML_TYPE_MXFP4 || !ggml_backend_buffer_is_axera(x->buffer))) {
                 GGML_ABORT("qwen35 template: %s is %s; the MoE kernels take MXFP4 experts in CMM (llama-quantize "
