@@ -66,6 +66,7 @@ struct axera_prof {
         return e != nullptr && std::atoi(e) != 0;
     }();
     std::map<std::string, std::pair<double, int64_t>> t;  // ms, calls
+    std::mutex                                        mu;  // timers on other threads (the MoE prefill slots calls)
     ~axera_prof() {
         for (const auto & [k, v] : t) {
             fprintf(stderr, "axera prof: %-22s %10.1f ms %8" PRId64 " calls %8.3f ms/call\n", k.c_str(), v.first, v.second,
@@ -82,7 +83,8 @@ struct axera_timer {
     ~axera_timer() { stop(); }
     void stop() {
         if (what) {
-            auto & e = g_axera_prof.t[what];
+            std::lock_guard<std::mutex> lock(g_axera_prof.mu);
+            auto &                      e = g_axera_prof.t[what];
             e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             e.second++;
             what = nullptr;
@@ -2033,7 +2035,9 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
     for (int P : { 256, 128, 64, 32, 16, 8, 4, 1 }) {
         if (m.moe) {  // MoE: qwen35moe_{gdn,attn}_prefill<P> (bf16 weights) with the slots kernel
             // attention: the fused kernel of the context tier, or split (flash) for long contexts
-            const std::string gn = "qwen35moe_gdn_prefill" + std::to_string(P);
+            // the GDN layer in MXFP8 where that kernel exists (prefill reads the weights: about 20% faster)
+            std::string gn = "qwen35moe_gdn_prefill" + std::to_string(P);
+            gn += mx8 && std::ifstream(axera_kernels().path(gn + "_mx8")).good() ? "_mx8" : "";
             const std::string an = "qwen35moe_attn_prefill" + std::to_string(P) + m.ctx_sfx;
             const bool fused = !m.flash && std::ifstream(axera_kernels().path(an)).good();
             const bool split = m.kv_llama && axera_q35_load_flash(m, P);  // wide masks, or no fused kernel
