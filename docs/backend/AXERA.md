@@ -271,33 +271,42 @@ the board pays ~25 us per small projection): llama.cpp allocates `ffn_gate_exps`
 few layers where a buffer boundary falls between get a buffer of their own (a GGUF with `ffn_gate_up_exps` works as
 is). `qwen35moe_experts8_mxfp4` (gate and up apart) serves when the gate-up kernel is missing.
 
-Prompts go in chunks of 64 / 16 / 4 tokens: `qwen35moe_{gdn,attn}_prefill<P>` (BF16 weights) end with the chunk's
-base, h2 and router logits rows; the host picks each token's experts, groups the picks by expert into slots of up to
-8 rows (gathering the h2 rows), and `qwen35moe_slots32_g8_gu_mxfp4` runs 32 slots per call (each slot one expert's
-weights, bound by address), whose rows the host adds to the tokens' base. Kernels: `q35_moe.py`,
-`q35_moe_prefill.py` (MXFP4 inputs declared as uint8 for the board runtime, `board_io.py`); the output projection
-GEMV is the 2B one (`n31040_k2048`), the vision encoder the 9B one with its own merger (out 2048). Contexts up to
-4096 cells so far.
+Prompts go in chunks of 128 / 64 / 16 / 4 tokens: `qwen35moe_{gdn,attn}_prefill<P>` (BF16 weights) end with the
+chunk's base, h2 and router logits rows; up to 8 chunks of 128 (`GGML_AXERA_MOE_GROUP`) run layer by layer and the
+routed experts once per layer for the whole group: the host picks each token's experts, groups the picks by expert
+into slots of up to 64 rows (gathering the h2 rows into non-cacheable CMM), and `qwen35moe_slots32_g64_gu_mxfp4` runs
+32 slots per call (each slot one expert's weights, bound by address), whose rows the host adds to the tokens' base.
+Long contexts take the split attention (`qwen35_attn_fd_{head,seg}*` with `qwen35moe_attn_fd_tail<R>`, which ends with
+the MoE's dense part); the 128-row segment kernel takes the query heads in 4 passes per block (`SEG_PARTS`: 1024 score
+rows at a time overflow the on-chip memory; 29.3 -> 12.1 ms over 32768 cells). Kernels: `q35_moe.py`,
+`q35_moe_prefill.py`, `q35_moe_flash.py` (MXFP4 inputs declared as uint8 for the board runtime, `board_io.py`); the
+output projection GEMV is the 2B one (`n31040_k2048`), the vision encoder the 9B one with its own merger (out 2048).
 
 On AX8860 (20 GB GGUF, loaded into CMM in 38 s): decode at 88 ms per token with MXFP8 (gdn layers 36 ms, attention
-10 ms, experts 25 ms, output projection 10 ms) and 114 ms with BF16; a 1717-token prompt in 16.0 s (9.3 ms per token;
-122 s token by token); PPL (zh, 2 x 512) 16.67 (MXFP8 decode) / 16.62 (BF16) against 16.58 for llama.cpp on x86 with
-the same GGUF (en 1.0128 against 1.0087); the cat photo above at 768 image tokens in about 1.8 s, described as "A
-stylish cat with fluffy white and gray fur wears a shiny pink leather hoodie and oversized round sunglasses, posing
-confidently against a soft pink background."
+10 ms, experts 25 ms, output projection 10 ms) and 114 ms with BF16; PPL (zh, 2 x 512) 16.67 (MXFP8 decode) / 16.62
+(BF16) against 16.58 for llama.cpp on x86 with the same GGUF (en 1.0128 against 1.0087); the cat photo above at 768
+image tokens in about 1.8 s, described as "A stylish cat with fluffy white and gray fur wears a shiny pink leather
+hoodie and oversized round sunglasses, posing confidently against a soft pink background." On a board with 48 GB of
+CMM (single core / 4 cores): 1717-token prompt 7.3 / 6.9 s, 15888 tokens 59 / 55 s, 66086 tokens 308 / 263 s, 118926
+tokens 663 / 539 s, the needle found in each; decode 95 ms per token at 4k, 199 / 172 ms at 119k.
 
-### Multi-core kernels (experimental)
+### Multi-core kernels
 
 With `GGML_AXERA_CORES=4` the kernels that have a four-core build (`<name>_x4`, AXDSL without synchronization
-between the cores: each core takes its share of heads or output channels and writes only its own outputs) replace
-the single-core ones: prefill chunks of 128 / 64 tokens and decode (`GGML_AXERA_MC_DECODE=0` keeps decode
-single-core) run as a chain of `qwen35_{gdn,mlp,attn_head,attn_tail}_mc<P>_x4` kernels that pass the residual as a
-base plus one fp32 partial per core, the segment kernels split their blocks over the cores and the tail merges the
-partial results on the NPU (more segments than its slots: merged on the CPU in between), and the output projection
-uses `mul_mat_bf16_n<C>_k<K>_x4`. On AX8860 the 39666-token prompt takes 19 s and decode 31 ms per token (43 ms at
-40k). It is off by default: inside llama.cpp the chain still gives NaN or drifting results and times out
-(`0x8006008a`) now and then, while the same kernels pass stress tests on their own; other NPU users at the same time
-always make the calls time out. `GGML_AXERA_PROF=1` prints per-kernel times at exit.
+between the cores: each core takes its share of heads, output channels, slots or KV blocks and writes only its own
+outputs) replace the single-core ones: for the dense models prefill chunks of 128 / 64 tokens and decode
+(`GGML_AXERA_MC_DECODE=0` keeps decode single-core) run as a chain of `qwen35_{gdn,mlp,attn_head,attn_tail}_mc<P>_x4`
+kernels that pass the residual as a base plus one fp32 partial per core, the segment kernels split their blocks over
+the cores and the tail merges the partial results on the NPU (more segments than its slots: merged on the CPU in
+between), and the output projection uses `mul_mat_bf16_n<C>_k<K>_x4`; for the MoE models the segment kernels, the
+slots kernel and the gate-up experts kernel (the cores' partial sums added on the host).
+
+On boards with the October 16-19 images this is stable (0.8B `llama-perplexity` three times bit-identical, PPL zh
+46.81 against 46.74 single-core from the order of the partial sums; on an older board it gave NaN and timeouts). The
+gain is limited by the DRAM bandwidth those boards reach, about 84 GB/s for all cores together (one core about
+53 GB/s; the CPU and the NPU together share the same 84 GB/s): compute-bound kernels scale (35B segment kernel 12.1 ->
+3.3 ms, 119k-token prompt 663 -> 539 s), bandwidth-bound ones barely (0.8B decode 42 -> 40 ms). `GGML_AXERA_PROF=1`
+prints per-kernel times at exit.
 
 ## Build
 
