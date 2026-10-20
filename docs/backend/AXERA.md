@@ -263,17 +263,27 @@ The MoE models (`qwen35moe` GGUF) run with their routed experts in MXFP4, as `ll
 them (the rest Q8_0, converted at load to BF16 or MXFP8 like any GGUF). Each layer takes two kernel calls:
 `qwen35moe_gdn[_mx8]` / `qwen35moe_attn[_mx8]_kvc_c<LMAX>` run the layer up to the MLP and then its dense part (the
 shared expert with its sigmoid gate on the residual, and the router logits); the host takes softmax / top-K /
-renormalization of the 256 logits and binds the 8 chosen experts' weights, by address in the GGUF tensors, to
-`qwen35moe_experts8_mxfp4`, which adds them to the residual. At load the experts are repacked in place from ggml's
-MXFP4 blocks (scale byte + 16 bytes of codes) to the kernels' layout (codes [rows][K / 2], then the scales), so no
-copy of the 17 GB of experts is made. Kernels: `q35_moe.py` (MXFP4 inputs declared as uint8 for the board runtime,
-`board_io.py`); the output projection GEMV is the 2B one (`n31040_k2048`), the vision encoder the 9B one with its own
-merger (out 2048). Prompts go token by token through the decode kernels so far, contexts up to 4096 cells.
+renormalization of the 256 logits and binds the 8 chosen experts' weights, by address, to
+`qwen35moe_experts8_gu_mxfp4`, which adds them to the residual. At load the experts are repacked in place (on the
+host thread pool) from ggml's MXFP4 blocks (scale byte + 16 bytes of codes) to the kernels' layout (codes
+[rows][K / 2], then the scales), with each expert's gate and up rows as one weight (one projection instead of two;
+the board pays ~25 us per small projection): llama.cpp allocates `ffn_gate_exps` and `ffn_up_exps` back to back, the
+few layers where a buffer boundary falls between get a buffer of their own (a GGUF with `ffn_gate_up_exps` works as
+is). `qwen35moe_experts8_mxfp4` (gate and up apart) serves when the gate-up kernel is missing.
 
-On AX8860 (20 GB GGUF, loaded into CMM in 132 s): decode at 105 ms per token with MXFP8 (gdn layers 58 ms, attention
-17 ms, experts 29 ms) and 131 ms with BF16; PPL (zh, 2 x 512) 16.80 / 16.66 against 16.58 for llama.cpp on x86 with the
-same GGUF (en 1.0118 against 1.0087); the cat photo above at 768 image tokens in about 1.8 s, described as "A stylish
-cat with fluffy white and gray fur wears a shiny pink leather hoodie and oversized round sunglasses, posing
+Prompts go in chunks of 64 / 16 / 4 tokens: `qwen35moe_{gdn,attn}_prefill<P>` (BF16 weights) end with the chunk's
+base, h2 and router logits rows; the host picks each token's experts, groups the picks by expert into slots of up to
+8 rows (gathering the h2 rows), and `qwen35moe_slots32_g8_gu_mxfp4` runs 32 slots per call (each slot one expert's
+weights, bound by address), whose rows the host adds to the tokens' base. Kernels: `q35_moe.py`,
+`q35_moe_prefill.py` (MXFP4 inputs declared as uint8 for the board runtime, `board_io.py`); the output projection
+GEMV is the 2B one (`n31040_k2048`), the vision encoder the 9B one with its own merger (out 2048). Contexts up to
+4096 cells so far.
+
+On AX8860 (20 GB GGUF, loaded into CMM in 38 s): decode at 88 ms per token with MXFP8 (gdn layers 36 ms, attention
+10 ms, experts 25 ms, output projection 10 ms) and 114 ms with BF16; a 1717-token prompt in 16.0 s (9.3 ms per token;
+122 s token by token); PPL (zh, 2 x 512) 16.67 (MXFP8 decode) / 16.62 (BF16) against 16.58 for llama.cpp on x86 with
+the same GGUF (en 1.0128 against 1.0087); the cat photo above at 768 image tokens in about 1.8 s, described as "A
+stylish cat with fluffy white and gray fur wears a shiny pink leather hoodie and oversized round sunglasses, posing
 confidently against a soft pink background."
 
 ### Multi-core kernels (experimental)
