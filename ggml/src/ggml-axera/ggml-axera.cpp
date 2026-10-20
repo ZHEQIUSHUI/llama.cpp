@@ -79,11 +79,13 @@ struct axera_timer {
     const char * what;
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     explicit axera_timer(const char * w) : what(g_axera_prof.on ? w : nullptr) {}
-    ~axera_timer() {
+    ~axera_timer() { stop(); }
+    void stop() {
         if (what) {
             auto & e = g_axera_prof.t[what];
             e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             e.second++;
+            what = nullptr;
         }
     }
 };
@@ -413,6 +415,7 @@ static void ggml_backend_axera_buffer_get_tensor(ggml_backend_buffer_t buffer, c
     // flushed yet (CPU backend ops on CMM): write back, then drop the cached lines, then read
     auto * ctx = (ggml_backend_axera_buffer_context *) buffer->context;
     char * p   = (char *) tensor->data + offset;
+    axera_timer tm("get_tensor");
     ctx->flush(p, size);
     ctx->invalidate(p, size);
     memcpy(data, p, size);
@@ -683,12 +686,13 @@ struct axera_q35_layer {
         int                                kc = -1, vc = -1, mask = -1;  // segment inputs, rebound per call
     };
     std::vector<fd_io>                 fd;  // [0]: decode, [1 + v]: m.pre[v]
-    struct expert_w {  // routed experts of an MoE layer (gate, up, down): MXFP4 repacked in place (axera_repack_mxfp4)
+    struct expert_w {  // routed experts of an MoE layer (gate or gate-up, up, down): MXFP4 repacked in place
         ggml_backend_axera_buffer_context * b = nullptr;
         char *                              base = nullptr;  // expert 0
         size_t                              stride = 0, data = 0, scale = 0;  // bytes per expert, its elements, scales
     };
     expert_w                           exps[3];
+    bool                               exps_gu = false;  // exps[0] holds gate and up (m.ex[1]), exps[1] unused
     struct mc_io {  // multi-core prefill chain of this layer: [gdn | head, seg, tail] then mlp
         std::vector<AX_ENGINE_IO_BUFFER_T> ain, aout, sin, sout, tin, tout, min, mout;
         int si = -1, so = -1, ci = -1, co = -1;            // state IO of the gdn call (rebound to the current row)
@@ -760,12 +764,17 @@ struct axera_q35 {
     std::map<int, fd_kernels> fd;  // by rows R
     // MoE (Qwen3.5-35B-A3B): per layer the layer kernel (qwen35moe_*: up to the shared expert and the router logits),
     // then the routed experts kernel on the top-K experts the host picks from the logits
-    bool                moe = false;
-    ggml_axera_kernel * experts = nullptr;  // qwen35moe_experts<K>_mxfp4
-    int                 n_expert = 0, top_k = 0;
-    axera_cmm           BASE, H2, LOGITS, RW;  // residual + gated shared expert, normed state, router logits, weights
-    std::vector<int>    e_w[3], e_s[3];        // experts kernel input indices of w_{g,u,d}<i> / s_{g,u,d}<i>
-    std::vector<AX_ENGINE_IO_BUFFER_T> ein, eout[2];  // its IO (weights rebound per token; out: the layer parity)
+    bool      moe      = false;
+    int       n_expert = 0, top_k = 0;
+    axera_cmm BASE, H2, LOGITS, RW;  // residual + gated shared expert, normed state, router logits, weights
+    struct experts_kernel {          // qwen35moe_experts<K>[_gu]_mxfp4 and its IO (weights rebound per token)
+        ggml_axera_kernel *                k = nullptr;
+        std::vector<int>                   w[4], s[4];  // input indices of w_<kind><i> / s_<kind><i>, kinds g u d c
+        std::vector<AX_ENGINE_IO_BUFFER_T> in, out[2];  // out: by the layer parity
+    };
+    // [0]: gate and up weights apart (w_g / w_u), [1]: one gate-up weight per expert (w_c: gate rows then up rows,
+    // one projection instead of two), for layers whose experts have that layout (axera_repack_mxfp4_gu)
+    experts_kernel ex[2];
 };
 
 // the Qwen3.5 vision encoder (mtmd clip graph, projector qwen3vl) on the q35_vit.py kernels
@@ -784,6 +793,10 @@ struct ggml_backend_axera_context {
     axera_cmm batch_out;  // f32 output rows of a batched GEMV call
     axera_q35 q35;
     axera_vit vit;
+    // the qwen35 template's name -> tensor map of the last graph, kept while the graph keeps its nodes (llama.cpp
+    // reuses the decode graph: rebuilding the map of a 35B-A3B graph takes ~10 ms on the A55)
+    std::vector<uintptr_t>               graph_key;
+    std::map<std::string, ggml_tensor *> graph_names;
 
     ggml_backend_axera_buffer_context * staging_for(size_t size) {
         if (!staging || staging->size < size) {
@@ -985,35 +998,71 @@ static const char * axera_q35_gguf_name(const axera_q35 & m, const std::string &
 // nibbles 16..31) -> the kernels' layout, in place per expert (dim 2): the codes [rows][K / 2], two consecutive elements
 // per byte (the first in the low nibble), then the scales [rows][K / 32]. Once per tensor: the GGUF data is the
 // kernels' afterwards (the template runs every MoE layer)
+// ggml block_mxfp4 rows (e byte + 16 bytes of nibble pairs per 32) -> the kernels' layout: codes [rows][K / 2] (FP4
+// pairs, low nibble first) then E8M0 scales [rows][K / 32]
+static void axera_mxfp4_rows(const uint8_t * src, int64_t rows, int64_t K, uint8_t * dq, uint8_t * ds) {
+    const int64_t nb = K / 32;
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t b = 0; b < nb; ++b) {
+            const uint8_t * blk = src + (r * nb + b) * 17;
+            uint8_t *       o   = dq + r * K / 2 + b * 16;
+            ds[r * nb + b]      = blk[0];
+            for (int j = 0; j < 8; ++j) {  // elements 2j, 2j + 1 (low nibbles), 16 + 2j, 17 + 2j (high nibbles)
+                o[j]     = (uint8_t) ((blk[1 + 2 * j] & 15) | ((blk[2 + 2 * j] & 15) << 4));
+                o[8 + j] = (uint8_t) ((blk[1 + 2 * j] >> 4) | (blk[2 + 2 * j] & 0xF0));
+            }
+        }
+    }
+}
+
+static void axera_check_mxfp4(const ggml_tensor * w) {
+    GGML_ASSERT(w->type == GGML_TYPE_MXFP4 && ggml_is_contiguous(w) && w->ne[0] % 32 == 0 && w->ne[3] == 1 &&
+                ggml_backend_buffer_is_axera(w->buffer) && w->nb[2] == (size_t) (w->ne[1] * w->ne[0] / 32 * 17));
+}
+
+// MoE experts [K, rows, n_expert] in place, each expert's slot (stride bytes) in the kernels' layout
 static void axera_repack_mxfp4(const ggml_tensor * w) {
     static std::set<const void *> done;
     if (!done.insert(w->data).second) {
         return;
     }
-    GGML_ASSERT(w->type == GGML_TYPE_MXFP4 && ggml_is_contiguous(w) && w->ne[0] % 32 == 0 && w->ne[3] == 1 &&
-                ggml_backend_buffer_is_axera(w->buffer));
-    const int64_t K = w->ne[0], rows = w->ne[1], nb = K / 32;
+    axera_check_mxfp4(w);
+    const int64_t K = w->ne[0], rows = w->ne[1];
     const size_t  stride = w->nb[2];
-    GGML_ASSERT(stride == (size_t) (rows * nb * 17));
-    std::vector<uint8_t> tmp(stride);
-    for (int64_t e = 0; e < w->ne[2]; ++e) {
-        uint8_t * src = (uint8_t *) w->data + e * stride;
-        uint8_t * dq  = tmp.data();
-        uint8_t * ds  = tmp.data() + rows * K / 2;
-        for (int64_t r = 0; r < rows; ++r) {
-            for (int64_t b = 0; b < nb; ++b) {
-                const uint8_t * blk = src + (r * nb + b) * 17;
-                uint8_t *       o   = dq + r * K / 2 + b * 16;
-                ds[r * nb + b]      = blk[0];
-                for (int j = 0; j < 8; ++j) {  // elements 2j, 2j + 1 (low nibbles), 16 + 2j, 17 + 2j (high nibbles)
-                    o[j]     = (uint8_t) ((blk[1 + 2 * j] & 15) | ((blk[2 + 2 * j] & 15) << 4));
-                    o[8 + j] = (uint8_t) ((blk[1 + 2 * j] >> 4) | (blk[2 + 2 * j] & 0xF0));
-                }
-            }
-        }
-        memcpy(src, tmp.data(), stride);
-    }
+    axera_host_pool().run(w->ne[2], [&](int64_t e) {
+        std::vector<uint8_t> tmp(stride);
+        axera_mxfp4_rows((const uint8_t *) w->data + e * stride, rows, K, tmp.data(), tmp.data() + rows * K / 2);
+        memcpy((uint8_t *) w->data + e * stride, tmp.data(), stride);
+    });
     ((ggml_backend_axera_buffer_context *) w->buffer->context)->flush(w->data, ggml_nbytes(w));
+}
+
+// gate and up experts stored back to back (llama.cpp allocates them so unless a buffer boundary falls between): the
+// pair becomes one gate-up tensor in place, expert e at 2 e strides from the gate's start: codes [2 rows][K / 2]
+// (gate rows, then up), scales [2 rows][K / 32] (as a GGUF ffn_gate_up_exps repacked by axera_repack_mxfp4)
+static bool axera_mxfp4_gu_adjacent(const ggml_tensor * g, const ggml_tensor * u) {
+    return g->buffer == u->buffer && ggml_are_same_shape(g, u) && g->type == u->type &&
+           (const char *) u->data == (const char *) g->data + ggml_nbytes(g);
+}
+
+static void axera_repack_mxfp4_gu(const ggml_tensor * g, const ggml_tensor * u) {
+    static std::set<const void *> done;
+    if (!done.insert(g->data).second) {
+        return;
+    }
+    axera_check_mxfp4(g);
+    axera_check_mxfp4(u);
+    GGML_ASSERT(axera_mxfp4_gu_adjacent(g, u));
+    const int64_t K = g->ne[0], rows = g->ne[1], n = g->ne[2];
+    const size_t  stride = g->nb[2], half = (size_t) (rows * K / 2);
+    std::vector<uint8_t> src((const uint8_t *) g->data, (const uint8_t *) g->data + 2 * ggml_nbytes(g));
+    axera_host_pool().run(n, [&](int64_t e) {
+        uint8_t * dq = (uint8_t *) g->data + 2 * e * stride;
+        uint8_t * ds = dq + 2 * half;
+        axera_mxfp4_rows(src.data() + e * stride, rows, K, dq, ds);
+        axera_mxfp4_rows(src.data() + (n + e) * stride, rows, K, dq + half, ds + rows * K / 32);
+    });
+    ((ggml_backend_axera_buffer_context *) g->buffer->context)->flush(g->data, 2 * ggml_nbytes(g));
 }
 
 // a bf16 view of a GGUF weight for a kernel input of `size` bytes: the tensor itself if it is bf16 in CMM, else a
@@ -1734,38 +1783,45 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
         GGML_ASSERT(topk != t.end() && "qwen35 template: no ffn_moe_topk node in the MoE graph");
         m.top_k    = (int) topk->second->ne[0];
         m.n_expert = (int) t.at("blk.0.ffn_gate_inp.weight")->ne[1];
-        m.experts  = axera_kernels().get("qwen35moe_experts" + std::to_string(m.top_k) + "_mxfp4");
         m.BASE     = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
         m.H2       = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
         m.LOGITS   = axera_cmm_alloc(m.n_expert * sizeof(float));
         m.RW       = axera_cmm_alloc(m.top_k * sizeof(float));
-        ggml_axera_kernel * ke = m.experts;
-        GGML_ASSERT(size_of(ke, "rw") == m.top_k * sizeof(float) && size_of(ke, "h2") == H * sizeof(ggml_bf16_t));
-        m.ein.assign(ke->info->nInputSize, {});
-        for (int g = 0; g < 3; ++g) {
-            m.e_w[g].assign(m.top_k, -1);
-            m.e_s[g].assign(m.top_k, -1);
-        }
-        for (uint32_t i = 0; i < ke->info->nInputSize; ++i) {
-            const std::string n = ke->info->pInputs[i].pName;
-            const uint32_t    sz = ke->info->pInputs[i].nSize;
-            if (n == "h2" || n == "base" || n == "rw") {
-                auto & c  = n == "h2" ? m.H2 : n == "base" ? m.BASE : m.RW;
-                m.ein[i]  = axera_io(c.get(), c->vir, sz);
-                continue;
+        for (int gu = 0; gu < 2; ++gu) {
+            const std::string name = "qwen35moe_experts" + std::to_string(m.top_k) + (gu ? "_gu" : "") + "_mxfp4";
+            auto &            ek   = m.ex[gu];
+            ek                     = {};
+            if (gu && !std::ifstream(axera_kernels().path(name)).good()) {
+                continue;  // optional
             }
-            const char * kinds = "gud";  // w_<kind><expert> / s_<kind><expert>
-            const char * kc    = n.size() > 3 ? strchr(kinds, n[2]) : nullptr;
-            const int    e     = kc ? atoi(n.c_str() + 3) : -1;
-            if ((n[0] != 'w' && n[0] != 's') || n[1] != '_' || !kc || e < 0 || e >= m.top_k) {
-                GGML_ABORT("qwen35 template: unexpected experts kernel input %s\n", n.c_str());
+            ek.k = axera_kernels().get(name);
+            GGML_ASSERT(size_of(ek.k, "rw") == m.top_k * sizeof(float) && size_of(ek.k, "h2") == H * sizeof(ggml_bf16_t));
+            ek.in.assign(ek.k->info->nInputSize, {});
+            for (int g = 0; g < 4; ++g) {
+                ek.w[g].assign(m.top_k, -1);
+                ek.s[g].assign(m.top_k, -1);
             }
-            (n[0] == 'w' ? m.e_w : m.e_s)[kc - kinds][e] = (int) i;
-        }
-        for (int par = 0; par < 2; ++par) {  // even layers write m.B, odd ones m.A
-            auto & x = par == 0 ? m.B : m.A;
-            m.eout[par].assign(ke->info->nOutputSize, {});
-            m.eout[par][ke->output("out")] = axera_io(x.get(), x->vir, H * sizeof(ggml_bf16_t));
+            for (uint32_t i = 0; i < ek.k->info->nInputSize; ++i) {
+                const std::string n  = ek.k->info->pInputs[i].pName;
+                const uint32_t    sz = ek.k->info->pInputs[i].nSize;
+                if (n == "h2" || n == "base" || n == "rw") {
+                    auto & c = n == "h2" ? m.H2 : n == "base" ? m.BASE : m.RW;
+                    ek.in[i] = axera_io(c.get(), c->vir, sz);
+                    continue;
+                }
+                const char * kinds = "gudc";  // w_<kind><expert> / s_<kind><expert>
+                const char * kc    = n.size() > 3 ? strchr(kinds, n[2]) : nullptr;
+                const int    e     = kc ? atoi(n.c_str() + 3) : -1;
+                if ((n[0] != 'w' && n[0] != 's') || n[1] != '_' || !kc || e < 0 || e >= m.top_k) {
+                    GGML_ABORT("qwen35 template: unexpected experts kernel input %s\n", n.c_str());
+                }
+                (n[0] == 'w' ? ek.w : ek.s)[kc - kinds][e] = (int) i;
+            }
+            for (int par = 0; par < 2; ++par) {  // even layers write m.B, odd ones m.A
+                auto & x = par == 0 ? m.B : m.A;
+                ek.out[par].assign(ek.k->info->nOutputSize, {});
+                ek.out[par][ek.k->output("out")] = axera_io(x.get(), x->vir, H * sizeof(ggml_bf16_t));
+            }
         }
     }
     m.layers.clear();
@@ -1777,24 +1833,62 @@ static void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::stri
             m.rollback = false;
         }
     }
-    for (int il = 0; il < L && m.moe; ++il) {  // each layer's routed experts, repacked in place for the kernel
-        const char * names[3] = { "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight" };
-        for (int g = 0; g < 3; ++g) {
-            const ggml_tensor * w = t.at("blk." + std::to_string(il) + "." + names[g]);
-            if (w->type != GGML_TYPE_MXFP4 || !ggml_backend_buffer_is_axera(w->buffer)) {
+    // each layer's routed experts, repacked in place for the kernels: gate-up (a GGUF ffn_gate_up_exps, or gate and up
+    // back to back) when the gate-up experts kernel exists, else gate and up apart
+    int n_gu = 0;
+    for (int il = 0; il < L && m.moe; ++il) {
+        auto &              ly = m.layers[il];
+        const std::string   b  = "blk." + std::to_string(il) + ".";
+        const ggml_tensor * w[3];
+        const auto          gu = t.find(b + "ffn_gate_up_exps.weight");
+        w[0]                   = gu != t.end() ? gu->second : t.at(b + "ffn_gate_exps.weight");
+        w[1]                   = gu != t.end() ? nullptr : t.at(b + "ffn_up_exps.weight");
+        w[2]                   = t.at(b + "ffn_down_exps.weight");
+        for (const ggml_tensor * x : w) {
+            if (x && (x->type != GGML_TYPE_MXFP4 || !ggml_backend_buffer_is_axera(x->buffer))) {
                 GGML_ABORT("qwen35 template: %s is %s; the MoE kernels take MXFP4 experts in CMM (llama-quantize "
-                           "MXFP4_MOE, -ngl 99)\n", w->name, ggml_type_name(w->type));
+                           "MXFP4_MOE, -ngl 99)\n", x->name, ggml_type_name(x->type));
             }
-            axera_repack_mxfp4(w);
-            auto & e  = m.layers[il].exps[g];
-            e.b       = (ggml_backend_axera_buffer_context *) w->buffer->context;
-            e.base    = (char *) w->data;
-            e.stride  = w->nb[2];
-            e.data    = (size_t) (w->ne[0] * w->ne[1] / 2);
-            e.scale   = (size_t) (w->ne[0] / 32 * w->ne[1]);
-            GGML_ASSERT(e.data == m.experts->info->pInputs[m.e_w[g][0]].nSize &&
-                        e.scale == m.experts->info->pInputs[m.e_s[g][0]].nSize);
         }
+        ly.exps_gu = gu != t.end() || (m.ex[1].k && axera_mxfp4_gu_adjacent(w[0], w[1]));
+        if (ly.exps_gu && !m.ex[1].k) {
+            GGML_ABORT("qwen35 template: %s needs the kernel qwen35moe_experts%d_gu_mxfp4\n", w[0]->name, m.top_k);
+        }
+        if (gu != t.end()) {
+            axera_repack_mxfp4(w[0]);
+        } else if (ly.exps_gu) {
+            axera_repack_mxfp4_gu(w[0], w[1]);
+        } else {
+            axera_repack_mxfp4(w[0]);
+            axera_repack_mxfp4(w[1]);
+        }
+        axera_repack_mxfp4(w[2]);
+        n_gu += ly.exps_gu;
+        const auto & ek = m.ex[ly.exps_gu];
+        for (int g = 0; g < 3; ++g) {
+            auto & e = ly.exps[g];
+            e        = {};
+            if (!w[g]) {
+                continue;
+            }
+            const int64_t rows = w[g]->ne[1] * (ly.exps_gu && g == 0 && gu == t.end() ? 2 : 1);
+            e.b                = (ggml_backend_axera_buffer_context *) w[g]->buffer->context;
+            e.base             = (char *) w[g]->data;
+            e.data             = (size_t) (w[g]->ne[0] * rows / 2);
+            e.scale            = (size_t) (w[g]->ne[0] / 32 * rows);
+            e.stride           = e.data + e.scale;
+            const int kind     = ly.exps_gu && g == 0 ? 3 : g;
+            if (ly.exps_gu && g == 1) {
+                continue;
+            }
+            GGML_ASSERT(e.stride == (ly.exps_gu && g == 0 && gu == t.end() ? 2 : 1) * w[g]->nb[2] &&
+                        e.data == ek.k->info->pInputs[ek.w[kind][0]].nSize &&
+                        e.scale == ek.k->info->pInputs[ek.s[kind][0]].nSize);
+        }
+    }
+    if (m.moe && m.ex[1].k && n_gu < L) {  // a buffer boundary between gate and up: those layers take two projections
+        GGML_LOG_WARN("%s: %d of %d MoE layers have gate and up experts apart (slower experts kernel)\n", __func__,
+                      L - n_gu, L);
     }
     // prefill kernels (every chunk size found, largest first). With MXFP8 decode, prefill takes MXFP8 weights too when
     // the kernel directory has MXFP8 prefill kernels (built where prefill is bound by reading the weights, 9B: about
@@ -2008,22 +2102,38 @@ static std::string axera_base_name(const char * name) {
 }
 
 static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph) {
-    std::map<std::string, ggml_tensor *> t;
+    axera_timer            tmap("graph name map");
+    std::vector<uintptr_t> key;
+    key.reserve((size_t) cgraph->n_nodes * (2 + GGML_MAX_SRC));
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_tensor * node = cgraph->nodes[i];
-        t.emplace(axera_base_name(node->name), node);
-        for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
-            ggml_tensor * src = node->src[s];
-            t.emplace(axera_base_name(src->name), src);
-            for (ggml_tensor * v = src->view_src; v; v = v->view_src) {  // e.g. the cache tensors behind their views
-                t.emplace(axera_base_name(v->name), v);
+        const ggml_tensor * node = cgraph->nodes[i];
+        key.push_back((uintptr_t) node);
+        key.push_back((uintptr_t) node->op);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            key.push_back((uintptr_t) node->src[s]);
+        }
+    }
+    std::map<std::string, ggml_tensor *> & t = ctx->graph_names;
+    if (key != ctx->graph_key) {
+        t.clear();
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            t.emplace(axera_base_name(node->name), node);
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+                ggml_tensor * src = node->src[s];
+                t.emplace(axera_base_name(src->name), src);
+                for (ggml_tensor * v = src->view_src; v; v = v->view_src) {  // e.g. the cache tensors behind their views
+                    t.emplace(axera_base_name(v->name), v);
+                }
             }
         }
+        ctx->graph_key = std::move(key);
     }
     auto find = [&](const char * name) -> ggml_tensor * {
         auto it = t.find(name);
         return it == t.end() ? nullptr : it->second;
     };
+    tmap.stop();
     ggml_tensor * norm0  = find("attn_norm-0");
     ggml_tensor * logits = find("result_output");
     ggml_tensor * inp_pos = find("inp_pos");
@@ -2502,6 +2612,7 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
     std::vector<int> e_ids(m.n_expert);
     auto run_experts = [&](int il, int64_t p) {
         axera_q35_layer & ly = m.layers[il];
+        axera_timer       tr("moe route (cpu)");
         m.LOGITS->invalidate(m.LOGITS->vir, m.LOGITS->size);
         const float * lg = (const float *) m.LOGITS->vir;
         std::iota(e_ids.begin(), e_ids.end(), 0);
@@ -2517,23 +2628,29 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
             rw[i] /= sum;
         }
         m.RW->flush(rw, m.top_k * sizeof(float));
+        auto & ek = m.ex[ly.exps_gu];
         for (int i = 0; i < m.top_k; ++i) {
             for (int g = 0; g < 3; ++g) {
-                const auto & e = ly.exps[g];
-                char *       w = e.base + (size_t) e_ids[i] * e.stride;
-                m.ein[m.e_w[g][i]] = axera_io(e.b, w, (uint32_t) e.data);
-                m.ein[m.e_s[g][i]] = axera_io(e.b, w + e.data, (uint32_t) e.scale);
+                if (ly.exps_gu && g == 1) {
+                    continue;
+                }
+                const int    kind = ly.exps_gu && g == 0 ? 3 : g;
+                const auto & e    = ly.exps[g];
+                char *       w    = e.base + (size_t) e_ids[i] * e.stride;
+                ek.in[ek.w[kind][i]] = axera_io(e.b, w, (uint32_t) e.data);
+                ek.in[ek.s[kind][i]] = axera_io(e.b, w + e.data, (uint32_t) e.scale);
             }
         }
-        auto & out = m.eout[il % 2];
+        auto & out = ek.out[il % 2];
         AX_ENGINE_IO_T io;
         memset(&io, 0, sizeof(io));
-        io.pInputs     = m.ein.data();
-        io.nInputSize  = (uint32_t) m.ein.size();
+        io.pInputs     = ek.in.data();
+        io.nInputSize  = (uint32_t) ek.in.size();
         io.pOutputs    = out.data();
         io.nOutputSize = (uint32_t) out.size();
+        tr.stop();
         axera_timer tm("moe experts");
-        const int ret = AX_ENGINE_RunSync(m.experts->handle, &io);
+        const int ret = AX_ENGINE_RunSync(ek.k->handle, &io);
         if (ret != 0) {
             GGML_ABORT("qwen35 template: RunSync failed (0x%x) in the experts of layer %d, position %" PRId64 "\n", ret,
                        il, p);
@@ -2564,8 +2681,12 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
             io.pOutputs    = out.data();
             io.nOutputSize = (uint32_t) out.size();
             ggml_axera_kernel * k = ly.gdn ? (prefill ? m.pre[v].gdn : m.gdn) : (prefill ? m.pre[v].attn : m.attn);
-            axera_timer tm(ly.gdn ? (prefill ? "gdn prefill" : "gdn decode") : (prefill ? "attn prefill" : "attn decode"));
-            const int ret = AX_ENGINE_RunSync(k->handle, &io);
+            int ret;
+            {
+                axera_timer tm(ly.gdn ? (prefill ? "gdn prefill" : "gdn decode") :
+                                        (prefill ? "attn prefill" : "attn decode"));
+                ret = AX_ENGINE_RunSync(k->handle, &io);
+            }
             if (ret != 0) {
                 GGML_ABORT("qwen35 template: RunSync failed (0x%x) at layer %d, position %" PRId64 "%s\n", ret, il, p,
                            prefill ? " (prefill)" : "");
@@ -2951,7 +3072,10 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
             m.NBLK->flush(m.NBLK->vir, m.NBLK->size);
             m.MASK->flush(m.MASK->vir, (size_t) *(int32_t *) m.NBLK->vir * m.BC * sizeof(ggml_bf16_t));  // blocks read
         }
-        run_layers(-1, it, p);
+        {
+            axera_timer tly("layers (decode)");
+            run_layers(-1, it, p);
+        }
         auto * fin = (L % 2 == 0 ? m.A : m.B).get();  // where the last layer writes
         fin->invalidate(fin->vir, H * sizeof(ggml_bf16_t));
         ggml_bf16_to_fp32_row((const ggml_bf16_t *) fin->vir, h.data() + (size_t) it * H, H);
@@ -3001,6 +3125,7 @@ static enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, stru
                                                                                   nullptr;
     void * lm_data = m.lm_q ? m.lm_q->vir : m.lm_bf ? m.lm_bf->vir : lm->data;
     auto   dst_of  = [&](int r) { return (float *) ((char *) logits->data + r * logits->nb[1]); };
+    axera_timer tl("lm_head");
     for (int r = 0; r < n_out;) {
         int done = 0;
         for (int Bn : { 8, 4, 2 }) {
@@ -3315,7 +3440,19 @@ static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend,
     auto * ctx = (ggml_backend_axera_context *) backend->context;
 
     if (axera_template_qwen35()) {
-        return axera_vit_graph(cgraph) ? axera_vit_compute(ctx, cgraph) : axera_q35_compute(ctx, cgraph);
+        static std::chrono::steady_clock::time_point last;  // profiling: host time between graphs
+        if (g_axera_prof.on && last.time_since_epoch().count()) {
+            auto & e = g_axera_prof.t["between graphs (host)"];
+            e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last).count();
+            e.second++;
+        }
+        enum ggml_status st;
+        {
+            axera_timer tm("graph_compute (all)");
+            st = axera_vit_graph(cgraph) ? axera_vit_compute(ctx, cgraph) : axera_q35_compute(ctx, cgraph);
+        }
+        last = std::chrono::steady_clock::now();
+        return st;
     }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
