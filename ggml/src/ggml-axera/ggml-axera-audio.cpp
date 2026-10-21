@@ -15,16 +15,18 @@ struct axera_audio {
     const void *        bound = nullptr;  // data of a.blk.0.attn_q.weight
 };
 
-// a graph is the audio encoder if it reads the conv front-end's output projection
+// a graph is the audio encoder if it reads the conv front-end's output projection and the transformer layers (the
+// Qwen3-TTS speaker encoder has a conv_out too)
 bool axera_audio_graph(const struct ggml_cgraph * cgraph) {
+    bool conv_out = false, layers = false;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         for (int s = 0; s < GGML_MAX_SRC && cgraph->nodes[i]->src[s]; ++s) {
-            if (axera_base_name(cgraph->nodes[i]->src[s]->name) == "a.conv_out.weight") {
-                return true;
-            }
+            const std::string n = axera_base_name(cgraph->nodes[i]->src[s]->name);
+            conv_out            = conv_out || n == "a.conv_out.weight";
+            layers              = layers || n == "a.blk.0.attn_q.weight";
         }
     }
-    return false;
+    return conv_out && layers;
 }
 
 // the conv front-end, nodes [0, n): on the CPU, except the matrix products of the 3 x 3 convolutions with a

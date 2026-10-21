@@ -225,31 +225,59 @@ std::string axera_base_name(const char * name) {
 // nodes [i0, i1) of the graph on the CPU backend (their tensors are host memory: CMM or the CPU's), for the parts of a
 // template's graph it does not run itself
 void axera_cpu_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph, int i0, int i1, const char * what) {
-    if (i1 <= i0) {
+    axera_cpu_compute_nodes(ctx, cgraph, cgraph->nodes + i0, i1 - i0, what);
+}
+
+// the n nodes at nodes (of cgraph, in its order) on the CPU backend
+void axera_cpu_compute_nodes(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph, ggml_tensor ** nodes, int n,
+                             const char * what) {
+    if (n <= 0) {
         return;
     }
-    if (!ctx->cpu) {
+    // a slice of small tensors on one thread: waking the CPU backend's threads for each of its nodes costs more than
+    // the nodes (the Qwen3-TTS code predictor's slices of one row)
+    int64_t big = 0;  // the largest node's work: its elements (times K for a matrix product)
+    for (int i = 0; i < n; i++) {
+        const ggml_tensor * t = nodes[i];
+        if (t->flags & GGML_TENSOR_FLAG_COMPUTE) {
+            big = std::max(big, ggml_nelements(t) * (t->op == GGML_OP_MUL_MAT ? t->src[0]->ne[0] : 1));
+        }
+    }
+    const int c = big <= 65536 ? 1 : 0;
+    if (!ctx->cpu[c]) {
         ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         GGML_ASSERT(dev && "axera: no CPU backend");
-        ctx->cpu = ggml_backend_dev_init(dev, nullptr);
-        auto set_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(
-            ggml_backend_dev_backend_reg(dev), "ggml_backend_set_n_threads");
+        ctx->cpu[c]             = ggml_backend_dev_init(dev, nullptr);
+        ggml_backend_reg_t  reg = ggml_backend_dev_backend_reg(dev);
+        const int           nt  = c ? 1 : (int) std::max(1u, std::thread::hardware_concurrency());
+        auto set_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (set_threads) {
-            set_threads(ctx->cpu, (int) std::max(1u, std::thread::hardware_concurrency()));
+            set_threads(ctx->cpu[c], nt);
+        }
+        // a threadpool of its own: without one the CPU backend starts its threads on every call (templates call it
+        // once per slice of a graph, thousands of times per graph for mtmd's generation graphs)
+        auto tp_new = (ggml_threadpool_t (*)(struct ggml_threadpool_params *)) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+        auto tp_set = (void (*)(ggml_backend_t, ggml_threadpool_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+        ctx->cpu_tp_free = (void (*)(ggml_threadpool_t)) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+        if (tp_new && tp_set && ctx->cpu_tp_free) {
+            struct ggml_threadpool_params tpp = ggml_threadpool_params_default(nt);
+            tpp.poll                          = 0;  // no spinning between calls: the NPU and the template's host work run then
+            ctx->cpu_tp[c]                    = tp_new(&tpp);
+            tp_set(ctx->cpu[c], ctx->cpu_tp[c]);
         }
     }
     // (CPU) the slice of ggml_graph_view (not exported by ggml-base)
     struct ggml_cgraph view = *cgraph;
     view.size               = 0;
-    view.n_nodes            = i1 - i0;
+    view.n_nodes            = n;
     view.n_leafs            = 0;
-    view.nodes              = cgraph->nodes + i0;
+    view.nodes              = nodes;
     view.grads              = nullptr;
     view.grad_accs          = nullptr;
     view.leafs              = nullptr;
     view.uid                = 0;
     axera_timer        tm(what);
-    if (ggml_backend_graph_compute(ctx->cpu, &view) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(ctx->cpu[c], &view) != GGML_STATUS_SUCCESS) {
         GGML_ABORT("axera: %s failed on the CPU backend\n", what);
     }
 }

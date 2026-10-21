@@ -27,7 +27,8 @@ static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend,
             axera_timer tm("graph_compute (all)");
             st = axera_vit_graph(cgraph)   ? axera_vit_compute(ctx, cgraph) :
                  axera_audio_graph(cgraph) ? axera_audio_compute(ctx, cgraph) :
-                                             axera_q35_compute(ctx, cgraph);
+                 axera_llama_graph(cgraph) ? axera_q35_compute(ctx, cgraph) :
+                                             axera_gen_compute(ctx, cgraph);
         }
         last = std::chrono::steady_clock::now();
         return st;

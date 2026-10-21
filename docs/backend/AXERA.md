@@ -398,17 +398,58 @@ Of the 0.45 s about 0.35 s is the front-end's CPU part; the 18 (0.6B) / 24 (1.7B
 
 ### Speech synthesis: Qwen3-TTS
 
-`llama-tts -m qwen3-tts.gguf -mm mmproj-qwen3-tts.gguf --no-mmproj-offload -ngl 99 -p "<text>" --tts-lang zh
---tts-speaker-file speaker.wav --output out.wav`. The talker (the 28-layer Qwen3 text model, its output projection the
-3072 codec tokens) runs on the template; the code predictor and the codec decoder run in mtmd on the CPU
-(`--no-mmproj-offload`). llama-tts keeps the hidden states (embeddings without pooling: the final norm is named
-`result_embd_pooled`, the template writes it with the logits), pads the codec logits to the text vocabulary with
--inf (the template fills that concat), and feeds mixed inputs, token embeddings set into rows of given embeddings
-(the template runs those input nodes on the CPU before the layers).
+`llama-tts -m qwen3-tts.gguf -mm mmproj-qwen3-tts.gguf -ngl 99 -c 4096 -p "<text>" --tts-lang zh --tts-speaker-file
+speaker.wav --output out.wav` (`-c 4096`: llama-tts's default context of 32768 cells would take the split attention,
+slower per frame; a generation is at most 512 frames). Three models take part per 80 ms codec frame:
 
-On AX8860 the Qwen3-TTS-1.7B talker takes 61 ms per codec frame (12.5 frames per second of audio); the whole
-generation takes about 20 s per second of audio (the CPU alone: 33 s), most of it the code predictor on the CPU. A Chinese and an
-English sentence, transcribed back by Qwen3-ASR-1.7B, read exactly as the input text.
+- **The talker**, the 28-layer Qwen3 text model with an output projection of 3072 codec tokens, runs on the template.
+  llama-tts keeps its hidden states (embeddings without pooling: the final norm is named `result_embd_pooled`, the
+  template writes it with the logits), pads the codec logits to the text vocabulary with -inf (the template fills that
+  concat) and feeds mixed inputs, token embeddings set into rows of given embeddings (the template runs those input
+  nodes on the CPU before its layers).
+- **The code predictor** (5 Qwen3 layers of 1024, Qwen3-0.6B's shapes) predicts the frame's other 15 codes, 16
+  positions per frame, in mtmd's generation graph.
+- **The codec decoder** (an 8-layer transformer, ConvNeXt upsampling and a DAC decoder with SnakeBeta activations)
+  turns windows of 72 frames into 24 kHz audio, also an mtmd graph.
+
+mtmd's graphs have no template of their own (`ggml-axera-gen.cpp`): the backend runs them on the CPU backend from
+inside the backend and takes over what has an NPU kernel:
+
+- each code predictor layer call as one call of Qwen3-0.6B's fused decode layer kernel (`qwen3tts_cp_attn_kvc_c4096`,
+  a copy of its bf16 `qwen3_attn_kvc_c4096`, or the MXFP8 `qwen3tts_cp_attn_mx8_kvc_c4096`; the 16 positions' KV
+  resident in the kernel). The backend finds the calls in the graph (`ln1` ... `ffn_down` of each layer and position)
+  and skips the nodes only they need, the attention and the graph's own KV cache among them;
+- the other matrix products: single rows on the GEMV kernels (one call for the q / k / v or gate / up of one input),
+  several rows on `mm_bf16_m<M>_n<N>_k<K>` GEMM kernels of their shapes (`mm_kernels.py`). For the convolutions the
+  backend writes the im2col rows as bf16 itself instead of running the CPU's im2col;
+- SnakeBeta (x + sin²(αx) · β⁻¹ per channel) in one pass on the host workers instead of five CPU ops.
+
+The rest (the codebook lookups and sampling of the code predictor, the codec decoder's elementwise ops, transposes and
+col2im) stays on the CPU backend, slices of small tensors on one thread. The CPU backend gets threadpools of its own
+(without one it starts its threads on every call, here thousands of times per graph).
+
+Precision decides whether a generation ends: the talker samples the end of speech from its codec logits frame by
+frame, and with MXFP8 weights Qwen3-TTS-0.6B's talker missed it for some seeds (2 of 4 generations of a Chinese
+sentence ran to the 512-frame limit; with the code predictor in bf16 1 of 6, with the code predictor on the CPU 1 of 5
+ran twice as long), the CPU never (3 of 3). With bf16 weights (no `GGML_AXERA_WEIGHTS`) all 15 seeds tried ended as on
+the CPU. Qwen3-TTS-1.7B's talker in MXFP8 ended every time (13 of 13). The code predictor's bf16 kernel comes first.
+
+On AX8860 (`-ngl 99 -c 4096`; 0.6B bf16, 1.7B MXFP8 with the code predictor in bf16; the CPU: the same build with
+`-ngl 0 --no-mmproj-offload` and a Q8_0 mmproj, as the A55 has no bf16 dot product), one Chinese and one English
+sentence:
+
+| Model | Sentence | NPU: audio, time | CPU: audio, time |
+|---|---|---|---|
+| Qwen3-TTS-1.7B | zh | 7.4 s, 31.4 s | 7.6 s, 244.4 s |
+| | en | 5.1 s, 20.3 s | 5.2 s, 156.5 s |
+| Qwen3-TTS-0.6B | zh | 7.1 s, 28.8 s | 7.2 s, 163.8 s |
+| | en | 4.7 s, 18.1 s | 4.8 s, 96.9 s |
+
+(The sampling seed differs, so the lengths do.) Every output, transcribed back by Qwen3-ASR-1.7B, reads exactly as
+its input text. Per frame (1.7B) the talker takes 43 ms and the code predictor's 80 layer calls 88 ms; most of the
+remaining ~100 ms is mtmd building and allocating its generation graph again for every frame. The codec decoder takes
+4.2 s per window of 72 frames (5.8 s of audio; the CPU: 43 s), of which the NPU's matrix products are 0.3 s and the
+host's im2col rows 1.6 s.
 
 ## Source layout
 
@@ -418,7 +459,7 @@ The backend separates what any model uses from the graph templates of one archit
 |---|---|
 | `ggml-axera-impl.h` | internal declarations, CMM buffers, kernel registry, host thread pool, profiling timers |
 | `ggml-axera.cpp` | backend, device and registry interface; dispatch of a graph to the per-op path or a template |
-| `ggml-axera-util.cpp` | runtime init, CMM allocation, settings (`GGML_AXERA_*`), kernel IO helpers |
+| `ggml-axera-util.cpp` | runtime init, CMM allocation, settings (`GGML_AXERA_*`), kernel IO helpers, graph slices on the CPU backend |
 | `ggml-axera-buffer.cpp` | the CMM buffer type, and the mapped buffers (the GGUF file mapping as device weights) |
 | `ggml-axera-weights.cpp` | weight formats (BF16 copies, MXFP8, MXFP4 repacking) and the GEMV calls, per-op `MUL_MAT` |
 | `ggml-axera-graph.cpp` | for templates: the graph's tensors by name, the output head (final norm, output projection, MTP's `h_nextn`) |
@@ -430,6 +471,7 @@ The backend separates what any model uses from the graph templates of one archit
 | `ggml-axera-q35-mc.cpp` | Qwen3.5: the multi-core prefill chain |
 | `ggml-axera-vit.cpp` | the Qwen3.5 vision encoder (mtmd) |
 | `ggml-axera-audio.cpp` | the Qwen3-ASR audio encoder (mtmd) |
+| `ggml-axera-gen.cpp` | graphs without a template (mtmd's generation graphs: the Qwen3-TTS code predictor and codec decoder) on the CPU backend, with their layers and matrix products on the NPU |
 
 A template for another architecture adds its layer kernels (AXDSL), a binding of its GGUF tensor names to their inputs
 and its layer loop; the KV cache handling, split attention, RoPE, the output head and the weight formats are shared.
