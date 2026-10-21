@@ -320,7 +320,12 @@ outputs) replace the single-core ones: for the dense models prefill chunks of 12
 kernels that pass the residual as a base plus one fp32 partial per core, the segment kernels split their blocks over
 the cores and the tail merges the partial results on the NPU (more segments than its slots: merged on the CPU in
 between), and the output projection uses the four-core `mul_mat_bf16_n<C>_k<K>`; for the MoE models the segment kernels, the
-slots kernel and the gate-up experts kernel (the cores' partial sums added on the host).
+slots kernel and the gate-up experts kernel (the cores' partial sums added on the host). Qwen3 models take the same
+chain without the gated delta net (`qwen3_{mlp,attn_head,attn_tail}_mc<P>_mx8`, MXFP8 weights sliced per core with
+their scales, the four-core `mul_mat_mx8_n<C>_k<K>` output projection); a layer with less than 32 MB of weights (0.6B)
+decodes on the single-core fused kernel below 1024 cells of KV (`GGML_AXERA_MC_DECODE_CELLS=<n>` overrides), where the
+chain's four calls per layer cost more than the bandwidth gains. The split attention takes the largest segment kernel
+within the cache (fewer segments to merge than the tail's slots).
 
 On boards with the October 16-19 images this is stable (0.8B `llama-perplexity` three times bit-identical, PPL zh
 46.81 against 46.74 single-core from the order of the partial sums; on an older board it gave NaN and timeouts). The
@@ -348,6 +353,9 @@ env $E LMAX=4096 WFMT=mx8 python ggml_template_build.py <kernel_dir>            
 env $E NODEC=1 LMAX=4096 PCHUNK=64 WFMT=mx8 python q35_prefill.py <kernel_dir>    # prefill chunks (P = 128 .. 2)
 env $E R=1 S=16384 CHECK=0 WFMT=mx8 python q35_flash.py <kernel_dir>             # split attention (R = 1 .. 64)
 env $E LMAX=4096 B=2 WFMT=mx8 python q35_batch.py <kernel_dir>                   # batched decode
+# four-core chain (P = 1, 16, 64, 128), output projection and segments
+env $E CORES=4 P=64 WFMT=mx8 LM_C=18992 python q35_mc.py <kernel_dir>
+R=64 S=4096 CORES=4 python q35_flash.py <kernel_dir>                               # and S=16384
 ```
 
 Models of the same shapes share their kernels: Qwen3-0.6B, Qwen3-ASR-0.6B, Qwen3-Embedding-0.6B and
@@ -355,15 +363,17 @@ Qwen3-Reranker-0.6B (1024 wide, 16 / 8 heads of 128, MLP 3072) run on one kernel
 Qwen3-TTS-1.7B talker (2048, MLP 6144) on another, the talker with an output projection of its 3072 codec tokens
 (`HEAD_C=3072`).
 
-On AX8860 (MXFP8 weights, single core, the GGUF mapped from eMMC):
+On AX8860 (MXFP8 weights, the GGUF mapped from eMMC, DRAM at 7500 MT/s; one core / four cores):
 
-| Model (GGUF) | Load | Decode | Prompt (1852 tokens) | PPL (zh, 2 x 512) | CPU PPL, same GGUF |
+| Model (GGUF) | Decode, short | Decode at 1.9k | Prompt (1852 tokens) | PPL (zh, 2 x 512) | CPU PPL, same GGUF |
 |---|---|---|---|---|---|
-| Qwen3-0.6B (BF16) | 4 s | 31.6 ms per token | 1.27 s | 43.845 | 42.61 |
-| Qwen3-8B (Q4_K_M) | 25 s | 158 ms per token (203 at 1.9k context) | 6.37 s | 17.886 | 17.754 |
+| Qwen3-0.6B (BF16) | 28.0 / 26.4 ms | 63.6 / 36.7 ms | | 43.845 / 43.350 | 42.61 |
+| Qwen3-8B (Q4_K_M) | 152.7 / 75.5 ms | 198.3 / 77.3 ms | 6.30 / 2.81 s | 17.886 / 17.818 | 17.754 |
 
-A 15539-token prompt with a number stated in its first line (split attention, segments of 16384 cells) takes 19.9 s
-(0.6B) and 79.0 s (8B), and both answer with the number. Qwen3-8B peaks at 10.1 GB of CMM at 16k context.
+A 15539-token prompt with a number stated in its first line (split attention) takes 76.2 / 20.6 s on Qwen3-8B (decode
+243 / 97 ms per token there), and both answer with the number; Qwen3-0.6B took 19.9 s single-core. Qwen3-8B peaks at
+10.1 GB of CMM at 16k context. Four-core runs repeat bit-identically (three perplexity runs); they differ from one core
+by the order of the cores' partial sums.
 
 ### Embeddings and reranking
 
@@ -425,7 +435,10 @@ inside the backend and takes over what has an NPU kernel:
 - each code predictor layer call as one call of Qwen3-0.6B's fused decode layer kernel (`qwen3tts_cp_attn_kvc_c4096`,
   a copy of its bf16 `qwen3_attn_kvc_c4096`, or the MXFP8 `qwen3tts_cp_attn_mx8_kvc_c4096`, the run's weight format
   first; the 16 positions' KV resident in the kernel). The backend finds the calls in the graph (`ln1` ... `ffn_down` of each layer and position)
-  and skips the nodes only they need, the attention and the graph's own KV cache among them;
+  and skips the nodes only they need, the attention and the graph's own KV cache among them. With a stacked kernel
+  `qwen3tts_cp_stack5[_mx8]_c<LMAX>` in the directory (`q3tts_cp.py`: the 5 layers in one kernel, the smallest LMAX
+  that holds the positions) a position's 5 layers are one call (16 instead of 80 calls per frame) when the layers
+  follow each other in the graph and nothing else reads their outputs; `GGML_AXERA_CP_STACK=0` keeps one call per layer;
 - the convolutions (ggml's im2col and matrix product) as `conv1d_bf16_ic<IC>_oc<OC>_k<K>_d<D>_l<L>` kernels
   (`conv1d_kernels.py`): K shifted matrix products accumulated in f32 on the input in ggml's [channels][time] layout,
   so the im2col never runs; the kernel's taps repacked once;
@@ -459,22 +472,24 @@ that: 16 generations each with the bf16 and the MXFP8 code predictor (both model
 4 seeds) all ended and read back exactly, and an MXFP8 layer call takes 0.885 ms instead of 1.06 ms. The code
 predictor follows `GGML_AXERA_WEIGHTS`: MXFP8 for an MXFP8 run (the 1.7B), bf16 otherwise (the 0.6B).
 
-On AX8860 (`-ngl 99 -c 4096`; 0.6B bf16, 1.7B MXFP8 with its code predictor in MXFP8), one Chinese and one English
-sentence, on a board with its DRAM at 3200 and at 7500 MT/s:
+On AX8860 (`-ngl 99 -c 4096`; 0.6B bf16, 1.7B MXFP8 with its code predictor in MXFP8, the stacked code predictor
+kernels, four cores), one Chinese and one English sentence, on a board with its DRAM at 3200 and at 7500 MT/s (the
+four-core talker sums in another order, so the 1.7B's samples and lengths differ between the boards):
 
-| Model | Sentence | Audio | Time (3200) | Time (7500) |
-|---|---|---|---|---|
-| Qwen3-TTS-1.7B | zh | 7.0 s | 16.9 s | 15.5 s |
-| | en | 5.2 s | 12.4 s | 11.4 s |
-| Qwen3-TTS-0.6B | zh | 7.1 s | 16.3 s | 15.3 s |
-| | en | 4.7 s | 10.9 s | 10.2 s |
+| Model | Sentence | Audio, time (3200) | Audio, time (7500) |
+|---|---|---|---|
+| Qwen3-TTS-1.7B | zh | 6.6 s, 15.8 s | 7.0 s, 14.0 s |
+| | en | 5.4 s, 12.6 s | 5.2 s, 10.4 s |
+| Qwen3-TTS-0.6B | zh | 7.1 s, 15.0 s | 7.1 s, 14.1 s |
+| | en | 4.7 s, 10.0 s | 4.7 s, 9.5 s |
 
-Every output, transcribed back by Qwen3-ASR-1.7B, reads exactly as its input text. Per frame (1.7B, 165 ms) the
-talker takes 43 ms and the code predictor's 80 layer calls 47 ms (0.6B: bf16 layer calls of 30 MB of weights, 87 ms;
-the positions depend on each other, so they cannot share a call); mtmd, sampling and the CPU slices the rest. These
-run on one NPU core, which reads DRAM at about 53 GB/s on either board, so the faster DRAM gains little. The codec
-decoder takes about 1.1 s per window of 72 frames (5.8 s of audio). Before the conv1d kernels, the bf16 weight cache,
-mtmd's graph reuse and the host workers' concat / transpose / col2im a frame took 248 ms and a window 4.3 s.
+Every output, transcribed back by Qwen3-ASR-1.7B, reads exactly as its input text. Per frame (1.7B at 7500 MT/s,
+145 ms) the talker takes 35 ms on four cores (41 ms on one; on the 3200 board four cores are slower, 48 ms, the
+cores sharing 84 GB/s) and the code predictor's 16 stacked calls 57 ms (80 single-layer calls took 71 ms; 0.6B: bf16
+weights, 71 ms); mtmd, sampling and the CPU slices the rest. The code predictor runs on one core, which reads DRAM at
+about 53 GB/s on either board. The codec decoder takes about 1.1 s per window of 72 frames (5.8 s of audio). Before
+the conv1d kernels, the bf16 weight cache, mtmd's graph reuse and the host workers' concat / transpose / col2im a frame
+took 248 ms and a window 4.3 s.
 
 ## Source layout
 

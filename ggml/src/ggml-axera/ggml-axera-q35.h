@@ -120,9 +120,10 @@ struct axera_q35 {
     std::string           ctx_sfx;           // attention kernel name suffix: "_kvc_c<LMAX>" on the llama.cpp KV cache
     bool                  flash = false;     // attention as head / per-segment / tail kernels (flash decoding)
     bool                  pre_mx = false;    // prefill kernels with MXFP8 weights
+    int64_t               mc_dec_min = 0;    // decode on the multi-core chain from this KV width (cells) on
     int64_t               S     = 0;         // their KV segment, cells
     using fd_kernels = axera_fd_kernels;
-    struct mc_kernels {  // multi-core prefill chain for P tokens: qwen35_{gdn,mlp,attn_head,attn_tail}_mc<P>_x<cores>
+    struct mc_kernels {  // multi-core chain for P tokens: <ap>_{gdn,mlp,attn_head,attn_tail}_mc<P>[_mx8] (no gdn: Qwen3)
         ggml_axera_kernel * gdn = nullptr, *mlp = nullptr, *head = nullptr, *tail = nullptr;
         int                 np = 0;            // partial attention slots the tail merges (segments x segment cores)
         size_t              ms = 0, ls = 0, os = 0;  // bytes per slot of m / l / o

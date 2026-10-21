@@ -371,8 +371,8 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             }
             v = ok ? (int) c : -1;
         }
-        // else one token on the multi-core chain (P = 1)
-        for (size_t c = 0; c < m.pre.size() && v < 0; ++c) {
+        // else one token on the multi-core chain (P = 1), from its KV width on (axera_q35::mc_dec_min)
+        for (size_t c = 0; c < m.pre.size() && v < 0 && kv.W >= m.mc_dec_min; ++c) {
             v = m.pre[c].P == 1 && chunk_fits(c) ? (int) c : -1;
         }
         // a MoE group: as many of its chunks as fit, consecutive

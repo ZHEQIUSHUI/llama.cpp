@@ -170,9 +170,17 @@ bool axera_flash_forced() {
 }
 
 // KV segment (cells) of the split attention kernels qwen35_attn_fd_seg<R>_c<S> (Qwen3: qwen3_*), 0 if there are none
-int64_t axera_flash_seg() {
-    const int64_t s = axera_kernels().ctx_for("qwen35_attn_fd_seg1", 0);
-    return s > 0 ? s : axera_kernels().ctx_for("qwen3_attn_fd_seg1", 0);
+// the split attention kernels' segment for a KV cache of n cells: the largest S of the *_attn_fd_seg1_c<S> kernels
+// within n (fewer segments: fewer calls per layer, and their partial results fit the multi-core tail's merge slots),
+// else the smallest
+int64_t axera_flash_seg(int64_t n) {
+    for (const char * k : { "qwen35_attn_fd_seg1", "qwen3_attn_fd_seg1" }) {
+        int64_t s = axera_kernels().ctx_at_most(k, n);
+        if (s > 0 || (s = axera_kernels().ctx_for(k, 0)) > 0) {
+            return s;
+        }
+    }
+    return 0;
 }
 
 // GGML_AXERA_WEIGHTS=mxfp8: the template quantizes the bf16 GGUF weights to MXFP8 at load (about half the bytes per

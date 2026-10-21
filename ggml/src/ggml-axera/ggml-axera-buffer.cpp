@@ -118,7 +118,7 @@ static size_t ggml_backend_axera_buffer_type_get_alloc_size(ggml_backend_buffer_
     int64_t           ctx = axera_kernels().ctx_for("qwen35" + kv, t->ne[1]);
     ctx                   = ctx > 0 ? ctx : axera_kernels().ctx_for("qwen35moe" + kv, t->ne[1]);
     ctx                   = ctx > 0 ? ctx : axera_kernels().ctx_for("qwen3" + kv, t->ne[1]);  // Qwen3
-    const int64_t S       = axera_flash_seg();  // split attention: whole segments
+    const int64_t S       = axera_flash_seg(t->ne[1]);  // split attention: whole segments
     const int64_t c   = S > 0 && (ctx == 0 || axera_flash_forced()) ? (t->ne[1] + S - 1) / S * S : ctx;
     return std::max(n, (size_t) (t->ne[2] - 1) * t->nb[2] + (size_t) c * t->nb[1]);  // ne[2]: per-sequence streams
     GGML_UNUSED(buft);

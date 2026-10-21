@@ -85,7 +85,7 @@ bool axera_template_qwen35();
 int64_t axera_split_min();
 int axera_cores();
 bool axera_flash_forced();
-int64_t axera_flash_seg();
+int64_t axera_flash_seg(int64_t n);
 bool axera_weights_mx8();
 void axera_quantize_mxfp8(const ggml_tensor * w, axera_cmm & q, axera_cmm & s);
 axera_cmm axera_to_bf16(const ggml_tensor * w);
@@ -357,6 +357,16 @@ struct ggml_axera_kernel_registry {
         }
         auto c = it->second.lower_bound(n);
         return c == it->second.end() ? 0 : *c;
+    }
+
+    // the largest context <= n among the <name>_c<LMAX> kernels, 0 if none
+    int64_t ctx_at_most(const std::string & name, int64_t n) const {
+        auto it = ctx.find(name);
+        if (it == ctx.end()) {
+            return 0;
+        }
+        auto c = it->second.upper_bound(n);
+        return c == it->second.begin() ? 0 : *std::prev(c);
     }
 
     // weight rows per call for a [N, K] weight: N itself, else the largest available C dividing N; 0 if none

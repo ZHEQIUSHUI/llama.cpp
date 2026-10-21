@@ -545,16 +545,17 @@ void axera_q35_bind_flash(axera_q35 & m, int il, int v, const std::map<std::stri
 }
 
 // the multi-core prefill chain for P tokens (q35_mc.py kernels) and its buffers; the segment kernel of the split
-// attention for P rows (any core count) must exist for the KV segment
+// attention for P rows (any core count) must exist for the KV segment. The chain in the prefill kernels' weight
+// format: <ap>_*_mc<P>_mx8 next to MXFP8 prefill kernels, else bf16; Qwen3 has no delta-net kernel
 bool axera_q35_load_mc(axera_q35 & m, int P) {
     if (m.mc.count(P)) {
         return true;
     }
-    const std::string sfx = std::to_string(P);  // (multi-core builds only)
+    const std::string sfx = std::to_string(P) + (m.pre_mx ? "_mx8" : "");  // (multi-core builds only)
     std::vector<std::string> names;
-    for (const char * k : { "qwen35_gdn_mc", "qwen35_mlp_mc", "qwen35_attn_head_mc", "qwen35_attn_tail_mc" }) {
-        names.push_back(k + sfx);
-        if (!std::ifstream(axera_kernels().path(names.back())).good()) {
+    for (const char * k : { "_gdn_mc", "_mlp_mc", "_attn_head_mc", "_attn_tail_mc" }) {
+        names.push_back(m.ap + k + sfx);
+        if (!axera_kernels().has(names.back()) && (m.hybrid || names.size() > 1)) {
             return false;
         }
     }
@@ -563,7 +564,7 @@ bool axera_q35_load_mc(axera_q35 & m, int P) {
     }
     axera_q35::fd_kernels &  fk = m.fd.at(P);
     axera_q35::mc_kernels    mk;
-    mk.gdn  = axera_kernels().get(names[0]);
+    mk.gdn  = m.hybrid ? axera_kernels().get(names[0]) : nullptr;
     mk.mlp  = axera_kernels().get(names[1]);
     mk.head = axera_kernels().get(names[2]);
     mk.tail = axera_kernels().get(names[3]);
@@ -679,12 +680,15 @@ void axera_q35_bind_mc(axera_q35 & m, int il, size_t v, const std::map<std::stri
                 }
                 continue;
             }
-            const char * g  = axera_q35_gguf_name(m, n);
+            // MXFP8 kernel: w_<x> elements and s_<x> scales of the GGUF tensor of w_<x> (shared with the layer's other
+            // MXFP8 kernels)
+            const bool   mx = (n.rfind("w_", 0) == 0 || n.rfind("s_", 0) == 0) && k->input(("s_" + n.substr(2)).c_str()) >= 0;
+            const char * g  = axera_q35_gguf_name(m, mx ? "w_" + n.substr(2) : n);
             auto         it = !g ? t.end() : t.find("blk." + std::to_string(il + m.off) + "." + g);
             if (it == t.end()) {
                 GGML_ABORT("qwen35 template: kernel input %s has no GGUF tensor\n", n.c_str());
             }
-            in[i] = axera_q35_gguf_input(m, ly, it->second, n, size);
+            in[i] = mx ? axera_q35_mx_input(ly, it->second, n, size) : axera_q35_gguf_input(m, ly, it->second, n, size);
         }
         for (uint32_t i = 0; i < k->info->nOutputSize; ++i) {
             const std::string n = k->info->pOutputs[i].pName;
@@ -778,7 +782,7 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
     const int64_t ctx = m.kv_llama ? axera_kernels().ctx_for(attn_name + "_kvc", m.N) : 0;
     m.fd.clear();
     m.mc.clear();
-    m.S     = axera_flash_seg();
+    m.S     = axera_flash_seg(m.N);
     m.flash = m.kv_llama && m.S > 0 && (ctx == 0 || axera_flash_forced()) && axera_q35_load_flash(m, 1);
     if (m.kv_llama && ctx == 0 && !m.flash) {
         GGML_LOG_WARN("%s: no %s_kvc_c<LMAX> kernel holds the %" PRId64 "-cell KV cache and no split attention "
@@ -1088,7 +1092,7 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         const std::string sfx  = std::to_string(P) + (pre_mx ? "_mx8" : "");
         const std::string asfx = sfx + m.ctx_sfx;
         // the multi-core chain (preferred), and / or the single-core layer kernels
-        const bool mc  = !pre_mx && (P > 1 || mc_dec) && axera_q35_load_mc(m, P);
+        const bool mc  = (P > 1 || mc_dec) && axera_q35_load_mc(m, P);
         const bool one = (!m.hybrid || std::ifstream(axera_kernels().path("qwen35_gdn_prefill" + sfx)).good()) &&
                          (m.flash ? axera_q35_load_flash(m, P) :
                                     std::ifstream(axera_kernels().path(m.ap + "_attn_prefill" + asfx)).good());
@@ -1216,6 +1220,22 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
     }
     if (!chunks.empty()) {
         chunks += pre_mx ? " (MXFP8)" : " (BF16)";
+    }
+    // decode on the multi-core chain: its four calls per layer cost more than a small layer's weights take to read
+    // on one core (Qwen3-0.6B, 15 MB per layer in MXFP8: 37 against 28 ms per token at a short context), until the
+    // attention over a long context outweighs them (1.9k cells: 37 against 64 ms). Small Qwen3 layers (< 32 MB)
+    // decode on the fused single-core kernel below 1024 cells; GGML_AXERA_MC_DECODE_CELLS=<n> sets the width
+    m.mc_dec_min = 0;
+    if (!m.hybrid && !m.flash) {
+        int64_t bytes = 0;
+        for (const char * w : { "attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down" }) {
+            auto it = t.find("blk." + std::to_string(m.off) + "." + w + ".weight");
+            bytes += it == t.end() ? 0 : ggml_nelements(it->second) * (mx8 ? 1 : 2);
+        }
+        m.mc_dec_min = bytes < (32 << 20) ? 1024 : 0;
+    }
+    if (const char * e = std::getenv("GGML_AXERA_MC_DECODE_CELLS")) {
+        m.mc_dec_min = std::max<int64_t>(0, std::atoll(e));
     }
     m.ready = true;
     GGML_LOG_INFO("%s: Axera qwen35 template: %d layers, context %" PRId64 " (kernels up to %d), %s weights, recurrent "
