@@ -419,13 +419,23 @@ inside the backend and takes over what has an NPU kernel:
   a copy of its bf16 `qwen3_attn_kvc_c4096`, or the MXFP8 `qwen3tts_cp_attn_mx8_kvc_c4096`; the 16 positions' KV
   resident in the kernel). The backend finds the calls in the graph (`ln1` ... `ffn_down` of each layer and position)
   and skips the nodes only they need, the attention and the graph's own KV cache among them;
+- the convolutions (ggml's im2col and matrix product) as `conv1d_bf16_ic<IC>_oc<OC>_k<K>_d<D>_l<L>` kernels
+  (`conv1d_kernels.py`): K shifted matrix products accumulated in f32 on the input in ggml's [channels][time] layout,
+  so the im2col never runs; the kernel's taps repacked once;
 - the other matrix products: single rows on the GEMV kernels (one call for the q / k / v or gate / up of one input),
-  several rows on `mm_bf16_m<M>_n<N>_k<K>` GEMM kernels of their shapes (`mm_kernels.py`). For the convolutions the
-  backend writes the im2col rows as bf16 itself instead of running the CPU's im2col;
+  several rows on `mm_bf16_m<M>_n<N>_k<K>` GEMM kernels of their shapes (`mm_kernels.py`; convolutions without a
+  conv1d kernel there too, the backend writing their im2col rows as bf16). A weight the graph transposes on every run
+  (a transposed convolution's kernel, `cont(transpose(w))`) is read once through the view's strides and kept as bf16;
+  the CONT does not run;
 - SnakeBeta (x + sin²(αx) · β⁻¹ per channel) in one pass on the host workers instead of five CPU ops.
 
-The rest (the codebook lookups and sampling of the code predictor, the codec decoder's elementwise ops, transposes and
-col2im) stays on the CPU backend, slices of small tensors on one thread. The CPU backend gets threadpools of its own
+mtmd itself keeps the code generation step's graph: the step builds the same graph for every frame (only its inputs
+differ), so `clip_encode` reuses it with the scheduler's allocation while the step's parameters stay, instead of
+building and allocating some 6000 nodes again (a codec decoder window or another graph in between drops it).
+
+The rest (the codebook lookups and sampling of the code predictor, the codec decoder's elementwise ops, transposes,
+concats of the convolutions' left context and col2im) stays on the CPU backend, slices of small tensors on one thread
+(views do not count). The template of a graph is kept for the same graph (telling them apart reads every node). The CPU backend gets threadpools of its own
 (without one it starts its threads on every call, here thousands of times per graph).
 
 Precision decides whether a generation ends: the talker samples the end of speech from its codec logits frame by
@@ -440,16 +450,17 @@ sentence:
 
 | Model | Sentence | NPU: audio, time | CPU: audio, time |
 |---|---|---|---|
-| Qwen3-TTS-1.7B | zh | 7.4 s, 31.4 s | 7.6 s, 244.4 s |
-| | en | 5.1 s, 20.3 s | 5.2 s, 156.5 s |
-| Qwen3-TTS-0.6B | zh | 7.1 s, 28.8 s | 7.2 s, 163.8 s |
-| | en | 4.7 s, 18.1 s | 4.8 s, 96.9 s |
+| Qwen3-TTS-1.7B | zh | 7.4 s, 20.6 s | 7.6 s, 244.4 s |
+| | en | 5.1 s, 14.0 s | 5.2 s, 156.5 s |
+| Qwen3-TTS-0.6B | zh | 7.1 s, 18.5 s | 7.2 s, 163.8 s |
+| | en | 4.7 s, 12.0 s | 4.8 s, 96.9 s |
 
 (The sampling seed differs, so the lengths do.) Every output, transcribed back by Qwen3-ASR-1.7B, reads exactly as
-its input text. Per frame (1.7B) the talker takes 43 ms and the code predictor's 80 layer calls 88 ms; most of the
-remaining ~100 ms is mtmd building and allocating its generation graph again for every frame. The codec decoder takes
-4.2 s per window of 72 frames (5.8 s of audio; the CPU: 43 s), of which the NPU's matrix products are 0.3 s and the
-host's im2col rows 1.6 s.
+its input text. Per frame (1.7B, 174 ms) the talker takes 43 ms and the code predictor's 80 layer calls 87 ms (a layer
+call of 30 MB of bf16 weights reads them at about 27 GB/s; the positions depend on each other, so they cannot share a
+call); mtmd, sampling and the CPU slices the rest. The codec decoder takes 2.1 s per window of 72 frames (5.8 s of
+audio; the CPU: 43 s), its convolutions 0.4 s of it. Before the conv1d kernels, the bf16 weight cache and mtmd's graph
+reuse a frame took 248 ms and a window 4.3 s.
 
 ## Source layout
 

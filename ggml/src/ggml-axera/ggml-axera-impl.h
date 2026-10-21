@@ -412,6 +412,13 @@ struct ggml_backend_axera_context {
     std::shared_ptr<axera_vit> vit;
     std::shared_ptr<axera_audio> audio;
     std::shared_ptr<axera_gen>   gen;
+    // the template of the last graph (0 vision encoder, 1 audio encoder, 2 llama.cpp model, 3 other) and that graph
+    struct {
+        const struct ggml_cgraph * g     = nullptr;
+        int                        n     = 0;
+        const ggml_tensor *        first = nullptr, *last = nullptr;
+        int                        kind  = 0;
+    } graph_kind;
     // the CPU backend for the graph nodes a template leaves to it (all threads, one thread) and its threadpools
     ggml_backend_t               cpu[2]    = {};
     ggml_threadpool_t            cpu_tp[2] = {};

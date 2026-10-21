@@ -239,7 +239,8 @@ void axera_cpu_compute_nodes(ggml_backend_axera_context * ctx, struct ggml_cgrap
     int64_t big = 0;  // the largest node's work: its elements (times K for a matrix product)
     for (int i = 0; i < n; i++) {
         const ggml_tensor * t = nodes[i];
-        if (t->flags & GGML_TENSOR_FLAG_COMPUTE) {
+        if ((t->flags & GGML_TENSOR_FLAG_COMPUTE) && !ggml_is_empty(t) && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE &&
+            t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE && t->op != GGML_OP_NONE) {  // (views do no work)
             big = std::max(big, ggml_nelements(t) * (t->op == GGML_OP_MUL_MAT ? t->src[0]->ne[0] : 1));
         }
     }

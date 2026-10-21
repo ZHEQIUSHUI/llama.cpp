@@ -62,6 +62,22 @@ static bool axera_gen_is_weight(const ggml_tensor * t) {
            (s->op == GGML_OP_NONE && !(s->flags & GGML_TENSOR_FLAG_INPUT) && s->data);
 }
 
+// the weight a tensor is made of by data movement only (reshape / view / transpose / permute / cont: e.g. a transposed
+// convolution's kernel made contiguous on every run), nullptr if it reads anything else
+static const ggml_tensor * axera_gen_const_root(const ggml_tensor * t) {
+    for (int depth = 0; t && depth < 8; ++depth) {
+        if (axera_gen_is_weight(t)) {
+            return t->view_src ? t->view_src : t;
+        }
+        if (t->op != GGML_OP_CONT && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_VIEW && t->op != GGML_OP_TRANSPOSE &&
+            t->op != GGML_OP_PERMUTE) {
+            return nullptr;
+        }
+        t = t->src[0];
+    }
+    return nullptr;
+}
+
 static bool axera_gen_have(axera_gen & g, const std::string & name) {
     auto it = g.have.find(name);
     if (it == g.have.end()) {
@@ -93,6 +109,27 @@ static void axera_gen_to_bf16(const ggml_tensor * t, int64_t rows, ggml_bf16_t *
     });
 }
 
+// the rows of a CONT node read through the strides of its source view instead (a transposed weight: the CONT itself
+// need not run), f32 / f16 / bf16 sources; false for any other
+static bool axera_gen_cont_bf16(const ggml_tensor * a, int64_t rows, ggml_bf16_t * dst) {
+    const ggml_tensor * v = a->src[0];
+    if (a->op != GGML_OP_CONT || !v->data || ggml_nelements(v) != ggml_nelements(a) || v->ne[2] * v->ne[3] != 1 ||
+        v->ne[0] != a->ne[0] || (v->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16)) {
+        return false;
+    }
+    const int64_t K = a->ne[0];
+    axera_host_pool().run(rows, [&](int64_t r) {
+        const char * row = (const char *) v->data + r * v->nb[1];
+        for (int64_t c = 0; c < K; ++c) {
+            const char * e = row + c * v->nb[0];
+            dst[r * K + c] = v->type == GGML_TYPE_BF16 ? *(const ggml_bf16_t *) e :
+                             ggml_fp32_to_bf16(v->type == GGML_TYPE_F32 ? *(const float *) e :
+                                                                          ggml_fp16_to_fp32(*(const ggml_fp16_t *) e));
+        }
+    });
+    return true;
+}
+
 // the bf16 [rows][K] of an operand: the tensor itself (bf16 in CMM), its cached copy (a weight), or converted per call
 // into tmp
 static std::pair<const ggml_backend_axera_buffer_context *, void *> axera_gen_bf16(axera_gen & g, const ggml_tensor * a,
@@ -101,6 +138,18 @@ static std::pair<const ggml_backend_axera_buffer_context *, void *> axera_gen_bf
     const size_t  bytes = (size_t) rows * K * sizeof(ggml_bf16_t);
     if (a->type == GGML_TYPE_BF16 && ggml_backend_buffer_is_axera(a->buffer)) {
         return { (const ggml_backend_axera_buffer_context *) a->buffer->context, a->data };
+    }
+    const ggml_tensor * root = axera_gen_is_weight(a) ? nullptr : axera_gen_const_root(a);
+    if (root) {  // a constant made of a weight: cached by the weight and its own shape (its data is the graph's)
+        auto & c = g.w[{ (const char *) root->data + a->ne[0], ggml_nbytes(a) }];
+        if (!c) {
+            c = axera_cmm_alloc(bytes);
+            if (!axera_gen_cont_bf16(a, rows, (ggml_bf16_t *) c->vir)) {
+                axera_gen_to_bf16(a, rows, (ggml_bf16_t *) c->vir);
+            }
+            c->flush(c->vir, bytes);
+        }
+        return { c.get(), c->vir };
     }
     if (axera_gen_is_weight(a)) {
         auto & c = g.w[{ a->data, ggml_nbytes(a) }];
@@ -152,8 +201,71 @@ static std::pair<const ggml_backend_axera_buffer_context *, void *> axera_gen_im
     return { tmp.get(), tmp->vir };
 }
 
-// the GEMM reading a 1-D IM2COL of node i within the next nodes, if a kernel takes its shape: the IM2COL is then left
-// to that GEMM
+// the conv1d kernel of a 1-D IM2COL's convolution (stride 1, no padding: mtmd's causal convolutions take their left
+// context as input): conv1d_bf16_ic<IC>_oc<OC>_k<K>_d<D>_l<L> (x [IC, L] bf16, w [K, OC, IC] bf16 -> out [OC, L -
+// (K - 1) D] f32, ggml's layout of the MUL_MAT after the IM2COL); empty if the convolution is not one
+static std::string axera_gen_conv_name(const ggml_tensor * ic, int64_t OC) {
+    const int32_t * p = (const int32_t *) ic->op_params;
+    if (p[0] != 1 || p[2] != 0) {
+        return "";
+    }
+    char name[96];
+    snprintf(name, sizeof(name), "conv1d_bf16_ic%" PRId64 "_oc%" PRId64 "_k%" PRId64 "_d%d_l%" PRId64, ic->src[1]->ne[1], OC,
+             ic->src[0]->ne[0], p[4], ic->src[1]->ne[0]);
+    return name;
+}
+
+// the MUL_MAT n after a 1-D IM2COL ic as one conv1d kernel call: the input converted to bf16, the kernel's taps
+// repacked once ([OC][IC][K] -> [K][OC][IC]), the output written into n
+static void axera_gen_conv(axera_gen & g, ggml_tensor * n, const ggml_tensor * ic, const std::string & name) {
+    const ggml_tensor * x  = ic->src[1];
+    const ggml_tensor * w  = ic->src[0];
+    const int64_t       KW = w->ne[0], IC = x->ne[1], L = x->ne[0], OC = n->ne[1];
+    auto *              dctx = (const ggml_backend_axera_buffer_context *) n->buffer->context;
+    axera_timer         tm(g.names.insert("gen " + name + " (npu)").first->c_str());
+    auto &              wk = g.w[{ w->data, ggml_nbytes(w) + 1 }];  // (+1: not the GEMM's copy of the same weight)
+    if (!wk) {
+        GGML_ASSERT(ggml_is_contiguous(w) && w->ne[1] == IC && w->ne[2] == OC);
+        wk = axera_cmm_alloc((size_t) KW * OC * IC * sizeof(ggml_bf16_t));
+        auto *     d  = (ggml_bf16_t *) wk->vir;
+        const auto tr = ggml_get_type_traits(w->type);
+        axera_host_pool().run(OC, [&](int64_t o) {  // row o: [IC][K] of any type
+            std::vector<float> f(IC * KW);
+            const char *       src = (const char *) w->data + o * w->nb[2];
+            if (w->type == GGML_TYPE_F32) {
+                memcpy(f.data(), src, f.size() * sizeof(float));
+            } else {
+                tr->to_float(src, f.data(), (int64_t) f.size());
+            }
+            for (int64_t k = 0; k < KW; ++k) {
+                for (int64_t i = 0; i < IC; ++i) {
+                    d[(k * OC + o) * IC + i] = ggml_fp32_to_bf16(f[i * KW + k]);
+                }
+            }
+        });
+        wk->flush(wk->vir, wk->size);
+    }
+    const size_t xb = (size_t) IC * L * sizeof(ggml_bf16_t);
+    if (!g.tmp[1] || g.tmp[1]->size < xb) {
+        g.tmp[1] = axera_cmm_alloc_nc(xb);  // written by the host only: no cache to clean before the NPU reads it
+    }
+    axera_gen_to_bf16(x, IC, (ggml_bf16_t *) g.tmp[1]->vir);
+    ggml_axera_kernel * k  = axera_kernels().get(name);
+    const int           ix = k->input("x"), iw = k->input("w"), io = k->output("out");
+    GGML_ASSERT(ix >= 0 && iw >= 0 && io >= 0 && k->info->nInputSize == 2 && k->info->nOutputSize == 1);
+    std::vector<AX_ENGINE_IO_BUFFER_T> in(2), out(1);
+    in[ix]  = axera_io(g.tmp[1].get(), g.tmp[1]->vir, (uint32_t) xb);
+    in[iw]  = axera_io(wk.get(), wk->vir, (uint32_t) wk->size);
+    out[io] = axera_io(dctx, n->data, (uint32_t) ggml_nbytes(n));
+    dctx->invalidate(n->data, ggml_nbytes(n));  // no dirty line of the output left to be written back over the NPU's
+    if (axera_run_sync(k, in, out) != 0) {
+        GGML_ABORT("%s: %s failed\n", __func__, name.c_str());
+    }
+    dctx->invalidate(n->data, ggml_nbytes(n));
+}
+
+// the GEMM reading a 1-D IM2COL of node i within the next nodes, if a GEMM or conv1d kernel takes its shape: the
+// IM2COL is then left to it
 static const ggml_tensor * axera_gen_im2col_user(axera_gen & g, struct ggml_cgraph * cgraph, int i) {
     const ggml_tensor * ic = cgraph->nodes[i];
     const int32_t *     p  = (const int32_t *) ic->op_params;
@@ -168,10 +280,43 @@ static const ggml_tensor * axera_gen_im2col_user(axera_gen & g, struct ggml_cgra
             K == ic->ne[0]) {
             char name[96];
             snprintf(name, sizeof(name), "mm_bf16_m%" PRId64 "_n%" PRId64 "_k%" PRId64, M, N, K);
-            return axera_gen_have(g, name) ? m : nullptr;
+            const std::string conv = axera_gen_conv_name(ic, M);
+            return axera_gen_have(g, name) || (!conv.empty() && axera_gen_have(g, conv)) ? m : nullptr;
         }
     }
     return nullptr;
+}
+
+// a CONT of a weight (axera_gen_const_root) whose only readers are offloaded MUL_MATs, which have its bf16 copy or
+// make it from the CONT's source view: nothing reads the CONT's own data, it is not run
+static bool axera_gen_const_skip(axera_gen & g, struct ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * n    = cgraph->nodes[i];
+    const ggml_tensor * root = axera_gen_const_root(n);
+    if (!root || (!g.w.count({ (const char *) root->data + n->ne[0], ggml_nbytes(n) }) &&
+                  !(n->src[0]->data && (n->src[0]->type == GGML_TYPE_F32 || n->src[0]->type == GGML_TYPE_F16 ||
+                                        n->src[0]->type == GGML_TYPE_BF16) && n->src[0]->ne[0] == n->ne[0] &&
+                    n->src[0]->ne[2] * n->src[0]->ne[3] == 1))) {
+        return false;  // (neither cached nor to be read through its source's strides)
+    }
+    int readers = 0;
+    for (int j = i + 1; j < cgraph->n_nodes; j++) {
+        const ggml_tensor * m = cgraph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC && m->src[s]; ++s) {
+            if (m->src[s] == n || m->src[s]->view_src == n) {
+                int64_t M, N, K;
+                char    name[96];
+                if (m->op != GGML_OP_MUL_MAT || s != 0 || m->src[0] != n || !axera_gen_mm_shape(m, &M, &N, &K)) {
+                    return false;
+                }
+                snprintf(name, sizeof(name), "mm_bf16_m%" PRId64 "_n%" PRId64 "_k%" PRId64, M, N, K);
+                if (!axera_gen_have(g, name)) {
+                    return false;
+                }
+                ++readers;
+            }
+        }
+    }
+    return readers > 0;
 }
 
 // SnakeBeta as mtmd builds it, nodes i .. i + 4: x * alpha -> sin -> sqr -> * beta -> + x (x [T, C], alpha / beta one
@@ -229,6 +374,15 @@ template <typename F> static bool axera_gen_mm(ggml_backend_axera_context * ctx,
     if (!axera_gen_mm_shape(n, &M, &N, &K)) {
         return false;
     }
+    auto ic = g.im2col.find(n);
+    if (ic != g.im2col.end()) {  // a convolution: its conv1d kernel if there is one
+        const std::string conv = axera_gen_conv_name(ic->second, M);
+        if (!conv.empty() && axera_gen_have(g, conv)) {
+            before();
+            axera_gen_conv(g, n, ic->second, conv);
+            return true;
+        }
+    }
     const ggml_tensor * a    = n->src[0];
     const ggml_tensor * b    = n->src[1];
     auto *              dctx = (const ggml_backend_axera_buffer_context *) n->buffer->context;
@@ -242,7 +396,6 @@ template <typename F> static bool axera_gen_mm(ggml_backend_axera_context * ctx,
     before();
     axera_timer tm(axera_gen_label(g, gemm ? "gen mm (npu) m%" PRId64 " n%" PRId64 " k%" PRId64 :
                                              "gen gemv (npu) m%" PRId64 " n%" PRId64 " k%" PRId64, M, N, K));
-    auto       ic = g.im2col.find(n);
     axera_timer tw(ic != g.im2col.end() ? "gen mm: im2col rows (host)" : "gen mm: w (host)");
     const auto w = ic != g.im2col.end() ? axera_gen_im2col_bf16(ic->second, g.tmp[0]) : axera_gen_bf16(g, a, N, g.tmp[0]);
     tw.stop();
@@ -721,6 +874,9 @@ enum ggml_status axera_gen_compute(ggml_backend_axera_context * ctx, struct ggml
                 g.im2col[m] = n;
                 continue;
             }
+        }
+        if (n->op == GGML_OP_CONT && axera_gen_const_skip(g, cgraph, i)) {  // a constant the NPU already has as bf16
+            continue;
         }
         if (n->op == GGML_OP_MUL && !axera_gen_prof_nodes() && axera_gen_snake(cgraph, i, cpu)) {
             i += 4;

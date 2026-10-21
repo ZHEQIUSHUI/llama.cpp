@@ -25,10 +25,21 @@ static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend,
         enum ggml_status st;
         {
             axera_timer tm("graph_compute (all)");
-            st = axera_vit_graph(cgraph)   ? axera_vit_compute(ctx, cgraph) :
-                 axera_audio_graph(cgraph) ? axera_audio_compute(ctx, cgraph) :
-                 axera_llama_graph(cgraph) ? axera_q35_compute(ctx, cgraph) :
-                                             axera_gen_compute(ctx, cgraph);
+            // which template: kept for the same graph (mtmd's and llama.cpp's graphs come again every token / frame,
+            // and telling them apart reads every node's sources by name)
+            auto & k = ctx->graph_kind;
+            if (k.g != cgraph || k.n != cgraph->n_nodes || k.first != (cgraph->n_nodes ? cgraph->nodes[0] : nullptr) ||
+                k.last != (cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1] : nullptr)) {
+                k.g     = cgraph;
+                k.n     = cgraph->n_nodes;
+                k.first = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
+                k.last  = cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1] : nullptr;
+                k.kind  = axera_vit_graph(cgraph) ? 0 : axera_audio_graph(cgraph) ? 1 : axera_llama_graph(cgraph) ? 2 : 3;
+            }
+            st = k.kind == 0 ? axera_vit_compute(ctx, cgraph) :
+                 k.kind == 1 ? axera_audio_compute(ctx, cgraph) :
+                 k.kind == 2 ? axera_q35_compute(ctx, cgraph) :
+                               axera_gen_compute(ctx, cgraph);
         }
         last = std::chrono::steady_clock::now();
         return st;

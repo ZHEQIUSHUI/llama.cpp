@@ -165,6 +165,12 @@ struct clip_ctx {
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
 
+    // the last graph built, if it is a Qwen3-TTS code generation step's: those are the same graph for every frame (only
+    // their inputs differ), so it is kept with the scheduler's allocation while the step's parameters stay
+    ggml_cgraph * gen_code_graph = nullptr;
+    int           gen_code_top_k = 0;
+    float         gen_code_top_p = 0.0f;
+
     bool debug_output_embeddings = false;
 
     // for measuring memory usage
@@ -4752,12 +4758,25 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         ctx->rng.seed(params->seed == UINT32_MAX ? std::random_device{}() : params->seed);
     }
 
-    // build the inference graph
-    ggml_backend_sched_reset(ctx->sched.get());
-    ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
-    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
-        LOG_ERR("%s: failed to allocate compute graph\n", __func__);
-        return false;
+    // build the inference graph (a Qwen3-TTS code generation step: the previous step's, if it is one with the same
+    // parameters, still allocated)
+    const bool gen_code = ctx->proj_type() == PROJECTOR_TYPE_QWEN3TTS_GEN && params->gen_process == CLIP_GEN_PROCESS_GEN_CODE;
+    ggml_cgraph * gf = nullptr;
+    if (gen_code && ctx->gen_code_graph && ctx->gen_code_top_k == params->top_k && ctx->gen_code_top_p == params->top_p) {
+        gf = ctx->gen_code_graph;
+    } else {
+        ctx->gen_code_graph = nullptr;
+        ggml_backend_sched_reset(ctx->sched.get());
+        gf = clip_get_graph_builder(ctx, imgs, params)->build();
+        if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+            LOG_ERR("%s: failed to allocate compute graph\n", __func__);
+            return false;
+        }
+        if (gen_code) {
+            ctx->gen_code_graph = gf;
+            ctx->gen_code_top_k = params->top_k;
+            ctx->gen_code_top_p = params->top_p;
+        }
     }
 
     // set inputs
