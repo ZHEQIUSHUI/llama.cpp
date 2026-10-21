@@ -87,8 +87,10 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
     const std::map<std::string, ggml_tensor *> & t = axera_graph_names(ctx, cgraph);
     auto find = [&](const char * name) { return axera_graph_find(t, name); };
     ggml_tensor * norm0  = find("attn_norm-0");
-    ggml_tensor * logits = find("result_output");
+    ggml_tensor * logits = axera_graph_head(t);
     ggml_tensor * inp_pos = find("inp_pos");
+    // pooled embeddings: no output projection, the graph split ends at the final norm (the pooling runs on the CPU)
+    const bool    embd   = !logits && axera_graph_norm(t);
     // MTP draft graph (llama.cpp LLM_GRAPH_TYPE_DECODER_MTP): its h input and the model layer of the NextN block
     const ggml_tensor * mtp_h  = find("mtp_h_input");
     int                 mtp_il = -1;
@@ -102,7 +104,7 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
     if (mtp_h && (mtp_il < 0 || mtp_h->type != GGML_TYPE_F32)) {
         GGML_ABORT("qwen35 template: MTP graph without a NextN block\n");
     }
-    if ((!norm0 && !mtp_h) || !logits || !inp_pos) {
+    if ((!norm0 && !mtp_h) || (!logits && !embd) || !inp_pos) {
         GGML_LOG_ERROR("qwen35 template: split of %d nodes (%s ... %s) lacks:%s%s%s\n", cgraph->n_nodes,
                        cgraph->n_nodes ? cgraph->nodes[0]->name : "", cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1]->name : "",
                        norm0 ? "" : " attn_norm-0", logits ? "" : " result_output", inp_pos ? "" : " inp_pos");
@@ -116,12 +118,21 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
         x0 = x0->src[0];
     }
     GGML_ASSERT(mtp_h || (x0 && x0->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(x0->src[0])));
+    // a layer-0 input computed in this split (llama.cpp's mixed input, the token embeddings set into rows of the given
+    // embeddings: Qwen3-TTS): its nodes on the CPU
+    if (x0 && x0->src[0]->op != GGML_OP_NONE) {
+        int n0 = 0;
+        while (n0 < cgraph->n_nodes && cgraph->nodes[n0] != x0) {
+            ++n0;
+        }
+        axera_cpu_compute(ctx, cgraph, 0, n0, "input (cpu)");
+    }
     x0 = x0 ? x0->src[0] : nullptr;
     const int H = (int) (mtp_h ? mtp_h->ne[0] : x0->ne[0]);
     const int T = (int) (mtp_h ? mtp_h->ne[1] : x0->ne[1]);
 
-    ggml_tensor * lm = logits->src[0];
-    GGML_ASSERT(logits->op == GGML_OP_MUL_MAT && lm->ne[0] == H && ggml_backend_buffer_is_axera(logits->buffer));
+    ggml_tensor * lm = logits ? logits->src[0] : nullptr;
+    GGML_ASSERT(!logits || (logits->op == GGML_OP_MUL_MAT && lm->ne[0] == H && ggml_backend_buffer_is_axera(logits->buffer)));
 
     int L = mtp_h ? 1 : 0;
     while (!mtp_h && t.count("blk." + std::to_string(L) + ".attn_norm.weight")) {
@@ -545,6 +556,10 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
         m.next_pos = p + 1;
         ++it;
     }
-    axera_output_head(ctx, cgraph, t, h, T, m.lm_q.get(), m.lm_s.get(), m.lm_bf.get());
+    if (embd) {
+        axera_output_norm(t, h, T);
+    } else {
+        axera_output_head(ctx, cgraph, t, h, T, m.lm_q.get(), m.lm_s.get(), m.lm_bf.get());
+    }
     return GGML_STATUS_SUCCESS;
 }

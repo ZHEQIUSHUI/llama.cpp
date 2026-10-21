@@ -20,6 +20,7 @@ ggml_add_backend_library(ggml-axera
                          ggml-axera-q35-moe.cpp
                          ggml-axera-q35-mc.cpp
                          ggml-axera-vit.cpp
+                         ggml-axera-audio.cpp
                         )
 
 target_include_directories(ggml-axera PRIVATE ${AXERA_INCLUDE_DIR})

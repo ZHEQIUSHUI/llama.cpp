@@ -40,12 +40,72 @@ ggml_tensor * axera_graph_find(const std::map<std::string, ggml_tensor *> & t, c
     return it == t.end() ? nullptr : it->second;
 }
 
+// the final norm rms_norm(h) * w (the MUL node): its weight and eps
+static const float * axera_final_norm(const ggml_tensor * mul, int H, float * eps) {
+    GGML_ASSERT(mul->op == GGML_OP_MUL);
+    ggml_tensor * rms = mul->src[0]->op == GGML_OP_RMS_NORM ? mul->src[0] : mul->src[1];
+    ggml_tensor * onw = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    GGML_ASSERT(rms->op == GGML_OP_RMS_NORM && onw->type == GGML_TYPE_F32 && onw->ne[0] == H);
+    *eps = axera_rms_eps(rms);
+    return (const float *) onw->data;
+}
+
+// pooled embeddings (no output projection): the final norm of every row of h into result_norm; the pooling after it
+// runs on the CPU (ggml_backend_axera_device_supports_op)
+// the final norm of every row: result_norm, named result_embd_pooled when the context keeps unpooled embeddings
+ggml_tensor * axera_graph_norm(const std::map<std::string, ggml_tensor *> & t) {
+    ggml_tensor * r = axera_graph_find(t, "result_norm");
+    ggml_tensor * p = r ? nullptr : axera_graph_find(t, "result_embd_pooled");
+    return r ? r : p && p->op == GGML_OP_MUL && p->src[0]->op == GGML_OP_RMS_NORM ? p : nullptr;
+}
+
+// the output projection (MUL_MAT): result_output, or the Qwen3-TTS codec head whose logits llama.cpp pads to the text
+// vocabulary with -inf in front (result_output = concat(pad, head), or that concat on the CPU)
+ggml_tensor * axera_graph_head(const std::map<std::string, ggml_tensor *> & t) {
+    ggml_tensor * r = axera_graph_find(t, "result_output");
+    if (r && r->op == GGML_OP_CONCAT && r->src[1] && r->src[1]->op == GGML_OP_MUL_MAT) {
+        return r->src[1];
+    }
+    if (r) {
+        return r;
+    }
+    for (const auto & kv : t) {
+        if (kv.second->op == GGML_OP_MUL_MAT && axera_base_name(kv.second->src[0]->name) == "output.weight") {
+            return kv.second;
+        }
+    }
+    return nullptr;
+}
+
+void axera_output_norm(const std::map<std::string, ggml_tensor *> & t, const std::vector<float> & h, int T) {
+    ggml_tensor * rnorm = axera_graph_norm(t);
+    const int     H     = (int) rnorm->ne[0];
+    GGML_ASSERT(rnorm->type == GGML_TYPE_F32 && rnorm->ne[1] == T && (size_t) T * H <= h.size());
+    float         eps;
+    const float * g = axera_final_norm(rnorm, H, &eps);
+    axera_host_pool().run(T, [&](int64_t r) {
+        const float * x  = h.data() + (size_t) r * H;
+        float *       y  = (float *) ((char *) rnorm->data + r * rnorm->nb[1]);
+        double        ss = 0;
+        for (int i = 0; i < H; ++i) {
+            ss += (double) x[i] * x[i];
+        }
+        const float scale = 1.0f / sqrtf((float) (ss / H) + eps);
+        for (int i = 0; i < H; ++i) {
+            y[i] = x[i] * scale * g[i];
+        }
+    });
+    if (ggml_backend_buffer_is_axera(rnorm->buffer)) {
+        ((ggml_backend_axera_buffer_context *) rnorm->buffer->context)->flush(rnorm->data, ggml_nbytes(rnorm));
+    }
+}
+
 // the final norm and the output projection for the requested rows of h (the last layer's output, [T][H] f32)
 void axera_output_head(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph,
                        const std::map<std::string, ggml_tensor *> & t, const std::vector<float> & h, int T,
                        const ggml_backend_axera_buffer_context * lm_q, const ggml_backend_axera_buffer_context * lm_s,
                        const ggml_backend_axera_buffer_context * lm_bf) {
-    ggml_tensor * logits = axera_graph_find(t, "result_output");
+    ggml_tensor * logits = axera_graph_head(t);
     ggml_tensor * lm     = logits->src[0];
     const int     H      = (int) lm->ne[0];
     // final norm: the lm head input is [get_rows(] rms_norm(h) * output_norm [, inp_out_ids)]
@@ -53,15 +113,12 @@ void axera_output_head(ggml_backend_axera_context * ctx, struct ggml_cgraph * cg
     while (hnext->op == GGML_OP_GET_ROWS || hnext->op == GGML_OP_VIEW || hnext->op == GGML_OP_RESHAPE) {
         hnext = hnext->src[0];
     }
-    GGML_ASSERT(hnext->op == GGML_OP_MUL);
-    ggml_tensor * rms = hnext->src[0]->op == GGML_OP_RMS_NORM ? hnext->src[0] : hnext->src[1];
-    ggml_tensor * onw = hnext->src[0] == rms ? hnext->src[1] : hnext->src[0];
-    GGML_ASSERT(rms->op == GGML_OP_RMS_NORM && onw->type == GGML_TYPE_F32 && onw->ne[0] == H);
-    const float eps = axera_rms_eps(rms);
+    float         eps;
+    const float * g = axera_final_norm(hnext, H, &eps);
 
     // the row ids are the GET_ROWS index that crops the last layer or the final norm to the outputs (by structure:
     // the scheduler may have renamed inp_out_ids)
-    ggml_tensor *   rnorm   = axera_graph_find(t, "result_norm");
+    ggml_tensor *   rnorm   = axera_graph_norm(t);
     const int       n_out   = (int) logits->ne[1];
     ggml_tensor *   out_ids = nullptr;
     for (int i = 0; i < cgraph->n_nodes && n_out < T; i++) {
@@ -75,7 +132,6 @@ void axera_output_head(ggml_backend_axera_context * ctx, struct ggml_cgraph * cg
         GGML_ABORT("axera template: %d of %d rows requested but no output row index in the graph\n", n_out, T);
     }
     std::vector<float> hn((size_t) n_out * H);
-    const float *   g = (const float *) onw->data;
     for (int r = 0; r < n_out; ++r) {
         const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : r;
         GGML_ASSERT(row >= 0 && row < T);
@@ -152,5 +208,16 @@ void axera_output_head(ggml_backend_axera_context * ctx, struct ggml_cgraph * cg
             axera_gemv(ctx, lm, y, logits, dst_of(r));
         }
         ++r;
+    }
+    // the padded logits (Qwen3-TTS) when the concat is in this split
+    ggml_tensor * padded = axera_graph_find(t, "result_output");
+    if (padded && padded != logits) {
+        const int64_t pad = padded->ne[0] - logits->ne[0];
+        GGML_ASSERT(padded->type == GGML_TYPE_F32 && padded->ne[1] == n_out && pad >= 0);
+        for (int r = 0; r < n_out; ++r) {
+            float * d = (float *) ((char *) padded->data + r * padded->nb[1]);
+            std::fill(d, d + pad, -INFINITY);
+            memcpy(d + pad, dst_of(r), logits->ne[0] * sizeof(float));
+        }
     }
 }

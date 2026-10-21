@@ -20,6 +20,9 @@ static const std::map<std::string, const char *> axera_q35_moe_direct = {
 
 // GGUF tensor (name within the layer) of kernel input n, nullptr if none
 const char * axera_q35_gguf_name(const axera_q35 & m, const std::string & n) {
+    if (n == "ln2" && !m.hybrid) {
+        return "ffn_norm.weight";  // Qwen3's name of the norm before the MLP
+    }
     if (m.moe) {
         auto it = axera_q35_moe_direct.find(n);
         if (it != axera_q35_moe_direct.end()) {
@@ -263,7 +266,7 @@ void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::string, ggm
 void axera_q35_bind_prefill(axera_q35 & m, int il, size_t v, const std::map<std::string, ggml_tensor *> & t) {
     axera_q35_layer &        ly = m.layers[il];
     axera_q35::prefill &     pf = m.pre[v];
-    if ((!ly.gdn && (m.flash || !pf.attn)) || !pf.gdn) {
+    if ((!ly.gdn && (m.flash || !pf.attn)) || (ly.gdn && !pf.gdn)) {
         // split attention: axera_q35_bind_flash; multi-core only: axera_q35_bind_mc
         ly.pre.resize(m.pre.size());
         ly.pre[v].batch = pf.batch;
@@ -397,8 +400,8 @@ bool axera_q35_load_flash(axera_q35 & m, int R, bool seg_only) {
     }
     const std::string r  = std::to_string(R);
     // MoE: the tail ends with the MoE's dense part (base, h2, router logits), qwen35moe_attn_fd_tail<R>
-    std::string hn = "qwen35_attn_fd_head" + r, tn = (m.moe ? "qwen35moe" : "qwen35") + std::string("_attn_fd_tail") + r;
-    std::string       sn = "qwen35_attn_fd_seg" + r + "_c" + std::to_string(m.S);
+    std::string hn = m.ap + "_attn_fd_head" + r, tn = (m.moe ? "qwen35moe" : m.ap) + std::string("_attn_fd_tail") + r;
+    std::string       sn = m.ap + "_attn_fd_seg" + r + "_c" + std::to_string(m.S);
     // head / tail in the run's weight format where those kernels exist: MXFP8 for decode with MXFP8 weights, for
     // prefill rows with the MXFP8 prefill kernels
     if (axera_weights_mx8() && (R == 1 || m.pre_mx) && std::ifstream(axera_kernels().path(hn + "_mx8")).good() &&
@@ -731,7 +734,13 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
     m.H    = H;
     const bool mx8 = axera_weights_mx8();
     m.moe          = t.count("blk." + std::to_string(m.off) + ".ffn_gate_inp.weight") > 0;  // Qwen3.5 MoE: qwen35moe_* kernels
-    const std::string kp = m.moe ? "qwen35moe" : "qwen35";
+    // Qwen3.5 or Qwen3 by the layers (the MTP graph holds the Qwen3.5 NextN attention block alone)
+    m.hybrid = m.mtp || m.moe;
+    for (int il = 0; il < L && !m.hybrid; ++il) {
+        m.hybrid = t.count("blk." + std::to_string(il + m.off) + ".ssm_a") > 0;
+    }
+    m.ap                 = m.hybrid ? "qwen35" : "qwen3";
+    const std::string kp = m.moe ? "qwen35moe" : m.ap;
     // RoPE of the graph: rotated dims, base and linear position scale (YaRN is not implemented by the template)
     int32_t rp[16];
     memcpy(rp, rope->op_params, sizeof(rp));
@@ -787,7 +796,7 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         m.S = m.S > 0 && ctx % m.S == 0 ? std::min<int64_t>(ctx, m.S) : ctx;  // the split kernels' segment
         axera_q35_load_flash(m, 1);
     }
-    m.gdn  = axera_kernels().get(kp + (mx8 ? "_gdn_mx8" : "_gdn"));
+    m.gdn  = m.hybrid ? axera_kernels().get(kp + (mx8 ? "_gdn_mx8" : "_gdn")) : nullptr;
     m.attn = m.flash ? nullptr : axera_kernels().get(attn_name + m.ctx_sfx);
     if (m.flash) {  // the KQ mask is cut per segment kernel (fd_kernels::bc); whole 64-cell blocks here
         m.LMAX = (int) m.S;
@@ -805,7 +814,9 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
     m.lm_s.reset();
     m.lm_bf.reset();
     m.bf16_of.clear();
-    if (mx8) {
+    if (!lm) {
+        // pooled embeddings: no output projection
+    } else if (mx8) {
         // one MXFP8 copy per output projection tensor, shared with the MTP draft context of the same model
         static std::mutex mu;
         static std::map<const ggml_tensor *, std::pair<std::weak_ptr<ggml_backend_axera_buffer_context>,
@@ -825,7 +836,7 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         m.lm_bf = axera_to_bf16(lm);
     }
     auto size_of = axera_input_size;
-    GGML_ASSERT(size_of(m.gdn, "x") == (uint32_t) H * sizeof(ggml_bf16_t));
+    GGML_ASSERT(!m.gdn || size_of(m.gdn, "x") == (uint32_t) H * sizeof(ggml_bf16_t));
     ggml_axera_kernel * rope_k = m.flash ? m.fd.at(1).head : m.attn;  // decode cos / sin [1, ROT / 2]
     m.A    = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
     m.B    = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
@@ -1026,7 +1037,10 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
     const char * pw     = std::getenv("GGML_AXERA_PREFILL_WEIGHTS");
     bool         pre_mx = false;
     for (int P : { 128, 64, 32, 16 }) {
-        pre_mx = pre_mx || std::ifstream(axera_kernels().path("qwen35_gdn_prefill" + std::to_string(P) + "_mx8")).good();
+        const std::string p = std::to_string(P);
+        pre_mx = pre_mx || std::ifstream(axera_kernels().path(m.hybrid ? "qwen35_gdn_prefill" + p + "_mx8" :
+                                                                         m.ap + "_attn_fd_head" + p + "_mx8")).good() ||
+                 (!m.hybrid && std::ifstream(axera_kernels().path(m.ap + "_attn_prefill" + p + "_mx8" + m.ctx_sfx)).good());
     }
     pre_mx = mx8 && (pw != nullptr ? strcmp(pw, "mxfp8") == 0 : pre_mx);
     m.pre_mx = pre_mx;
@@ -1080,9 +1094,9 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         const std::string asfx = sfx + m.ctx_sfx;
         // the multi-core chain (preferred), and / or the single-core layer kernels
         const bool mc  = !pre_mx && (P > 1 || mc_dec) && axera_q35_load_mc(m, P);
-        const bool one = std::ifstream(axera_kernels().path("qwen35_gdn_prefill" + sfx)).good() &&
+        const bool one = (!m.hybrid || std::ifstream(axera_kernels().path("qwen35_gdn_prefill" + sfx)).good()) &&
                          (m.flash ? axera_q35_load_flash(m, P) :
-                                    std::ifstream(axera_kernels().path("qwen35_attn_prefill" + asfx)).good());
+                                    std::ifstream(axera_kernels().path(m.ap + "_attn_prefill" + asfx)).good());
         if (!mc && !one) {
             continue;
         }
@@ -1092,11 +1106,11 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         axera_q35::prefill pf;
         pf.P    = P;
         pf.mc   = mc;
-        pf.gdn  = one ? axera_kernels().get("qwen35_gdn_prefill" + sfx) : nullptr;
+        pf.gdn  = one && m.hybrid ? axera_kernels().get("qwen35_gdn_prefill" + sfx) : nullptr;
         if (pf.gdn && std::ifstream(axera_kernels().path("qwen35_gdn_prefill" + sfx + "_rs")).good()) {
             pf.gdn_rs = axera_kernels().get("qwen35_gdn_prefill" + sfx + "_rs");
         }
-        pf.attn = one && !m.flash ? axera_kernels().get("qwen35_attn_prefill" + asfx) : nullptr;
+        pf.attn = one && !m.flash ? axera_kernels().get(m.ap + "_attn_prefill" + asfx) : nullptr;
         GGML_ASSERT(!pf.gdn || size_of(pf.gdn, "x") == (uint32_t) P * H * sizeof(ggml_bf16_t));
         ggml_axera_kernel * rk = mc ? m.mc.at(P).head : m.flash ? m.fd.at(P).head : pf.attn;
         if (pf.attn) {
@@ -1116,18 +1130,18 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
     // bf16 GGUF tensors
     for (int Bn : { 8, 4, 2 }) {
         const std::string b  = std::to_string(Bn);
-        const std::string bs = mx8 && std::ifstream(axera_kernels().path("qwen35_gdn_batch" + b + "_mx8")).good() ? "_mx8" : "";
-        const std::string gn = "qwen35_gdn_batch" + b + bs, an = "qwen35_attn_batch" + b + bs;
-        if (m.moe || !m.kv_llama || !m.rollback || !std::ifstream(axera_kernels().path(gn)).good() ||
+        const std::string bs = mx8 && std::ifstream(axera_kernels().path(m.ap + "_attn_batch" + b + "_mx8" + m.ctx_sfx)).good() ? "_mx8" : "";
+        const std::string gn = "qwen35_gdn_batch" + b + bs, an = m.ap + "_attn_batch" + b + bs;
+        if (m.moe || !m.kv_llama || !m.rollback || (m.hybrid && !std::ifstream(axera_kernels().path(gn)).good()) ||
             !(m.flash ? axera_q35_load_flash(m, Bn) : std::ifstream(axera_kernels().path(an + m.ctx_sfx)).good())) {
             continue;
         }
         axera_q35::prefill pf;
         pf.P     = Bn;
         pf.batch = true;
-        pf.gdn   = axera_kernels().get(gn);
+        pf.gdn   = m.hybrid ? axera_kernels().get(gn) : nullptr;
         pf.attn  = m.flash ? nullptr : axera_kernels().get(an + m.ctx_sfx);
-        GGML_ASSERT(size_of(pf.gdn, "x") == (uint32_t) Bn * H * sizeof(ggml_bf16_t));
+        GGML_ASSERT(!pf.gdn || size_of(pf.gdn, "x") == (uint32_t) Bn * H * sizeof(ggml_bf16_t));
         ggml_axera_kernel * rk = m.flash ? m.fd.at(Bn).head : pf.attn;
         if (!m.flash) {
             pf.R = (int64_t) (size_of(pf.attn, "mask") / sizeof(ggml_bf16_t)) / m.LMAX;

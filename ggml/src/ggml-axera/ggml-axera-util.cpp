@@ -116,14 +116,26 @@ int axera_run_sync(ggml_axera_kernel * k, std::vector<AX_ENGINE_IO_BUFFER_T> & i
     io.nInputSize  = (uint32_t) in.size();
     io.pOutputs    = out.data();
     io.nOutputSize = (uint32_t) out.size();
-    return AX_ENGINE_RunSync(k->handle, &io);
+    const int ret  = AX_ENGINE_RunSync(k->handle, &io);
+    if (ret != 0) {  // the IO the kernel got, for the caller's abort (stderr: the log is asynchronous)
+        for (int o = 0; o < 2; ++o) {
+            const auto & bufs = o ? out : in;
+            for (size_t i = 0; i < bufs.size(); ++i) {
+                const AX_ENGINE_IOMETA_T & mt = o ? k->info->pOutputs[i] : k->info->pInputs[i];
+                fprintf(stderr, "%s: RunSync 0x%x: %s %zu %s: %u bytes (bound %u at phy 0x%llx)\n", __func__, ret,
+                               o ? "output" : "input", i, mt.pName, mt.nSize, bufs[i].nSize,
+                               (unsigned long long) bufs[i].phyAddr);
+            }
+        }
+    }
+    return ret;
 }
 
-// GGML_AXERA_TEMPLATE=qwen35: the Qwen3.5 graph template (ggml-axera-q35.h)
+// GGML_AXERA_TEMPLATE=qwen35 (or qwen3): the graph template of Qwen3.5 and Qwen3 transformers (ggml-axera-q35.h)
 bool axera_template_qwen35() {
     static const bool on = [] {
         const char * e = std::getenv("GGML_AXERA_TEMPLATE");
-        return e != nullptr && strcmp(e, "qwen35") == 0;
+        return e != nullptr && (strcmp(e, "qwen35") == 0 || strcmp(e, "qwen3") == 0);
     }();
     return on;
 }
@@ -172,9 +184,10 @@ bool axera_flash_forced() {
     return on;
 }
 
-// KV segment (cells) of the split attention kernels qwen35_attn_fd_seg<R>_c<S>, 0 if there are none
+// KV segment (cells) of the split attention kernels qwen35_attn_fd_seg<R>_c<S> (Qwen3: qwen3_*), 0 if there are none
 int64_t axera_flash_seg() {
-    return axera_kernels().ctx_for("qwen35_attn_fd_seg1", 0);
+    const int64_t s = axera_kernels().ctx_for("qwen35_attn_fd_seg1", 0);
+    return s > 0 ? s : axera_kernels().ctx_for("qwen3_attn_fd_seg1", 0);
 }
 
 // GGML_AXERA_WEIGHTS=mxfp8: the template quantizes the bf16 GGUF weights to MXFP8 at load (about half the bytes per
@@ -207,4 +220,36 @@ std::string axera_base_name(const char * name) {
     const char * a = strchr(name, '#');
     const char * b = a ? strrchr(name, '#') : nullptr;
     return a && b > a ? std::string(a + 1, b) : std::string(name);
+}
+
+// nodes [i0, i1) of the graph on the CPU backend (their tensors are host memory: CMM or the CPU's), for the parts of a
+// template's graph it does not run itself
+void axera_cpu_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph, int i0, int i1, const char * what) {
+    if (i1 <= i0) {
+        return;
+    }
+    if (!ctx->cpu) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        GGML_ASSERT(dev && "axera: no CPU backend");
+        ctx->cpu = ggml_backend_dev_init(dev, nullptr);
+        auto set_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(dev), "ggml_backend_set_n_threads");
+        if (set_threads) {
+            set_threads(ctx->cpu, (int) std::max(1u, std::thread::hardware_concurrency()));
+        }
+    }
+    // (CPU) the slice of ggml_graph_view (not exported by ggml-base)
+    struct ggml_cgraph view = *cgraph;
+    view.size               = 0;
+    view.n_nodes            = i1 - i0;
+    view.n_leafs            = 0;
+    view.nodes              = cgraph->nodes + i0;
+    view.grads              = nullptr;
+    view.grad_accs          = nullptr;
+    view.leafs              = nullptr;
+    view.uid                = 0;
+    axera_timer        tm(what);
+    if (ggml_backend_graph_compute(ctx->cpu, &view) != GGML_STATUS_SUCCESS) {
+        GGML_ABORT("axera: %s failed on the CPU backend\n", what);
+    }
 }

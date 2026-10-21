@@ -1,4 +1,6 @@
-// Axera NPU backend: the Qwen3.5 graph template (GGML_AXERA_TEMPLATE=qwen35; 0.8B .. 9B dense, 35B-A3B MoE, MTP)
+// Axera NPU backend: the Qwen3.5 graph template (GGML_AXERA_TEMPLATE=qwen35; 0.8B .. 27B dense, 35B-A3B MoE, MTP), which
+// also runs Qwen3 transformers (attention layers only, qwen3_* kernels: Qwen3, the text models of Qwen3-VL / Qwen3-ASR,
+// the Qwen3-TTS talker, Qwen3-Embedding / Reranker, whose pooling after the final norm stays on the CPU)
 #pragma once
 //
 //
@@ -72,6 +74,10 @@ struct axera_q35 {
     bool                  ready = false;
     const void *          bound = nullptr;  // data of blk.0.attn_norm.weight the layers were bound to
     int                   L = 0, H = 0, LMAX = 0, BC = 0, ROT = 0;
+    // Qwen3.5 (gated delta net layers between gated attention layers: qwen35_* kernels) or a Qwen3 transformer
+    // (attention layers only, no output gate: qwen3_* kernels; also the text model of Qwen3-VL / Qwen3-ASR)
+    bool                  hybrid = true;
+    std::string           ap     = "qwen35";  // kernel name prefix of the attention / dense layers
     int64_t               N = 0;  // KV cells in use: the llama.cpp cache size (<= LMAX), else LMAX
     double                THETA = 0;
     float                 freq_scale = 1.0f;

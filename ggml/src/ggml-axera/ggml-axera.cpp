@@ -25,7 +25,9 @@ static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend,
         enum ggml_status st;
         {
             axera_timer tm("graph_compute (all)");
-            st = axera_vit_graph(cgraph) ? axera_vit_compute(ctx, cgraph) : axera_q35_compute(ctx, cgraph);
+            st = axera_vit_graph(cgraph)   ? axera_vit_compute(ctx, cgraph) :
+                 axera_audio_graph(cgraph) ? axera_audio_compute(ctx, cgraph) :
+                                             axera_q35_compute(ctx, cgraph);
         }
         last = std::chrono::steady_clock::now();
         return st;
@@ -163,10 +165,42 @@ static ggml_backend_buffer_type_t ggml_backend_axera_device_get_buffer_type(ggml
     GGML_UNUSED(dev);
 }
 
+// the pooling inputs of an embeddings graph: the rows to pick (cls) or average (mean)
+static bool axera_pooling_input(const ggml_tensor * t) {
+    for (const char * n : { "inp_cls", "cls", "inp_mean", "mean" }) {
+        if (strcmp(t->name, n) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// a pooling op of an embeddings graph: after the final norm (result_norm), on the rows picked / averaged by the
+// pooling inputs, up to the pooled output (and a rerank head)
+static bool axera_pooling_op(const ggml_tensor * op, int depth) {
+    if (!op || depth > 6) {
+        return false;
+    }
+    // (without pooling result_embd_pooled is the final norm itself, run by the template)
+    const bool final_norm = op->op == GGML_OP_MUL && op->src[0] && op->src[0]->op == GGML_OP_RMS_NORM;
+    if ((strcmp(op->name, "result_embd_pooled") == 0 && !final_norm) || strncmp(op->name, "result_norm (", 13) == 0) {
+        return true;
+    }
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        const ggml_tensor * src = op->src[s];
+        if (src && ((src->op == GGML_OP_NONE && axera_pooling_input(src)) ||
+                    (src->op != GGML_OP_NONE && axera_pooling_op(src, depth + 1)))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool ggml_backend_axera_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     if (axera_template_qwen35()) {
-        // the template runs the whole graph; weights must still be in CMM to be offloaded
-        return true;
+        // the template runs the whole graph up to the logits or, for pooled embeddings, the final norm: the pooling
+        // stays on the CPU. Weights must still be in CMM (or the mapped GGUF) to be offloaded
+        return !axera_pooling_op(op, 0);
     }
     switch (op->op) {
         case GGML_OP_NONE:

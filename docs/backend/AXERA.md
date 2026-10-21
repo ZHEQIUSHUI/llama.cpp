@@ -325,6 +325,91 @@ gain is limited by the DRAM bandwidth those boards reach, about 84 GB/s for all 
 3.3 ms, 119k-token prompt 663 -> 539 s), bandwidth-bound ones barely (0.8B decode 42 -> 40 ms). `GGML_AXERA_PROF=1`
 prints per-kernel times at exit.
 
+## Graph template: Qwen3 transformers
+
+The same template runs Qwen3 transformers: attention layers only, no output gate, full-width RoPE, RMSNorm weights as
+they are. That covers Qwen3 itself and the models built on its text model: the language model of Qwen3-VL and
+Qwen3-ASR (llama.cpp arch `qwen3vl`), the Qwen3-TTS talker (`qwen3tts`), Qwen3-Embedding and Qwen3-Reranker. The
+backend tells the two families apart by the graph (gated delta net layers or not) and takes `qwen3_*` kernels for
+Qwen3, built by the same scripts from the model's config (`MODEL=<Qwen3 dir>`: a config without `text_config` /
+`layer_types` is a Qwen3 one, `q35_step.py` then leaves out the gate and the delta-net layer). `GGML_AXERA_TEMPLATE=qwen3`
+is a synonym of `qwen35`.
+
+```sh
+# kernels of a Qwen3 model (random weights of the config's shapes); HEAD_C divides the vocabulary (151936 = 8 x 18992)
+E="QW_RANDOM=1 KVL=cell BC=256 MODEL=<Qwen3 dir> HEAD_C=18992"
+env $E LMAX=4096 WFMT=mx8 python ggml_template_build.py <kernel_dir>              # decode, output projection
+env $E NODEC=1 LMAX=4096 PCHUNK=64 WFMT=mx8 python q35_prefill.py <kernel_dir>    # prefill chunks (P = 128 .. 2)
+env $E R=1 S=16384 CHECK=0 WFMT=mx8 python q35_flash.py <kernel_dir>             # split attention (R = 1 .. 64)
+env $E LMAX=4096 B=2 WFMT=mx8 python q35_batch.py <kernel_dir>                   # batched decode
+```
+
+Models of the same shapes share their kernels: Qwen3-0.6B, Qwen3-ASR-0.6B, Qwen3-Embedding-0.6B and
+Qwen3-Reranker-0.6B (1024 wide, 16 / 8 heads of 128, MLP 3072) run on one kernel directory; Qwen3-ASR-1.7B and the
+Qwen3-TTS-1.7B talker (2048, MLP 6144) on another, the talker with an output projection of its 3072 codec tokens
+(`HEAD_C=3072`).
+
+On AX8860 (MXFP8 weights, single core, the GGUF mapped from eMMC):
+
+| Model (GGUF) | Load | Decode | Prompt (1852 tokens) | PPL (zh, 2 x 512) | CPU PPL, same GGUF |
+|---|---|---|---|---|---|
+| Qwen3-0.6B (BF16) | 4 s | 31.6 ms per token | 1.27 s | 43.845 | 42.61 |
+| Qwen3-8B (Q4_K_M) | 25 s | 158 ms per token (203 at 1.9k context) | 6.37 s | 17.886 | 17.754 |
+
+A 15539-token prompt with a number stated in its first line (split attention, segments of 16384 cells) takes 19.9 s
+(0.6B) and 79.0 s (8B), and both answer with the number. Qwen3-8B peaks at 10.1 GB of CMM at 16k context.
+
+### Embeddings and reranking
+
+With pooled embeddings (`llama-embedding`, `llama-server --embedding` / `--rerank`) the graph has no output
+projection: the template stops at the final norm (`result_norm`, every row) and the pooling after it (`inp_cls` /
+`inp_mean` rows, the rerank head `cls.output`, its softmax) runs on the CPU; the backend does not claim those ops.
+
+Qwen3-Embedding-0.6B (last-token pooling) gives embeddings of cosine 0.996 - 0.997 to llama.cpp's on the CPU and the
+same ranking of documents for each query; Qwen3-Reranker-0.6B (`--pooling rank`) gives the same relevance decisions
+as on the CPU.
+
+### Speech recognition: Qwen3-ASR
+
+`llama-mtmd-cli -m qwen3-asr.gguf --mmproj mmproj-qwen3-asr.gguf --audio speech.wav -p "Transcribe the audio."`. The
+transformers checkpoints (`Qwen/Qwen3-ASR-0.6B-hf`, `-1.7B-hf`) keep the audio config at the top level, the audio
+tower as `model.audio_tower.*` and the projector as `model.multi_modal_projector.linear_{1,2}`, and give the text
+model plain RoPE; the converter maps them to the Qwen3-Omni names and writes M-RoPE sections that are plain RoPE for
+the sequential positions of audio and text.
+
+The audio encoder's 18 (0.6B) / 24 (1.7B) transformer layers run on `q3a_audio.py`'s kernels
+(`qwen3a_{pre,attn,post}<N>_h<H>`: q35_vit.py's layer kernels without RoPE, GELU erf, LayerNorm 1e-5; N rows
+padded, 13 rows per second of audio), the conv front-end before them and the post norm and projector after them are
+the graph's own nodes, run by the CPU backend from inside the backend. Without kernels for the row count the whole
+encoder runs on the CPU.
+
+The matrix products of the front-end's two 480-channel convolutions (ggml's im2col rows times the kernel), most of its
+CPU time, run on `q3a_conv.py`'s kernels (`qwen3a_conv_o<OC>_k<K>_r<R>`, rows padded to R: 6400 and 1664 cover the
+8 one-second chunks of an encoder call); bias, GELU and the rest of the front-end stay on the CPU.
+
+On AX8860 (text model MXFP8, mmproj Q8_0), per encoder call (8 s of audio):
+
+| Model | Encoder, CPU | Encoder, NPU | Transcript of 60 s of Chinese speech |
+|---|---|---|---|
+| Qwen3-ASR-0.6B | 2.8 s | 0.45 s | as on the CPU but for one interjection |
+| Qwen3-ASR-1.7B | 3.3 s | 0.47 s | as on the CPU |
+
+Of the 0.45 s about 0.35 s is the front-end's CPU part; the 18 (0.6B) / 24 (1.7B) layers take 33 / 47 ms.
+
+### Speech synthesis: Qwen3-TTS
+
+`llama-tts -m qwen3-tts.gguf -mm mmproj-qwen3-tts.gguf --no-mmproj-offload -ngl 99 -p "<text>" --tts-lang zh
+--tts-speaker-file speaker.wav --output out.wav`. The talker (the 28-layer Qwen3 text model, its output projection the
+3072 codec tokens) runs on the template; the code predictor and the codec decoder run in mtmd on the CPU
+(`--no-mmproj-offload`). llama-tts keeps the hidden states (embeddings without pooling: the final norm is named
+`result_embd_pooled`, the template writes it with the logits), pads the codec logits to the text vocabulary with
+-inf (the template fills that concat), and feeds mixed inputs, token embeddings set into rows of given embeddings
+(the template runs those input nodes on the CPU before the layers).
+
+On AX8860 the Qwen3-TTS-1.7B talker takes 61 ms per codec frame (12.5 frames per second of audio); the whole
+generation takes about 20 s per second of audio (the CPU alone: 33 s), most of it the code predictor on the CPU. A Chinese and an
+English sentence, transcribed back by Qwen3-ASR-1.7B, read exactly as the input text.
+
 ## Source layout
 
 The backend separates what any model uses from the graph templates of one architecture:
@@ -338,12 +423,13 @@ The backend separates what any model uses from the graph templates of one archit
 | `ggml-axera-weights.cpp` | weight formats (BF16 copies, MXFP8, MXFP4 repacking) and the GEMV calls, per-op `MUL_MAT` |
 | `ggml-axera-graph.cpp` | for templates: the graph's tensors by name, the output head (final norm, output projection, MTP's `h_nextn`) |
 | `ggml-axera-attn.h/.cpp` | for templates: the llama.cpp KV cache and KQ mask of a batch, split attention (segments, merge), RoPE / M-RoPE tables |
-| `ggml-axera-q35.h` | Qwen3.5 template: its state and per-graph run state |
+| `ggml-axera-q35.h` | Qwen3.5 / Qwen3 template: its state and per-graph run state |
 | `ggml-axera-q35-bind.cpp` | Qwen3.5: kernel loading, binding GGUF tensors and cache tensors to kernel IO |
 | `ggml-axera-q35-run.cpp` | Qwen3.5: one graph (recurrent-state bookkeeping, MTP input, chunks, layer calls) |
 | `ggml-axera-q35-moe.cpp` | Qwen3.5 MoE: expert routing and the experts / slots kernels |
 | `ggml-axera-q35-mc.cpp` | Qwen3.5: the multi-core prefill chain |
 | `ggml-axera-vit.cpp` | the Qwen3.5 vision encoder (mtmd) |
+| `ggml-axera-audio.cpp` | the Qwen3-ASR audio encoder (mtmd) |
 
 A template for another architecture adds its layer kernels (AXDSL), a binding of its GGUF tensor names to their inputs
 and its layer loop; the KV cache handling, split attention, RoPE, the output head and the weight formats are shared.

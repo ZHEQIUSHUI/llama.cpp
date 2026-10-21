@@ -224,6 +224,21 @@ class Qwen3ASRMmprojModel(Qwen3OmniMmprojModel):
     has_audio_encoder = True
     has_vision_encoder = False
 
+    def get_audio_config(self) -> dict[str, Any] | None:
+        # the transformers checkpoints (-hf) keep the audio config at the top level, Qwen3-Omni in thinker_config
+        return self.global_config.get("thinker_config", self.global_config).get("audio_config")
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        # transformers checkpoints: model.audio_tower.*, and the projector as model.multi_modal_projector.linear_{1,2}
+        # (Qwen3-Omni's audio_tower.proj{1,2})
+        if name.startswith("model.multi_modal_projector.linear_"):
+            name = name.replace("model.multi_modal_projector.linear_", "thinker.audio_tower.proj", 1)
+        elif name.startswith("model.audio_tower."):
+            name = name.replace("model.audio_tower.", "thinker.audio_tower.", 1)
+        return super().filter_tensors((name, gen))
+
 
 @ModelBase.register("Glm4vForConditionalGeneration", "Glm4vMoeForConditionalGeneration", "GlmOcrForConditionalGeneration")
 @ModelBase.example("zai-org/GLM-4.1V-9B-Thinking", "zai-org/GLM-4.5V")
@@ -380,6 +395,12 @@ class Qwen3ASRTextModel(Qwen3VLTextModel):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_num_deepstack_layers(0)
+        if "mrope_section" not in self.rope_parameters:
+            # the transformers checkpoints (-hf) have plain RoPE: audio and text positions advance together (t = h =
+            # w), where any split of the M-RoPE sections is plain RoPE; Qwen3-VL's split over the rotary pairs
+            n_pairs = self.hparams.get("head_dim", self.hparams["hidden_size"] // self.hparams["num_attention_heads"]) // 2
+            t = n_pairs - 2 * (n_pairs * 5 // 16)
+            self.gguf_writer.add_rope_dimension_sections([t, n_pairs * 5 // 16, n_pairs * 5 // 16, 0])
 
     def set_vocab(self):
         super().set_vocab()

@@ -65,6 +65,7 @@ using axera_cmm = std::unique_ptr<ggml_backend_axera_buffer_context>;
 struct ggml_backend_axera_context;
 struct axera_q35;
 struct axera_vit;
+struct axera_audio;
 
 // functions of the backend sources (ggml-axera-*.cpp)
 bool axera_debug();
@@ -118,6 +119,9 @@ int axera_run_sync(ggml_axera_kernel * k, std::vector<AX_ENGINE_IO_BUFFER_T> & i
 const std::map<std::string, ggml_tensor *> & axera_graph_names(ggml_backend_axera_context * ctx,
                                                                struct ggml_cgraph * cgraph);
 ggml_tensor * axera_graph_find(const std::map<std::string, ggml_tensor *> & t, const char * name);
+ggml_tensor * axera_graph_norm(const std::map<std::string, ggml_tensor *> & t);
+ggml_tensor * axera_graph_head(const std::map<std::string, ggml_tensor *> & t);
+void axera_output_norm(const std::map<std::string, ggml_tensor *> & t, const std::vector<float> & h, int T);
 void axera_output_head(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph,
                        const std::map<std::string, ggml_tensor *> & t, const std::vector<float> & h, int T,
                        const ggml_backend_axera_buffer_context * lm_q, const ggml_backend_axera_buffer_context * lm_s,
@@ -125,6 +129,9 @@ void axera_output_head(ggml_backend_axera_context * ctx, struct ggml_cgraph * cg
 enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph);
 bool axera_vit_graph(const struct ggml_cgraph * cgraph);
 enum ggml_status axera_vit_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph);
+bool axera_audio_graph(const struct ggml_cgraph * cgraph);
+enum ggml_status axera_audio_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph);
+void axera_cpu_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph, int i0, int i1, const char * what);
 
 // GGML_AXERA_PROF=1: wall time per part of the qwen35 template, printed at exit
 struct axera_prof {
@@ -398,10 +405,18 @@ struct ggml_backend_axera_context {
     // the graph templates' state (created by their first graph)
     std::shared_ptr<axera_q35> q35;
     std::shared_ptr<axera_vit> vit;
+    std::shared_ptr<axera_audio> audio;
+    ggml_backend_t               cpu = nullptr;  // the CPU backend for the graph nodes a template leaves to it
     // the graph templates' name -> tensor map of the last graph, kept while the graph keeps its nodes (llama.cpp
     // reuses the decode graph: rebuilding the map of a 35B-A3B graph takes ~10 ms on the A55)
     std::vector<uintptr_t>               graph_key;
     std::map<std::string, ggml_tensor *> graph_names;
+
+    ~ggml_backend_axera_context() {
+        if (cpu) {
+            ggml_backend_free(cpu);
+        }
+    }
 
     ggml_backend_axera_buffer_context * staging_for(size_t size) {
         if (!staging || staging->size < size) {
