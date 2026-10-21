@@ -409,9 +409,6 @@ bool axera_q35_load_flash(axera_q35 & m, int R, bool seg_only) {
         hn += "_mx8";
         tn += "_mx8";
     }
-    if (axera_cores() > 1 && std::ifstream(axera_kernels().path(sn + "_x" + std::to_string(axera_cores()))).good()) {
-        sn += "_x" + std::to_string(axera_cores());  // the multi-core segment kernel
-    }
     const bool ht = std::ifstream(axera_kernels().path(hn)).good() && std::ifstream(axera_kernels().path(tn)).good();
     if (!std::ifstream(axera_kernels().path(sn)).good() || (!ht && !seg_only)) {
         return false;
@@ -553,7 +550,7 @@ bool axera_q35_load_mc(axera_q35 & m, int P) {
     if (m.mc.count(P)) {
         return true;
     }
-    const std::string sfx = std::to_string(P) + "_x" + std::to_string(axera_cores());
+    const std::string sfx = std::to_string(P);  // (multi-core builds only)
     std::vector<std::string> names;
     for (const char * k : { "qwen35_gdn_mc", "qwen35_mlp_mc", "qwen35_attn_head_mc", "qwen35_attn_tail_mc" }) {
         names.push_back(k + sfx);
@@ -868,9 +865,8 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         m.LOGITS   = axera_cmm_alloc(m.n_expert * sizeof(float));
         m.RW       = axera_cmm_alloc(m.top_k * sizeof(float));
         for (int gu = 0; gu < 2; ++gu) {
-            // the gate-up kernel's multi-core build (_x<cores>) writes the cores' partial sums, added on the host
-            std::string name = "qwen35moe_experts" + std::to_string(m.top_k) + (gu ? "_gu" : "") + "_mxfp4";
-            name             = gu ? axera_multi_core(name) : name;
+            // the gate-up kernel's multi-core build writes the cores' partial sums, added on the host
+            const std::string name = "qwen35moe_experts" + std::to_string(m.top_k) + (gu ? "_gu" : "") + "_mxfp4";
             auto &            ek   = m.ex[gu];
             ek                     = {};
             if (gu && !std::ifstream(axera_kernels().path(name)).good()) {
@@ -925,7 +921,6 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         if (const char * e = std::getenv("GGML_AXERA_MOE_SLOTS")) {  // e.g. qwen35moe_slots32_g8_gu_mxfp4
             sn = e;
         }
-        sn = sn.empty() ? sn : axera_multi_core(sn);
         if (m.ex[1].k && !sn.empty()) {
             auto & sk = m.slots;
             sk.k      = axera_kernels().get(sn);

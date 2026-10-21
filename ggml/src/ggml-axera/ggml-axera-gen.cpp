@@ -117,14 +117,17 @@ static bool axera_gen_cont_bf16(const ggml_tensor * a, int64_t rows, ggml_bf16_t
         v->ne[0] != a->ne[0] || (v->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16)) {
         return false;
     }
-    const int64_t K = a->ne[0];
-    axera_host_pool().run(rows, [&](int64_t r) {
-        const char * row = (const char *) v->data + r * v->nb[1];
-        for (int64_t c = 0; c < K; ++c) {
-            const char * e = row + c * v->nb[0];
-            dst[r * K + c] = v->type == GGML_TYPE_BF16 ? *(const ggml_bf16_t *) e :
-                             ggml_fp32_to_bf16(v->type == GGML_TYPE_F32 ? *(const float *) e :
-                                                                          ggml_fp16_to_fp32(*(const ggml_fp16_t *) e));
+    const int64_t K = a->ne[0], B = 64, nr = (rows + B - 1) / B, nc = (K + B - 1) / B;
+    axera_host_pool().run(nr * nc, [&](int64_t job) {  // 64 x 64 blocks: a transposed source read a block at a time
+        const int64_t r0 = job / nc * B, c0 = job % nc * B;
+        for (int64_t r = r0; r < std::min(rows, r0 + B); ++r) {
+            const char * row = (const char *) v->data + r * v->nb[1];
+            for (int64_t c = c0; c < std::min(K, c0 + B); ++c) {
+                const char * e = row + c * v->nb[0];
+                dst[r * K + c] = v->type == GGML_TYPE_BF16 ? *(const ggml_bf16_t *) e :
+                                 ggml_fp32_to_bf16(v->type == GGML_TYPE_F32 ? *(const float *) e :
+                                                                              ggml_fp16_to_fp32(*(const ggml_fp16_t *) e));
+            }
         }
     });
     return true;
@@ -352,9 +355,129 @@ template <typename F> static bool axera_gen_snake(struct ggml_cgraph * cgraph, i
         const float   al = ((const float *) a->data)[c], be = ((const float *) b->data)[c];
         const float * xr = (const float *) ((const char *) x->data + c * x->nb[1]);
         float *       y  = (float *) ((char *) n[4]->data + c * n[4]->nb[1]);
-        for (int64_t t = t0; t < t1; ++t) {
-            const float sv = sinf(al * xr[t]);
-            y[t]           = xr[t] + sv * sv * be;
+        for (int64_t t = t0; t < t1; ++t) {  // (vectorized: sin(v)^2 by range reduction and a polynomial)
+            const float v  = al * xr[t];
+            const float q  = floorf(v * 0.318309886f + 0.5f);  // v = q pi + r, |r| <= pi / 2
+            const float r  = (v - q * 3.14159274f) + q * 8.74227766e-8f;
+            const float r2 = r * r;
+            const float sv = r * (1.0f + r2 * (-1.66666667e-1f + r2 * (8.33333310e-3f + r2 * (-1.98412701e-4f +
+                                 r2 * (2.75573137e-6f + r2 * -2.50521084e-8f)))));
+            y[t] = xr[t] + sv * sv * be;  // (the sign of sin(v) = (-1)^q sin(r) drops out of the square)
+        }
+    });
+    return true;
+}
+
+// CONCAT along dim 0 of two f32 matrices (the causal convolutions' left context before their input), row by row on
+// the host workers (the CPU's concat goes element by element); false if the node is not that
+static bool axera_gen_concat(ggml_tensor * n) {
+    const ggml_tensor * a = n->src[0];
+    const ggml_tensor * b = n->src[1];
+    if (n->op != GGML_OP_CONCAT || ((const int32_t *) n->op_params)[0] != 0 || n->type != GGML_TYPE_F32 ||
+        a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || !ggml_is_contiguous(n) || a->nb[0] != sizeof(float) ||
+        b->nb[0] != sizeof(float) || n->ne[2] * n->ne[3] != 1 || a->ne[2] * a->ne[3] != 1 || b->ne[2] * b->ne[3] != 1 ||
+        a->ne[1] != n->ne[1] || b->ne[1] != n->ne[1]) {
+        return false;
+    }
+    axera_timer tm("gen concat (host)");
+    axera_host_pool().run(n->ne[1], [&](int64_t r) {
+        float * d = (float *) ((char *) n->data + r * n->nb[1]);
+        memcpy(d, (const char *) a->data + r * a->nb[1], a->ne[0] * sizeof(float));
+        memcpy(d + a->ne[0], (const char *) b->data + r * b->nb[1], b->ne[0] * sizeof(float));
+    });
+    return true;
+}
+
+// CONT of a transposed f32 matrix (the convolutions' [T, C] <-> [C, T] layouts) in 64 x 64 blocks on the host workers;
+// false if the node is not that
+static bool axera_gen_transpose(ggml_tensor * n) {
+    const ggml_tensor * s = n->src[0];
+    if (n->op != GGML_OP_CONT || n->type != GGML_TYPE_F32 || s->type != GGML_TYPE_F32 || !ggml_is_contiguous(n) ||
+        n->ne[2] * n->ne[3] != 1 || s->ne[2] * s->ne[3] != 1 || s->nb[1] != sizeof(float) || s->nb[0] < s->nb[1] * s->ne[1]) {
+        return false;
+    }
+    const int64_t R = n->ne[1], C = n->ne[0], B = 64, nr = (R + B - 1) / B, nc = (C + B - 1) / B;
+    axera_timer   tm("gen transpose (host)");
+    axera_host_pool().run(nr * nc, [&](int64_t job) {
+        const int64_t r0 = job / nc * B, c0 = job % nc * B;
+        for (int64_t r = r0; r < std::min(R, r0 + B); ++r) {
+            float * d = (float *) ((char *) n->data + r * n->nb[1]);
+            for (int64_t c = c0; c < std::min(C, c0 + B); ++c) {
+                d[c] = *(const float *) ((const char *) s->data + c * s->nb[0] + r * s->nb[1]);
+            }
+        }
+    });
+    return true;
+}
+
+// COL2IM_1D (a transposed convolution's GEMM result [T_in][K * OC] scattered into [OC][T_out]) on the host workers,
+// by blocks of output steps over all channels (reading whole rows of the GEMM result); false if not f32
+static bool axera_gen_col2im(ggml_tensor * n) {
+    const ggml_tensor * s = n->src[0];
+    if (n->op != GGML_OP_COL2IM_1D || n->type != GGML_TYPE_F32 || s->type != GGML_TYPE_F32 || !ggml_is_contiguous(s) ||
+        !ggml_is_contiguous(n)) {
+        return false;
+    }
+    const int32_t * p = (const int32_t *) n->op_params;
+    const int64_t   S = p[0], OC = p[1], P = p[2], KOC = s->ne[0], T_in = s->ne[1], K = KOC / OC, T = n->ne[0];
+    const int64_t   B = 1024, nb = (T + B - 1) / B;
+    axera_timer     tm("gen col2im (host)");
+    axera_host_pool().run(nb, [&](int64_t blk) {
+        const int64_t t0 = blk * B, t1 = std::min(T, t0 + B);
+        auto *        d  = (float *) n->data;
+        for (int64_t oc = 0; oc < OC; ++oc) {
+            memset(d + oc * T + t0, 0, (t1 - t0) * sizeof(float));
+        }
+        // the input steps whose taps reach [t0, t1): t_in s + k - P in it, 0 <= k < K
+        const int64_t lo = std::max<int64_t>(0, (t0 + P - K + 1 + S - 1) / S), hi = std::min(T_in - 1, (t1 - 1 + P) / S);
+        for (int64_t ti = lo; ti <= hi; ++ti) {
+            const float * row = (const float *) s->data + ti * KOC;
+            const int64_t k0 = std::max<int64_t>(0, t0 + P - ti * S), k1 = std::min(K, t1 + P - ti * S);
+            for (int64_t oc = 0; oc < OC; ++oc) {
+                float *       o = d + oc * T + ti * S - P;
+                const float * c = row + oc * K;
+                for (int64_t k = k0; k < k1; ++k) {
+                    o[k] += c[k];
+                }
+            }
+        }
+    });
+    return true;
+}
+
+// a depthwise 1-D convolution (ggml_conv_1d_dw: IM2COL ic of x [T, 1, C] into f16 rows, then the MUL_MAT m of them by
+// the kernel [K, 1, C]): m computed directly in f32 on the host workers, ic not needed. False if they are not that
+static bool axera_gen_dwconv(const ggml_tensor * ic, ggml_tensor * m) {
+    const int32_t *     p = (const int32_t *) ic->op_params;
+    const ggml_tensor * w = ic->src[0];
+    const ggml_tensor * x = ic->src[1];
+    const int64_t       K = w->ne[0], C = w->ne[2], OW = ic->ne[1];
+    if (p[6] != 0 || x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || w->ne[1] != 1 || x->ne[1] != 1 ||
+        x->ne[2] != C || x->ne[3] != 1 || w->ne[3] != 1 || !ggml_is_contiguous(w) || m->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(m) || m->ne[0] != OW || m->ne[1] != 1 || m->ne[2] != C ||
+        (w->type != GGML_TYPE_F32 && !ggml_get_type_traits(w->type)->to_float)) {
+        return false;
+    }
+    const int s0 = p[0], p0 = p[2], d0 = p[4];
+    const int64_t IW = x->ne[0];
+    axera_timer tm("gen dwconv (host)");
+    axera_host_pool().run(C, [&](int64_t c) {
+        std::vector<float> k(K);
+        const char *       wr = (const char *) w->data + c * w->nb[2];
+        if (w->type == GGML_TYPE_F32) {
+            memcpy(k.data(), wr, K * sizeof(float));
+        } else {
+            ggml_get_type_traits(w->type)->to_float(wr, k.data(), K);
+        }
+        const float * xr = (const float *) ((const char *) x->data + c * x->nb[2]);
+        float *       o  = (float *) ((char *) m->data + c * m->nb[2]);
+        for (int64_t t = 0; t < OW; ++t) {
+            float acc = 0.0f;
+            for (int64_t j = 0; j < K; ++j) {
+                const int64_t iw = t * s0 + j * d0 - p0;
+                acc += iw >= 0 && iw < IW ? k[j] * xr[iw] : 0.0f;
+            }
+            o[t] = acc;
         }
     });
     return true;
@@ -602,10 +725,11 @@ static bool axera_gen_cp_bind(axera_gen & g, const std::map<std::string, ggml_te
         return true;
     }
     if (!g.cp) {
-        // bf16 first: with MXFP8 weights Qwen3-TTS-0.6B's talker misses the end of speech for some seeds
-        for (const char * name : { "qwen3tts_cp_attn_kvc_c4096", "qwen3tts_cp_attn_mx8_kvc_c4096" }) {
-            struct stat st;
-            if (stat(axera_kernels().path(name).c_str(), &st) == 0) {
+        // the run's weight format first (MXFP8 with GGML_AXERA_WEIGHTS=mxfp8: about 17% faster per layer call, the
+        // generations end as with bf16), else the other one
+        const char * bf = "qwen3tts_cp_attn_kvc_c4096", * mx = "qwen3tts_cp_attn_mx8_kvc_c4096";
+        for (const char * name : { axera_weights_mx8() ? mx : bf, axera_weights_mx8() ? bf : mx }) {
+            if (axera_kernels().has(name)) {
                 g.cp = axera_kernels().get(name);
                 break;
             }
@@ -872,6 +996,21 @@ enum ggml_status axera_gen_compute(ggml_backend_axera_context * ctx, struct ggml
         if (n->op == GGML_OP_IM2COL) {
             if (const ggml_tensor * m = axera_gen_im2col_user(g, cgraph, i)) {
                 g.im2col[m] = n;
+                continue;
+            }
+            if (i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
+                cgraph->nodes[i + 1]->src[0] == n && cgraph->nodes[i + 1]->src[1] == n->src[0]) {
+                cpu();
+                if (axera_gen_dwconv(n, cgraph->nodes[i + 1])) {
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        if ((n->op == GGML_OP_CONCAT || n->op == GGML_OP_CONT || n->op == GGML_OP_COL2IM_1D) &&
+            ggml_nelements(n) >= 65536 && !axera_gen_const_root(n)) {  // (large ones: the host workers' start costs)
+            cpu();
+            if (axera_gen_concat(n) || axera_gen_transpose(n) || axera_gen_col2im(n)) {
                 continue;
             }
         }

@@ -11,14 +11,14 @@
 //   line may be evicted over the result) and invalidates it afterwards.
 // - Kernels are precompiled axmodels (AXDSL), looked up by name in GGML_AXERA_KERNEL_DIR (default ./axera_kernels).
 //   An op is supported only if the kernel for its shape exists; everything else falls back to the CPU backend.
-// - Ops: MUL_MAT with BF16 weights and F32 activations. Kernel "mul_mat_bf16_n<C>_k<K>.axmodel" (x [1, K] bf16,
+// - Kernel files are <name>_npu<N>.axmodel, N the cores the kernel was compiled for; the code names kernels by <name>.
+// - Ops: MUL_MAT with BF16 weights and F32 activations. Kernel "mul_mat_bf16_n<C>_k<K>" (x [1, K] bf16,
 //   w [C, K] bf16 -> out [1, C] f32) computes one activation row against C weight rows; N is covered by N / C calls
 //   (C = N, or the largest kernel C that divides N, e.g. a vocabulary-sized output projection in chunks). Several
 //   activation rows (prompt processing) run row by row, rereading the weights each time, until a batched kernel exists.
-// - Multi-core builds (name_x<cores>, AXDSL kernels split over the cores without synchronization) replace the
-//   single-core kernel of the same name with GGML_AXERA_CORES=4 (experimental, off by default: in llama.cpp the
-//   chains still produce NaN / drifting results or time out (0x8006008a) now and then, while the kernels pass
-//   stress tests on their own). They need all cores: other NPU users at the same time make the calls time out.
+// - GGML_AXERA_CORES=N (default 4) runs <name>_npuN (AXDSL kernels split over the N cores without synchronization)
+//   where it exists, else <name>_npu1; GGML_AXERA_CORES=1 only the single-core builds. Multi-core kernels need all
+//   cores: other NPU users at the same time make the calls time out.
 //
 // GGML_AXERA_TEMPLATE=qwen35 runs whole Qwen3.5 graphs with per-layer kernels instead (ggml-axera-q35.h).
 // GGML_AXERA_DEBUG=1 logs every missing kernel once.
@@ -84,7 +84,6 @@ AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, vo
 bool axera_template_qwen35();
 int64_t axera_split_min();
 int axera_cores();
-std::string axera_multi_core(const std::string & name);
 bool axera_flash_forced();
 int64_t axera_flash_seg();
 bool axera_weights_mx8();
@@ -293,31 +292,62 @@ struct ggml_axera_kernel_registry {
     std::set<std::string>                                     reported;
     std::map<std::string, std::unique_ptr<ggml_axera_kernel>> loaded;
 
+    std::map<std::string, std::set<int>>                      files;  // base name -> core counts (<name>_npu<N>.axmodel)
+
     ggml_axera_kernel_registry() {
         const char * e = std::getenv("GGML_AXERA_KERNEL_DIR");
         dir = e ? e : "./axera_kernels";
         if (DIR * d = opendir(dir.c_str())) {
             while (dirent * f = readdir(d)) {
-                long long c, k;
-                char      tail[16];
-                if (sscanf(f->d_name, "mul_mat_bf16_n%lld_k%lld%15s", &c, &k, tail) == 3 && strcmp(tail, ".axmodel") == 0) {
-                    mul_mat[k].insert(c);
-                }
-                if (sscanf(f->d_name, "mul_mat_mx8_n%lld_k%lld%15s", &c, &k, tail) == 3 && strcmp(tail, ".axmodel") == 0) {
-                    mul_mat_mx8[k].insert(c);
-                }
                 const std::string n  = f->d_name;
-                const size_t      us = n.rfind("_c");
-                if (us != std::string::npos && sscanf(n.c_str() + us, "_c%lld%15s", &c, tail) == 2 &&
-                    strcmp(tail, ".axmodel") == 0) {
-                    ctx[n.substr(0, us)].insert(c);
+                const size_t      us = n.rfind("_npu");
+                int               cores, len = 0;
+                if (us != std::string::npos && sscanf(n.c_str() + us, "_npu%d.axmodel%n", &cores, &len) == 1 &&
+                    us + len == n.size()) {
+                    files[n.substr(0, us)].insert(cores);
                 }
             }
             closedir(d);
         }
+        for (const auto & f : files) {  // the kernels this core count runs: shapes by family
+            const std::string & n = f.first;
+            long long           c, k;
+            int                 len = 0;
+            if (file(n).empty()) {
+                continue;
+            }
+            if (sscanf(n.c_str(), "mul_mat_bf16_n%lld_k%lld%n", &c, &k, &len) == 2 && (size_t) len == n.size()) {
+                mul_mat[k].insert(c);
+            }
+            len = 0;
+            if (sscanf(n.c_str(), "mul_mat_mx8_n%lld_k%lld%n", &c, &k, &len) == 2 && (size_t) len == n.size()) {
+                mul_mat_mx8[k].insert(c);
+            }
+            const size_t us = n.rfind("_c");
+            len             = 0;
+            if (us != std::string::npos && sscanf(n.c_str() + us, "_c%lld%n", &c, &len) == 1 && us + len == n.size()) {
+                ctx[n.substr(0, us)].insert(c);
+            }
+        }
     }
 
-    std::string path(const std::string & name) const { return dir + "/" + name + ".axmodel"; }
+    // the file of a kernel: <name>_npu<GGML_AXERA_CORES> (all cores), else its single-core build <name>_npu1; empty if
+    // neither exists
+    std::string file(const std::string & name) const {
+        auto it = files.find(name);
+        if (it == files.end()) {
+            return "";
+        }
+        const int cores = it->second.count(axera_cores()) ? axera_cores() : it->second.count(1) ? 1 : 0;
+        return cores ? name + "_npu" + std::to_string(cores) : "";
+    }
+
+    bool has(const std::string & name) const { return !file(name).empty(); }
+
+    std::string path(const std::string & name) const {
+        const std::string f = file(name);
+        return dir + "/" + (f.empty() ? name + "_npu1" : f) + ".axmodel";
+    }
 
     // the smallest context >= n among the <name>_c<LMAX> kernels, 0 if none
     int64_t ctx_for(const std::string & name, int64_t n) const {

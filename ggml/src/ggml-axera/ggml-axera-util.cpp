@@ -156,26 +156,11 @@ int64_t axera_split_min() {
 int axera_cores() {
     static const int n = [] {
         const char * e = std::getenv("GGML_AXERA_CORES");
-        return e ? std::max(1, std::atoi(e)) : 1;
+        return e ? std::max(1, std::atoi(e)) : 4;  // all cores; GGML_AXERA_CORES=1 for the single-core kernels
     }();
     return n;
 }
 
-// name, or its multi-core build name_x<cores> when that exists (same IO, the work split over the cores)
-std::string axera_multi_core(const std::string & name) {
-    static std::mutex                  mu;
-    static std::map<std::string, bool> found;
-    if (axera_cores() < 2) {
-        return name;
-    }
-    const std::string           mc = name + "_x" + std::to_string(axera_cores());
-    std::lock_guard<std::mutex> lock(mu);
-    auto                        f = found.find(mc);
-    if (f == found.end()) {
-        f = found.emplace(mc, std::ifstream(axera_kernels().path(mc)).good()).first;
-    }
-    return f->second ? mc : name;
-}
 bool axera_flash_forced() {
     static const bool on = [] {
         const char * e = std::getenv("GGML_AXERA_FLASH");

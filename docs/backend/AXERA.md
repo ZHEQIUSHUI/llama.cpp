@@ -17,15 +17,19 @@ with precompiled kernels, and leaves everything else to the CPU backend.
   process, so the CPU backend reads and writes the same buffers without copies; the NPU addresses them physically.
 - **Kernels**: AXDSL programs compiled offline into `.axmodel` files. Weights are runtime inputs, so one kernel serves
   every tensor of the same shape and GGUF weights are used as they are. The backend looks kernels up by name in
-  `GGML_AXERA_KERNEL_DIR` (default `./axera_kernels`) and only claims an op if its kernel exists.
-- **Cores**: kernels are single-core. The current NPU driver neither synchronizes cores reliably inside a task nor runs
-  tasks on different cores concurrently.
+  `GGML_AXERA_KERNEL_DIR` (default `./axera_kernels`) and only claims an op if its kernel exists. A kernel file is
+  `<name>_npu<N>.axmodel`, N the NPU cores it was compiled for (`qwen3_attn_mx8_kvc_c4096_npu1.axmodel`,
+  `qwen35_mlp_mc128_npu4.axmodel`); below kernels are named without that suffix.
+- **Cores**: `GGML_AXERA_CORES` (default 4) picks `<name>_npu<GGML_AXERA_CORES>` where it exists, else the single-core
+  `<name>_npu1`; `GGML_AXERA_CORES=1` runs the single-core builds only. The multi-core builds split their work over the
+  cores without synchronizing them (the driver neither synchronizes cores reliably inside a task nor runs tasks on
+  different cores concurrently) and need all cores: other NPU users at the same time make their calls time out.
 
 ## Supported ops
 
 | Op | Condition | Kernel |
 |---|---|---|
-| `MUL_MAT` | BF16 weights in CMM, F32 activations | `mul_mat_bf16_n<C>_k<K>.axmodel`: inputs `x` [1, K] bf16, `w` [C, K] bf16; output `out` [1, C] f32 |
+| `MUL_MAT` | BF16 weights in CMM, F32 activations | `mul_mat_bf16_n<C>_k<K>`: inputs `x` [1, K] bf16, `w` [C, K] bf16; output `out` [1, C] f32 |
 
 `C` is the weight row count `N` itself, or the largest available `C` that divides `N`: a vocabulary-sized output
 projection runs as `N / C` calls. Several activation rows (prompt processing) run row by row and reread the weights
@@ -39,12 +43,12 @@ from the GGUF tensors in CMM. Two weights are converted once at load: `ssm_a` to
 are reversed and stored as bf16. Then the CPU applies the final norm and the GEMV kernels compute the output
 projection.
 
-Kernels in `GGML_AXERA_KERNEL_DIR`: `qwen35_gdn.axmodel`, the attention kernels `qwen35_attn_kvc_c<LMAX>.axmodel`
+Kernels in `GGML_AXERA_KERNEL_DIR`: `qwen35_gdn`, the attention kernels `qwen35_attn_kvc_c<LMAX>`
 (one per supported context, see below), plus the `mul_mat` kernel for the output projection. Nothing else is needed:
 the backend reads the context `LMAX` and the KV block size from the attention kernel's mask input, and the RoPE
 parameters (rotated dims, base, linear scale) from the graph's ROPE nodes.
 
-Optional prefill kernels `qwen35_gdn_prefill<P>.axmodel` / `qwen35_attn_prefill<P>.axmodel` (P = 128, 64, 32, 16, 8, 4)
+Optional prefill kernels `qwen35_gdn_prefill<P>` / `qwen35_attn_prefill<P>` (P = 128, 64, 32, 16, 8, 4)
 process P consecutive prompt tokens per call. The projections and the MLP read every weight once per chunk. For
 P >= 16 the delta rule runs in the chunked form (the triangular solve of `gdn_stable_chunk`, 32 tokens per solve,
 8 heads batched), so a chunk is mostly matrix products; for P = 8 / 4 it runs token by token. The backend splits a
@@ -63,7 +67,7 @@ Limits of the template:
 
 An NPU kernel's IO sizes are fixed at compile time (the runtime rejects a smaller buffer), and the attention kernels
 take the whole KV cache of a layer as one IO. Kernels are therefore compiled per context and named by it:
-`qwen35_attn[_mx8]_kvc_c<LMAX>.axmodel` and `qwen35_attn_prefill<P>[_mx8]_kvc_c<LMAX>.axmodel`, several side by side.
+`qwen35_attn[_mx8]_kvc_c<LMAX>` and `qwen35_attn_prefill<P>[_mx8]_kvc_c<LMAX>`, several side by side.
 For `-c N` the backend takes the smallest `LMAX >= N` and allocates the llama.cpp KV cache tensors with room for
 `LMAX` cells (`get_alloc_size`); the kernels only scan the blocks in use. `-c 6000` runs on the 8192 kernels with a
 96 MiB KV buffer instead of 72. The attention kernels' cost does not depend on `LMAX`: decode is 40.6 ms per token with
@@ -132,12 +136,12 @@ interleave with the others', which changes the bf16 summation order, and a long 
 ### Batched decode
 
 With the unified KV cache (`-kvu`; llama-server's default `-np auto` sets it), a decode batch of several sequences
-runs through the batched kernels `qwen35_gdn_batch<B>[_mx8].axmodel` / `qwen35_attn_batch<B>[_mx8]_kvc_c<LMAX>.axmodel`
+runs through the batched kernels `qwen35_gdn_batch<B>[_mx8]` / `qwen35_attn_batch<B>[_mx8]_kvc_c<LMAX>`
 (B = 4, 2):
 one call per layer for one token of each of B sequences, so every weight is read once per B tokens. The delta-net
 kernel updates B consecutive rows of the recurrent cache in place, each sequence with its own conv and delta-rule
 state; the attention kernel writes each token's K/V at its own cell and attends through its own KQ mask row. The
-output projection runs B rows per call through `mul_mat_<bf16|mx8>_b<B>_n<C>_k<K>.axmodel` (also for the rows of
+output projection runs B rows per call through `mul_mat_<bf16|mx8>_b<B>_n<C>_k<K>` (also for the rows of
 `llama-perplexity`). Per-sequence KV streams (an explicit `-np` without `-kvu`) keep the token-by-token path.
 
 `llama-batched-bench -npp 128 -ntg 64 -kvu`, decode tokens per second:
@@ -196,7 +200,7 @@ in CMM, so there the default is off (`GGML_AXERA_MMAP=1` forces it).
 
 With `GGML_AXERA_WEIGHTS=mxfp8` the template quantizes the bf16 GGUF weights to MXFP8 at load: E4M3 elements and one
 E8M0 scale per 32 inputs, with the exponent chosen so that nothing saturates. This roughly halves the bytes read per
-token. It needs the kernels `qwen35_gdn_mx8.axmodel`, `qwen35_attn_mx8.axmodel` and `mul_mat_mx8_n<C>_k<K>.axmodel`.
+token. It needs the kernels `qwen35_gdn_mx8`, `qwen35_attn_mx8` and `mul_mat_mx8_n<C>_k<K>`.
 
 Qwen3.5-0.8B, `llama-perplexity`, 2 x 512 tokens:
 
@@ -232,7 +236,7 @@ On AX8860 the 39666-token prompt above takes 42.6 s instead of 81 s (decode 69 m
 
 Qwen3.5 checkpoints carry a vision encoder (a ViT: 12 layers of 768 for 0.8B, 24 x 1024 for 2B / 4B, 27 x 1152 for
 9B and up). Its mmproj GGUF (`convert_hf_to_gguf.py --mmproj`) runs on the NPU when the kernels
-`qwen35_vit_{embed,pre,attn,post,merge}<N>_h<hidden>.axmodel` exist (`q35_vit.py`; N = 256, 1024, 2048, 3072
+`qwen35_vit_{embed,pre,attn,post,merge}<N>_h<hidden>` exist (`q35_vit.py`; N = 256, 1024, 2048, 3072
 patches): the backend recognizes the clip graph by its `v.blk.*` weights, cuts the image into patches in the 2 x 2
 merge order, interpolates the learned position table and builds the 2-D RoPE tables on the host, and runs the patch
 projection, every layer (three kernels: norm / qkv / RoPE, bidirectional attention, output projection / MLP) and the
@@ -309,21 +313,23 @@ tokens 663 / 539 s, the needle found in each; decode 95 ms per token at 4k, 199 
 
 ### Multi-core kernels
 
-With `GGML_AXERA_CORES=4` the kernels that have a four-core build (`<name>_x4`, AXDSL without synchronization
+By default (`GGML_AXERA_CORES=4`) the kernels that have a four-core build (`<name>_npu4`, AXDSL without synchronization
 between the cores: each core takes its share of heads, output channels, slots or KV blocks and writes only its own
 outputs) replace the single-core ones: for the dense models prefill chunks of 128 / 64 tokens and decode
-(`GGML_AXERA_MC_DECODE=0` keeps decode single-core) run as a chain of `qwen35_{gdn,mlp,attn_head,attn_tail}_mc<P>_x4`
+(`GGML_AXERA_MC_DECODE=0` keeps decode single-core) run as a chain of `qwen35_{gdn,mlp,attn_head,attn_tail}_mc<P>`
 kernels that pass the residual as a base plus one fp32 partial per core, the segment kernels split their blocks over
 the cores and the tail merges the partial results on the NPU (more segments than its slots: merged on the CPU in
-between), and the output projection uses `mul_mat_bf16_n<C>_k<K>_x4`; for the MoE models the segment kernels, the
+between), and the output projection uses the four-core `mul_mat_bf16_n<C>_k<K>`; for the MoE models the segment kernels, the
 slots kernel and the gate-up experts kernel (the cores' partial sums added on the host).
 
 On boards with the October 16-19 images this is stable (0.8B `llama-perplexity` three times bit-identical, PPL zh
 46.81 against 46.74 single-core from the order of the partial sums; on an older board it gave NaN and timeouts). The
 gain is limited by the DRAM bandwidth those boards reach, about 84 GB/s for all cores together (one core about
 53 GB/s; the CPU and the NPU together share the same 84 GB/s): compute-bound kernels scale (35B segment kernel 12.1 ->
-3.3 ms, 119k-token prompt 663 -> 539 s), bandwidth-bound ones barely (0.8B decode 42 -> 40 ms). `GGML_AXERA_PROF=1`
-prints per-kernel times at exit.
+3.3 ms, 119k-token prompt 663 -> 539 s), bandwidth-bound ones barely (0.8B decode 42 -> 40 ms). A board with its DRAM
+at 7500 MT/s reaches 165 GB/s with four cores (a copy kernel: 256 MB in 1.55 ms), while one core stays at about
+53 GB/s on either board: there the single-core kernels gain little and the bandwidth-bound ones need their four-core
+builds. `GGML_AXERA_PROF=1` prints per-kernel times at exit.
 
 ## Graph template: Qwen3 transformers
 
@@ -366,7 +372,8 @@ projection: the template stops at the final norm (`result_norm`, every row) and 
 `inp_mean` rows, the rerank head `cls.output`, its softmax) runs on the CPU; the backend does not claim those ops.
 
 Qwen3-Embedding-0.6B (last-token pooling) gives embeddings of cosine 0.996 - 0.997 to llama.cpp's on the CPU and the
-same ranking of documents for each query; Qwen3-Reranker-0.6B (`--pooling rank`) gives the same relevance decisions
+same ranking of documents for each query, Qwen3-Embedding-8B (Q8_0 GGUF, on Qwen3-8B's kernels) 0.994 - 0.996 and the
+same rankings (six inputs, 114 tokens, in 1.2 s; converting its weights to MXFP8 at the first graph takes 19 s); Qwen3-Reranker-0.6B (`--pooling rank`) gives the same relevance decisions
 as on the CPU.
 
 ### Speech recognition: Qwen3-ASR
@@ -416,8 +423,8 @@ mtmd's graphs have no template of their own (`ggml-axera-gen.cpp`): the backend 
 inside the backend and takes over what has an NPU kernel:
 
 - each code predictor layer call as one call of Qwen3-0.6B's fused decode layer kernel (`qwen3tts_cp_attn_kvc_c4096`,
-  a copy of its bf16 `qwen3_attn_kvc_c4096`, or the MXFP8 `qwen3tts_cp_attn_mx8_kvc_c4096`; the 16 positions' KV
-  resident in the kernel). The backend finds the calls in the graph (`ln1` ... `ffn_down` of each layer and position)
+  a copy of its bf16 `qwen3_attn_kvc_c4096`, or the MXFP8 `qwen3tts_cp_attn_mx8_kvc_c4096`, the run's weight format
+  first; the 16 positions' KV resident in the kernel). The backend finds the calls in the graph (`ln1` ... `ffn_down` of each layer and position)
   and skips the nodes only they need, the attention and the graph's own KV cache among them;
 - the convolutions (ggml's im2col and matrix product) as `conv1d_bf16_ic<IC>_oc<OC>_k<K>_d<D>_l<L>` kernels
   (`conv1d_kernels.py`): K shifted matrix products accumulated in f32 on the input in ggml's [channels][time] layout,
@@ -427,14 +434,19 @@ inside the backend and takes over what has an NPU kernel:
   conv1d kernel there too, the backend writing their im2col rows as bf16). A weight the graph transposes on every run
   (a transposed convolution's kernel, `cont(transpose(w))`) is read once through the view's strides and kept as bf16;
   the CONT does not run;
-- SnakeBeta (x + sin²(αx) · β⁻¹ per channel) in one pass on the host workers instead of five CPU ops.
+- SnakeBeta (x + sin²(αx) · β⁻¹ per channel) in one pass on the host workers instead of five CPU ops, sin by range
+  reduction and a polynomial (vectorized);
+- on the host workers too, instead of the CPU backend's element-by-element loops: the concats of the convolutions'
+  left context (row copies), the transposes between the [time][channels] and [channels][time] layouts (64 x 64
+  blocks), col2im of the transposed convolutions (blocks of output steps) and the ConvNeXt blocks' depthwise
+  convolution (computed directly in f32, its f16 im2col not run).
 
 mtmd itself keeps the code generation step's graph: the step builds the same graph for every frame (only its inputs
 differ), so `clip_encode` reuses it with the scheduler's allocation while the step's parameters stay, instead of
 building and allocating some 6000 nodes again (a codec decoder window or another graph in between drops it).
 
-The rest (the codebook lookups and sampling of the code predictor, the codec decoder's elementwise ops, transposes,
-concats of the convolutions' left context and col2im) stays on the CPU backend, slices of small tensors on one thread
+The rest (the codebook lookups and sampling of the code predictor, the codec decoder's other elementwise ops, its
+attention) stays on the CPU backend, slices of small tensors on one thread
 (views do not count). The template of a graph is kept for the same graph (telling them apart reads every node). The CPU backend gets threadpools of its own
 (without one it starts its threads on every call, here thousands of times per graph).
 
@@ -442,25 +454,27 @@ Precision decides whether a generation ends: the talker samples the end of speec
 frame, and with MXFP8 weights Qwen3-TTS-0.6B's talker missed it for some seeds (2 of 4 generations of a Chinese
 sentence ran to the 512-frame limit; with the code predictor in bf16 1 of 6, with the code predictor on the CPU 1 of 5
 ran twice as long), the CPU never (3 of 3). With bf16 weights (no `GGML_AXERA_WEIGHTS`) all 15 seeds tried ended as on
-the CPU. Qwen3-TTS-1.7B's talker in MXFP8 ended every time (13 of 13). The code predictor's bf16 kernel comes first.
+the CPU. Qwen3-TTS-1.7B's talker in MXFP8 ended every time (13 of 13). The code predictor in MXFP8 does not change
+that: 16 generations each with the bf16 and the MXFP8 code predictor (both models, a Chinese and an English sentence,
+4 seeds) all ended and read back exactly, and an MXFP8 layer call takes 0.885 ms instead of 1.06 ms. The code
+predictor follows `GGML_AXERA_WEIGHTS`: MXFP8 for an MXFP8 run (the 1.7B), bf16 otherwise (the 0.6B).
 
-On AX8860 (`-ngl 99 -c 4096`; 0.6B bf16, 1.7B MXFP8 with the code predictor in bf16; the CPU: the same build with
-`-ngl 0 --no-mmproj-offload` and a Q8_0 mmproj, as the A55 has no bf16 dot product), one Chinese and one English
-sentence:
+On AX8860 (`-ngl 99 -c 4096`; 0.6B bf16, 1.7B MXFP8 with its code predictor in MXFP8), one Chinese and one English
+sentence, on a board with its DRAM at 3200 and at 7500 MT/s:
 
-| Model | Sentence | NPU: audio, time | CPU: audio, time |
-|---|---|---|---|
-| Qwen3-TTS-1.7B | zh | 7.4 s, 20.6 s | 7.6 s, 244.4 s |
-| | en | 5.1 s, 14.0 s | 5.2 s, 156.5 s |
-| Qwen3-TTS-0.6B | zh | 7.1 s, 18.5 s | 7.2 s, 163.8 s |
-| | en | 4.7 s, 12.0 s | 4.8 s, 96.9 s |
+| Model | Sentence | Audio | Time (3200) | Time (7500) |
+|---|---|---|---|---|
+| Qwen3-TTS-1.7B | zh | 7.0 s | 16.9 s | 15.5 s |
+| | en | 5.2 s | 12.4 s | 11.4 s |
+| Qwen3-TTS-0.6B | zh | 7.1 s | 16.3 s | 15.3 s |
+| | en | 4.7 s | 10.9 s | 10.2 s |
 
-(The sampling seed differs, so the lengths do.) Every output, transcribed back by Qwen3-ASR-1.7B, reads exactly as
-its input text. Per frame (1.7B, 174 ms) the talker takes 43 ms and the code predictor's 80 layer calls 87 ms (a layer
-call of 30 MB of bf16 weights reads them at about 27 GB/s; the positions depend on each other, so they cannot share a
-call); mtmd, sampling and the CPU slices the rest. The codec decoder takes 2.1 s per window of 72 frames (5.8 s of
-audio; the CPU: 43 s), its convolutions 0.4 s of it. Before the conv1d kernels, the bf16 weight cache and mtmd's graph
-reuse a frame took 248 ms and a window 4.3 s.
+Every output, transcribed back by Qwen3-ASR-1.7B, reads exactly as its input text. Per frame (1.7B, 165 ms) the
+talker takes 43 ms and the code predictor's 80 layer calls 47 ms (0.6B: bf16 layer calls of 30 MB of weights, 87 ms;
+the positions depend on each other, so they cannot share a call); mtmd, sampling and the CPU slices the rest. These
+run on one NPU core, which reads DRAM at about 53 GB/s on either board, so the faster DRAM gains little. The codec
+decoder takes about 1.1 s per window of 72 frames (5.8 s of audio). Before the conv1d kernels, the bf16 weight cache,
+mtmd's graph reuse and the host workers' concat / transpose / col2im a frame took 248 ms and a window 4.3 s.
 
 ## Source layout
 
@@ -518,6 +532,7 @@ missing, i.e. the kernels to compile next.
 
 ## Kernels
 
-The kernels are generated from the GGUF itself: every BF16 2-D weight shape gets one GEMV kernel (in chunks for
+Kernel files are named `<name>_npu<cores>.axmodel` (see Cores above). The kernels are generated from the GGUF itself:
+every BF16 2-D weight shape gets one GEMV kernel (in chunks for
 vocabulary-sized shapes), checked on the NPU simulator against PyTorch. The generator needs the Axera `axnn` toolchain and is kept with the AXDSL kernel sources,
 outside this repository.

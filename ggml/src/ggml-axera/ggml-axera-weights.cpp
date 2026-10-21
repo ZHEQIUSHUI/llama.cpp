@@ -39,7 +39,7 @@ void axera_gemv_raw_to(ggml_backend_axera_context * ctx, const ggml_backend_axer
     const int64_t C   = axera_kernels().mul_mat_chunk(N, K);
     GGML_ASSERT(C > 0);
 
-    ggml_axera_kernel * k  = axera_kernels().get(axera_multi_core(axera_mul_mat_kernel_name(C, K)));
+    ggml_axera_kernel * k  = axera_kernels().get(axera_mul_mat_kernel_name(C, K));
     const int           ix = k->input("x"), iw = k->input("w"), io = k->output("out");
     GGML_ASSERT(ix >= 0 && iw >= 0 && io >= 0 && k->info->nInputSize == 2 && k->info->nOutputSize == 1);
     GGML_ASSERT(k->info->pInputs[ix].nSize == K * sizeof(ggml_bf16_t) &&
@@ -140,7 +140,7 @@ void axera_gemv_mx8(ggml_backend_axera_context * ctx, const ggml_backend_axera_b
                     ggml_tensor * dst, float * out) {
     const int64_t C = axera_kernels().mul_mat_chunk(N, K, true);
     GGML_ASSERT(C > 0);
-    ggml_axera_kernel * k  = axera_kernels().get(axera_multi_core(axera_mul_mat_kernel_name(C, K, true)));
+    ggml_axera_kernel * k  = axera_kernels().get(axera_mul_mat_kernel_name(C, K, true));
     const int           ix = k->input("x"), iw = k->input("w"), is = k->input("s"), io = k->output("out");
     GGML_ASSERT(ix >= 0 && iw >= 0 && is >= 0 && io >= 0 && k->info->nInputSize == 3 && k->info->nOutputSize == 1);
     const int64_t gs = K / AXERA_MX_GROUP;
