@@ -408,6 +408,9 @@ struct ggml_axera_kernel_registry {
         if (ret != 0) {
             GGML_ABORT("%s: failed to load kernel %s (0x%x)\n", __func__, path(name).c_str(), ret);
         }
+        if (axera_cores() > 1 && file(name) == name + "_npu1") {  // no build for all cores: runs on one
+            GGML_LOG_WARN("axera: %s runs on 1 core (no %s_npu%d)\n", name.c_str(), name.c_str(), axera_cores());
+        }
         return (loaded[name] = std::move(k)).get();
     }
 };
