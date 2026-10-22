@@ -151,11 +151,12 @@ struct axera_q35 {
     struct slots_kernel {
         ggml_axera_kernel *                k = nullptr;
         int                                S = 0, G = 0, x = -1, rw = -1, out = -1;
+        bool                               ob = false;  // out in bf16 (else f32)
         std::vector<int>                   w[2], s[2];  // input indices of w_<c|d><slot> / s_<c|d><slot>
         std::vector<AX_ENGINE_IO_BUFFER_T> in, outs;
     };
     slots_kernel slots;
-    axera_cmm    SX, SRW, SOUT;  // all slots of a chunk's layer: rows [slots][G][H] bf16, weights f32, results f32
+    axera_cmm    SX, SRW, SOUT;  // all slots of a chunk's layer: rows [slots][G][H] bf16, weights f32, results f32 / bf16
 };
 
 // one graph on the template: what its layers share (ggml-axera-q35-run.cpp, -moe.cpp, -mc.cpp)
@@ -184,7 +185,7 @@ struct axera_q35_batch {
     void run_experts(int il, int64_t p);
     void run_experts_pre(int il, const std::vector<int> & vs);
     // ggml-axera-q35-mc.cpp
-    void run_mc(int v, int t0);
+    void run_mc(int v, int t0, int il0 = 0, int il1 = -1);  // layers il0 .. il1 - 1 (-1: all)
 };
 
 const char * axera_q35_gguf_name(const axera_q35 & m, const std::string & n);

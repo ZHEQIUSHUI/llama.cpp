@@ -293,10 +293,17 @@ few layers where a buffer boundary falls between get a buffer of their own (a GG
 is). `qwen35moe_experts8_mxfp4` (gate and up apart) serves when the gate-up kernel is missing.
 
 Prompts go in chunks of 128 / 64 / 16 / 4 tokens: `qwen35moe_{gdn,attn}_prefill<P>` (BF16 weights) end with the
-chunk's base, h2 and router logits rows; up to 8 chunks of 128 (`GGML_AXERA_MOE_GROUP`) run layer by layer and the
-routed experts once per layer for the whole group: the host picks each token's experts, groups the picks by expert
-into slots of up to 64 rows (gathering the h2 rows into non-cacheable CMM), and `qwen35moe_slots32_g64_gu_mxfp4` runs
-32 slots per call (each slot one expert's weights, bound by address), whose rows the host adds to the tokens' base.
+chunk's base, h2 and router logits rows; up to 2048 tokens of chunks of 128 (`GGML_AXERA_MOE_GROUP` chunks, default
+2048 / 128) run layer by layer and the routed experts once per layer for the whole group: the host picks each token's
+experts, groups the picks by expert into slots of up to 64 rows (gathering the h2 rows into non-cacheable CMM), and
+`qwen35moe_slots32_g64_gu_mxfp4[_bo]` runs 32 slots per call (each slot one expert's weights, bound by address), whose
+rows (bf16 with `_bo`) the host adds to the tokens' base. A group holds at most one ubatch, so run MoE models with
+`-ub 2048` (llama.cpp's default 512 leaves about 16 rows per expert where a slot takes 64: 46.2 s instead of 33.4 s for
+15888 tokens). With MXFP8 weights and the four-core kernels (`q35_mc.py` with the MoE config: `qwen35_gdn_mc128_mx8`,
+`qwen35_attn_{head,tail}_mc128_mx8`, and `qwen35_moe_pre_mc128_mx8` in place of the MLP: x = base + the partials, 32
+tokens per core, the shared expert, h2 and the router logits) the 128-token chunks run on the multi-core chain, one
+layer per call between the experts (the layer input in A / B without partials); the attention segments merge on the
+NPU (the tail's slots) instead of the host.
 Long contexts take the split attention (`qwen35_attn_fd_{head,seg}*` with `qwen35moe_attn_fd_tail<R>`, which ends with
 the MoE's dense part); the 128-row segment kernel takes the query heads in 4 passes per block (`SEG_PARTS`: 1024 score
 rows at a time overflow the on-chip memory; 29.3 -> 12.1 ms over 32768 cells). Kernels: `q35_moe.py`,

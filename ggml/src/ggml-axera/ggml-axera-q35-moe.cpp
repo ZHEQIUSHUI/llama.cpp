@@ -67,6 +67,7 @@ void axera_q35_batch::run_experts_pre(int il, const std::vector<int> & vs) {
     axera_q35_layer & ly = m.layers[il];
     auto &            sk = m.slots;
     const int         P = m.pre[vs[0]].P, NT = P * (int) vs.size(), K = m.top_k, NE = m.n_expert, S = sk.S, G = sk.G;
+    const size_t      es = sk.ob ? sizeof(ggml_bf16_t) : sizeof(float);  // bytes per result element
     GGML_ASSERT(ly.exps_gu);
     axera_timer tr("moe prefill route (cpu)");
     for (int v : vs) {
@@ -95,6 +96,7 @@ void axera_q35_batch::run_experts_pre(int il, const std::vector<int> & vs) {
             wts[r * K + i] /= sum;
         }
     });
+    axera_timer tg("moe prefill route: gather (cpu)");
     std::vector<std::vector<int>> by(NE);  // picks (token * K + i) per expert
     for (int pk = 0; pk < NT * K; ++pk) {
         by[ids[pk]].push_back(pk);
@@ -135,6 +137,7 @@ void axera_q35_batch::run_experts_pre(int il, const std::vector<int> & vs) {
         }
     });
     m.SRW->flush(m.SRW->vir, (size_t) calls * S * G * sizeof(float));
+    tg.stop();
     tr.stop();
     const auto & ec = ly.exps[0];  // gate-up
     const auto & ed = ly.exps[2];  // down
@@ -142,7 +145,7 @@ void axera_q35_batch::run_experts_pre(int il, const std::vector<int> & vs) {
         const size_t r0 = (size_t) c * S * G;
         sk.in[sk.x]      = axera_io(m.SX.get(), sx + r0 * H, (uint32_t) (S * G * H * sizeof(ggml_bf16_t)));
         sk.in[sk.rw]     = axera_io(m.SRW.get(), sw + r0, (uint32_t) (S * G * sizeof(float)));
-        sk.outs[sk.out]  = axera_io(m.SOUT.get(), (float *) m.SOUT->vir + r0 * H, (uint32_t) (S * G * H * sizeof(float)));
+        sk.outs[sk.out]  = axera_io(m.SOUT.get(), (char *) m.SOUT->vir + r0 * H * es, (uint32_t) (S * G * H * es));
         for (int i = 0; i < S; ++i) {
             const int e = se[(size_t) c * S + i];
             char *    wc = ec.base + (size_t) e * ec.stride;
@@ -161,25 +164,41 @@ void axera_q35_batch::run_experts_pre(int il, const std::vector<int> & vs) {
     axera_timer tc("moe prefill combine (cpu)");
     axera_host_pool().run((int64_t) calls * S, [&](int64_t sl) {
         if (used[sl]) {
-            m.SOUT->invalidate((float *) m.SOUT->vir + sl * G * H, (size_t) used[sl] * H * sizeof(float));
+            m.SOUT->invalidate((char *) m.SOUT->vir + sl * G * H * es, (size_t) used[sl] * H * es);
         }
     });
-    const auto * so = (const float *) m.SOUT->vir;
+    tc.stop();
+    axera_timer  ts("moe prefill combine: sum (cpu)");
+    const auto * so = (const char *) m.SOUT->vir;
     axera_host_pool().run(NT, [&](int64_t r) {
-        const auto *       base = (const ggml_bf16_t *) row_ptr(&axera_q35::prefill::BASE, (int) r, H * sizeof(ggml_bf16_t));
+        // bf16 -> f32 as a 16-bit shift (vectorized; ggml_bf16_to_fp32 per element is not)
+        auto               f32 = [](uint16_t h) { const uint32_t u = (uint32_t) h << 16; float f; memcpy(&f, &u, 4); return f; };
+        const auto *       base = (const uint16_t *) row_ptr(&axera_q35::prefill::BASE, (int) r, H * sizeof(ggml_bf16_t));
         std::vector<float> acc(H);
         for (int i = 0; i < H; ++i) {
-            acc[i] = ggml_bf16_to_fp32(base[i]);
+            acc[i] = f32(base[i]);
         }
         for (int k = 0; k < K; ++k) {
-            const float * o = so + (size_t) loc[r * K + k] * H;
-            for (int i = 0; i < H; ++i) {
-                acc[i] += o[i];
+            const char * o = so + (size_t) loc[r * K + k] * H * es;
+            if (sk.ob) {
+                const auto * ob = (const uint16_t *) o;
+                for (int i = 0; i < H; ++i) {
+                    acc[i] += f32(ob[i]);
+                }
+            } else {
+                for (int i = 0; i < H; ++i) {
+                    acc[i] += ((const float *) o)[i];
+                }
             }
         }
         const auto & pf = m.pre[vs[r / P]];
         auto *       xo = (il % 2 == 0 ? pf.B : pf.A).get();
-        ggml_fp32_to_bf16_row(acc.data(), (ggml_bf16_t *) xo->vir + (r % P) * H, H);
+        auto *     xr = (uint16_t *) xo->vir + (size_t) (r % P) * H;
+        for (int i = 0; i < H; ++i) {  // round to nearest even, as ggml_fp32_to_bf16 (finite values), vectorized
+            uint32_t u;
+            memcpy(&u, &acc[i], 4);
+            xr[i] = (uint16_t) ((u + 0x7fff + ((u >> 16) & 1)) >> 16);
+        }
     });
     for (int v : vs) {
         auto * xo = (il % 2 == 0 ? m.pre[v].B : m.pre[v].A).get();

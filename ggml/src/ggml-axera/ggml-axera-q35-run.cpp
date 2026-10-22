@@ -12,6 +12,10 @@ bool axera_q35_batch::pre_split(int v) const {
 
 void axera_q35_batch::run_layer(int il, int v, int t0, int64_t p) {
     const bool        prefill = v >= 0;
+    if (prefill && m.moe && m.pre[v].mc) {  // MoE on the multi-core chain: the layer up to moe_pre_mc
+        run_mc(v, t0, il, il + 1);
+        return;
+    }
     const bool        split   = prefill ? pre_split(v) : use_split(1);
     axera_q35_layer & ly      = m.layers[il];
     if (split && !ly.gdn) {
@@ -390,7 +394,7 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             }
             ng = n;
         }
-        if (ng > 1) {
+        if (ng > 1 || (v >= 0 && m.moe && m.pre[v].mc && !m.pre[v].group.empty())) {
             const int        P = m.pre[v].P;
             std::vector<int> vs(m.pre[v].group.begin(), m.pre[v].group.begin() + ng);
             for (int c = 0; c < ng; ++c) {

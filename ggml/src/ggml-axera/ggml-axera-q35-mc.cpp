@@ -4,11 +4,12 @@
 
 // multi-core prefill chain of chunk v (P tokens from t0): per layer gdn | head, segments, tail; then mlp. The
 // residual leaves the last layer as base (pf.A) + the partials (PART0)
-void axera_q35_batch::run_mc(int v, int t0) {
-    axera_q35::prefill &    pf = m.pre[v];
-    const int               P  = pf.P;
-    axera_q35::mc_kernels & mk = m.mc.at(P);
-    axera_q35::fd_kernels & fk = m.fd.at(P);
+void axera_q35_batch::run_mc(int v, int t0, int il0, int il1) {
+    axera_q35::prefill &    pf  = m.pre[v];
+    const int               P   = pf.P;
+    const int               key = axera_q35_fd_key(m, v);  // a MoE group's chunk: its own split attention buffers
+    axera_q35::mc_kernels & mk  = m.mc.at(P);
+    axera_q35::fd_kernels & fk  = m.fd.at(key);
     // GGML_AXERA_MC_CHECK=1: debugging, report the first kernel output holding a NaN / Inf (bf16, f16 or f32 by name)
     // (2: only invalidate the outputs, 3: only wait 300 us after each call)
     static const int check_mode = [] {
@@ -148,9 +149,9 @@ void axera_q35_batch::run_mc(int v, int t0) {
         }
     };
     const int64_t st = kv.stream_of(t0);
-    for (int il = 0; il < L; ++il) {
+    for (int il = il0; il < (il1 < 0 ? L : il1); ++il) {
         axera_q35_layer &        ly = m.layers[il];
-        axera_q35_layer::mc_io & io = ly.mc.at(P);
+        axera_q35_layer::mc_io & io = ly.mc.at(key);
         if (ly.gdn) {
             io.ain[io.si] = io.aout[io.so] = ly.in[io.dsi];  // the current recurrent-cache row
             io.ain[io.ci] = io.aout[io.co] = ly.in[io.dci];
