@@ -1260,7 +1260,7 @@ void axera_q35_set_row(axera_q35 & m, int64_t row) {
             ly.in[rg.in]                   = io;
             ly.out[rg.out]                 = io;
             for (auto & pre : ly.pre) {
-                if (!pre.batch) {
+                if (!pre.batch && !pre.in.empty()) {  // empty: a multi-core-only chunk (its gdn reads ly.in per call)
                     pre.in[rg.conv ? pre.ci : pre.si]  = io;
                     pre.out[rg.conv ? pre.co : pre.so] = io;
                 }
