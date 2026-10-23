@@ -1381,12 +1381,11 @@ static bool axera_gen_step_bind(axera_gen & g, const std::map<std::string, ggml_
     return true;
 }
 
-// GGML_AXERA_CP_FRAME=1: a whole frame of the code predictor in one call where its frame kernel exists (off by
-// default)
+// a whole frame of the code predictor in one call where its frame kernel exists and fits; GGML_AXERA_CP_FRAME=0 off
 static bool axera_gen_frame_on() {
     static const bool on = [] {
         const char * e = std::getenv("GGML_AXERA_CP_FRAME");
-        return e && strcmp(e, "1") == 0;
+        return !(e && strcmp(e, "0") == 0);
     }();
     return on;
 }
@@ -1549,8 +1548,10 @@ static void axera_gen_frame_check(axera_gen & g, const axera_gen_analysis::frame
 }
 
 // the frame on the frame kernel: the talker's hidden state and code 0's embedding row as bf16, the draws; then the
-// graph's outputs as its nodes would have computed them: the 16 codes, and the sum of their embeddings in f32
-static void axera_gen_frame_run(axera_gen & g, const axera_gen_analysis::frame_io & fr) {
+// graph's outputs as its nodes would have computed them: the 16 codes, and the sum of their embeddings in f32. False
+// (counted, with a warning; nothing written) if the cores sampled different codes: the graph then runs this frame on
+// the step kernel
+static bool axera_gen_frame_run(axera_gen & g, const axera_gen_analysis::frame_io & fr) {
     const int64_t HT = fr.h->ne[0], NP = fr.n_codes;
     const int32_t code0 = *(const int32_t *) fr.code0->data;
     GGML_ASSERT(code0 >= 0 && code0 < fr.out_embd_w->ne[1]);
@@ -1581,13 +1582,21 @@ static void axera_gen_frame_run(axera_gen & g, const axera_gen_analysis::frame_i
     const size_t cores = g.cpf_codes->size / (NP * sizeof(int32_t));
     for (size_t c = 1; c < cores; ++c) {
         if (memcmp(cr, cr + c * NP, NP * sizeof(int32_t)) != 0) {
-            GGML_ABORT("axera gen: the frame kernel's cores sampled different codes\n");
+            static int n_diff = 0;
+            GGML_LOG_WARN("axera gen: the frame kernel's cores sampled different codes (%d times), this frame on the step "
+                          "kernel\n", ++n_diff);
+            return false;
         }
     }
     std::vector<int32_t> codes(NP);
     codes[0] = code0;
     for (int64_t p = 1; p < NP; ++p) {
-        GGML_ASSERT(cr[p] >= 0 && cr[p] < fr.embd_w->ne[1]);
+        if (cr[p] < 0 || cr[p] >= fr.embd_w->ne[1]) {
+            static int n_bad = 0;
+            GGML_LOG_WARN("axera gen: the frame kernel sampled code %d out of range (%d times), this frame on the step "
+                          "kernel\n", cr[p], ++n_bad);
+            return false;
+        }
         codes[p] = cr[p];
     }
     axera_gen_frame_check(g, fr, codes.data());
@@ -1614,6 +1623,7 @@ static void axera_gen_frame_run(axera_gen & g, const axera_gen_analysis::frame_i
             ((ggml_backend_axera_buffer_context *) o->buffer->context)->flush(o->data, ggml_nbytes(o));
         }
     }
+    return true;
 }
 
 // one predictor position on the step kernel: the position's mask cell and RoPE rows (position 0: a new frame, every
@@ -1852,8 +1862,7 @@ enum ggml_status axera_gen_compute(ggml_backend_axera_context * ctx, struct ggml
         g.key = std::move(key);
     }
     const axera_gen_analysis &            an    = *g.analysis;
-    if (an.frame.on) {  // the whole code generation step on the frame kernel
-        axera_gen_frame_run(g, an.frame);
+    if (an.frame.on && axera_gen_frame_run(g, an.frame)) {  // the whole code generation step on the frame kernel
         return GGML_STATUS_SUCCESS;
     }
     const std::set<const ggml_tensor *> & skip  = an.skip;

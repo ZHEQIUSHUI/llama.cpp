@@ -395,7 +395,7 @@ slot rows. Each script checks its kernel on the simulator against the single-cor
 | `GGML_AXERA_PROF` | 0 | `1`: time per kernel at exit; `2`: also every CPU node |
 | `GGML_AXERA_TRACE` | unset | set: one line per graph (kind, nodes, host gap before it, run time) and the weight preparations of mtmd's matrix products |
 | `GGML_AXERA_CP_STEP` | 1 | `0`: Qwen3-TTS code predictor without its step kernel (stacked layers and GEMVs) |
-| `GGML_AXERA_CP_FRAME` | 0 | `1`: a Qwen3-TTS code predictor frame in one call on its frame kernel, sampling on chip |
+| `GGML_AXERA_CP_FRAME` | 1 | `0`: Qwen3-TTS code predictor frames without the frame kernel (one call per frame, sampling on chip) |
 | `GGML_AXERA_CP_FRAME_CHECK` | 0 | `1`: log the frame kernel's codes whose draw lies near a cumulative sum, or that a host sampling of its logits picks differently |
 | `GGML_AXERA_CP_STACK` | 1 | `0`: one call per code predictor layer |
 | `GGML_AXERA_DEBUG` | 0 | `1`: log op shapes without a kernel |
@@ -515,13 +515,16 @@ inside the backend and takes over what has an NPU kernel:
   RoPE rows of its own. It is used whenever it is in the directory and fits the model (every layout member found with
   its size, the embedding row, head and logits of the model's sizes; otherwise the stacked kernel runs the positions;
   `GGML_AXERA_CP_STEP=0`: the stacked kernel and the GEMVs).
-  With `GGML_AXERA_CP_FRAME=1` (off by default) and a frame kernel `qwen3tts_cp_frame5_mx8_h<HT>_k<top_k>_c16`
-  (`q3tts_cp_frame.py`, the step kernel's `.layout`) a whole frame is one call: its 16 positions, each code's
+  With a frame kernel `qwen3tts_cp_frame5_mx8_h<HT>_k<top_k>_c16` (`q3tts_cp_frame.py`, the step kernel's
+  `.layout`; used whenever it is in the directory with the step kernel and fits, `GGML_AXERA_CP_FRAME=0` off) a whole
+  frame is one call: its 16 positions, each code's
   embedding row loaded by the code on chip, and the sampling on chip as mtmd's graph does it (the top_k largest logits,
   ties to the lower id, the first two swapped as ggml's top_k leaves them, softmax and cumulative sum in f32, the first
   candidate whose sum exceeds the position's draw; mtmd's draws passed in). The backend then runs none of the graph's
   nodes: it writes the codes and the next frame's embedding (code 0's row plus each code's row, added in the graph's
   order). Only for top_p 1 and the top_k it was built for; otherwise, or if it does not fit the model, the step kernel.
+  The backend compares the four cores' codes: should they ever differ (or a code be out of range), that frame runs on
+  the step kernel, with a warning and a count.
   With `--top-k 1` the audio is identical to the step kernel's (both models, zh / en), with sampling 16 of 16
   generations identical; in a 3-request run one of 6 differed from frame 9 of a request on, where the draw was 1e-7
   from a cumulative sum (`GGML_AXERA_CP_FRAME_CHECK=1` logs every position whose draw lies within 1e-5 of one, and
@@ -605,11 +608,18 @@ third without the one-time costs (0.4 s converting the codec decoder's weights, 
 | Qwen3-TTS-1.7B | zh | 87 | 4.20 s + 0.48 s | 54 ms |
 | | en | 153 | 7.43 s + 0.50 s | 52 ms |
 
-With the frame kernel (`GGML_AXERA_CP_FRAME=1`, default sampling, the board's load 20), the second and third request:
-1.7B zh 90 / 88 frames 3.64 / 3.62 s + 0.48 / 0.47 s (46 ms per frame; 55 ms with the step kernel), en 67 / 63
-frames 2.04 / 1.90 s + 0.94 / 0.96 s (45 ms; 53 ms).
+Step kernel against frame kernel, alternating, two rounds each (default sampling, the second and third request of
+each process; the board's CPUs shared with other work, load 9 - 25: absolute times to be measured on an idle board),
+milliseconds per frame (generation and the last decoder batch over the frames):
 
-The three requests give the same audio. mtmd's sampler keeps its random state across requests with the same seed,
+| Model | Sentence | Frames | Step kernel | Frame kernel |
+|---|---|---|---|---|
+| Qwen3-TTS-1.7B | zh | 90 / 88 | 53.6 - 55.9 | 45.9 - 46.9 |
+| | en | 67 / 63 - 65 | 51.9 - 54.5 | 44.2 - 46.0 |
+| Qwen3-TTS-0.6B | zh | 93 / 103 | 49.2 - 51.8 | 41.0 - 42.3 |
+| | en | 63 / 72 | 45.7 - 49.5 | 38.8 - 40.5 |
+
+With `--top-k 1` the three requests of a process give the same audio (both models, zh / en, frame kernel on). mtmd's sampler keeps its random state across requests with the same seed,
 so sampled requests after the first differ from a fresh process.
 
 ## Source layout
