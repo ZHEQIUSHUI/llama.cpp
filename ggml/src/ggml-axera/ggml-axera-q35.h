@@ -233,6 +233,8 @@ struct axera_q35 {
         std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
     };
     combine_kernel comb;
+    std::vector<combine_kernel> comb_small;  // the same for fewer tokens (T < comb.T), smallest first: a group that
+                                             // fills only its first chunks adds only their rows
     axera_cmm      GA, GB, GH2, GBASE, GLOG, TOK, LOC;
     axera_cmm    SX, SRW, SOUT;  // all slots of a chunk's layer: rows [slots][G][H] bf16, weights f32, results f32 / bf16
 };

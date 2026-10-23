@@ -1001,11 +1001,13 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
                          // bf16-output build (_bo) first; with planar experts the planar build (_pl, seven IO), most
                          // slots per call first
         m.planar = m.full[0].k || m.full[1].k;
-        for (const char * o : { "_bo", "" }) {
-            const std::string n = std::string("qwen35moe_slots64_g64_px_mxfp4") + o;
-            if (sn.empty() && m.ex[1].k && axera_kernels().has(n)) {
-                sn       = n;
-                m.planar = true;
+        for (const char * sl : { "128", "64" }) {  // the most slots per call first (a fixed cost per call)
+            for (const char * o : { "_bo", "" }) {
+                const std::string n = std::string("qwen35moe_slots") + sl + "_g64_px_mxfp4" + o;
+                if (sn.empty() && m.ex[1].k && axera_kernels().has(n)) {
+                    sn       = n;
+                    m.planar = true;
+                }
             }
         }
         for (const char * sl : { "64", "32" }) {
@@ -1337,6 +1339,18 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         for (const auto & f : { std::string("_r32768") }) {
             if (m.slots.tok >= 0 && axera_kernels().has(cn + f)) {
                 m.comb.k = axera_kernels().get(cn + f);
+            }
+        }
+        m.comb_small.clear();
+        for (int t = 256; m.comb.k && t < NT; t *= 2) {
+            const std::string n = "qwen35moe_combine" + std::to_string(m.top_k) + "_t" + std::to_string(t) + "_r32768";
+            if (axera_kernels().has(n)) {
+                axera_q35::combine_kernel cs;
+                cs.k = axera_kernels().get(n);
+                cs.T = t;
+                cs.R = (int) (size_of(cs.k, "sout") / (H * sizeof(ggml_bf16_t)));
+                GGML_ASSERT(cs.R == (int) (size_of(m.comb.k, "sout") / (H * sizeof(ggml_bf16_t))));
+                m.comb_small.push_back(std::move(cs));
             }
         }
         if (m.comb.k) {  // the chunks' rows in one buffer each: views
