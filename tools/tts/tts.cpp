@@ -6,7 +6,9 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -42,81 +44,14 @@ static void print_usage(int, char ** argv) {
     LOG("\n\n");
 }
 
-int main(int argc, char ** argv) {
-    common_params params;
-
-    common_init();
-
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_TTS, print_usage)) {
-        return 1;
-    }
-
-    mtmd_helper_log_set(common_log_default_callback, nullptr);
-
-    if (params.prompt.empty()) {
-        LOG_ERR("no prompt provided, use -p \"text\"\n");
-        return 1;
-    }
-    if (params.mmproj.path.empty()) {
-        LOG_ERR("no mmproj provided, use --mmproj\n");
-        return 1;
-    }
-
-    // important: keep this file as generic as possible
-    //            model-specific logic should be in mtmd-helper-gen or mtmd API
-
-    // always enable embd, so that we can pass hidden states to the audio generation helper
-    params.embedding = true;
-
-    llama_backend_init();
-    llama_numa_init(params.numa);
-
-    //
-    // load backbone model and mmproj
-    //
-
-    auto llama_init = common_init_from_params(params);
-    llama_model    * model = llama_init->model();
-    llama_context  * lctx  = llama_init->context();
-    common_sampler * smpl  = llama_init->sampler(0);
-    if (!model || !lctx) {
-        LOG_ERR("failed to init model/context\n");
-        return 1;
-    }
-
-    mtmd_context_params mtmd_params = mtmd_context_params_default();
-    mtmd_params.use_gpu = params.mmproj_use_gpu;
-    mtmd_params.device  = params.mmproj_device;
-    mtmd::context_ptr mctx(mtmd_init_from_file(params.mmproj.path.c_str(), model, mtmd_params));
-    if (!mctx) {
-        LOG_ERR("failed to load mmproj %s\n", params.mmproj.path.c_str());
-        return 1;
-    }
-    if (mtmd_gen_audio_get_info(mctx.get()).type == MTMD_GEN_AUDIO_TYPE_NONE) {
-        LOG_ERR("mmproj does not support audio generation\n");
-        return 1;
-    }
-
-    //
-    // stage 0: process speaker reference file, if any
-    //
-
-    mtmd::bitmap_ptr speaker_bitmap;
-    if (!params.tts_speaker_file.empty()) {
-        auto wrapper = mtmd_helper_bitmap_init_from_file(mctx.get(), params.tts_speaker_file.c_str(), false, mtmd_helper_init_opt_default());
-        if (!wrapper.bitmap) {
-            LOG_ERR("failed to load speaker file %s\n", params.tts_speaker_file.c_str());
-            return 1;
-        }
-        speaker_bitmap.reset(wrapper.bitmap);
-    }
-
-    mtmd_helper::gen_audio gen(lctx, mctx.get());
+// one request: the prompt, the frames, the audio written to out_file; 0 on success
+static int tts_request(mtmd_helper::gen_audio & gen, common_params & params, common_sampler * smpl, llama_context * lctx,
+                       mtmd_bitmap * speaker, const std::string & out_file) {
     mtmd_helper_gen_audio_inp inp{};
     inp.seq_id      = 0;
     inp.prompt      = params.prompt.c_str();
     inp.prompt_len  = params.prompt.size();
-    inp.speaker_ref = speaker_bitmap.get();
+    inp.speaker_ref = speaker;
     inp.lang        = params.tts_lang.c_str();
     inp.top_k       = params.sampling.top_k;
     inp.top_p       = params.sampling.top_p;
@@ -200,14 +135,103 @@ int main(int argc, char ** argv) {
     LOG_INF("timings: prompt eval %.2fs + generation %.2fs + vocoder %.2fs = total %.2fs\n",
             t_prompt_s, t_gen_s, t_wav_s, t_total_s);
     LOG_INF("         output audio = %.2fs (audio time = %.2fx process time)\n", audio_s, t_total_s > 0 ? audio_s / t_total_s : 0.0);
-    FILE * f = fopen(params.out_file.c_str(), "wb");
+    FILE * f = fopen(out_file.c_str(), "wb");
     if (!f) {
-        LOG_ERR("failed to open %s\n", params.out_file.c_str());
+        LOG_ERR("failed to open %s\n", out_file.c_str());
         return 1;
     }
     fwrite(data, 1, data_len, f);
     fclose(f);
-    LOG_INF("wrote %s\n", params.out_file.c_str());
+    LOG_INF("wrote %s\n", out_file.c_str());
+
+    return 0;
+}
+
+int main(int argc, char ** argv) {
+    common_params params;
+
+    common_init();
+
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_TTS, print_usage)) {
+        return 1;
+    }
+
+    mtmd_helper_log_set(common_log_default_callback, nullptr);
+
+    if (params.prompt.empty()) {
+        LOG_ERR("no prompt provided, use -p \"text\"\n");
+        return 1;
+    }
+    if (params.mmproj.path.empty()) {
+        LOG_ERR("no mmproj provided, use --mmproj\n");
+        return 1;
+    }
+
+    // important: keep this file as generic as possible
+    //            model-specific logic should be in mtmd-helper-gen or mtmd API
+
+    // always enable embd, so that we can pass hidden states to the audio generation helper
+    params.embedding = true;
+
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
+    //
+    // load backbone model and mmproj
+    //
+
+    auto llama_init = common_init_from_params(params);
+    llama_model    * model = llama_init->model();
+    llama_context  * lctx  = llama_init->context();
+    common_sampler * smpl  = llama_init->sampler(0);
+    if (!model || !lctx) {
+        LOG_ERR("failed to init model/context\n");
+        return 1;
+    }
+
+    mtmd_context_params mtmd_params = mtmd_context_params_default();
+    mtmd_params.use_gpu = params.mmproj_use_gpu;
+    mtmd_params.device  = params.mmproj_device;
+    mtmd::context_ptr mctx(mtmd_init_from_file(params.mmproj.path.c_str(), model, mtmd_params));
+    if (!mctx) {
+        LOG_ERR("failed to load mmproj %s\n", params.mmproj.path.c_str());
+        return 1;
+    }
+    if (mtmd_gen_audio_get_info(mctx.get()).type == MTMD_GEN_AUDIO_TYPE_NONE) {
+        LOG_ERR("mmproj does not support audio generation\n");
+        return 1;
+    }
+
+    //
+    // stage 0: process speaker reference file, if any
+    //
+
+    mtmd::bitmap_ptr speaker_bitmap;
+    if (!params.tts_speaker_file.empty()) {
+        auto wrapper = mtmd_helper_bitmap_init_from_file(mctx.get(), params.tts_speaker_file.c_str(), false, mtmd_helper_init_opt_default());
+        if (!wrapper.bitmap) {
+            LOG_ERR("failed to load speaker file %s\n", params.tts_speaker_file.c_str());
+            return 1;
+        }
+        speaker_bitmap.reset(wrapper.bitmap);
+    }
+
+    // TTS_REPEAT=<n> (bench): the same request n times in this process and pipeline (a service's steady state: the
+    // later ones without the one-time costs), the outputs after the first to <output>.<i>.wav
+    mtmd_helper::gen_audio gen(lctx, mctx.get());
+    const char * rep_env = getenv("TTS_REPEAT");
+    const int    n_rep   = rep_env ? std::max(1, atoi(rep_env)) : 1;
+    for (int rep = 0; rep < n_rep; ++rep) {
+        if (rep > 0) {
+            llama_memory_clear(llama_get_memory(lctx), true);
+            common_sampler_reset(smpl);
+            LOG_INF("request %d\n", rep);
+        }
+        const std::string out = rep == 0 ? params.out_file : params.out_file + "." + std::to_string(rep) + ".wav";
+        if (tts_request(gen, params, smpl, lctx, speaker_bitmap.get(), out) != 0) {
+            return 1;
+        }
+    }
 
     llama_backend_free();
     return 0;
