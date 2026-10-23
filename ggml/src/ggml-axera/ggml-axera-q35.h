@@ -15,10 +15,11 @@
 //
 
 // Sources: ggml-axera-q35-bind.cpp (kernels, IO binding, initialization), ggml-axera-q35-run.cpp (a graph: batch
-// bookkeeping, chunks, layers), ggml-axera-q35-moe.cpp (routed experts), ggml-axera-q35-mc.cpp (multi-core prefill
-// chain). The split attention, RoPE and output head are the backend's (ggml-axera-attn.h, ggml-axera-graph.cpp).
+// bookkeeping, chunks, layers), ggml-axera-q35-moe.cpp (routed experts). The split attention, RoPE and output head are the backend's (ggml-axera-attn.h, ggml-axera-graph.cpp).
 
 #include "ggml-axera-attn.h"
+
+#include <array>
 
 struct axera_q35_layer {
     bool                               gdn = false;
@@ -47,6 +48,7 @@ struct axera_q35_layer {
         std::vector<AX_ENGINE_IO_BUFFER_T> rin, rout;
         int                                rsi = -1, rso = -1, rci = -1, rco = -1;
         std::vector<int>                   rs_state, rs_conv;  // [j]: output index
+        std::vector<AX_ENGINE_IO_BUFFER_T> pin, pout;  // the packed kernel's IO (packs bound, the rest per call)
     };
     std::vector<prefill_io>            pre;  // one per prefill chunk size
     using fd_io = axera_fd_io;
@@ -55,19 +57,21 @@ struct axera_q35_layer {
         ggml_backend_axera_buffer_context * b = nullptr;
         char *                              base = nullptr;  // expert 0
         size_t                              stride = 0, data = 0, scale = 0;  // bytes per expert, its elements, scales
+        int64_t                             n = 0;       // experts
+        bool                                planar = false;  // all experts' codes, then all their scales
+        char * w(int64_t e) const { return planar ? base + e * data : base + e * stride; }
+        char * s(int64_t e) const { return planar ? base + n * data + e * scale : base + e * stride + data; }
     };
     expert_w                           exps[3];
     bool                               exps_gu = false;  // exps[0] holds gate and up (m.ex[1]), exps[1] unused
-    struct mc_io {  // multi-core prefill chain of this layer: [gdn | head, seg, tail] then mlp
-        std::vector<AX_ENGINE_IO_BUFFER_T> ain, aout, sin, sout, tin, tout, min, mout;
-        int si = -1, so = -1, ci = -1, co = -1;            // state IO of the gdn call (rebound to the current row)
-        int dsi = -1, dci = -1;                            // the decode kernel's state inputs (ly.in)
-        int kc = -1, vc = -1, mask = -1, mo = -1, lo = -1, oo = -1;  // segment IO, rebound per segment
-    };
-    std::map<int, mc_io>               mc;  // by chunk size P
+    // packed decode kernel (axera_q35::gdn_pk / attn_pk): its IO, the packs bound, the rest taken from in / out per call
+    std::vector<AX_ENGINE_IO_BUFFER_T> pin, pout;
+    std::map<std::string, std::pair<std::string, AX_ENGINE_IO_BUFFER_T>> packs;  // pack name -> (layout sig, IO)
     std::vector<axera_cmm>             own;                                // converted weights, state, KV cache
+    axera_cmm                          whole_packs[4];  // a packed whole-layer kernel's pw / ps / pf / pb inputs
     std::map<std::string, std::pair<ggml_backend_axera_buffer_context *, ggml_backend_axera_buffer_context *>> mx;
     std::vector<ggml_backend_axera_buffer_context *> state;                // state buffers to clear on restart
+    bool released = false;  // decode packs freed (axera_q35_release): the group runs every decode token
 };
 
 struct axera_q35 {
@@ -84,6 +88,46 @@ struct axera_q35 {
     int                   rope_mode = 0;               // GGML_ROPE_TYPE_*: (I)MROPE takes position t / h / w / e by section
     int                   sections[4] = { 0, 0, 0, 0 };  // M-RoPE sections (rotary frequency pairs per position)
     ggml_axera_kernel *   gdn = nullptr, *attn = nullptr;
+    // the decode layer kernels with the layer's parameters in one input per dtype (<name>_pk, q35_layer_pk.py: about
+    // 7 us less per IO and call): pk_*_in / pk_*_out map their IO to the unpacked kernel's (-1: a pack), the layout
+    // places each parameter of the unpacked kernel in a pack
+    struct packed {
+        ggml_axera_kernel * k = nullptr;
+        std::vector<int>    in, out;
+        struct member {
+            std::string name, pack;
+            size_t      off = 0, bytes = 0;
+            int64_t     rows = 0, cols = 0, bw = 0;  // bw > 0: stored as its column strips of width bw, one after another
+        };
+        std::vector<member>           members;
+        std::map<std::string, size_t> packs;  // bytes
+        std::string                   sig;    // the layout as read: kernels of equal layouts share a layer's packs
+    };
+    packed                gdn_pk, attn_pk;
+    // G consecutive decode layers in one kernel (<ap>_group<G>_<kinds>_mx8<ctx>, q35_group.py): one call per group;
+    // its IO per group: the packs of the group's layers (bound once), x / out of the group, each layer's state / conv
+    // or kc / vc (taken from the layer's IO per call, as the unpacked kernels have them), cs / pn / mask
+    struct group {
+        ggml_axera_kernel * k = nullptr;
+        int                 G = 0;
+        struct io_src {
+            int layer = -1;  // the group's layer j, -1: static (a pack, cs, pn) or the model's (mask)
+            int idx   = -1;  // that layer's unpacked kernel IO index
+            bool out  = false;  // from the layer's out (else in)
+        };
+        std::vector<io_src> in, out;
+        std::vector<packed::member> members;  // name "L<j>.<parameter>"
+        std::map<std::string, size_t> packs;
+        std::vector<std::vector<AX_ENGINE_IO_BUFFER_T>> gin, gout;  // per group (static entries bound)
+        // the whole model with its output head (<...>_lm8 / _lm4): the final norm and the output projection in the
+        // packs (LM.norm, LM.w_lm, LM.s_lm), the logits [1, V] f32 into LOGITS; ran: the last decode token's logits
+        bool                lm  = false;
+        bool                ran = false;
+        axera_cmm           LOGITS;
+        ggml_tensor *       dst = nullptr;  // this token's: the graph's logits tensor, written by the kernel directly
+    };
+    group                 grp;
+    axera_cmm             CS, PN;  // cos / sin and pos / nblk in one buffer each (packed kernels' cs / pn)
     axera_cmm             A, B, POS, NBLK, MASK, COS, SIN;  // A/B: layer input/output ping-pong
     std::shared_ptr<ggml_backend_axera_buffer_context> lm_q, lm_s;  // MXFP8 output projection (shared by contexts)
     axera_cmm             lm_bf;                            // bf16 copy of a non-bf16 output projection
@@ -91,9 +135,9 @@ struct axera_q35 {
         int                 P = 0;
         int64_t             R = 0;  // mask rows per KV block
         bool                batch = false;  // P tokens of P consecutive sequences (recurrent rows), one each
-        bool                mc    = false;  // the multi-core chain m.mc[P] exists (gdn / attn may be null then)
         ggml_axera_kernel * gdn = nullptr, *attn = nullptr;
         axera_cmm           A, B, MASK, COS, SIN, POS;  // POS: the batch's P cells
+        axera_cmm           CPOS, CNBLK;  // a MoE group's chunk copy with fused attention: its own pos / nblk inputs
         axera_cmm           BASE, H2, LOG;              // MoE: the layer kernel's base, h2 and router logits rows
         // speculative decoding (llama.cpp n_rs_seq > 0): the GDN kernel that also writes the recurrent state after
         // each of the P tokens (qwen35_gdn_prefill<P>[_mx8]_rs) into the cache's snapshot planes
@@ -103,6 +147,7 @@ struct axera_q35 {
         // split attention state m.fd[fdk]), never picked alone; group: the chunks of the group, this one first
         int                 sub = 0, fdk = 0;  // fdk: key of the split attention kernels in m.fd (0: P)
         std::vector<int>    group;
+        packed              gdn_pk, attn_pk;  // the packed variants (axera_q35::packed)
     };
     std::vector<prefill>  pre;  // prefill chunks, then batched decode sizes, largest first
     const ggml_tensor *   lm = nullptr;
@@ -119,17 +164,10 @@ struct axera_q35 {
     bool                  kv_llama = false;  // attention kernels on the llama.cpp KV cache (cells, f16) and its KQ mask
     std::string           ctx_sfx;           // attention kernel name suffix: "_kvc_c<LMAX>" on the llama.cpp KV cache
     bool                  flash = false;     // attention as head / per-segment / tail kernels (flash decoding)
+    bool                  attn_all = false;  // the fused attention kernels run on all cores: no split below LMAX
     bool                  pre_mx = false;    // prefill kernels with MXFP8 weights
-    int64_t               mc_dec_min = 0;    // decode on the multi-core chain from this KV width (cells) on
     int64_t               S     = 0;         // their KV segment, cells
     using fd_kernels = axera_fd_kernels;
-    struct mc_kernels {  // multi-core chain for P tokens: <ap>_{gdn,mlp,attn_head,attn_tail}_mc<P>[_mx8] (no gdn: Qwen3)
-        ggml_axera_kernel * gdn = nullptr, *mlp = nullptr, *head = nullptr, *tail = nullptr;
-        int                 np = 0;            // partial attention slots the tail merges (segments x segment cores)
-        size_t              ms = 0, ls = 0, os = 0;  // bytes per slot of m / l / o
-        axera_cmm           BASE1, PART0, PART1, ZERO, MALL, LALL, OALL;  // the residual base 0 is m.pre[v].A
-    };
-    std::map<int, mc_kernels> mc;  // by P
     std::map<int, fd_kernels> fd;  // by rows R
     // MoE (Qwen3.5-35B-A3B): per layer the layer kernel (qwen35moe_*: up to the shared expert and the router logits),
     // then the routed experts kernel on the top-K experts the host picks from the logits
@@ -138,13 +176,65 @@ struct axera_q35 {
     axera_cmm BASE, H2, LOGITS, RW;  // residual + gated shared expert, normed state, router logits, weights
     struct experts_kernel {          // qwen35moe_experts<K>[_gu]_mxfp4 and its IO (weights rebound per token)
         ggml_axera_kernel *                k = nullptr;
-        axera_cmm                          PART;  // multi-core build: the cores' fp32 partial sums (out = their sum)
         std::vector<int>                   w[4], s[4];  // input indices of w_<kind><i> / s_<kind><i>, kinds g u d c
         std::vector<AX_ENGINE_IO_BUFFER_T> in, out[2];  // out: by the layer parity
     };
     // [0]: gate and up weights apart (w_g / w_u), [1]: one gate-up weight per expert (w_c: gate rows then up rows,
     // one projection instead of two; axera_repack_mxfp4_gu), preferred when the kernel exists
     experts_kernel         ex[2];
+    // decode: layer i's routed experts and layer i + 1's layer kernel in one call (qwen35moe_experts<K>_gu_gdn[_mx8],
+    // _gu_attn[_mx8]_kvc_c<LMAX>): its inputs those of the gate-up experts kernel and of the layer kernel but x
+    struct merged_kernel {
+        ggml_axera_kernel * k = nullptr;
+        std::vector<int>    body, ein;  // per input: the layer kernel's input index, else (-1) the experts kernel's
+        std::vector<int>    bout;       // per output: the layer kernel's output index
+        std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
+    };
+    merged_kernel          mx[2];  // [0]: next layer a GDN layer, [1]: an attention layer
+    // decode: a whole MoE layer in one call (qwen35moe_layer_gdn_mx8, _layer_attn_mx8_kvc_c<LMAX>): the layer, the
+    // router, top-K and the experts on the NPU, which picks them out of the layer's planar expert tensors (e_gw / e_gs
+    // gate-up codes / scales, e_dw / e_ds down); inputs and outputs those of the layer kernel by name, out the next x
+    struct full_kernel {
+        ggml_axera_kernel * k = nullptr;
+        std::vector<int>    body, plane;  // per input: the layer kernel's input index, else (-1) the expert plane 0 .. 3
+        // packed build (_pk, <file>.layout): per input its pack 0 .. 3 (pw ps pf pb, else -1); the members, copied
+        // from the layer kernel's bound inputs once: pack, byte offset, bytes, layer kernel input index
+        std::vector<int>    pack;
+        size_t              pack_bytes[4] = {};
+        struct member {
+            int    pack, body;
+            size_t off, bytes;
+            size_t rows = 0, row_bytes = 0;                    // column blocks: source rows, bytes per row
+            std::vector<std::pair<size_t, size_t>> blocks;     // byte ranges of a row, stored block after block
+        };
+        std::vector<member> members;
+        std::vector<int>    bout;         // per output: the layer kernel's output index (-1: out, the next layer's x)
+        std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
+    };
+    full_kernel            full[2];  // [0]: a GDN layer, [1]: an attention layer
+    // decode: G consecutive whole MoE layers in one call (qwen35moe_group<G>_<kinds>_mx8_kvc_c<LMAX>, kinds g / a per
+    // layer): x, the packs of all G layers (members "L<j>.<name>" in the .layout), per layer j its expert planes
+    // e_gw<j> .. e_ds<j> and its state st<j> / cv<j> (GDN) or kc<j> / vc<j> (attention), in place; cos .. mask shared
+    struct moe_group_kernel {
+        ggml_axera_kernel * k = nullptr;
+        int                 G = 0;
+        size_t              pack_bytes[4] = {};
+        struct member : full_kernel::member {
+            int         j = 0;  // its layer in the group
+            std::string name;   // input name of the layer kernel
+        };
+        std::vector<member> members;
+        struct io {
+            int         kind = 0;  // 0 x, 1 pack, 2 expert plane, 3 layer j's kernel input / output n, 4 out
+            int         j = 0, idx = 0;  // the layer, the pack / plane index
+            std::string n;
+        };
+        std::vector<io>                    ins, outs;
+        std::vector<std::array<axera_cmm, 4>> packs;  // per group (layers g * G ..)
+        std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
+    };
+    moe_group_kernel       mgrp;
+    bool                   planar = false;  // the layers' experts in planes (whole layers, the planar slots kernel)
     std::vector<axera_cmm> gu_own;  // gate-up experts of layers whose gate and up are not back to back
     // prefill: the routed experts of a chunk grouped by expert, qwen35moe_slots<S>_g<G>_gu_mxfp4: per call S slots,
     // each one expert (gate-up and down weights bound by address) on up to G token rows gathered by the host from h2
@@ -153,13 +243,27 @@ struct axera_q35 {
         int                                S = 0, G = 0, x = -1, rw = -1, out = -1;
         bool                               ob = false;  // out in bf16 (else f32)
         std::vector<int>                   w[2], s[2];  // input indices of w_<c|d><slot> / s_<c|d><slot>
+        int                                tok = -1, h2 = -1;  // _px build: [S][expert, G tokens] rows of h2
+        int                                sid = -1, plane[4] = { -1, -1, -1, -1 };  // planar build (_pl): slot
+                                                                                      // experts, e_gw e_gs e_dw e_ds
+        axera_cmm                          SID;
         std::vector<AX_ENGINE_IO_BUFFER_T> in, outs;
     };
     slots_kernel slots;
+    // MoE groups on the NPU (slots kernel _px, qwen35moe_combine<K>_t<T>_r<R>): the group's chunks' A / B / h2 / base /
+    // logits rows are views of one buffer each, the slots kernel reads its rows out of the group's h2 by token, the
+    // combine kernel adds each token's K slot rows to its base into the group's next x
+    struct combine_kernel {
+        ggml_axera_kernel *                k = nullptr;
+        int                                T = 0, R = 0;
+        std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
+    };
+    combine_kernel comb;
+    axera_cmm      GA, GB, GH2, GBASE, GLOG, TOK, LOC;
     axera_cmm    SX, SRW, SOUT;  // all slots of a chunk's layer: rows [slots][G][H] bf16, weights f32, results f32 / bf16
 };
 
-// one graph on the template: what its layers share (ggml-axera-q35-run.cpp, -moe.cpp, -mc.cpp)
+// one graph on the template: what its layers share (ggml-axera-q35-run.cpp, -moe.cpp)
 struct axera_q35_batch {
     ggml_backend_axera_context * ctx;
     axera_q35 &                  m;
@@ -182,10 +286,14 @@ struct axera_q35_batch {
     // a MoE group: chunks vs of P tokens from t0 (position p), layer by layer, the experts once per layer
     void run_group(const std::vector<int> & vs, int t0, int64_t p);
     // ggml-axera-q35-moe.cpp
-    void run_experts(int il, int64_t p);
+    void run_experts(int il, int64_t p, int next = -1);  // next >= 0: with layer next in one call (m.mx)
+    bool merged(int il) const;  // layer il's body runs with layer il - 1's experts
+    bool whole(int il) const;   // layer il runs as one call (m.full)
+    void run_whole(int il, int64_t p);
+    bool grouped(int il) const;  // layers il .. il + G - 1 run as one call (m.mgrp)
+    void run_grouped(int il, int64_t p);
     void run_experts_pre(int il, const std::vector<int> & vs);
-    // ggml-axera-q35-mc.cpp
-    void run_mc(int v, int t0, int il0 = 0, int il1 = -1);  // layers il0 .. il1 - 1 (-1: all)
+    void run_experts_px(int il, const std::vector<int> & vs);  // a group of contiguous chunks, routing on the host only
 };
 
 const char * axera_q35_gguf_name(const axera_q35 & m, const std::string & n);
@@ -193,16 +301,16 @@ AX_ENGINE_IO_BUFFER_T axera_q35_weight_bf16(axera_q35 & m, const ggml_tensor * w
 AX_ENGINE_IO_BUFFER_T axera_q35_gguf_input(axera_q35 & m, axera_q35_layer & ly, const ggml_tensor * w,
                                            const std::string & n, uint32_t size);
 AX_ENGINE_IO_BUFFER_T axera_q35_mx_input(axera_q35_layer & ly, const ggml_tensor * w, const std::string & n,
-                                         uint32_t size);
+                                         uint32_t size, ggml_axera_kernel * k);
 void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::string, ggml_tensor *> & t);
+void axera_q35_load_group(axera_q35 & m, const std::string & ctx_sfx);
+void axera_q35_bind_group(axera_q35 & m, const std::map<std::string, ggml_tensor *> & t);
 void axera_q35_bind_prefill(axera_q35 & m, int il, size_t v, const std::map<std::string, ggml_tensor *> & t);
 void axera_q35_context(ggml_axera_kernel * k, int & LMAX, int & BC);
 bool axera_q35_load_flash(axera_q35 & m, int R, bool seg_only = false);
 int axera_q35_fd_key(const axera_q35 & m, int v);
 void axera_q35_clone_flash(axera_q35 & m, int R, int key);
 void axera_q35_bind_flash(axera_q35 & m, int il, int v, const std::map<std::string, ggml_tensor *> & t);
-bool axera_q35_load_mc(axera_q35 & m, int P);
-void axera_q35_bind_mc(axera_q35 & m, int il, size_t v, const std::map<std::string, ggml_tensor *> & t);
 void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggml_tensor *> & t,
                     const ggml_tensor * lm, const ggml_tensor * rope);
 void axera_q35_set_row(axera_q35 & m, int64_t row);

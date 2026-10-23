@@ -19,11 +19,11 @@ with precompiled kernels, and leaves everything else to the CPU backend.
   every tensor of the same shape and GGUF weights are used as they are. The backend looks kernels up by name in
   `GGML_AXERA_KERNEL_DIR` (default `./axera_kernels`) and only claims an op if its kernel exists. A kernel file is
   `<name>_npu<N>.axmodel`, N the NPU cores it was compiled for (`qwen3_attn_mx8_kvc_c4096_npu1.axmodel`,
-  `qwen35_mlp_mc128_npu4.axmodel`); below kernels are named without that suffix.
+  `qwen35_gdn_mx8_npu4.axmodel`); below kernels are named without that suffix.
 - **Cores**: `GGML_AXERA_CORES` (default 4) picks `<name>_npu<GGML_AXERA_CORES>` where it exists, else the single-core
-  `<name>_npu1`; `GGML_AXERA_CORES=1` runs the single-core builds only. The multi-core builds split their work over the
-  cores without synchronizing them (the driver neither synchronizes cores reliably inside a task nor runs tasks on
-  different cores concurrently) and need all cores: other NPU users at the same time make their calls time out.
+  `<name>_npu1`; `GGML_AXERA_CORES=1` runs the single-core builds only. A layer is one kernel either way: a four-core
+  build has the single-core one's name and IO and synchronizes its cores inside the call (shared on-chip memory,
+  AXDSL `pub` / `sub`). It needs all cores: other NPU users at the same time make its calls time out.
 
 ## Supported ops
 
@@ -59,7 +59,8 @@ batch greedily into the largest chunks that fit and runs the rest through the de
 Limits of the template:
 - The recurrent state and the KV cache live in the llama.cpp memory, so its checkpoints, prompt cache, sequence edits
   and parallel sequences apply.
-- Contexts up to 32768 cells with the fused attention kernels, beyond that split attention (flash decoding).
+- Any context the kernel directory has fused attention kernels for (`LMAX`, see Packed layers and layer groups);
+  over the largest one the backend stops at load unless the directory has the split attention kernels.
 - Prompt tokens go through the prefill kernels in chunks of 64 / 32 / 16 / 8 / 4, if present, and through the decode
   kernels otherwise.
 
@@ -299,11 +300,7 @@ experts, groups the picks by expert into slots of up to 64 rows (gathering the h
 `qwen35moe_slots32_g64_gu_mxfp4[_bo]` runs 32 slots per call (each slot one expert's weights, bound by address), whose
 rows (bf16 with `_bo`) the host adds to the tokens' base. A group holds at most one ubatch, so run MoE models with
 `-ub 2048` (llama.cpp's default 512 leaves about 16 rows per expert where a slot takes 64: 46.2 s instead of 33.4 s for
-15888 tokens). With MXFP8 weights and the four-core kernels (`q35_mc.py` with the MoE config: `qwen35_gdn_mc128_mx8`,
-`qwen35_attn_{head,tail}_mc128_mx8`, and `qwen35_moe_pre_mc128_mx8` in place of the MLP: x = base + the partials, 32
-tokens per core, the shared expert, h2 and the router logits) the 128-token chunks run on the multi-core chain, one
-layer per call between the experts (the layer input in A / B without partials); the attention segments merge on the
-NPU (the tail's slots) instead of the host.
+15888 tokens).
 Long contexts take the split attention (`qwen35_attn_fd_{head,seg}*` with `qwen35moe_attn_fd_tail<R>`, which ends with
 the MoE's dense part); the 128-row segment kernel takes the query heads in 4 passes per block (`SEG_PARTS`: 1024 score
 rows at a time overflow the on-chip memory; 29.3 -> 12.1 ms over 32768 cells). Kernels: `q35_moe.py`,
@@ -320,28 +317,81 @@ tokens 663 / 539 s, the needle found in each; decode 95 ms per token at 4k, 199 
 
 ### Multi-core kernels
 
-By default (`GGML_AXERA_CORES=4`) the kernels that have a four-core build (`<name>_npu4`, AXDSL without synchronization
-between the cores: each core takes its share of heads, output channels, slots or KV blocks and writes only its own
-outputs) replace the single-core ones: for the dense models prefill chunks of 128 / 64 tokens and decode
-(`GGML_AXERA_MC_DECODE=0` keeps decode single-core) run as a chain of `qwen35_{gdn,mlp,attn_head,attn_tail}_mc<P>`
-kernels that pass the residual as a base plus one fp32 partial per core, the segment kernels split their blocks over
-the cores and the tail merges the partial results on the NPU (more segments than its slots: merged on the CPU in
-between), and the output projection uses the four-core `mul_mat_bf16_n<C>_k<K>`; for the MoE models the segment kernels, the
-slots kernel and the gate-up experts kernel (the cores' partial sums added on the host). Qwen3 models take the same
-chain without the gated delta net (`qwen3_{mlp,attn_head,attn_tail}_mc<P>_mx8`, MXFP8 weights sliced per core with
-their scales, the four-core `mul_mat_mx8_n<C>_k<K>` output projection); a layer with less than 32 MB of weights (0.6B)
-decodes on the single-core fused kernel below 1024 cells of KV (`GGML_AXERA_MC_DECODE_CELLS=<n>` overrides), where the
-chain's four calls per layer cost more than the bandwidth gains. The split attention takes the largest segment kernel
-within the cache (fewer segments to merge than the tail's slots).
+By default (`GGML_AXERA_CORES=4`) a layer runs as the four-core build of its fused kernel (`q35_layer_mc.py`, written as
+`<name>_npu4` with the single-core kernel's name and IO): the decode and prefill layers of Qwen3.5 (GDN, attention),
+Qwen3 (attention) and the 35B-A3B MoE layer bodies, the MoE experts kernel and the output projection GEMV. In a layer
+each core takes its share of query / KV heads (delta-net key heads and their value heads) and of MLP channels; the
+cores meet in shared on-chip memory between the halves of the layer (`pub` / `sub`): decode sums the cores' fp32
+partial projections there, prefill passes the attention output, x1 and the MLP activations to every core, which then
+computes its columns of the next projection over the whole input (per element the single-core kernel's arithmetic:
+bit-identical outputs). The split attention's segment kernels split their KV blocks over the cores. A kernel without a
+four-core build runs on one core; the backend warns at its first call (`runs on 1 core`).
 
-On boards with the October 16-19 images this is stable (0.8B `llama-perplexity` three times bit-identical, PPL zh
-46.81 against 46.74 single-core from the order of the partial sums; on an older board it gave NaN and timeouts). The
-gain is limited by the DRAM bandwidth those boards reach, about 84 GB/s for all cores together (one core about
-53 GB/s; the CPU and the NPU together share the same 84 GB/s): compute-bound kernels scale (35B segment kernel 12.1 ->
-3.3 ms, 119k-token prompt 663 -> 539 s), bandwidth-bound ones barely (0.8B decode 42 -> 40 ms). A board with its DRAM
-at 7500 MT/s reaches 165 GB/s with four cores (a copy kernel: 256 MB in 1.55 ms), while one core stays at about
-53 GB/s on either board: there the single-core kernels gain little and the bandwidth-bound ones need their four-core
-builds. `GGML_AXERA_PROF=1` prints per-kernel times at exit.
+The gain is bounded by the DRAM bandwidth: one core reads about 53 GB/s on any board, four cores 84 GB/s with DRAM at
+3200 MT/s and 165 GB/s at 7500 MT/s (a copy kernel: 256 MB in 1.55 ms). Each call also costs about 0.25 ms on the host
+and the runtime, which is why a layer is one call. `GGML_AXERA_PROF=1` prints per-kernel times at exit.
+
+### Packed layers and layer groups
+
+A kernel call costs about 7 us per IO on top of the 0.25 ms, and a fused layer kernel had 25 - 28 inputs. The packed
+layer kernels (`q35_layer_pk.py`, `<KP>_gdn[_prefill<P>]_mx8_pk`, `<KP>_attn[_prefill<P>]_mx8_pk_kvc_c<LMAX>`) take a
+layer's parameters as one input per dtype (`pw` fp8 elements, `ps` e8m0 scales, `pf` f32 norms, `pb` bf16 conv taps);
+the `.layout` file next to the kernel lists each member's pack, offset and size, and the backend copies the converted
+weights into the packs once at load. The group kernels (`q35_group.py`, `<KP>_group<G>_<kinds>_mx8_kvc_c<LMAX>`, kinds
+`g` / `a` per layer) run G consecutive decode layers in one call, each layer's output staying on chip; a group of the
+whole model can end with the output projection (`_lm8` MXFP8, `_lm4` MXFP4) and writes the logits straight into the
+graph's output tensor. The MoE models have their own groups (`q35_moe_group.py`, `qwen35moe_group<G>_<kinds>_mx8_*`:
+whole layers with router, top-K and the experts picked from the layers' planar expert tensors on the NPU). A single IO's
+size field overflows at 2 GiB, so `q35_group.py` splits a group whose packs pass 1.75 GiB, and the backend checks every
+pack and expert plane at load.
+
+Kernel directories are tiered by context: the `c4096` kernels attend on each core over all KV blocks, the `c16384` and
+larger ones (`DEC_SPLIT=1`) share the KV blocks of a decode step out over the cores and merge in shared on-chip memory.
+A directory holds the attention, prefill and group kernels of every context it serves; `-c` picks the smallest `LMAX`
+that holds it. A `-c` over the largest `LMAX` stops at load with the context to use instead, unless the directory has
+the split attention kernels (`qwen35_attn_fd_*`, DEPRECATED, kept for the Qwen3 family, 0.8B, ASR and TTS).
+
+Building (AXDSL, `qwen3_5/` of the kernel sources; common environment `KVL=cell BC=256 CORES=4 WFMT=mx8 BLOCK=1
+MODEL=<hf dir>`, plus `DEC_SPLIT=1` for contexts over 4096 and `WFMT4=1` for MXFP4 MLP weights):
+
+| Kernels | Command |
+|---|---|
+| decode attention, packed | `LMAX=<ctx> STEPS=2 T0=2000 PCHUNK=1 ONLY=attn python q35_layer_pk.py <dir>` |
+| decode gated delta net, packed | `LMAX=4096 STEPS=2 PCHUNK=1 ONLY=gdn python q35_layer_pk.py <dir>` |
+| prefill chunk, attention | `LMAX=<ctx> STEPS=1 PCHUNK=<P> ONLY=attn python q35_layer_pk.py <dir>` |
+| prefill chunk, gated delta net (any context) | `LMAX=4096 STEPS=1 PCHUNK=<P> ONLY=gdn python q35_layer_pk.py <dir>` |
+| layer group | `LMAX=<ctx> STEPS=1 G=<layers> FIRST=0 [LMHEAD=1] python q35_group.py <dir>` |
+| output projection, MXFP4 | `LM_C=<vocab> LM_K=<hidden> [LM_TILE=<rows>] python lm4.py <dir>` (`LM_QUANT=moe` for the MoE models' rounding) |
+| MoE layer group | `LMAX=<ctx> G=<layers> [FIRST=0] [NOREF=1] python q35_moe_group.py <dir>` |
+| MoE prefill slots / combine | `ONLY=slots_px python q35_moe_prefill.py <dir>` (`SLOTS`, `SLOT_G`), `ONLY=combine python q35_moe_prefill.py <dir>` (`T_GROUP`, `COMBINE_R`) |
+
+The combine kernel is named `qwen35moe_combine<K>_t<T>_r<R>`; the backend takes the smallest `R` that holds a group's
+slot rows. Each script checks its kernel on the simulator against the single-core kernel or torch before writing it.
+
+### Settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GGML_AXERA_TEMPLATE` | per op | `qwen35` / `qwen3`: the graph template |
+| `GGML_AXERA_KERNEL_DIR` | `./axera_kernels` | kernel directory |
+| `GGML_AXERA_CORES` | 4 | cores per kernel (`_npu<N>`); a kernel without that build runs on one core with a warning at its first call |
+| `GGML_AXERA_WEIGHTS` | bf16 | `mxfp8`; `mxfp4`: MLP and output projection MXFP4; `mxfp4m`: MLP MXFP4, the rest MXFP8 |
+| `GGML_AXERA_LMHEAD` | `mxfp4` for MoE models and `WEIGHTS=mxfp4` when `mul_mat_mx4_n<C>_k<K>` exists, else `mxfp8` | output projection format |
+| `GGML_AXERA_PREFILL_WEIGHTS` | MXFP8 if the directory has MXFP8 prefill kernels | `mxfp8` / `bf16` |
+| `GGML_AXERA_GROUP` | the largest group with a kernel (the whole model first) | layers per call; `0`: no groups |
+| `GGML_AXERA_GROUP_LM` | 1 | `0`: a whole-model group without the output projection |
+| `GGML_AXERA_GROUP_DIRECT` | 1 | `0`: a group's logits through an internal buffer, then copied |
+| `GGML_AXERA_NO_GROUP` | unset | set: no MoE layer groups |
+| `GGML_AXERA_MOE_GROUP` | 2048 / P | MoE prefill chunks whose experts run together |
+| `GGML_AXERA_MOE_SLOTS` | from the directory | MoE slots kernel name |
+| `GGML_AXERA_KEEP_UNPACKED` | 0 | `1`: keep the converted weights and per-layer packs that packed / group kernels no longer read |
+| `GGML_AXERA_LOGITS_CLEAN` | 1 | `0`: cache maintenance on reading logits the NPU just wrote |
+| `GGML_AXERA_PIN_HOST` | 1 | locks the weights left on the CPU (token embeddings) in memory, up to 2 GiB; if `mlock` fails (`ulimit -l`) it says so once and stops |
+| `GGML_AXERA_MMAP` | 1 with a template | `0`: load the GGUF into CMM |
+| `GGML_AXERA_FLASH` | 0 | `1`: split attention even where a fused kernel holds the context |
+| `GGML_AXERA_SPLIT_MIN` | 4096 | prefill masks from this many cells take the split kernels (where present) |
+| `GGML_AXERA_PROF` | 0 | `1`: time per kernel at exit; `2`: also every CPU node |
+| `GGML_AXERA_DEBUG` | 0 | `1`: log op shapes without a kernel |
 
 ## Graph template: Qwen3 transformers
 
@@ -360,9 +410,11 @@ env $E LMAX=4096 WFMT=mx8 python ggml_template_build.py <kernel_dir>            
 env $E NODEC=1 LMAX=4096 PCHUNK=64 WFMT=mx8 python q35_prefill.py <kernel_dir>    # prefill chunks (P = 128 .. 2)
 env $E R=1 S=16384 CHECK=0 WFMT=mx8 python q35_flash.py <kernel_dir>             # split attention (R = 1 .. 64)
 env $E LMAX=4096 B=2 WFMT=mx8 python q35_batch.py <kernel_dir>                   # batched decode
-# four-core chain (P = 1, 16, 64, 128), output projection and segments
-env $E CORES=4 P=64 WFMT=mx8 LM_C=18992 python q35_mc.py <kernel_dir>
-R=64 S=4096 CORES=4 python q35_flash.py <kernel_dir>                               # and S=16384
+# four-core layers: decode (PCHUNK unset), prefill chunks (PCHUNK=128 ..), output projection (ONLY=lm)
+env $E CORES=4 LMAX=4096 WFMT=mx8 python q35_layer_mc.py <kernel_dir>
+env $E CORES=4 LMAX=4096 WFMT=mx8 PCHUNK=64 python q35_layer_mc.py <kernel_dir>
+env $E CORES=4 WFMT=mx8 ONLY=lm LM_C=18992 python q35_layer_mc.py <kernel_dir>
+R=64 S=4096 CORES=4 python q35_flash.py <kernel_dir>                               # segments, and S=16384
 ```
 
 Models of the same shapes share their kernels: Qwen3-0.6B, Qwen3-ASR-0.6B, Qwen3-Embedding-0.6B and
@@ -379,8 +431,7 @@ On AX8860 (MXFP8 weights, the GGUF mapped from eMMC, DRAM at 7500 MT/s; one core
 
 A 15539-token prompt with a number stated in its first line (split attention) takes 76.2 / 20.6 s on Qwen3-8B (decode
 243 / 97 ms per token there), and both answer with the number; Qwen3-0.6B took 19.9 s single-core. Qwen3-8B peaks at
-10.1 GB of CMM at 16k context. Four-core runs repeat bit-identically (three perplexity runs); they differ from one core
-by the order of the cores' partial sums.
+10.1 GB of CMM at 16k context.
 
 ### Embeddings and reranking
 
@@ -515,7 +566,6 @@ The backend separates what any model uses from the graph templates of one archit
 | `ggml-axera-q35-bind.cpp` | Qwen3.5: kernel loading, binding GGUF tensors and cache tensors to kernel IO |
 | `ggml-axera-q35-run.cpp` | Qwen3.5: one graph (recurrent-state bookkeeping, MTP input, chunks, layer calls) |
 | `ggml-axera-q35-moe.cpp` | Qwen3.5 MoE: expert routing and the experts / slots kernels |
-| `ggml-axera-q35-mc.cpp` | Qwen3.5: the multi-core prefill chain |
 | `ggml-axera-vit.cpp` | the Qwen3.5 vision encoder (mtmd) |
 | `ggml-axera-audio.cpp` | the Qwen3-ASR audio encoder (mtmd) |
 | `ggml-axera-gen.cpp` | graphs without a template (mtmd's generation graphs: the Qwen3-TTS code predictor and codec decoder) on the CPU backend, with their layers and matrix products on the NPU |

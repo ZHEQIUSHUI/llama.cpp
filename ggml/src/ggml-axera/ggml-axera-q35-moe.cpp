@@ -5,7 +5,116 @@
 // MoE layer il after its layer kernel: the top-K experts of the router logits (softmax, top-K, renormalized: as
 // transformers' Qwen3_5MoeTopKRouter; the softmax over the top-K alone gives the same weights), their weights
 // bound to the experts kernel, which adds them to the residual + shared expert (BASE) into the layer output
-void axera_q35_batch::run_experts(int il, int64_t p) {
+bool axera_q35_batch::whole(int il) const {
+    if (il >= L || !m.layers[il].exps[0].planar) {
+        return false;
+    }
+    const auto & ly = m.layers[il];
+    return m.full[ly.gdn ? 0 : 1].k && (ly.gdn || !use_split(1));
+}
+
+// a whole MoE layer in one call: the layer kernel's IO by name, the layer's planar expert tensors, out the next x
+void axera_q35_batch::run_whole(int il, int64_t p) {
+    axera_q35_layer & ly = m.layers[il];
+    auto &            fk = m.full[ly.gdn ? 0 : 1];
+    for (size_t i = 0; i < fk.in.size(); ++i) {
+        if (fk.body[i] >= 0) {
+            fk.in[i] = ly.in[fk.body[i]];
+            continue;
+        }
+        if (fk.pack[i] >= 0) {
+            const auto & pk = ly.whole_packs[fk.pack[i]];
+            fk.in[i]        = axera_io(pk.get(), pk->vir, (uint32_t) fk.pack_bytes[fk.pack[i]]);
+            continue;
+        }
+        const auto & e = ly.exps[fk.plane[i] < 2 ? 0 : 2];  // gate-up, down
+        fk.in[i] = fk.plane[i] % 2 == 0 ? axera_io(e.b, e.base, (uint32_t) (e.n * e.data)) :
+                                          axera_io(e.b, e.s(0), (uint32_t) (e.n * e.scale));
+    }
+    auto & x = il % 2 == 0 ? m.B : m.A;  // as the experts kernel writes it
+    for (size_t i = 0; i < fk.out.size(); ++i) {
+        fk.out[i] = fk.bout[i] >= 0 ? ly.out[fk.bout[i]] : axera_io(x.get(), x->vir, (uint32_t) (m.H * sizeof(ggml_bf16_t)));
+    }
+    axera_timer tm(ly.gdn ? "moe layer gdn (whole)" : "moe layer attn (whole)");
+    const int   ret = axera_run_sync(fk.k, fk.in, fk.out);
+    if (ret != 0) {
+        GGML_ABORT("qwen35 template: RunSync failed (0x%x) in the whole MoE layer %d, position %" PRId64 "\n", ret, il, p);
+    }
+    if (ly.si >= 0) {
+        std::swap(ly.in[ly.si], ly.out[ly.so]);
+        std::swap(ly.in[ly.ci], ly.out[ly.co]);
+    }
+}
+
+bool axera_q35_batch::grouped(int il) const {
+    const int G = m.mgrp.G;
+    if (!m.mgrp.k || il % G != 0 || il + G > L) {
+        return false;
+    }
+    for (int j = 0; j < G; ++j) {
+        if (!whole(il + j)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// layers il .. il + G - 1 in one call: their IO by name with the layer index (layer kernels' buffers), the group's
+// packs, out the x of the group's last layer (as its whole-layer kernel writes it)
+void axera_q35_batch::run_grouped(int il, int64_t p) {
+    auto & gk = m.mgrp;
+    auto   io = [&](const axera_q35::moe_group_kernel::io & d, bool out) -> AX_ENGINE_IO_BUFFER_T {
+        axera_q35_layer & ly = m.layers[il + d.j];
+        switch (d.kind) {
+            case 0:
+                return ly.in[(ly.gdn ? m.gdn : m.attn)->input("x")];
+            case 1: {
+                const auto & pk = gk.packs[il / gk.G][d.idx];
+                return axera_io(pk.get(), pk->vir, (uint32_t) gk.pack_bytes[d.idx]);
+            }
+            case 2: {
+                const auto & e = ly.exps[d.idx < 2 ? 0 : 2];  // gate-up, down
+                return d.idx % 2 == 0 ? axera_io(e.b, e.base, (uint32_t) (e.n * e.data)) :
+                                        axera_io(e.b, e.s(0), (uint32_t) (e.n * e.scale));
+            }
+            case 3:
+                return out ? ly.out[d.idx] : ly.in[d.idx];
+            default: {
+                auto & x = (il + gk.G - 1) % 2 == 0 ? m.B : m.A;
+                return axera_io(x.get(), x->vir, (uint32_t) (m.H * sizeof(ggml_bf16_t)));
+            }
+        }
+    };
+    for (size_t i = 0; i < gk.in.size(); ++i) {
+        gk.in[i] = io(gk.ins[i], false);
+    }
+    for (size_t i = 0; i < gk.out.size(); ++i) {
+        gk.out[i] = io(gk.outs[i], true);
+    }
+    axera_timer tm("moe layer group");
+    const int   ret = axera_run_sync(gk.k, gk.in, gk.out);
+    if (ret != 0) {
+        GGML_ABORT("qwen35 template: RunSync failed (0x%x) in the MoE layers %d .. %d, position %" PRId64 "\n", ret, il,
+                   il + gk.G - 1, p);
+    }
+    for (int j = 0; j < gk.G; ++j) {
+        axera_q35_layer & ly = m.layers[il + j];
+        if (ly.si >= 0) {
+            std::swap(ly.in[ly.si], ly.out[ly.so]);
+            std::swap(ly.in[ly.ci], ly.out[ly.co]);
+        }
+    }
+}
+
+bool axera_q35_batch::merged(int il) const {
+    if (il == 0 || il >= L || !m.layers[il - 1].exps_gu || whole(il) || whole(il - 1)) {
+        return false;
+    }
+    const auto & ly = m.layers[il];
+    return m.mx[ly.gdn ? 0 : 1].k && (ly.gdn || !use_split(1));
+}
+
+void axera_q35_batch::run_experts(int il, int64_t p, int next) {
     axera_q35_layer & ly = m.layers[il];
     axera_timer       tr("moe route (cpu)");
     m.LOGITS->invalidate(m.LOGITS->vir, m.LOGITS->size);
@@ -31,40 +140,165 @@ void axera_q35_batch::run_experts(int il, int64_t p) {
             }
             const int    kind = ly.exps_gu && g == 0 ? 3 : g;
             const auto & e    = ly.exps[g];
-            char *       w    = e.base + (size_t) e_ids[i] * e.stride;
-            ek.in[ek.w[kind][i]] = axera_io(e.b, w, (uint32_t) e.data);
-            ek.in[ek.s[kind][i]] = axera_io(e.b, w + e.data, (uint32_t) e.scale);
+            ek.in[ek.w[kind][i]] = axera_io(e.b, e.w(e_ids[i]), (uint32_t) e.data);
+            ek.in[ek.s[kind][i]] = axera_io(e.b, e.s(e_ids[i]), (uint32_t) e.scale);
         }
     }
     auto & out = ek.out[il % 2];
     tr.stop();
+    if (next >= 0) {  // with layer next's body: its IO, the experts' IO for the rest
+        axera_q35_layer & ln = m.layers[next];
+        auto &            mk = m.mx[ln.gdn ? 0 : 1];
+        for (size_t i = 0; i < mk.in.size(); ++i) {
+            mk.in[i] = mk.body[i] >= 0 ? ln.in[mk.body[i]] : ek.in[mk.ein[i]];
+        }
+        for (size_t i = 0; i < mk.out.size(); ++i) {
+            mk.out[i] = ln.out[mk.bout[i]];
+        }
+        axera_timer tm(ln.gdn ? "moe experts + gdn decode" : "moe experts + attn decode");
+        const int   ret = axera_run_sync(mk.k, mk.in, mk.out);
+        if (ret != 0) {
+            GGML_ABORT("qwen35 template: RunSync failed (0x%x) in the experts of layer %d with layer %d, position %"
+                       PRId64 "\n", ret, il, next, p);
+        }
+        if (ln.si >= 0) {
+            std::swap(ln.in[ln.si], ln.out[ln.so]);
+            std::swap(ln.in[ln.ci], ln.out[ln.co]);
+        }
+        return;
+    }
     axera_timer tm("moe experts");
     const int   ret = axera_run_sync(ek.k, ek.in, out);
     if (ret != 0) {
         GGML_ABORT("qwen35 template: RunSync failed (0x%x) in the experts of layer %d, position %" PRId64 "\n", ret,
                    il, p);
     }
-    if (ek.PART) {  // multi-core: the layer output = the sum of the cores' rows
-        const int cores = (int) (axera_output_size(ek.k, "part_out") / (H * sizeof(float)));
-        ek.PART->invalidate(ek.PART->vir, ek.PART->size);
-        const auto *       pr = (const float *) ek.PART->vir;
-        std::vector<float> acc(pr, pr + H);
-        for (int c = 1; c < cores; ++c) {
-            for (int i = 0; i < H; ++i) {
-                acc[i] += pr[(size_t) c * H + i];
-            }
-        }
-        auto * x = (il % 2 == 0 ? m.B : m.A).get();
-        ggml_fp32_to_bf16_row(acc.data(), (ggml_bf16_t *) x->vir, H);
-        x->flush(x->vir, H * sizeof(ggml_bf16_t));
-    }
 }
 
 // MoE layer il of prefill chunks vs (a group, or one chunk) after their layer kernels: each token's top-K experts
 // (as run_experts), the picks grouped by expert into slots of up to G rows (h2 rows and routing weights gathered
 // here), S slots per call of the slots kernel, then per token base + its K results into the next layer's input
+// the group's experts with the rows read and added on the NPU: the host routes (top-K of the logits), lays the picks
+// out in slots of up to G rows per expert and writes each slot's expert and tokens and each token's K slot rows; the
+// slots kernel reads its rows out of the group's h2, the combine kernel adds them to the base into the next x
+void axera_q35_batch::run_experts_px(int il, const std::vector<int> & vs) {
+    axera_q35_layer & ly = m.layers[il];
+    auto &            sk = m.slots;
+    const int         P = m.pre[vs[0]].P, NT = P * (int) vs.size(), K = m.top_k, NE = m.n_expert, S = sk.S, G = sk.G;
+    const size_t      es = sk.ob ? sizeof(ggml_bf16_t) : sizeof(float);
+    axera_timer       tr("moe prefill route (cpu)");
+    m.GLOG->invalidate(m.GLOG->vir, (size_t) NT * NE * sizeof(float));
+    const float *      lgs = (const float *) m.GLOG->vir;
+    std::vector<int>   ids((size_t) NT * K);
+    std::vector<float> wts((size_t) NT * K);
+    axera_host_pool().run(NT, [&](int64_t r) {
+        const float *    lg = lgs + r * NE;
+        std::vector<int> o(NE);
+        std::iota(o.begin(), o.end(), 0);
+        std::partial_sort(o.begin(), o.begin() + K, o.end(), [&](int a, int b) { return lg[a] > lg[b]; });
+        float sum = 0.0f;
+        for (int i = 0; i < K; ++i) {
+            ids[r * K + i] = o[i];
+            wts[r * K + i] = std::exp(lg[o[i]] - lg[o[0]]);
+            sum += wts[r * K + i];
+        }
+        for (int i = 0; i < K; ++i) {
+            wts[r * K + i] /= sum;
+        }
+    });
+    std::vector<std::vector<int>> by(NE);  // picks (token * K + i) per expert
+    for (int pk = 0; pk < NT * K; ++pk) {
+        by[ids[pk]].push_back(pk);
+    }
+    // the slots this group needs (G picks of one expert each, then padding to whole calls of S slots): within the
+    // combine kernel's rows and the slot buffers before anything is written
+    int need = 0;
+    for (int e = 0; e < NE; ++e) {
+        need += (int) ((by[e].size() + G - 1) / G);
+    }
+    const int calls = (need + S - 1) / S;
+    GGML_ASSERT((size_t) calls * S * G <= (size_t) m.comb.R);
+    GGML_ASSERT((size_t) calls * S * (1 + G) * sizeof(int32_t) <= m.TOK->size &&
+                (size_t) calls * S * G * sizeof(float) <= m.SRW->size);
+    auto * tok = (int32_t *) m.TOK->vir;  // per slot: expert, G token rows of h2
+    auto * sw  = (float *) m.SRW->vir;
+    auto * loc = (int32_t *) m.LOC->vir;  // per pick and token ([K][T]): the slot row of its result
+    int    ns  = 0;
+    for (int e = 0; e < NE; ++e) {
+        for (size_t j = 0; j < by[e].size(); j += G, ++ns) {
+            int32_t * t = tok + (size_t) ns * (1 + G);
+            t[0]        = e;
+            for (int g = 0; g < G; ++g) {
+                const size_t row = (size_t) ns * G + g;
+                const int    pk  = j + g < by[e].size() ? by[e][j + g] : -1;
+                t[1 + g]         = pk >= 0 ? pk / K : 0;
+                sw[row]          = pk >= 0 ? wts[pk] : 0.0f;
+                if (pk >= 0) {
+                    loc[(size_t) (pk % K) * m.comb.T + pk / K] = (int32_t) row;  // [K][T]
+                }
+            }
+        }
+    }
+    GGML_ASSERT(ns == need);
+    for (; ns < calls * S; ++ns) {  // padding slots: some expert, weight 0
+        int32_t * t = tok + (size_t) ns * (1 + G);
+        t[0]        = 0;
+        for (int g = 0; g < G; ++g) {
+            t[1 + g]                   = 0;
+            sw[(size_t) ns * G + g] = 0.0f;
+        }
+    }
+    for (int k = 0; k < K; ++k) {
+        for (int t = NT; t < m.comb.T; ++t) {
+            loc[(size_t) k * m.comb.T + t] = 0;  // the tokens of chunks this group does not fill
+        }
+    }
+    tr.stop();
+    const auto & ec = ly.exps[0];
+    const auto & ed = ly.exps[2];
+    sk.in[sk.h2]       = axera_io(m.GH2.get(), m.GH2->vir, (uint32_t) m.GH2->size);
+    sk.in[sk.plane[0]] = axera_io(ec.b, ec.base, (uint32_t) (ec.n * ec.data));
+    sk.in[sk.plane[1]] = axera_io(ec.b, ec.s(0), (uint32_t) (ec.n * ec.scale));
+    sk.in[sk.plane[2]] = axera_io(ed.b, ed.base, (uint32_t) (ed.n * ed.data));
+    sk.in[sk.plane[3]] = axera_io(ed.b, ed.s(0), (uint32_t) (ed.n * ed.scale));
+    for (int c = 0; c < calls; ++c) {
+        const size_t r0 = (size_t) c * S * G;
+        sk.in[sk.tok]   = axera_io(m.TOK.get(), tok + (size_t) c * S * (1 + G), (uint32_t) (S * (1 + G) * sizeof(int32_t)));
+        sk.in[sk.rw]    = axera_io(m.SRW.get(), sw + r0, (uint32_t) (S * G * sizeof(float)));
+        sk.outs[sk.out] = axera_io(m.SOUT.get(), (char *) m.SOUT->vir + r0 * H * es, (uint32_t) (S * G * H * es));
+        axera_timer tm("moe prefill slots");
+        const int   ret = axera_run_sync(sk.k, sk.in, sk.outs);
+        if (ret != 0) {
+            GGML_ABORT("qwen35 template: RunSync failed (0x%x) in the prefill experts of layer %d\n", ret, il);
+        }
+    }
+    auto & cb = m.comb;
+    auto & xo = il % 2 == 0 ? m.GB : m.GA;  // the group's next x
+    cb.in.assign(cb.k->info->nInputSize, {});
+    cb.out.assign(cb.k->info->nOutputSize, {});
+    cb.in[cb.k->input("base")] = axera_io(m.GBASE.get(), m.GBASE->vir, (uint32_t) m.GBASE->size);
+    cb.in[cb.k->input("loc")]  = axera_io(m.LOC.get(), m.LOC->vir, (uint32_t) m.LOC->size);
+    cb.in[cb.k->input("sout")] = axera_io(m.SOUT.get(), m.SOUT->vir, axera_input_size(cb.k, "sout"));
+    cb.out[cb.k->output("out")] = axera_io(xo.get(), xo->vir, (uint32_t) xo->size);
+    axera_timer tc("moe prefill combine (npu)");
+    const int   ret = axera_run_sync(cb.k, cb.in, cb.out);
+    if (ret != 0) {
+        GGML_ABORT("qwen35 template: RunSync failed (0x%x) in the prefill combine of layer %d\n", ret, il);
+    }
+}
+
 void axera_q35_batch::run_experts_pre(int il, const std::vector<int> & vs) {
     axera_q35_layer & ly = m.layers[il];
+    if (m.comb.k && ly.exps[0].planar) {  // a group's chunks (or its first) in order: their rows are contiguous
+        bool ok = vs.size() <= m.pre[0].group.size();
+        for (size_t c = 0; ok && c < vs.size(); ++c) {
+            ok = vs[c] == m.pre[0].group[c];
+        }
+        if (ok) {
+            run_experts_px(il, vs);
+            return;
+        }
+    }
     auto &            sk = m.slots;
     const int         P = m.pre[vs[0]].P, NT = P * (int) vs.size(), K = m.top_k, NE = m.n_expert, S = sk.S, G = sk.G;
     const size_t      es = sk.ob ? sizeof(ggml_bf16_t) : sizeof(float);  // bytes per result element
@@ -120,19 +354,37 @@ void axera_q35_batch::run_experts_pre(int il, const std::vector<int> & vs) {
     std::vector<int> used((size_t) calls * S, 0);
     auto *           sx = (ggml_bf16_t *) m.SX->vir;
     auto *           sw = (float *) m.SRW->vir;
+    const bool       px = sk.tok >= 0;  // the slots kernel reads rows of h2 by token: the chunks' h2 rows into SX
+    auto *           tk = px ? (int32_t *) m.TOK->vir : nullptr;
+    if (px) {
+        GGML_ASSERT((size_t) calls * S * (1 + G) * sizeof(int32_t) <= m.TOK->size);
+        for (int t = 0; t < NT; ++t) {
+            memcpy(sx + (size_t) t * H, row_ptr(&axera_q35::prefill::H2, t, H * sizeof(ggml_bf16_t)),
+                   H * sizeof(ggml_bf16_t));
+        }
+        m.SX->flush(sx, (size_t) NT * H * sizeof(ggml_bf16_t));
+    }
     axera_host_pool().run((int64_t) calls * S, [&](int64_t sl) {
+        if (px) {
+            tk[sl * (1 + G)] = se[sl];
+        }
         for (int g = 0; g < G; ++g) {
             const int64_t row = sl * G + g;
             const int     pk  = sp[row];
             sw[row]           = pk >= 0 ? wts[pk] : 0.0f;
+            if (px) {
+                tk[sl * (1 + G) + 1 + g] = pk >= 0 ? pk / K : 0;
+            }
             if (pk >= 0) {
-                memcpy(sx + row * H, row_ptr(&axera_q35::prefill::H2, pk / K, H * sizeof(ggml_bf16_t)),
-                       H * sizeof(ggml_bf16_t));
+                if (!px) {
+                    memcpy(sx + row * H, row_ptr(&axera_q35::prefill::H2, pk / K, H * sizeof(ggml_bf16_t)),
+                           H * sizeof(ggml_bf16_t));
+                }
                 loc[pk]  = (int) row;
                 used[sl] = g + 1;
             }
         }
-        if (used[sl]) {
+        if (used[sl] && !px) {
             m.SX->flush(sx + sl * G * H, (size_t) used[sl] * H * sizeof(ggml_bf16_t));
         }
     });
@@ -143,17 +395,32 @@ void axera_q35_batch::run_experts_pre(int il, const std::vector<int> & vs) {
     const auto & ed = ly.exps[2];  // down
     for (int c = 0; c < calls; ++c) {
         const size_t r0 = (size_t) c * S * G;
-        sk.in[sk.x]      = axera_io(m.SX.get(), sx + r0 * H, (uint32_t) (S * G * H * sizeof(ggml_bf16_t)));
+        if (px) {
+            sk.in[sk.h2]  = axera_io(m.SX.get(), sx, axera_input_size(sk.k, "h2"));
+            sk.in[sk.tok] = axera_io(m.TOK.get(), tk + (size_t) c * S * (1 + G), (uint32_t) (S * (1 + G) * sizeof(int32_t)));
+        } else {
+            sk.in[sk.x] = axera_io(m.SX.get(), sx + r0 * H, (uint32_t) (S * G * H * sizeof(ggml_bf16_t)));
+        }
         sk.in[sk.rw]     = axera_io(m.SRW.get(), sw + r0, (uint32_t) (S * G * sizeof(float)));
         sk.outs[sk.out]  = axera_io(m.SOUT.get(), (char *) m.SOUT->vir + r0 * H * es, (uint32_t) (S * G * H * es));
-        for (int i = 0; i < S; ++i) {
+        if (sk.sid >= 0 || px) {  // planar: the layer's expert planes, each slot's expert by index
+            for (int i = 0; i < S && !px; ++i) {
+                ((int32_t *) sk.SID->vir)[i] = se[(size_t) c * S + i];
+            }
+            if (!px) {
+                sk.SID->flush(sk.SID->vir, S * sizeof(int32_t));
+            }
+            sk.in[sk.plane[0]] = axera_io(ec.b, ec.base, (uint32_t) (ec.n * ec.data));
+            sk.in[sk.plane[1]] = axera_io(ec.b, ec.s(0), (uint32_t) (ec.n * ec.scale));
+            sk.in[sk.plane[2]] = axera_io(ed.b, ed.base, (uint32_t) (ed.n * ed.data));
+            sk.in[sk.plane[3]] = axera_io(ed.b, ed.s(0), (uint32_t) (ed.n * ed.scale));
+        }
+        for (int i = 0; i < S && sk.sid < 0 && !px; ++i) {
             const int e = se[(size_t) c * S + i];
-            char *    wc = ec.base + (size_t) e * ec.stride;
-            char *    wd = ed.base + (size_t) e * ed.stride;
-            sk.in[sk.w[0][i]] = axera_io(ec.b, wc, (uint32_t) ec.data);
-            sk.in[sk.s[0][i]] = axera_io(ec.b, wc + ec.data, (uint32_t) ec.scale);
-            sk.in[sk.w[1][i]] = axera_io(ed.b, wd, (uint32_t) ed.data);
-            sk.in[sk.s[1][i]] = axera_io(ed.b, wd + ed.data, (uint32_t) ed.scale);
+            sk.in[sk.w[0][i]] = axera_io(ec.b, ec.w(e), (uint32_t) ec.data);
+            sk.in[sk.s[0][i]] = axera_io(ec.b, ec.s(e), (uint32_t) ec.scale);
+            sk.in[sk.w[1][i]] = axera_io(ed.b, ed.w(e), (uint32_t) ed.data);
+            sk.in[sk.s[1][i]] = axera_io(ed.b, ed.s(e), (uint32_t) ed.scale);
         }
         axera_timer tm("moe prefill slots");
         const int   ret = axera_run_sync(sk.k, sk.in, sk.outs);

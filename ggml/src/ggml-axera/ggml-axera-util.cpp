@@ -1,6 +1,9 @@
 // Axera NPU backend: profiling, host thread pool, runtime, kernel registry, CMM, settings
 
 #include "ggml-axera-impl.h"
+
+#include <ax_engine_advanced_api.h>
+
 bool axera_debug() {
     static const bool debug = [] {
         const char * e = std::getenv("GGML_AXERA_DEBUG");
@@ -98,6 +101,17 @@ std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_alloc_nc(size_t siz
     }
     return b;
 }
+std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_view(const ggml_backend_axera_buffer_context * b, size_t off,
+                                                                  size_t size) {
+    GGML_ASSERT(off + size <= b->size);
+    auto v  = std::make_unique<ggml_backend_axera_buffer_context>();
+    v->phy  = b->phy + off;
+    v->vir  = (char *) b->vir + off;
+    v->size = size;
+    v->nc   = b->nc;
+    v->view = true;
+    return v;
+}
 AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint32_t size) {
     AX_ENGINE_IO_BUFFER_T b;
     memset(&b, 0, sizeof(b));
@@ -108,8 +122,17 @@ AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, vo
 }
 
 // one kernel call; the AX_ENGINE_RunSync status
+// the first run of a single-core build loaded for lack of the multi-core one
+void axera_warn_one_core(ggml_axera_kernel * k) {
+    if (!k->one_core.empty()) {
+        GGML_LOG_WARN("axera: %s runs on 1 core (no %s_npu%d)\n", k->one_core.c_str(), k->one_core.c_str(), axera_cores());
+        k->one_core.clear();
+    }
+}
+
 int axera_run_sync(ggml_axera_kernel * k, std::vector<AX_ENGINE_IO_BUFFER_T> & in,
                    std::vector<AX_ENGINE_IO_BUFFER_T> & out) {
+    axera_warn_one_core(k);
     AX_ENGINE_IO_T io;
     memset(&io, 0, sizeof(io));
     io.pInputs     = in.data();
@@ -131,6 +154,8 @@ int axera_run_sync(ggml_axera_kernel * k, std::vector<AX_ENGINE_IO_BUFFER_T> & i
     return ret;
 }
 
+std::atomic<uint64_t> axera_graph_epoch{ 0 };
+
 // GGML_AXERA_TEMPLATE=qwen35 (or qwen3): the graph template of Qwen3.5 and Qwen3 transformers (ggml-axera-q35.h)
 bool axera_template_qwen35() {
     static const bool on = [] {
@@ -143,6 +168,7 @@ bool axera_template_qwen35() {
 // GGML_AXERA_FLASH=1: split attention (flash decoding) even when a fused attention kernel holds the KV cache
 // GGML_AXERA_SPLIT_MIN: with a fused attention kernel, the KQ mask width (cells) from which a batch takes the split
 // attention kernels instead when they exist for the context (multi-core segment scan; default 4096, 0: always)
+
 int64_t axera_split_min() {
     static const int64_t n = [] {
         const char * e = std::getenv("GGML_AXERA_SPLIT_MIN");
@@ -185,12 +211,30 @@ int64_t axera_flash_seg(int64_t n) {
 
 // GGML_AXERA_WEIGHTS=mxfp8: the template quantizes the bf16 GGUF weights to MXFP8 at load (about half the bytes per
 // token; see docs/backend/AXERA.md for the accuracy cost)
+// GGML_AXERA_WEIGHTS=mxfp4: the layer weights in MXFP4 (kernels <name>_mx4), the output projection in MXFP4 when its
+// mul_mat_mx4 kernel exists (else MXFP8; GGML_AXERA_LMHEAD); the MXFP8 code paths otherwise (axera_weights_mx8 is
+// true for both)
 bool axera_weights_mx8() {
     static const bool on = [] {
         const char * e = std::getenv("GGML_AXERA_WEIGHTS");
-        return e != nullptr && strcmp(e, "mxfp8") == 0;
+        return e != nullptr && (strcmp(e, "mxfp8") == 0 || strcmp(e, "mxfp4") == 0 || strcmp(e, "mxfp4m") == 0);
     }();
     return on;
+}
+bool axera_weights_mx4() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_AXERA_WEIGHTS");
+        return e != nullptr && (strcmp(e, "mxfp4") == 0 || strcmp(e, "mxfp4m") == 0);
+    }();
+    return on;
+}
+// mxfp4m: the MLP weights in MXFP4, the other layer weights MXFP8 (kernels _mx4m)
+const char * axera_mx_sfx() {
+    static const char * sfx = [] {
+        const char * e = std::getenv("GGML_AXERA_WEIGHTS");
+        return e && strcmp(e, "mxfp4m") == 0 ? "_mx4m" : e && strcmp(e, "mxfp4") == 0 ? "_mx4" : "_mx8";
+    }();
+    return sfx;
 }
 float axera_rms_eps(const ggml_tensor * rms_norm) {
     float eps;

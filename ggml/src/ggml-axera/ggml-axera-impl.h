@@ -80,6 +80,12 @@ ggml_backend_buffer_type_t ggml_backend_axera_mapped_buffer_type(void);
 ggml_backend_buffer_t axera_mapped_buffer(void * ptr, size_t size);
 std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_alloc(size_t size);
 std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_alloc_nc(size_t size);
+// bytes off .. off + size of b as a buffer of its own (b outlives it)
+std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_view(const ggml_backend_axera_buffer_context * b, size_t off,
+                                                                  size_t size);
+// the largest single IO: the runtime's size field overflows at 2 GiB (packs are split well below it)
+constexpr size_t AXERA_IO_MAX = (size_t) 2 << 30;
+
 AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint32_t size);
 bool axera_template_qwen35();
 int64_t axera_split_min();
@@ -87,7 +93,10 @@ int axera_cores();
 bool axera_flash_forced();
 int64_t axera_flash_seg(int64_t n);
 bool axera_weights_mx8();
+bool axera_weights_mx4();
+const char * axera_mx_sfx();  // the layer kernels' weight format suffix: _mx8, _mx4 (GGML_AXERA_WEIGHTS=mxfp4)
 void axera_quantize_mxfp8(const ggml_tensor * w, axera_cmm & q, axera_cmm & s);
+void axera_quantize_mxfp4(const ggml_tensor * w, axera_cmm & q, axera_cmm & s);
 axera_cmm axera_to_bf16(const ggml_tensor * w);
 void axera_gemv_raw(ggml_backend_axera_context * ctx, const ggml_backend_axera_buffer_context * wctx,
                     void * wdata, int64_t N, int64_t K, const float * x, ggml_tensor * dst, float * out);
@@ -102,6 +111,9 @@ void axera_gemv(ggml_backend_axera_context * ctx, const ggml_tensor * w, const f
 void axera_gemv_mx8(ggml_backend_axera_context * ctx, const ggml_backend_axera_buffer_context * q,
                     const ggml_backend_axera_buffer_context * sc, int64_t N, int64_t K, const float * x,
                     ggml_tensor * dst, float * out);
+void axera_gemv_mx4(ggml_backend_axera_context * ctx, const ggml_backend_axera_buffer_context * q,
+                    const ggml_backend_axera_buffer_context * sc, int64_t N, int64_t K, const float * x,
+                    ggml_tensor * dst, float * out);
 void ggml_backend_axera_mul_mat(ggml_backend_axera_context * ctx, ggml_tensor * dst);
 float axera_rms_eps(const ggml_tensor * rms_norm);
 void axera_mxfp4_rows(const uint8_t * src, int64_t rows, int64_t K, uint8_t * dq, uint8_t * ds);
@@ -113,14 +125,17 @@ void axera_repack_mxfp4_gu(const ggml_tensor * g, const ggml_tensor * u, uint8_t
 uint32_t axera_input_size(ggml_axera_kernel * k, const char * name);
 uint32_t axera_output_size(ggml_axera_kernel * k, const char * name);
 std::string axera_base_name(const char * name);
+void axera_warn_one_core(ggml_axera_kernel * k);  // the first run of a single-core fallback build: warn once
 int axera_run_sync(ggml_axera_kernel * k, std::vector<AX_ENGINE_IO_BUFFER_T> & in,
                    std::vector<AX_ENGINE_IO_BUFFER_T> & out);
+extern std::atomic<uint64_t> axera_graph_epoch;  // graphs computed so far (ggml_backend_axera_graph_compute)
 // graph templates: the graph's name -> tensor map (cached in the context), the find by name, the output head
 const std::map<std::string, ggml_tensor *> & axera_graph_names(ggml_backend_axera_context * ctx,
                                                                struct ggml_cgraph * cgraph);
 ggml_tensor * axera_graph_find(const std::map<std::string, ggml_tensor *> & t, const char * name);
 ggml_tensor * axera_graph_norm(const std::map<std::string, ggml_tensor *> & t);
 ggml_tensor * axera_graph_head(const std::map<std::string, ggml_tensor *> & t);
+const float * axera_final_norm(const ggml_tensor * mul, int H, float * eps);  // the final norm's weight and eps
 void axera_output_norm(const std::map<std::string, ggml_tensor *> & t, const std::vector<float> & h, int T);
 void axera_output_head(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph,
                        const std::map<std::string, ggml_tensor *> & t, const std::vector<float> & h, int T,
@@ -169,6 +184,47 @@ struct axera_timer {
         }
     }
 };
+
+// GGML_AXERA_PROF=1: the host time between two template graphs split at the backend's entry points, for gaps under
+// 50 ms (decode steps): graph end -> first get_tensor (llama.cpp after compute), the get_tensor calls, their end ->
+// first set_tensor (sampling, the next graph's build and allocation), first set_tensor -> compute (inputs)
+struct axera_host_phase {
+    using clk = std::chrono::steady_clock;
+    clk::time_point end, get0, get1, set0;
+    void add(const char * what, clk::time_point a, clk::time_point b) {
+        auto & e = g_axera_prof.t[what];
+        e.first += std::chrono::duration<double, std::milli>(b - a).count();
+        e.second++;
+    }
+    void on_get(clk::time_point a, clk::time_point b) {
+        if (g_axera_prof.on && end.time_since_epoch().count()) {
+            get0 = get0 > end ? get0 : a;
+            get1 = b;
+        }
+    }
+    void on_set() {
+        if (g_axera_prof.on && end.time_since_epoch().count() && !(set0 > end)) {
+            set0 = clk::now();
+        }
+    }
+    void on_compute() {  // at the start of a graph
+        const clk::time_point now = clk::now();
+        if (!g_axera_prof.on || !end.time_since_epoch().count() || now - end > std::chrono::milliseconds(50)) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(g_axera_prof.mu);
+        const bool got = get0 > end, set = set0 > end && (!got || set0 > get1);
+        const clk::time_point a = got ? get1 : end, s = set ? set0 : now;
+        add("host 0: decode gap (all)", end, now);
+        if (got) {
+            add("host 1: graph end -> get_tensor", end, get0);
+            add("host 2: get_tensor calls", get0, get1);
+        }
+        add("host 3: -> first set_tensor", a, s);
+        add("host 4: first set_tensor -> graph", s, now);
+    }
+};
+inline axera_host_phase g_axera_host;
 
 // persistent workers for the template's host loops (masks, merges): run(n, fn) calls fn(0 .. n - 1) on the workers
 // and the caller, returning when all are done
@@ -257,6 +313,10 @@ class axera_pool {
 struct ggml_axera_kernel {
     AX_ENGINE_HANDLE      handle = nullptr;
     AX_ENGINE_IO_INFO_T * info   = nullptr;
+    int                   cores   = 1;  // the build's core count (<name>_npu<cores>)
+    // a single-core build loaded for lack of the multi-core one: warned at its first run (axera_run_sync),
+    // not at load (a template also loads unpacked kernels for their IO only, running the packed ones)
+    std::string           one_core;
 
     ~ggml_axera_kernel() {
         if (handle) {
@@ -408,8 +468,9 @@ struct ggml_axera_kernel_registry {
         if (ret != 0) {
             GGML_ABORT("%s: failed to load kernel %s (0x%x)\n", __func__, path(name).c_str(), ret);
         }
+        k->cores = atoi(file(name).c_str() + file(name).rfind("_npu") + 4);
         if (axera_cores() > 1 && file(name) == name + "_npu1") {  // no build for all cores: runs on one
-            GGML_LOG_WARN("axera: %s runs on 1 core (no %s_npu%d)\n", name.c_str(), name.c_str(), axera_cores());
+            k->one_core = name;
         }
         return (loaded[name] = std::move(k)).get();
     }
@@ -424,9 +485,15 @@ struct ggml_backend_axera_buffer_context {
     void * vir  = nullptr;
     size_t size = 0;
     bool   nc   = false;  // non-cacheable: no cache maintenance (host writes only, e.g. gathered kernel inputs)
+    bool   view = false;  // a range of another buffer (axera_cmm_view): not freed
+    // a range the NPU wrote and the host invalidated in the current graph (axera_graph_epoch): read back without cache
+    // maintenance (the logits, 1 MB per token)
+    mutable const void * clean_p     = nullptr;
+    mutable size_t       clean_n     = 0;
+    mutable uint64_t     clean_epoch = 0;
 
     ~ggml_backend_axera_buffer_context() {
-        if (vir) {
+        if (vir && !view) {
             AX_SYS_MemFree(phy, vir);
         }
     }

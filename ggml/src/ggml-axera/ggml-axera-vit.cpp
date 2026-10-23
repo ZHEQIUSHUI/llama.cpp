@@ -248,6 +248,7 @@ enum ggml_status axera_vit_compute(ggml_backend_axera_context * ctx, struct ggml
         s.pOutputs    = outs.data();
         s.nOutputSize = (uint32_t) outs.size();
         axera_timer tm(what);
+        axera_warn_one_core(k);
         const int   ret = AX_ENGINE_RunSync(k->handle, &s);
         if (ret != 0) {
             GGML_ABORT("qwen35 vision: RunSync failed (0x%x) in %s\n", ret, what);

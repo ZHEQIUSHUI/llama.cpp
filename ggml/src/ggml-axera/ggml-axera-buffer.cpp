@@ -20,6 +20,8 @@ static void ggml_backend_axera_buffer_memset_tensor(ggml_backend_buffer_t buffer
 static void ggml_backend_axera_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
                                                  size_t offset, size_t size) {
     auto * ctx = (ggml_backend_axera_buffer_context *) buffer->context;
+    g_axera_host.on_set();
+    ctx->clean_n = 0;
     memcpy((char *) tensor->data + offset, data, size);
     ctx->flush((char *) tensor->data + offset, size);
 }
@@ -31,9 +33,19 @@ static void ggml_backend_axera_buffer_get_tensor(ggml_backend_buffer_t buffer, c
     auto * ctx = (ggml_backend_axera_buffer_context *) buffer->context;
     char * p   = (char *) tensor->data + offset;
     axera_timer tm("get_tensor");
-    ctx->flush(p, size);
-    ctx->invalidate(p, size);
+    const auto  t0 = std::chrono::steady_clock::now();
+    // the logits the NPU wrote this graph, already invalidated: no cache maintenance (GGML_AXERA_LOGITS_CLEAN=0 keeps it)
+    static const bool skip = [] {
+        const char * e = std::getenv("GGML_AXERA_LOGITS_CLEAN");
+        return e == nullptr || strcmp(e, "0") != 0;
+    }();
+    if (!(skip && ctx->clean_epoch == axera_graph_epoch && p >= (const char *) ctx->clean_p &&
+          p + size <= (const char *) ctx->clean_p + ctx->clean_n)) {
+        ctx->flush(p, size);
+        ctx->invalidate(p, size);
+    }
     memcpy(data, p, size);
+    g_axera_host.on_get(t0, std::chrono::steady_clock::now());
 }
 
 static bool ggml_backend_axera_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src,
@@ -113,11 +125,15 @@ static size_t ggml_backend_axera_buffer_type_get_alloc_size(ggml_backend_buffer_
         (strncmp(t->name, "cache_k_l", 9) != 0 && strncmp(t->name, "cache_v_l", 9) != 0)) {
         return n;
     }
-    // dense or MoE attention kernels (a kernel directory holds one model's; no graph yet to tell)
-    const std::string kv  = axera_weights_mx8() ? "_attn_mx8_kvc" : "_attn_kvc";
-    int64_t           ctx = axera_kernels().ctx_for("qwen35" + kv, t->ne[1]);
-    ctx                   = ctx > 0 ? ctx : axera_kernels().ctx_for("qwen35moe" + kv, t->ne[1]);
-    ctx                   = ctx > 0 ? ctx : axera_kernels().ctx_for("qwen3" + kv, t->ne[1]);  // Qwen3
+    // dense or MoE attention kernels (a kernel directory holds one model's; no graph yet to tell), in the weight
+    // format's kernels (_mx8 / _mx4 / _mx4m) or else the MXFP8 ones
+    const std::string fmt = axera_weights_mx8() ? std::string(axera_mx_sfx()) : "";
+    int64_t           ctx = 0;
+    for (const char * kp : { "qwen35", "qwen35moe", "qwen3" }) {
+        for (const std::string & f : { fmt, std::string(fmt.empty() ? "" : "_mx8") }) {
+            ctx = ctx > 0 ? ctx : axera_kernels().ctx_for(kp + std::string("_attn") + f + "_kvc", t->ne[1]);
+        }
+    }
     const int64_t S       = axera_flash_seg(t->ne[1]);  // split attention: whole segments
     const int64_t c   = S > 0 && (ctx == 0 || axera_flash_forced()) ? (t->ne[1] + S - 1) / S * S : ctx;
     return std::max(n, (size_t) (t->ne[2] - 1) * t->nb[2] + (size_t) c * t->nb[1]);  // ne[2]: per-sequence streams
