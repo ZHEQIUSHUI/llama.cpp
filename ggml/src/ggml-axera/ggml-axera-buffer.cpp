@@ -20,6 +20,8 @@ static void ggml_backend_axera_buffer_memset_tensor(ggml_backend_buffer_t buffer
 static void ggml_backend_axera_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
                                                  size_t offset, size_t size) {
     auto * ctx = (ggml_backend_axera_buffer_context *) buffer->context;
+    g_axera_host.on_set();
+    ctx->clean_n = 0;
     memcpy((char *) tensor->data + offset, data, size);
     ctx->flush((char *) tensor->data + offset, size);
 }
@@ -31,9 +33,19 @@ static void ggml_backend_axera_buffer_get_tensor(ggml_backend_buffer_t buffer, c
     auto * ctx = (ggml_backend_axera_buffer_context *) buffer->context;
     char * p   = (char *) tensor->data + offset;
     axera_timer tm("get_tensor");
-    ctx->flush(p, size);
-    ctx->invalidate(p, size);
+    const auto  t0 = std::chrono::steady_clock::now();
+    // the logits the NPU wrote this graph, already invalidated: no cache maintenance (GGML_AXERA_LOGITS_CLEAN=0 keeps it)
+    static const bool skip = [] {
+        const char * e = std::getenv("GGML_AXERA_LOGITS_CLEAN");
+        return e == nullptr || strcmp(e, "0") != 0;
+    }();
+    if (!(skip && ctx->clean_epoch == axera_graph_epoch && p >= (const char *) ctx->clean_p &&
+          p + size <= (const char *) ctx->clean_p + ctx->clean_n)) {
+        ctx->flush(p, size);
+        ctx->invalidate(p, size);
+    }
     memcpy(data, p, size);
+    g_axera_host.on_get(t0, std::chrono::steady_clock::now());
 }
 
 static bool ggml_backend_axera_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src,

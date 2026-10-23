@@ -1504,13 +1504,44 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// LLAMA_PROF_UBATCH=1: host time of process_ubatch per part (memory apply, graph build, allocation, inputs), printed
+// at exit
+static struct llama_ubatch_prof {
+    const bool on = [] { const char * e = getenv("LLAMA_PROF_UBATCH"); return e && atoi(e) != 0; }();
+    double     pre = 0, apply = 0, build = 0, alloc = 0, inputs = 0, post = 0, check = 0, compute = 0;  // check: reused
+    int        splits = 0;
+    int64_t    n = 0, reused = 0, t_decode = 0, t_done = 0;
+    ~llama_ubatch_prof() {
+        if (on && n) {
+            const int64_t nb = std::max<int64_t>(n - reused, 1), nr = std::max<int64_t>(reused, 1);
+            fprintf(stderr, "llama prof: %lld ubatches: decode -> ubatch %.3f, memory apply %.3f, set_inputs %.3f, "
+                    "graph_compute %.3f, compute -> decode return %.3f ms per ubatch (%d splits); %lld reused (check %.3f ms "
+                    "each), %lld built (build %.3f, alloc %.3f ms each)\n", (long long) n, pre / n, apply / n, inputs / n,
+                    compute / n, post / n, splits,
+                    (long long) reused, check / nr, (long long) (n - reused), build / nb, alloc / nb);
+        }
+    }
+} g_ub_prof;
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    int64_t t_us = ggml_time_us();
+    auto lap = [&](double & acc) {
+        const int64_t now = ggml_time_us();
+        acc += (now - t_us) / 1000.0;
+        t_us = now;
+    };
+    if (g_ub_prof.on) {
+        g_ub_prof.n++;
+        g_ub_prof.pre += g_ub_prof.t_decode ? (t_us - g_ub_prof.t_decode) / 1000.0 : 0.0;
+        g_ub_prof.t_decode = 0;
+    }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
+    lap(g_ub_prof.apply);
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1529,6 +1560,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        g_ub_prof.reused++;
+        lap(g_ub_prof.check);
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
@@ -1548,11 +1581,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        lap(g_ub_prof.build);
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        lap(g_ub_prof.alloc);
 
         gf_res_prev_active = res;
     }
@@ -1563,11 +1598,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+        lap(g_ub_prof.inputs);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    lap(g_ub_prof.compute);
+    g_ub_prof.splits = ggml_backend_sched_get_n_splits(sched.get());
+    g_ub_prof.t_done = ggml_time_us();
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1819,6 +1858,17 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (g_ub_prof.on) {
+        g_ub_prof.t_decode = ggml_time_us();
+    }
+    struct post_timer {
+        ~post_timer() {
+            if (g_ub_prof.on && g_ub_prof.t_done) {
+                g_ub_prof.post += (ggml_time_us() - g_ub_prof.t_done) / 1000.0;
+                g_ub_prof.t_done = 0;
+            }
+        }
+    } post_t;
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);

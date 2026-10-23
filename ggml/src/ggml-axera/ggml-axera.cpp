@@ -14,6 +14,7 @@ static void ggml_backend_axera_free(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * ctx = (ggml_backend_axera_context *) backend->context;
+    ++axera_graph_epoch;
 
     if (axera_template_qwen35()) {
         static std::chrono::steady_clock::time_point last;  // profiling: host time between graphs
@@ -22,6 +23,7 @@ static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend,
             e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last).count();
             e.second++;
         }
+        g_axera_host.on_compute();
         enum ggml_status st;
         {
             axera_timer tm("graph_compute (all)");
@@ -41,7 +43,8 @@ static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend,
                  k.kind == 2 ? axera_q35_compute(ctx, cgraph) :
                                axera_gen_compute(ctx, cgraph);
         }
-        last = std::chrono::steady_clock::now();
+        last             = std::chrono::steady_clock::now();
+        g_axera_host.end = last;
         return st;
     }
 
@@ -294,10 +297,20 @@ static ggml_backend_dev_t ggml_backend_axera_reg_get_device(ggml_backend_reg_t r
     GGML_UNUSED(index);
 }
 
+// the weights left on the CPU (the token embeddings: one row read per token) kept resident when the model is mmap'ed:
+// the NPU weights take most of the board's memory, page reclaim evicts the embedding pages, and every token's row
+// then faults in from storage (~2 ms per token on a 16 GB board with a 20 GB model). GGML_AXERA_PIN_HOST=0: off
+static bool ggml_backend_axera_pin_host_weights(void) {
+    const char * e = std::getenv("GGML_AXERA_PIN_HOST");
+    return e == nullptr || strcmp(e, "0") != 0;
+}
+
 static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_pin_host_weights") == 0) {
+        return (void *) ggml_backend_axera_pin_host_weights;
+    }
     return NULL;
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
 }
 
 static const struct ggml_backend_reg_i ggml_backend_axera_reg_i = {
