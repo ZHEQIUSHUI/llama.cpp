@@ -740,6 +740,11 @@ void axera_q35_bind_prefill(axera_q35 & m, int il, size_t v, const std::map<std:
     }
     for (uint32_t i = 0; i < k->info->nOutputSize; ++i) {
         const std::string n = k->info->pOutputs[i].pName;
+        if (n == "topk_v" || n == "topk_i") {  // the router's top-K (kernels built with it)
+            auto * b  = (n == "topk_v" ? pf.TKV : pf.TKI).get();
+            io.out[i] = axera_io(b, b->vir, k->info->pOutputs[i].nSize);
+            continue;
+        }
         if (n == "out" || n == "h2_out" || n == "logits_out") {  // MoE: the experts add to the base, into xout
             auto * b  = n == "h2_out" ? pf.H2.get() : n == "logits_out" ? pf.LOG.get() : m.moe ? pf.BASE.get() : xout;
             io.out[i] = axera_io(b, b->vir, k->info->pOutputs[i].nSize);
@@ -1390,8 +1395,8 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         if (const char * e = std::getenv("GGML_AXERA_MOE_SLOTS")) {  // e.g. qwen35moe_slots32_g8_gu_mxfp4
             sn = e;
         }
-        if (m.ex[1].k && !sn.empty()) {
-            auto & sk = m.slots;
+        // a slots kernel's IO indices by name, its slot count S and rows per slot G (from rw [S, G])
+        auto setup = [&](axera_q35::slots_kernel & sk, const std::string & sn) {
             sk.k      = axera_kernels().get(sn);
             sk.x      = sk.k->input("x");
             sk.tok    = sk.k->input("tok");
@@ -1427,13 +1432,31 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
                 }
                 (n[0] == 'w' ? sk.w : sk.s)[n[2] == 'd'][e] = (int) i;
             }
-            if (sk.tok >= 0) {  // per slot: expert, G token rows; a decode token's slots here, a prefill chunk's below
-                const size_t ns = (size_t) GGML_PAD(std::min(m.top_k, m.n_expert + (m.top_k + sk.G - 1) / sk.G), sk.S);
-                m.TOK           = axera_cmm_alloc_nc(ns * (1 + sk.G) * sizeof(int32_t));
-            }
             if (sk.sid >= 0) {
                 sk.SID          = axera_cmm_alloc(sk.S * sizeof(int32_t));
                 sk.in[sk.sid]   = axera_io(sk.SID.get(), sk.SID->vir, (uint32_t) (sk.S * sizeof(int32_t)));
+            }
+        };
+        m.slots_rem.clear();
+        if (m.ex[1].k && !sn.empty()) {
+            auto & sk = m.slots;
+            setup(sk, sn);
+            if (sk.tok >= 0) {  // per slot: expert, G token rows; a decode token's slots here, a prefill chunk's below
+                const size_t ns = (size_t) GGML_PAD(std::min(m.top_k, m.n_expert + (m.top_k + sk.G - 1) / sk.G), sk.S);
+                m.TOK           = axera_cmm_alloc(ns * (1 + sk.G) * sizeof(int32_t));
+                // the same kernel with fewer slots (qwen35moe_slots<S'>_g<G>_px..., S' < S) for a group's last call:
+                // its padding slots read an expert's weights for nothing (GGML_AXERA_SLOTS_REM=0: not)
+                const char * re = std::getenv("GGML_AXERA_SLOTS_REM");
+                for (int s2 = 8; s2 < sk.S && !(re && strcmp(re, "0") == 0); s2 *= 2) {
+                    const std::string n = "qwen35moe_slots" + std::to_string(s2) + "_g" + std::to_string(sk.G) +
+                                          "_px_mxfp4" + (sk.ob ? "_bo" : "");
+                    if (axera_kernels().has(n)) {
+                        m.slots_rem.emplace_back();
+                        setup(m.slots_rem.back(), n);
+                        GGML_ASSERT(m.slots_rem.back().tok >= 0 && m.slots_rem.back().G == sk.G &&
+                                    m.slots_rem.back().ob == sk.ob);
+                    }
+                }
             }
         }
     }
@@ -1544,8 +1567,17 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
             // context (m.flash), never in place of a missing chunk size of a fused tier
             // the GDN layer in MXFP8 where that kernel exists (prefill reads the weights: about 20% faster)
             std::string gn = "qwen35moe_gdn_prefill" + std::to_string(P);
-            gn += mx8 && std::ifstream(axera_kernels().path(gn + "_mx8")).good() ? "_mx8" : "";
-            const std::string an = "qwen35moe_attn_prefill" + std::to_string(P) + m.ctx_sfx;
+            gn += mx8 && (axera_kernels().has(gn + "_mx8") || axera_kernels().has(gn + "_mx8_tk")) ? "_mx8" : "";
+            // the builds that also output the router's top-K (_tk) first (GGML_AXERA_PREFILL_TK=0: not)
+            const char * tke = std::getenv("GGML_AXERA_PREFILL_TK");
+            const bool   tk  = !(tke && strcmp(tke, "0") == 0);
+            gn += (tk || !axera_kernels().has(gn)) && axera_kernels().has(gn + "_tk") ? "_tk" : "";
+            // (the _tk build also where it is the only one: its top-K outputs are then just not read)
+            std::string ab = "qwen35moe_attn_prefill" + std::to_string(P);
+            if ((tk || !axera_kernels().has(ab + m.ctx_sfx)) && axera_kernels().has(ab + "_tk" + m.ctx_sfx)) {
+                ab += "_tk";
+            }
+            const std::string an = ab + m.ctx_sfx;
             const bool fused = !m.flash && std::ifstream(axera_kernels().path(an)).good();
             const bool split = m.kv_llama && (m.flash || (!m.attn_all && !fused)) && axera_q35_load_flash(m, P);
             if (P == 1 || !m.slots.k || !std::ifstream(axera_kernels().path(gn)).good() || !(fused || split)) {
@@ -1555,6 +1587,13 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
             pf.P    = P;
             pf.gdn  = axera_kernels().get(gn);
             pf.attn = fused ? axera_kernels().get(an) : nullptr;
+            const char * pke = std::getenv("GGML_AXERA_PREFILL_PK");  // 0: the unpacked kernels
+            if (!(pke && strcmp(pke, "0") == 0)) {
+                axera_q35_load_packed(pf.gdn_pk, gn + "_pk", pf.gdn);
+                // <name>_pk (q35_layer_mc check_pre_pk), or the packed suffix before the context one
+                const std::string apn = axera_kernels().has(an + "_pk") ? an + "_pk" : ab + "_pk" + m.ctx_sfx;
+                axera_q35_load_packed(pf.attn_pk, pf.attn ? apn : "", pf.attn);
+            }
             GGML_ASSERT(size_of(pf.gdn, "x") == (uint32_t) P * H * sizeof(ggml_bf16_t));
             if (pf.attn) {
                 pf.R = (int64_t) (size_of(pf.attn, "mask") / sizeof(ggml_bf16_t)) / m.LMAX;
@@ -1569,13 +1608,19 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
             pf.BASE = axera_cmm_alloc(P * H * sizeof(ggml_bf16_t));
             pf.H2   = axera_cmm_alloc(P * H * sizeof(ggml_bf16_t));
             pf.LOG  = axera_cmm_alloc((size_t) P * m.n_expert * sizeof(float));
+            pf.gdn_tk  = tk && pf.gdn && pf.gdn->output("topk_i") >= 0;  // TK=0: the host top-K
+            pf.attn_tk = tk && pf.attn && pf.attn->output("topk_i") >= 0;
+            if ((pf.gdn && pf.gdn->output("topk_i") >= 0) || (pf.attn && pf.attn->output("topk_i") >= 0)) {
+                pf.TKV = axera_cmm_alloc((size_t) P * m.top_k * sizeof(float));
+                pf.TKI = axera_cmm_alloc((size_t) P * m.top_k * sizeof(int32_t));
+            }
             // at most one partly filled slot per expert
             const int    G     = m.slots.G;
             const size_t slots = (size_t) GGML_PAD(std::min(P * m.top_k, m.n_expert + (P * m.top_k + G - 1) / G), m.slots.S);
             const size_t rows  = slots * G;
             if (!m.SX || m.SX->size < rows * H * sizeof(ggml_bf16_t)) {
                 m.SX   = axera_cmm_alloc_nc(rows * H * sizeof(ggml_bf16_t));
-                m.SRW  = axera_cmm_alloc_nc(rows * sizeof(float));
+                m.SRW  = axera_cmm_alloc(rows * sizeof(float));
                 m.SOUT = axera_cmm_alloc(rows * H * sizeof(float));
             }
             m.pre.push_back(std::move(pf));
@@ -1659,6 +1704,7 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
             axera_q35::prefill pc;
             pc.P    = P;
             pc.gdn  = m.pre[0].gdn;
+            pc.gdn_pk = m.pre[0].gdn_pk;
             pc.sub  = c;
             pc.fdk  = P + 1000 * c;
             pc.A    = axera_cmm_alloc(m.pre[0].A->size);
@@ -1668,8 +1714,15 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
             pc.BASE = axera_cmm_alloc(m.pre[0].BASE->size);
             pc.H2   = axera_cmm_alloc(m.pre[0].H2->size);
             pc.LOG  = axera_cmm_alloc(m.pre[0].LOG->size);
+            pc.gdn_tk  = m.pre[0].gdn_tk;
+            pc.attn_tk = m.pre[0].attn_tk;
+            if (m.pre[0].TKV) {
+                pc.TKV = axera_cmm_alloc(m.pre[0].TKV->size);
+                pc.TKI = axera_cmm_alloc(m.pre[0].TKI->size);
+            }
             if (m.pre[0].attn) {
                 pc.attn  = m.pre[0].attn;
+                pc.attn_pk = m.pre[0].attn_pk;
                 pc.R     = m.pre[0].R;
                 pc.MASK  = axera_cmm_alloc(m.pre[0].MASK->size);
                 pc.CPOS  = axera_cmm_alloc(m.POS->size);
@@ -1702,6 +1755,20 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
                 m.comb.k = axera_kernels().get(cn + "_r" + std::to_string(best));
             }
         }
+        m.comb_small.clear();
+        if (m.comb.k) {  // the same rows for fewer tokens: a group that fills only its first chunks
+            const std::string rs = "_r" + std::to_string(size_of(m.comb.k, "sout") / (H * sizeof(ggml_bf16_t)));
+            for (int t = 256; t < NT; t *= 2) {
+                const std::string n = "qwen35moe_combine" + std::to_string(m.top_k) + "_t" + std::to_string(t) + rs;
+                if (axera_kernels().has(n)) {
+                    axera_q35::combine_kernel cs;
+                    cs.k = axera_kernels().get(n);
+                    cs.T = t;
+                    cs.R = (int) (size_of(cs.k, "sout") / (H * sizeof(ggml_bf16_t)));
+                    m.comb_small.push_back(std::move(cs));
+                }
+            }
+        }
         if (m.comb.k) {  // the chunks' rows in one buffer each: views
             m.comb.T = NT;
             m.comb.R = (int) (size_of(m.comb.k, "sout") / (H * sizeof(ggml_bf16_t)));
@@ -1711,10 +1778,16 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
             m.GH2   = axera_cmm_alloc(xr * Q);
             m.GBASE = axera_cmm_alloc(xr * Q);
             m.GLOG  = axera_cmm_alloc(lr * Q);
-            if (m.TOK->size < (size_t) m.comb.R / G * (1 + G) * sizeof(int32_t)) {
-                m.TOK = axera_cmm_alloc_nc((size_t) m.comb.R / G * (1 + G) * sizeof(int32_t));
+            const size_t tr = (size_t) P * m.top_k * sizeof(float);  // top-K rows of a chunk (values / experts)
+            if (m.pre[0].TKV) {
+                m.GTKV = axera_cmm_alloc(tr * Q);
+                m.GTKI = axera_cmm_alloc(tr * Q);
             }
-            m.LOC   = axera_cmm_alloc_nc((size_t) NT * m.top_k * sizeof(int32_t));
+            // TOK / SRW / LOC: cached, written by the host and flushed (run_experts_px)
+            if (m.TOK->size < (size_t) m.comb.R / G * (1 + G) * sizeof(int32_t)) {
+                m.TOK = axera_cmm_alloc((size_t) m.comb.R / G * (1 + G) * sizeof(int32_t));
+            }
+            m.LOC   = axera_cmm_alloc((size_t) NT * m.top_k * sizeof(int32_t));
             for (int c = 0; c < Q; ++c) {
                 auto & pc = m.pre[m.pre[0].group[c]];
                 pc.A      = axera_cmm_view(m.GA.get(), c * xr, xr);
@@ -1722,23 +1795,27 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
                 pc.H2     = axera_cmm_view(m.GH2.get(), c * xr, xr);
                 pc.BASE   = axera_cmm_view(m.GBASE.get(), c * xr, xr);
                 pc.LOG    = axera_cmm_view(m.GLOG.get(), c * lr, lr);
+                if (m.GTKV) {
+                    pc.TKV = axera_cmm_view(m.GTKV.get(), c * tr, tr);
+                    pc.TKI = axera_cmm_view(m.GTKI.get(), c * tr, tr);
+                }
             }
             GGML_ASSERT(size_of(m.comb.k, "base") == xr * Q && size_of(m.comb.k, "loc") == m.LOC->size);
         }
         const size_t slots = (size_t) GGML_PAD(std::min(NT * m.top_k, m.n_expert + (NT * m.top_k + G - 1) / G), m.slots.S);
         const size_t rows  = slots * G;
         if (m.TOK && m.TOK->size < slots * (1 + G) * sizeof(int32_t)) {  // the group's slots (P, top_k, G)
-            m.TOK = axera_cmm_alloc_nc(slots * (1 + G) * sizeof(int32_t));
+            m.TOK = axera_cmm_alloc(slots * (1 + G) * sizeof(int32_t));
         }
         if (m.SX->size < rows * H * sizeof(ggml_bf16_t)) {
             m.SX   = axera_cmm_alloc_nc(rows * H * sizeof(ggml_bf16_t));
-            m.SRW  = axera_cmm_alloc_nc(rows * sizeof(float));
+            m.SRW  = axera_cmm_alloc(rows * sizeof(float));
             m.SOUT = axera_cmm_alloc(rows * H * sizeof(float));
         }
         if (m.comb.k) {
             GGML_ASSERT(rows <= (size_t) m.comb.R && m.SOUT->size >= size_of(m.comb.k, "sout"));
             if (m.SRW->size < (size_t) m.comb.R * sizeof(float)) {
-                m.SRW = axera_cmm_alloc_nc((size_t) m.comb.R * sizeof(float));
+                m.SRW = axera_cmm_alloc((size_t) m.comb.R * sizeof(float));
             }
         }
     }
