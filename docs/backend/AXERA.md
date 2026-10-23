@@ -564,7 +564,14 @@ With the talker's four-core layer group (`qwen3_group28_*_mx8_kvc_c4096`) and th
 MXFP8): a 1.7B frame takes about 36 ms, the talker 9.0 ms, the code predictor's 16 steps 0.93 ms each (15 ms), the
 CPU slices (sampling, codebook lookups) about 5.5 ms and the gaps between mtmd's and llama's graphs about 6 ms; the
 0.6B talker takes 4.6 ms and its steps 0.89 ms. A codec decoder window takes about 0.9 s (13 ms per frame of a full
-window; the last window of a generation is a full window whatever its frames). The backend keeps the analysis of up to
+window). The last window of a generation is decoded as its frames rounded up to 24 or 48 (mtmd pads it with code 0
+and cuts the padding's audio; the decoder is causal) with kernels of those shapes in the directory: a sentence of 82
+frames decodes its last 10 frames in 0.57 s instead of 0.92 s, one of 16 to 20 frames in 1.1 to 1.2 s instead of
+1.8 s (its first window, with the one-time weight conversions). The audio is not bit-identical to a padded whole
+window (the attention over a shorter batch sums in another order; on the CPU too), and reads back the same. The
+codec decoder's convolutions take each block as one product over all taps (K x IC), no accumulation into an f32
+output across products: with the taps accumulated the four-core kernels gave different audio between runs (3 of 8
+requests of a 153-frame sentence), now 12 of 12 the same. The backend keeps the analysis of up to
 four graphs (the code step's and the codec decoder's alternate), so a window no longer costs a new analysis of the
 code step's graph. mtmd keeps the speaker encoder's embedding per reference (a service speaks with a few voices; the
 encoder takes 11 s for a 22 s reference on the CPU). In one process (`TTS_REPEAT=3 llama-tts ...`, the requests after
