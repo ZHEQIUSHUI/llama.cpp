@@ -3,6 +3,8 @@
 
 #include "ggml-axera-impl.h"
 
+#include <unordered_set>
+
 const std::map<std::string, ggml_tensor *> & axera_graph_names(ggml_backend_axera_context * ctx,
                                                                struct ggml_cgraph * cgraph) {
     axera_timer tmap("graph name map");
@@ -15,16 +17,32 @@ const std::map<std::string, ggml_tensor *> & axera_graph_names(ggml_backend_axer
     }
     std::map<std::string, ggml_tensor *> & t = ctx->graph_names;
     if (key != ctx->graph_key) {
-        t.clear();
+        // each tensor once (in the order met: the first of a name wins), then sorted by name into the map at its end
+        std::unordered_set<const ggml_tensor *>             seen;
+        std::vector<std::pair<std::string, ggml_tensor *>> named;
+        seen.reserve(4 * (size_t) cgraph->n_nodes);
+        named.reserve(4 * (size_t) cgraph->n_nodes);
+        auto add = [&](ggml_tensor * x) {
+            if (seen.insert(x).second) {
+                named.emplace_back(axera_base_name(x->name), x);
+            }
+        };
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
-            t.emplace(axera_base_name(node->name), node);
+            add(node);
             for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
                 ggml_tensor * src = node->src[s];
-                t.emplace(axera_base_name(src->name), src);
+                add(src);
                 for (ggml_tensor * v = src->view_src; v; v = v->view_src) {  // e.g. the cache tensors behind their views
-                    t.emplace(axera_base_name(v->name), v);
+                    add(v);
                 }
+            }
+        }
+        std::stable_sort(named.begin(), named.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+        t.clear();
+        for (auto & n : named) {
+            if (t.empty() || std::prev(t.end())->first != n.first) {
+                t.emplace_hint(t.end(), std::move(n.first), n.second);
             }
         }
         ctx->graph_key = std::move(key);
