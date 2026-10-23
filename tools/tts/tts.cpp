@@ -6,7 +6,9 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -111,103 +113,115 @@ int main(int argc, char ** argv) {
         speaker_bitmap.reset(wrapper.bitmap);
     }
 
-    mtmd_helper::gen_audio gen(lctx, mctx.get());
-    mtmd_helper_gen_audio_inp inp{};
-    inp.seq_id      = 0;
-    inp.prompt      = params.prompt.c_str();
-    inp.prompt_len  = params.prompt.size();
-    inp.speaker_ref = speaker_bitmap.get();
-    inp.lang        = params.tts_lang.c_str();
-    inp.top_k       = params.sampling.top_k;
-    inp.top_p       = params.sampling.top_p;
-    inp.seed        = params.sampling.seed;
-    inp.out_type    = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+    // TTS_REPEAT=<n>: the same request n times in this process (a service's steady state: the later ones without the
+    // one-time costs), the outputs after the first to <output>.<i>.wav
+    const char * rep_env = getenv("TTS_REPEAT");
+    const int    n_rep   = rep_env ? std::max(1, atoi(rep_env)) : 1;
+    for (int rep = 0; rep < n_rep; ++rep) {
+        if (rep > 0) {
+            llama_memory_clear(llama_get_memory(lctx), true);
+            common_sampler_reset(smpl);
+            LOG_INF("request %d\n", rep);
+        }
+        mtmd_helper::gen_audio gen(lctx, mctx.get());
+        mtmd_helper_gen_audio_inp inp{};
+        inp.seq_id      = 0;
+        inp.prompt      = params.prompt.c_str();
+        inp.prompt_len  = params.prompt.size();
+        inp.speaker_ref = speaker_bitmap.get();
+        inp.lang        = params.tts_lang.c_str();
+        inp.top_k       = params.sampling.top_k;
+        inp.top_p       = params.sampling.top_p;
+        inp.seed        = params.sampling.seed;
+        inp.out_type    = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
 
-    //
-    // stage 1: process prompt via backbone model, generate semantic representation
-    //
+        //
+        // stage 1: process prompt via backbone model, generate semantic representation
+        //
 
-    if (gen.set_input(&inp) != 0) {
-        LOG_ERR("set_input failed\n");
-        return 1;
-    }
-
-    const int64_t t_prompt_start_us = ggml_time_us();
-
-    for (;;) {
-        int32_t ret = gen.step_prompt(params.n_batch);
-        if (ret < 0) {
-            LOG_ERR("prompt processing failed\n");
+        if (gen.set_input(&inp) != 0) {
+            LOG_ERR("set_input failed\n");
             return 1;
         }
-        if (ret == 0) {
-            break;
+
+        const int64_t t_prompt_start_us = ggml_time_us();
+
+        for (;;) {
+            int32_t ret = gen.step_prompt(params.n_batch);
+            if (ret < 0) {
+                LOG_ERR("prompt processing failed\n");
+                return 1;
+            }
+            if (ret == 0) {
+                break;
+            }
         }
-    }
 
-    // note: some pipelines ignore this token and use the hidden state instead
-    auto sample_semantic_code = [&]() -> llama_token {
-        llama_token t = common_sampler_sample(smpl, lctx, -1);
-        common_sampler_accept(smpl, t, true);
-        return t;
-    };
+        // note: some pipelines ignore this token and use the hidden state instead
+        auto sample_semantic_code = [&]() -> llama_token {
+            llama_token t = common_sampler_sample(smpl, lctx, -1);
+            common_sampler_accept(smpl, t, true);
+            return t;
+        };
 
-    const int max_new = params.n_predict > 0 ? params.n_predict : 512;
-    int n_frames = 0;
-    llama_token sampled = sample_semantic_code();
-    const float * h_state = llama_get_embeddings_ith(lctx, -1);
+        const int max_new = params.n_predict > 0 ? params.n_predict : 512;
+        int n_frames = 0;
+        llama_token sampled = sample_semantic_code();
+        const float * h_state = llama_get_embeddings_ith(lctx, -1);
 
-    tts_timings timings;
-    const int64_t t_gen_start_us = ggml_time_us();
+        tts_timings timings;
+        const int64_t t_gen_start_us = ggml_time_us();
 
-    bool stop = false;
-    while (!stop && n_frames < max_new) {
-        const float * h_next = nullptr;
+        bool stop = false;
+        while (!stop && n_frames < max_new) {
+            const float * h_next = nullptr;
 
-        // stage 2+3: semantic --> acoustic details --> audio waveform
-        //            step_gen() runs both stages and returns new h_state for next step
-        if (gen.step_gen(sampled, h_state, &h_next, &stop) != 0) {
-            LOG_ERR("step_gen failed at frame %d\n", n_frames);
+            // stage 2+3: semantic --> acoustic details --> audio waveform
+            //            step_gen() runs both stages and returns new h_state for next step
+            if (gen.step_gen(sampled, h_state, &h_next, &stop) != 0) {
+                LOG_ERR("step_gen failed at frame %d\n", n_frames);
+                return 1;
+            }
+            if (!h_next) {
+                break; // stopped without generating a frame
+            }
+
+            n_frames++;
+            h_state = h_next;
+            sampled = sample_semantic_code();
+            timings.report(n_frames);
+        }
+        const double t_gen_s = (ggml_time_us() - t_gen_start_us) / 1e6;
+
+        int32_t      sample_rate = 0;
+        const char * data        = nullptr;
+        size_t       data_len    = 0;
+        int64_t      n_samples   = 0;
+        const int64_t t_wav_start_us = ggml_time_us();
+        if (gen.get_output(&sample_rate, &data, &data_len, &n_samples) != 0) {
+            LOG_ERR("get_output failed\n");
             return 1;
         }
-        if (!h_next) {
-            break; // stopped without generating a frame
+        const double t_wav_s = (ggml_time_us() - t_wav_start_us) / 1e6;
+
+        LOG_INF("generated %d frames, %zu bytes of WAV audio (%d Hz)\n", n_frames, data_len, sample_rate);
+
+        const double t_prompt_s = (t_gen_start_us - t_prompt_start_us) / 1e6;
+        const double t_total_s  = t_prompt_s + t_gen_s + t_wav_s;
+        const double audio_s    = sample_rate > 0 ? (double) n_samples / sample_rate : 0.0;
+        LOG_INF("timings: prompt eval %.2fs + generation %.2fs + vocoder %.2fs = total %.2fs\n",
+                t_prompt_s, t_gen_s, t_wav_s, t_total_s);
+        LOG_INF("         output audio = %.2fs (audio time = %.2fx process time)\n", audio_s, t_total_s > 0 ? audio_s / t_total_s : 0.0);
+        const std::string out_file = rep == 0 ? params.out_file : params.out_file + "." + std::to_string(rep) + ".wav";
+        FILE * f = fopen(out_file.c_str(), "wb");
+        if (!f) {
+            LOG_ERR("failed to open %s\n", out_file.c_str());
+            return 1;
         }
-
-        n_frames++;
-        h_state = h_next;
-        sampled = sample_semantic_code();
-        timings.report(n_frames);
+        fwrite(data, 1, data_len, f);
+        fclose(f);
+        LOG_INF("wrote %s\n", out_file.c_str());
     }
-    const double t_gen_s = (ggml_time_us() - t_gen_start_us) / 1e6;
-
-    int32_t      sample_rate = 0;
-    const char * data        = nullptr;
-    size_t       data_len    = 0;
-    int64_t      n_samples   = 0;
-    const int64_t t_wav_start_us = ggml_time_us();
-    if (gen.get_output(&sample_rate, &data, &data_len, &n_samples) != 0) {
-        LOG_ERR("get_output failed\n");
-        return 1;
-    }
-    const double t_wav_s = (ggml_time_us() - t_wav_start_us) / 1e6;
-
-    LOG_INF("generated %d frames, %zu bytes of WAV audio (%d Hz)\n", n_frames, data_len, sample_rate);
-
-    const double t_prompt_s = (t_gen_start_us - t_prompt_start_us) / 1e6;
-    const double t_total_s  = t_prompt_s + t_gen_s + t_wav_s;
-    const double audio_s    = sample_rate > 0 ? (double) n_samples / sample_rate : 0.0;
-    LOG_INF("timings: prompt eval %.2fs + generation %.2fs + vocoder %.2fs = total %.2fs\n",
-            t_prompt_s, t_gen_s, t_wav_s, t_total_s);
-    LOG_INF("         output audio = %.2fs (audio time = %.2fx process time)\n", audio_s, t_total_s > 0 ? audio_s / t_total_s : 0.0);
-    FILE * f = fopen(params.out_file.c_str(), "wb");
-    if (!f) {
-        LOG_ERR("failed to open %s\n", params.out_file.c_str());
-        return 1;
-    }
-    fwrite(data, 1, data_len, f);
-    fclose(f);
-    LOG_INF("wrote %s\n", params.out_file.c_str());
 
     llama_backend_free();
     return 0;

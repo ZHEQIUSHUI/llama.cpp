@@ -391,6 +391,9 @@ slot rows. Each script checks its kernel on the simulator against the single-cor
 | `GGML_AXERA_FLASH` | 0 | `1`: split attention even where a fused kernel holds the context |
 | `GGML_AXERA_SPLIT_MIN` | 4096 | prefill masks from this many cells take the split kernels (where present) |
 | `GGML_AXERA_PROF` | 0 | `1`: time per kernel at exit; `2`: also every CPU node |
+| `GGML_AXERA_TRACE` | unset | set: one line per graph (kind, nodes, host gap before it, run time) and the weight preparations of mtmd's matrix products |
+| `GGML_AXERA_CP_STEP` | 1 | `0`: Qwen3-TTS code predictor without its step kernel (stacked layers and GEMVs) |
+| `GGML_AXERA_CP_STACK` | 1 | `0`: one call per code predictor layer |
 | `GGML_AXERA_DEBUG` | 0 | `1`: log op shapes without a kernel |
 
 ## Graph template: Qwen3 transformers
@@ -496,7 +499,15 @@ inside the backend and takes over what has an NPU kernel:
   and skips the nodes only they need, the attention and the graph's own KV cache among them. With a stacked kernel
   `qwen3tts_cp_stack5[_mx8]_c<LMAX>` in the directory (`q3tts_cp.py`: the 5 layers in one kernel, the smallest LMAX
   that holds the positions) a position's 5 layers are one call (16 instead of 80 calls per frame) when the layers
-  follow each other in the graph and nothing else reads their outputs; `GGML_AXERA_CP_STACK=0` keeps one call per layer;
+  follow each other in the graph and nothing else reads their outputs; `GGML_AXERA_CP_STACK=0` keeps one call per layer.
+  With a step kernel `qwen3tts_cp_step5_mx8_c16` (`q3tts_cp_step.py`, four cores, its `.layout` beside it) a whole
+  position is one call: the input projection (1.7B: the talker's 2048 to 1024, with its bias), the 5 layers, the final
+  norm and the position's codebook head, its logits written into the head's node; the backend finds the projection and
+  the head in the graph (MUL_MAT + ADD before layer 0, RMS_NORM, MUL, MUL_MAT after the last layer) and skips them too.
+  Each core projects its share of the KV heads and writes the K / V rows of all heads through shared OCM, reading back
+  only what it wrote itself (no cross-core read after write in DRAM), and every product reads the whole K (no
+  accumulation across calls or cores): the codes are the same as with the stacked four-core kernel. It is used whenever
+  it is in the directory (`GGML_AXERA_CP_STEP=0`: the stacked kernel and the GEMVs);
 - the convolutions (ggml's im2col and matrix product) as `conv1d_bf16_ic<IC>_oc<OC>_k<K>_d<D>_l<L>` kernels
   (`conv1d_kernels.py`): K shifted matrix products accumulated in f32 on the input in ggml's [channels][time] layout,
   so the im2col never runs; the kernel's taps repacked once;
@@ -548,6 +559,26 @@ weights, 71 ms); mtmd, sampling and the CPU slices the rest. The code predictor 
 about 53 GB/s on either board. The codec decoder takes about 1.1 s per window of 72 frames (5.8 s of audio). Before
 the conv1d kernels, the bf16 weight cache, mtmd's graph reuse and the host workers' concat / transpose / col2im a frame
 took 248 ms and a window 4.3 s.
+
+With the talker's four-core layer group (`qwen3_group28_*_mx8_kvc_c4096`) and the step kernel (7500 MT/s board,
+MXFP8): a 1.7B frame takes about 36 ms, the talker 9.0 ms, the code predictor's 16 steps 0.93 ms each (15 ms), the
+CPU slices (sampling, codebook lookups) about 5.5 ms and the gaps between mtmd's and llama's graphs about 6 ms; the
+0.6B talker takes 4.6 ms and its steps 0.89 ms. A codec decoder window takes about 0.9 s (13 ms per frame of a full
+window; the last window of a generation is a full window whatever its frames). The backend keeps the analysis of up to
+four graphs (the code step's and the codec decoder's alternate), so a window no longer costs a new analysis of the
+code step's graph. mtmd keeps the speaker encoder's embedding per reference (a service speaks with a few voices; the
+encoder takes 11 s for a 22 s reference on the CPU). In one process (`TTS_REPEAT=3 llama-tts ...`, the requests after
+the first, without the one-time costs: 0.4 s converting the codec decoder's weights, 1 s of graph analyses):
+
+| Model | Sentence | Frames | Generation + decoder | Per frame |
+|---|---|---|---|---|
+| Qwen3-TTS-1.7B | zh | 90 | 4.43 s + 1.05 s | 61 ms |
+| | en | 67 | 2.53 s + 1.06 s | 54 ms |
+| Qwen3-TTS-0.6B | zh | 126 | 7.00 s + 0.96 s (first request) | 63 ms |
+| | en | 61 | 3.00 s + 1.87 s (first request) | 80 ms |
+
+With `--top-k 1` the three requests of one process give the same audio (a Chinese sentence); mtmd's sampler keeps its
+random state across requests with the same seed, so sampled requests after the first differ from a fresh process.
 
 ## Source layout
 

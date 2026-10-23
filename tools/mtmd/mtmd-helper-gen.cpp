@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -363,12 +364,29 @@ private:
         return true;
     }
 
-    // runs the reference wav through the speaker encoder, returns one x-vector embedding row
+    // runs the reference wav through the speaker encoder, returns one x-vector embedding row; the result is kept per
+    // context and reference (a service speaks with the same few voices: the encoder runs once per voice)
     bool encode_speaker(mtmd_bitmap * bitmap, std::vector<float> & out) {
         if (!mtmd_support_audio(mctx)) {
             LOG_ERR("mtmd_helper_gen_audio: mmproj has no speaker/audio encoder\n");
             return false;
         }
+        static std::unordered_map<std::string, std::vector<float>> cache;
+        const std::string key = std::to_string((uintptr_t) mctx) + ":" +
+            std::string((const char *) mtmd_bitmap_get_data(bitmap), mtmd_bitmap_get_n_bytes(bitmap));
+        auto hit = cache.find(key);
+        if (hit != cache.end()) {
+            out = hit->second;
+            return true;
+        }
+        if (!encode_speaker_uncached(bitmap, out)) {
+            return false;
+        }
+        cache[key] = out;
+        return true;
+    }
+
+    bool encode_speaker_uncached(mtmd_bitmap * bitmap, std::vector<float> & out) {
         const std::string  marker = mtmd_default_marker();
         mtmd_input_text     text{ marker.c_str(), marker.size(), false, true };
         mtmd_input_chunks * chunks = mtmd_input_chunks_init();

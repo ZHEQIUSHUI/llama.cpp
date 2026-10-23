@@ -5,6 +5,7 @@
 #include "ggml-axera-q35.h"  // axera_q35_context: the fused layer kernel's LMAX / BC
 
 #include <set>
+#include <sstream>
 #include <sys/stat.h>
 
 // bf16 copies of the weights the NPU reads (any GGUF type), by data and size (views of a 3-D weight are separate)
@@ -34,10 +35,21 @@ struct axera_gen {
     // between them): its IO, the layers' K / V resident in it
     ggml_axera_kernel * cps = nullptr;
     layer               cps_io;
+    // or one whole predictor position per call, its input projection and codebook head included
+    // (qwen3tts_cp_step<layers>_mx8_c<LMAX>, q3tts_cp_step.py): IO bound once but the head (per call), the step's
+    // embedding row E, cos | sin CS, pos | nblk PN, its logits LG; GGML_AXERA_CP_STEP=0 off
+    ggml_axera_kernel * cpx = nullptr;
+    layer               cpx_io;
+    axera_cmm           E, CS, PN, LG;
+    int                 cpx_e = -1, cpx_head = -1, cpx_logits = -1;
+    const ggml_tensor * cpx_bound = nullptr, *cpx_norm = nullptr;  // the weights the step kernel's packs hold
     axera_cmm           X, Y, POS, NBLK, MASK, COS, SIN;
     bool                cp_off = false;  // the kernel is missing or a graph did not fit: the layers stay as they are
     std::vector<uintptr_t>                      key;       // the last graph's nodes, and its analysis
     std::shared_ptr<struct axera_gen_analysis> analysis;
+    // the analyses of the last few graphs by their key (the code generation and code2wav graphs alternate: neither
+    // analyzed again when the other one ran in between)
+    std::map<std::vector<uintptr_t>, std::shared_ptr<struct axera_gen_analysis>> analyses;
 };
 
 // ggml's MUL_MAT out [M][N] = src1 [M][K] . src0 [N][K]^T (out ne0 = N): src0 the weight or, for a convolution, the
@@ -524,8 +536,15 @@ template <typename F> static bool axera_gen_mm(ggml_backend_axera_context * ctx,
     axera_timer tm(axera_gen_label(g, gemm ? "gen mm (npu) m%" PRId64 " n%" PRId64 " k%" PRId64 :
                                              "gen gemv (npu) m%" PRId64 " n%" PRId64 " k%" PRId64, M, N, K));
     axera_timer tw(ic != g.im2col.end() ? "gen mm: im2col rows (host)" : "gen mm: w (host)");
+    const auto  tw0 = std::chrono::steady_clock::now();
     const auto w = ic != g.im2col.end() ? axera_gen_im2col_bf16(ic->second, g.tmp[0]) : axera_gen_bf16(g, a, N, g.tmp[0]);
     tw.stop();
+    static const bool trace = std::getenv("GGML_AXERA_TRACE") != nullptr;
+    if (trace) {
+        fprintf(stderr, "axera trace: mm %s m%" PRId64 " n%" PRId64 " k%" PRId64 " w %s (%s, %s, weight %d) %.3f ms\n", n->name, M, N,
+                K, a->name, ggml_op_desc(a), ggml_type_name(a->type), (int) axera_gen_is_weight(a),
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count());
+    }
     if (!gemm) {
         for (int64_t r = 0; r < M;) {
             const float * x    = (const float *) ((const char *) b->data + r * b->nb[1]);
@@ -978,6 +997,15 @@ struct axera_gen_analysis {
     // may reuse its memory later) and by the node their result is written into (the last layer's output, if any)
     std::map<const ggml_tensor *, const axera_gen_cp_call *> stack_at, stack_out;
     float                                                    theta = 0.0f;
+    // one call per position with the step kernel (axera_gen::cpx): the step's embedding row (the projection's
+    // input), its logits node (the head's MUL_MAT, nullptr at position 0) and head weight; by the node it runs at
+    struct step {
+        const ggml_tensor * e = nullptr, *head_w = nullptr;
+        ggml_tensor *       logits = nullptr;
+        int                 pos = 0;
+    };
+    std::vector<step>                                 steps;
+    std::map<const ggml_tensor *, const step *>       step_at;
 };
 
 // whether the layer calls can be one call per position: each position's layers chained (layer il reads layer il - 1's
@@ -1013,6 +1041,294 @@ static bool axera_gen_cp_stackable(struct ggml_cgraph * cgraph, const std::vecto
         }
     }
     return true;
+}
+
+// GGML_AXERA_CP_STEP=0: the predictor's positions through the stacked layers kernel and the GEMVs, as before
+static bool axera_gen_step_on() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_AXERA_CP_STEP");
+        return !(e && strcmp(e, "0") == 0);
+    }();
+    return on;
+}
+
+// the stacked positions of a graph as step kernel calls: per position its embedding row (the input projection's
+// input, or layer 0's input without a projection) and, but at position 0, its codebook head (MUL_MAT of final_norm(the
+// last layer's output)); the projection, the final norm and the head nodes added to skip. Empty (skip unchanged) unless
+// every position has that shape, with one projection and one norm weight
+static std::vector<axera_gen_analysis::step> axera_gen_cp_steps(struct ggml_cgraph * cgraph,
+                                                                const std::vector<axera_gen_cp_call> & st,
+                                                                std::set<const ggml_tensor *> & skip,
+                                                                const ggml_tensor ** proj_w, const ggml_tensor ** proj_b,
+                                                                const ggml_tensor ** norm_w) {
+    std::map<const ggml_tensor *, std::vector<ggml_tensor *>> users;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * n = cgraph->nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC && n->src[s]; ++s) {
+            users[n->src[s]].push_back(n);
+        }
+    }
+    auto only_user = [&](const ggml_tensor * t, ggml_op op) -> ggml_tensor * {
+        auto it = users.find(t);
+        return it != users.end() && it->second.size() == 1 && it->second[0]->op == op ? it->second[0] : nullptr;
+    };
+    std::vector<axera_gen_analysis::step> steps;
+    std::set<const ggml_tensor *>         add;
+    *proj_w = *proj_b = *norm_w = nullptr;
+    for (size_t i = 0; i < st.size(); ++i) {
+        const axera_gen_cp_call & c = st[i];
+        axera_gen_analysis::step  s;
+        s.pos                         = c.pos;
+        const ggml_tensor * x         = c.x;
+        const ggml_tensor * mm        = x->op == GGML_OP_ADD && x->src[0]->op == GGML_OP_MUL_MAT ? x->src[0] :
+                                        x->op == GGML_OP_MUL_MAT ? x : nullptr;
+        const bool          proj      = mm && axera_gen_is_weight(mm->src[0]) && mm->src[1]->ne[1] == 1 &&
+                                        mm->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(mm->src[1]);
+        const ggml_tensor * pb        = proj && x != mm ? x->src[1] : nullptr;
+        if (i == 0) {
+            *proj_w = proj ? mm->src[0] : nullptr;
+            *proj_b = pb;
+        } else if ((proj ? mm->src[0] : nullptr) != *proj_w || pb != *proj_b) {
+            return {};
+        }
+        if (pb && (pb->type != GGML_TYPE_F32 || !axera_gen_is_weight(pb))) {
+            return {};
+        }
+        s.e = proj ? mm->src[1] : x;
+        if (proj) {
+            add.insert(mm);
+            add.insert(x);
+        }
+        if (c.out) {
+            ggml_tensor * r = only_user(c.out, GGML_OP_RMS_NORM);
+            ggml_tensor * m = r ? only_user(r, GGML_OP_MUL) : nullptr;
+            ggml_tensor * h = m && m->src[0] == r ? only_user(m, GGML_OP_MUL_MAT) : nullptr;
+            if (!h || h->src[1] != m || h->type != GGML_TYPE_F32 || !ggml_is_contiguous(h) || h->ne[1] != 1 ||
+                (*norm_w && m->src[1] != *norm_w)) {
+                return {};
+            }
+            *norm_w   = m->src[1];
+            s.logits  = h;
+            s.head_w  = h->src[0];
+            add.insert(c.out);
+            add.insert(r);
+            add.insert(m);
+            add.insert(h);
+        }
+        steps.push_back(s);
+    }
+    if (!*norm_w || (*norm_w)->type != GGML_TYPE_F32) {
+        return {};
+    }
+    skip.insert(add.begin(), add.end());
+    return steps;
+}
+
+// binds the step kernel (qwen3tts_cp_step<n_layer>_mx8_c<LMAX> and its .layout) for HT-wide embedding rows: its packs
+// filled once from the predictor's weights (MXFP8 layer weights by the members' sizes, the projection as bf16, the
+// bias and norms as f32), its K / V resident; false if there is no such kernel
+static bool axera_gen_step_bind(axera_gen & g, const std::map<std::string, ggml_tensor *> & t, int n_layer,
+                                int64_t HT, int positions, const ggml_tensor * proj_w, const ggml_tensor * proj_b,
+                                const ggml_tensor * norm_w) {
+    if (g.cpx && g.cpx_bound == proj_w && g.cpx_norm == norm_w && g.E && g.E->size == (size_t) HT * sizeof(ggml_bf16_t)) {
+        return true;  // bound to these weights already (the graph built again)
+    }
+    const std::string sn = "qwen3tts_cp_step" + std::to_string(n_layer) + "_mx8";
+    const int64_t     sc = axera_weights_mx8() ? axera_kernels().ctx_for(sn, positions) : 0;
+    if (sc == 0) {
+        return false;
+    }
+    const std::string name = sn + "_c" + std::to_string(sc);
+    const std::string path = axera_kernels().path(name);
+    std::ifstream     f(path.substr(0, path.size() - strlen(".axmodel")) + ".layout");
+    if (!f.good()) {
+        GGML_LOG_WARN("axera gen: %s has no layout file, not used\n", name.c_str());
+        return false;
+    }
+    struct member {
+        std::string name, pack;
+        size_t      off = 0, bytes = 0;
+        int64_t     rows = 0, cols = 0, bw = 0;
+    };
+    std::vector<member>           members;
+    std::map<std::string, size_t> psize;
+    std::string                   line;
+    while (std::getline(f, line)) {
+        std::istringstream ls(line);
+        member             m;
+        std::string        blk;
+        if (!(ls >> m.name >> m.pack >> m.off >> m.bytes)) {
+            continue;
+        }
+        if (ls >> blk && blk == "blk") {
+            ls >> m.rows >> m.cols >> m.bw;
+        }
+        if (m.pack == "-") {
+            psize[m.name] = m.bytes;
+        } else {
+            members.push_back(m);
+        }
+    }
+    static const std::map<std::string, const char *> names = {
+        { "ln1", "ln1.weight" },         { "ln2", "ln2.weight" },         { "q_norm", "attn_q_norm.weight" },
+        { "k_norm", "attn_k_norm.weight" }, { "q", "attn_q.weight" },    { "k", "attn_k.weight" },
+        { "v", "attn_v.weight" },        { "o", "attn_out.weight" },      { "gate", "ffn_gate.weight" },
+        { "up", "ffn_up.weight" },       { "down", "ffn_down.weight" },
+    };
+    ggml_axera_kernel * k = axera_kernels().get(name);
+    g.cpx_io              = axera_gen::layer();
+    std::map<std::string, ggml_backend_axera_buffer_context *> packs;
+    for (const auto & p : psize) {
+        g.cpx_io.own.push_back(axera_cmm_alloc(std::max<size_t>(p.second, 64)));
+        packs[p.first] = g.cpx_io.own.back().get();
+        memset(packs[p.first]->vir, 0, packs[p.first]->size);
+    }
+    std::map<const ggml_tensor *, std::pair<axera_cmm, axera_cmm>> mx;  // MXFP8 copies, by weight
+    for (const auto & m : members) {
+        const size_t      dot = m.name.find('.');
+        const std::string lj = m.name.substr(0, dot), par = m.name.substr(dot + 1);
+        const ggml_tensor * w = nullptr;
+        if (lj == "LP") {
+            w = par == "w_pin" ? proj_w : par == "b_pin" ? proj_b : par == "norm" ? norm_w : nullptr;
+        } else if (lj.size() > 1 && lj[0] == 'L') {
+            const std::string wn = par.rfind("w_", 0) == 0 || par.rfind("s_", 0) == 0 ? par.substr(2) : par;
+            auto              it = names.find(wn);
+            w = it == names.end() ? nullptr :
+                axera_graph_find(t, ("a.gen.code.blk." + lj.substr(1) + "." + it->second).c_str());
+        }
+        if (!w || !packs.count(m.pack)) {
+            GGML_ABORT("axera gen: %s: no tensor for member %s\n", name.c_str(), m.name.c_str());
+        }
+        std::vector<char> src;
+        const bool        mxm = (par.rfind("w_", 0) == 0 || par.rfind("s_", 0) == 0) && lj != "LP";
+        if (mxm) {  // MXFP8 elements (one byte each) or their scales (one per 32)
+            auto & q = mx[w];
+            if (!q.first) {
+                axera_quantize_mxfp8(w, q.first, q.second);
+            }
+            const auto & b = par[0] == 'w' ? q.first : q.second;
+            GGML_ASSERT(b->size == m.bytes);
+            src.assign((const char *) b->vir, (const char *) b->vir + m.bytes);
+        } else if (m.bytes == (size_t) ggml_nelements(w) * sizeof(ggml_bf16_t) && m.pack == "pb") {
+            src.resize(m.bytes);
+            axera_gen_to_bf16(w, ggml_nrows(w), (ggml_bf16_t *) src.data());
+        } else {
+            GGML_ASSERT(w->type == GGML_TYPE_F32 && m.bytes == ggml_nbytes(w));
+            src.assign((const char *) w->data, (const char *) w->data + m.bytes);
+        }
+        char * dst = (char *) packs[m.pack]->vir + m.off;
+        if (m.bw == 0) {
+            memcpy(dst, src.data(), m.bytes);
+        } else {  // [rows][cols] -> strip j = columns j * bw .. (j + 1) * bw of every row, one strip after another
+            const size_t es = m.bytes / (size_t) (m.rows * m.cols);
+            for (int64_t j = 0; j < m.cols / m.bw; ++j) {
+                for (int64_t r = 0; r < m.rows; ++r) {
+                    memcpy(dst + ((j * m.rows + r) * m.bw) * es, src.data() + (r * m.cols + j * m.bw) * es, m.bw * es);
+                }
+            }
+        }
+    }
+    for (auto & p : packs) {
+        p.second->flush(p.second->vir, p.second->size);
+    }
+    int lmax, bc;
+    axera_q35_context(k, lmax, bc);
+    g.cp_LMAX = lmax, g.cp_BC = bc;
+    const int ic = k->input("cs");
+    GGML_ASSERT(ic >= 0);
+    g.cp_ROT = (int) (k->info->pInputs[ic].nSize / sizeof(ggml_bf16_t));  // cos | sin: ROT / 2 each
+    g.E      = axera_cmm_alloc(HT * sizeof(ggml_bf16_t));
+    g.CS     = axera_cmm_alloc(g.cp_ROT * sizeof(ggml_bf16_t));
+    g.PN     = axera_cmm_alloc(2 * sizeof(int32_t));
+    if (!g.MASK || g.MASK->size < (size_t) lmax * sizeof(ggml_bf16_t)) {
+        g.MASK = axera_cmm_alloc(lmax * sizeof(ggml_bf16_t));
+    }
+    g.cpx_io.in.assign(k->info->nInputSize, {});
+    g.cpx_io.out.assign(k->info->nOutputSize, {});
+    for (uint32_t i = 0; i < k->info->nInputSize; ++i) {
+        const std::string n    = k->info->pInputs[i].pName;
+        const uint32_t    size = k->info->pInputs[i].nSize;
+        ggml_backend_axera_buffer_context * b = n == "e" ? g.E.get() : n == "cs" ? g.CS.get() : n == "pn" ? g.PN.get() :
+                                                n == "mask" ? g.MASK.get() : packs.count(n) ? packs[n] : nullptr;
+        if (n == "w_head") {
+            g.cpx_head = (int) i;
+            continue;
+        }
+        if (n == "e") {
+            g.cpx_e = (int) i;
+            GGML_ASSERT(size == HT * sizeof(ggml_bf16_t));
+        }
+        if (!b || b->size < size) {
+            GGML_ABORT("axera gen: %s input %s (%u bytes) has no buffer\n", name.c_str(), n.c_str(), size);
+        }
+        g.cpx_io.in[i] = axera_io(b, b->vir, size);
+    }
+    for (uint32_t i = 0; i < k->info->nOutputSize; ++i) {
+        const std::string n    = k->info->pOutputs[i].pName;
+        const uint32_t    size = k->info->pOutputs[i].nSize;
+        g.cpx_io.own.push_back(axera_cmm_alloc(size));  // logits, or a layer's resident K / V
+        auto * b = g.cpx_io.own.back().get();
+        memset(b->vir, 0, size);
+        b->flush(b->vir, size);
+        if (n == "logits") {
+            g.cpx_logits = (int) i;
+        }
+        g.cpx_io.out[i] = axera_io(b, b->vir, size);
+    }
+    GGML_ASSERT(g.cpx_e >= 0 && g.cpx_head >= 0 && g.cpx_logits >= 0);
+    g.cpx       = k;
+    g.cpx_bound = proj_w;
+    g.cpx_norm  = norm_w;
+    return true;
+}
+
+// one predictor position on the step kernel: the position's mask cell and RoPE rows (position 0: a new frame, every
+// cell masked), its embedding row as bf16, the step's head; its logits into the head node
+static void axera_gen_step_run(ggml_backend_axera_context * ctx, axera_gen & g, const axera_gen_analysis & an,
+                               const axera_gen_analysis::step & s) {
+    auto * mask = (ggml_bf16_t *) g.MASK->vir;
+    if (s.pos == 0) {
+        std::fill(mask, mask + g.MASK->size / sizeof(ggml_bf16_t), ggml_fp32_to_bf16(-3e38f));
+    }
+    mask[s.pos] = ggml_fp32_to_bf16(0.0f);
+    g.MASK->flush(g.MASK->vir, (size_t) g.cp_BC * (s.pos / g.cp_BC + 1) * sizeof(ggml_bf16_t));
+    ((int32_t *) g.PN->vir)[0] = s.pos;
+    ((int32_t *) g.PN->vir)[1] = s.pos / g.cp_BC + 1;
+    g.PN->flush(g.PN->vir, g.PN->size);
+    const int half = g.cp_ROT / 2;
+    for (int i = 0; i < half; ++i) {
+        const float a                           = (float) s.pos * powf(an.theta, -2.0f * i / g.cp_ROT);
+        ((ggml_bf16_t *) g.CS->vir)[i]          = ggml_fp32_to_bf16(cosf(a));
+        ((ggml_bf16_t *) g.CS->vir)[half + i]   = ggml_fp32_to_bf16(sinf(a));
+    }
+    g.CS->flush(g.CS->vir, g.CS->size);
+    const int64_t HT = s.e->ne[0];
+    ggml_fp32_to_bf16_row((const float *) s.e->data, (ggml_bf16_t *) g.E->vir, HT);
+    g.E->flush(g.E->vir, HT * sizeof(ggml_bf16_t));
+    // the head: this step's (position 0's logits are not read: any head, the next position's)
+    const ggml_tensor * hw = s.head_w;
+    for (size_t i = 0; !hw && i < an.steps.size(); ++i) {
+        hw = an.steps[i].head_w;
+    }
+    const auto w = axera_gen_bf16(g, hw, hw->ne[1], g.tmp[0]);
+    g.cpx_io.in[g.cpx_head] = axera_io(w.first, w.second, (uint32_t) (hw->ne[0] * hw->ne[1] * sizeof(ggml_bf16_t)));
+    if (axera_run_sync(g.cpx, g.cpx_io.in, g.cpx_io.out) != 0) {
+        GGML_ABORT("axera gen: code predictor step at position %d failed\n", s.pos);
+    }
+    if (s.logits) {
+        auto * lg = g.cpx_io.own[0].get();  // (outputs own in IO order: logits first, then K / V)
+        for (auto & o : g.cpx_io.own) {
+            if (o->vir == g.cpx_io.out[g.cpx_logits].pVirAddr) {
+                lg = o.get();
+            }
+        }
+        lg->invalidate(lg->vir, ggml_nbytes(s.logits));
+        memcpy(s.logits->data, lg->vir, ggml_nbytes(s.logits));
+        if (ggml_backend_buffer_is_axera(s.logits->buffer)) {
+            ((ggml_backend_axera_buffer_context *) s.logits->buffer->context)->flush(s.logits->data, ggml_nbytes(s.logits));
+        }
+    }
+    GGML_UNUSED(ctx);
 }
 
 static void axera_gen_analyze(ggml_backend_axera_context * ctx, axera_gen & g, struct ggml_cgraph * cgraph,
@@ -1070,6 +1386,16 @@ static void axera_gen_analyze(ggml_backend_axera_context * ctx, axera_gen & g, s
                     skip.insert(m);
                 }
             }
+            // the whole position (projection, layers, final norm, head) on the step kernel where it exists
+            const ggml_tensor *pw = nullptr, *pb = nullptr, *nw = nullptr;
+            std::set<const ggml_tensor *> sk = skip;
+            auto steps = axera_gen_step_on() ? axera_gen_cp_steps(cgraph, calls, sk, &pw, &pb, &nw) :
+                                               std::vector<axera_gen_analysis::step>();
+            if (!steps.empty() && axera_gen_step_bind(g, axera_graph_names(ctx, cgraph), n_layer, steps[0].e->ne[0],
+                                                      positions, pw, pb, nw)) {
+                an.steps = std::move(steps);
+                skip     = std::move(sk);
+            }
         }
         std::set<const ggml_tensor *> outs;
         for (const auto & c : calls) {
@@ -1082,11 +1408,18 @@ static void axera_gen_analyze(ggml_backend_axera_context * ctx, axera_gen & g, s
                 (!c.out && !g.cps && !outs.count(c.x))) {
                 calls.clear();
                 skip.clear();
+                an.steps.clear();
                 break;
             }
         }
     }
+    for (const auto & st : an.steps) {  // (the step kernel: at layer 0's output node, as the stacked calls)
+        an.step_at[first[st.pos]] = &st;
+    }
     for (const auto & c : calls) {
+        if (g.cps && !an.steps.empty()) {
+            continue;
+        }
         if (g.cps) {
             an.stack_at[first[c.pos]] = &c;
             if (c.out) {
@@ -1097,8 +1430,8 @@ static void axera_gen_analyze(ggml_backend_axera_context * ctx, axera_gen & g, s
         }
     }
     if (axera_debug() && g.cps) {
-        fprintf(stderr, "axera gen: code predictor stacked, %zu calls (%zu with output)\n", calls.size(),
-                an.stack_out.size());
+        fprintf(stderr, "axera gen: code predictor stacked, %zu calls (%zu with output), %zu step kernel calls\n",
+                calls.size(), an.stack_out.size(), an.steps.size());
     }
 }
 
@@ -1122,10 +1455,19 @@ enum ggml_status axera_gen_compute(ggml_backend_axera_context * ctx, struct ggml
         }
     }
     if (!g.analysis || key != g.key) {
-        auto an = std::make_shared<axera_gen_analysis>();
-        axera_gen_analyze(ctx, g, cgraph, *an);
-        g.analysis = an;
-        g.key      = std::move(key);
+        auto it = g.analyses.find(key);
+        if (it != g.analyses.end()) {
+            g.analysis = it->second;
+        } else {
+            auto an = std::make_shared<axera_gen_analysis>();
+            axera_gen_analyze(ctx, g, cgraph, *an);
+            g.analysis = an;
+            if (g.analyses.size() >= 4) {
+                g.analyses.clear();
+            }
+            g.analyses[key] = an;
+        }
+        g.key = std::move(key);
     }
     const axera_gen_analysis &            an    = *g.analysis;
     const std::set<const ggml_tensor *> & skip  = an.skip;
@@ -1154,6 +1496,13 @@ enum ggml_status axera_gen_compute(ggml_backend_axera_context * ctx, struct ggml
         if (c != call_of.end()) {
             cpu();
             cp_run(*c->second);
+            continue;
+        }
+        auto sx = an.step_at.find(n);
+        if (sx != an.step_at.end()) {  // a whole predictor position in one call, its logits into the head node
+            cpu();
+            axera_timer tm("gen code predictor step (npu)");
+            axera_gen_step_run(ctx, g, an, *sx->second);
             continue;
         }
         auto sa = an.stack_at.find(n);
