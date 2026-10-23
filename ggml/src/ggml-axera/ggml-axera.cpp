@@ -211,44 +211,49 @@ static bool axera_pooling_input(const ggml_tensor * t) {
 }
 
 // a pooling op of an embeddings graph: after the final norm (result_norm), on the rows picked / averaged by the
-// pooling inputs, up to the pooled output (and a rerank head): within 6 ops of a pooled result or a pooling input.
-// The distance (capped at 7) is kept per node: walked from every node of a 1929-node graph it took 8 ms of the
-// scheduler's split per batch. A node is recomputed when its op or name changed (llama.cpp rebuilds the graph per
-// batch, mostly at the same addresses with the same structure)
-static int axera_pooling_dist(const ggml_tensor * op) {
-    struct entry {
-        ggml_op op;
-        char    name[GGML_MAX_NAME];
-        int     dist;
-    };
-    static std::unordered_map<const ggml_tensor *, entry> memo;  // the scheduler asks from one thread
-    auto it = memo.find(op);
-    if (it != memo.end() && it->second.op == op->op && strncmp(it->second.name, op->name, GGML_MAX_NAME) == 0) {
-        return it->second.dist;
+// pooling inputs, up to the pooled output (and a rerank head): within 6 ops of a pooled result or a pooling input
+static bool axera_pooling_walk(const ggml_tensor * op, int depth) {
+    if (!op || depth > 6) {
+        return false;
     }
-    int dist = 7;
     // (without pooling result_embd_pooled is the final norm itself, run by the template)
     const bool final_norm = op->op == GGML_OP_MUL && op->src[0] && op->src[0]->op == GGML_OP_RMS_NORM;
     if ((strcmp(op->name, "result_embd_pooled") == 0 && !final_norm) || strncmp(op->name, "result_norm (", 13) == 0) {
-        dist = 0;
+        return true;
     }
-    for (int s = 0; s < GGML_MAX_SRC && dist > 0; ++s) {
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
         const ggml_tensor * src = op->src[s];
-        if (src && src->op == GGML_OP_NONE && axera_pooling_input(src)) {
-            dist = 0;
-        } else if (src && src->op != GGML_OP_NONE) {
-            dist = std::min(dist, 1 + axera_pooling_dist(src));
+        if (src && ((src->op == GGML_OP_NONE && axera_pooling_input(src)) ||
+                    (src->op != GGML_OP_NONE && axera_pooling_walk(src, depth + 1)))) {
+            return true;
         }
+    }
+    return false;
+}
+
+// the walk's answer kept per node: walked from every node of a 1929-node graph it took 8 ms of the scheduler's split
+// per batch. A node is walked again when its op or name changed (llama.cpp rebuilds the graph per batch, mostly at the
+// same addresses with the same structure). Only the answer is kept, not distances: the walk stays six levels deep (a
+// memoized walk over all sources did not end on mtmd's Qwen3-TTS generation graphs)
+static bool axera_pooling_op(const ggml_tensor * op) {
+    struct entry {
+        ggml_op op;
+        char    name[GGML_MAX_NAME];
+        bool    pooling;
+    };
+    static std::unordered_map<const ggml_tensor *, entry> memo;  // the scheduler asks from one thread
+    if (!op) {
+        return false;
+    }
+    auto it = memo.find(op);
+    if (it != memo.end() && it->second.op == op->op && strncmp(it->second.name, op->name, GGML_MAX_NAME) == 0) {
+        return it->second.pooling;
     }
     entry & e = memo[op];
     e.op      = op->op;
     strncpy(e.name, op->name, GGML_MAX_NAME);
-    e.dist = dist;
-    return dist;
-}
-
-static bool axera_pooling_op(const ggml_tensor * op) {
-    return op && axera_pooling_dist(op) <= 6;
+    e.pooling = axera_pooling_walk(op, 0);
+    return e.pooling;
 }
 
 static bool ggml_backend_axera_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
