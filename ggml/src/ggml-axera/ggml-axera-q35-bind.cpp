@@ -75,20 +75,31 @@ AX_ENGINE_IO_BUFFER_T axera_q35_gguf_input(axera_q35 & m, axera_q35_layer & ly, 
     return axera_io(b, b->vir, size);
 }
 
-// MXFP8 kernel input w_<x> (elements) or s_<x> (scales), quantized once per layer from the GGUF tensor w of w_<x> and
-// shared by the layer's decode, prefill and split attention kernels
+// a quantized projection's kernel input of k: w_<x> / s_<x> (MX), also t_<x> (NVFP4: the kernel has t_<x>)
+bool axera_q35_mx_name(const ggml_axera_kernel * k, const std::string & n) {
+    return n.size() > 2 && n[1] == '_' && (n[0] == 'w' || n[0] == 's' || n[0] == 't') &&
+           k->input(("s_" + n.substr(2)).c_str()) >= 0;
+}
+
+// MX / NVFP4 kernel input w_<x> (elements), s_<x> (scales) or t_<x> (NVFP4's tensor scale2), quantized once per layer
+// from the GGUF tensor w of w_<x> and shared by the layer's decode, prefill and split attention kernels: NVFP4 when the
+// kernel has t_<x>, else MXFP4 when its elements w_<x> are 4-bit (half a byte each), else MXFP8
 AX_ENGINE_IO_BUFFER_T axera_q35_mx_input(axera_q35_layer & ly, const ggml_tensor * w, const std::string & n,
                                          uint32_t size, ggml_axera_kernel * k) {
     const std::string wn = "w_" + n.substr(2);
-    // MXFP4 when the kernel's elements w_<x> are 4-bit (half a byte each); the scales follow their elements
     const int         iw = k->input(wn.c_str());
     GGML_ASSERT(iw >= 0);
-    const bool        f4 = (int64_t) k->info->pInputs[iw].nSize * 2 == ggml_nelements(w);
-    const std::string key = wn + (f4 ? "#4" : "");
+    const bool        nv  = k->input(("t_" + n.substr(2)).c_str()) >= 0;
+    const bool        f4  = (int64_t) k->info->pInputs[iw].nSize * 2 == ggml_nelements(w);
+    const std::string key = wn + (nv ? "#nv" : f4 ? "#4" : "");
     auto              mx  = ly.mx.find(key);
     if (mx == ly.mx.end()) {
-        axera_cmm q, sc;
-        if (f4) {
+        axera_cmm q, sc, s2;
+        if (nv) {
+            axera_quantize_nvfp4(w, q, sc, s2);
+            ly.mx_t[key] = s2.get();
+            ly.own.push_back(std::move(s2));
+        } else if (f4) {
             axera_quantize_mxfp4(w, q, sc);
         } else {
             axera_quantize_mxfp8(w, q, sc);
@@ -97,7 +108,7 @@ AX_ENGINE_IO_BUFFER_T axera_q35_mx_input(axera_q35_layer & ly, const ggml_tensor
         ly.own.push_back(std::move(q));
         ly.own.push_back(std::move(sc));
     }
-    auto * b = n[0] == 'w' ? mx->second.first : mx->second.second;
+    auto * b = n[0] == 'w' ? mx->second.first : n[0] == 's' ? mx->second.second : ly.mx_t.at(key);
     if (b->size < size) {
         GGML_ABORT("qwen35 template: %s is %zu bytes, kernel wants %u\n", n.c_str(), b->size, size);
     }
@@ -238,6 +249,7 @@ void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::string, ggm
     ly.own.clear();
     ly.state.clear();
     ly.mx.clear();
+    ly.mx_t.clear();
     ly.in_place = false;
     ly.cache_state.clear();
     ly.row = 0;
@@ -316,8 +328,8 @@ void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::string, ggm
                 }
             }
             b->flush(b->vir, size);
-        } else if ((n.rfind("w_", 0) == 0 || n.rfind("s_", 0) == 0) && k->input(("s_" + n.substr(2)).c_str()) >= 0) {
-            // MXFP8 kernel: w_<x> elements and s_<x> scales, quantized from the GGUF tensor of w_<x>
+        } else if (axera_q35_mx_name(k, n)) {
+            // MX / NVFP4 kernel: w_<x> elements, s_<x> scales (t_<x> scale2), quantized from the GGUF tensor of w_<x>
             const char * g = axera_q35_gguf_name(m, "w_" + n.substr(2));
             if (!g) {
                 GGML_ABORT("qwen35 template: kernel input %s has no GGUF tensor\n", n.c_str());
@@ -658,12 +670,17 @@ static void axera_q35_release(axera_q35 & m, bool packs) {
         };
         std::set<const void *> bufs;
         for (auto it = ly.mx.begin(); it != ly.mx.end();) {
-            if (in_use(it->second.first) || in_use(it->second.second)) {
+            auto t = ly.mx_t.find(it->first);  // NVFP4: the tensor scale2 goes with them
+            if (in_use(it->second.first) || in_use(it->second.second) || (t != ly.mx_t.end() && in_use(t->second))) {
                 ++it;
                 continue;
             }
             bufs.insert(it->second.first);
             bufs.insert(it->second.second);
+            if (t != ly.mx_t.end()) {
+                bufs.insert(t->second);
+                ly.mx_t.erase(t);
+            }
             it = ly.mx.erase(it);
         }
         drop(ly, bufs);
@@ -941,7 +958,7 @@ void axera_q35_bind_flash(axera_q35 & m, int il, int v, const std::map<std::stri
                 in[i] = axera_io(b->second.first, b->second.second, size);
                 continue;
             }
-            const bool mx = (n.rfind("w_", 0) == 0 || n.rfind("s_", 0) == 0) && k->input(("s_" + n.substr(2)).c_str()) >= 0;
+            const bool mx = axera_q35_mx_name(k, n);
             const char * g  = axera_q35_gguf_name(m, mx ? "w_" + n.substr(2) : n);
             auto         it = !g ? t.end() : t.find("blk." + std::to_string(il + m.off) + "." + g);
             if (it == t.end()) {
@@ -1172,7 +1189,7 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         // GGML_AXERA_WEIGHTS=mxfp4, else GGML_AXERA_LMHEAD=mxfp4; GGML_AXERA_LMHEAD=mxfp8 keeps MXFP8 (mxfp4m: MXFP8
         // unless asked)
         const char * lh  = std::getenv("GGML_AXERA_LMHEAD");
-        const bool   lm4 = (lh ? strcmp(lh, "mxfp4") == 0 : m.moe || strcmp(axera_mx_sfx(), "_mx4") == 0) &&
+        const bool   lm4 = (lh ? strcmp(lh, "mxfp4") == 0 : m.moe || strcmp(axera_mx_sfx(), "_mx4") == 0 || axera_weights_nv4()) &&
                          axera_kernels().has("mul_mat_mx4_n" + std::to_string(lm->ne[1]) + "_k" + std::to_string(lm->ne[0]));
         auto & sh = shared[{ lm, lm4 }];
         m.lm_q    = sh.first.lock();
