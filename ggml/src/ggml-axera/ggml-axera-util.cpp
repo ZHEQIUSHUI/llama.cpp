@@ -1,6 +1,10 @@
 // Axera NPU backend: profiling, host thread pool, runtime, kernel registry, CMM, settings
 
 #include "ggml-axera-impl.h"
+
+#include <ax_engine_advanced_api.h>
+
+#include <deque>
 bool axera_debug() {
     static const bool debug = [] {
         const char * e = std::getenv("GGML_AXERA_DEBUG");
@@ -98,6 +102,17 @@ std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_alloc_nc(size_t siz
     }
     return b;
 }
+std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_view(const ggml_backend_axera_buffer_context * b, size_t off,
+                                                                  size_t size) {
+    GGML_ASSERT(off + size <= b->size);
+    auto v  = std::make_unique<ggml_backend_axera_buffer_context>();
+    v->phy  = b->phy + off;
+    v->vir  = (char *) b->vir + off;
+    v->size = size;
+    v->nc   = b->nc;
+    v->view = true;
+    return v;
+}
 AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint32_t size) {
     AX_ENGINE_IO_BUFFER_T b;
     memset(&b, 0, sizeof(b));
@@ -108,8 +123,20 @@ AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, vo
 }
 
 // one kernel call; the AX_ENGINE_RunSync status
+// the first run of a single-core build loaded for lack of the multi-core one
+void axera_warn_one_core(ggml_axera_kernel * k) {
+    if (!k->one_core.empty()) {
+        GGML_LOG_WARN("axera: %s runs on 1 core (no %s_npu%d)\n", k->one_core.c_str(), k->one_core.c_str(), axera_cores());
+        k->one_core.clear();
+    }
+}
+
 int axera_run_sync(ggml_axera_kernel * k, std::vector<AX_ENGINE_IO_BUFFER_T> & in,
                    std::vector<AX_ENGINE_IO_BUFFER_T> & out) {
+    axera_warn_one_core(k);
+    if (const int r = axera_run_drain()) {
+        return r;
+    }
     AX_ENGINE_IO_T io;
     memset(&io, 0, sizeof(io));
     io.pInputs     = in.data();
@@ -131,6 +158,84 @@ int axera_run_sync(ggml_axera_kernel * k, std::vector<AX_ENGINE_IO_BUFFER_T> & i
     return ret;
 }
 
+std::atomic<uint64_t> axera_graph_epoch{ 0 };
+
+namespace {
+struct axera_inflight {
+    ggml_axera_kernel *                k   = nullptr;
+    AX_ENGINE_CONTEXT_T                ctx = nullptr;
+    std::vector<AX_ENGINE_IO_BUFFER_T> in, out;  // the call's IO, kept until it completes
+    AX_ENGINE_IO_T                     io;
+};
+std::deque<axera_inflight> axera_queue;
+int                        axera_ctx_next = 0;
+}  // namespace
+
+static int axera_wait_oldest() {
+    axera_inflight & f = axera_queue.front();
+    const int        r = AX_ENGINE_WaitAsync(f.k->handle, f.ctx, 60000);
+    axera_queue.pop_front();
+    return r;
+}
+
+int axera_run_drain() {
+    int ret = 0;
+    while (!axera_queue.empty()) {
+        const int r = axera_wait_oldest();
+        ret         = ret ? ret : r;
+    }
+    return ret;
+}
+
+int axera_run_submit(ggml_axera_kernel * k, const std::vector<AX_ENGINE_IO_BUFFER_T> & in,
+                     const std::vector<AX_ENGINE_IO_BUFFER_T> & out) {
+    axera_warn_one_core(k);
+    // off by default: the runtime starts a core's part of the next task as soon as that core finished the previous
+    // one, so a kernel reading other cores' results of the previous call (every layer kernel) can race (a chain of
+    // cross-core reads came out wrong; 2B decode text differed in 3 of 12 runs)
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_AXERA_ASYNC");
+        return e != nullptr && strcmp(e, "1") == 0;
+    }();
+    if (!on || k->cores < 2) {
+        auto i = in, o = out;
+        return axera_run_sync(k, i, o);
+    }
+    if (!axera_queue.empty() && axera_queue.back().k != k) {
+        if (const int r = axera_run_drain()) {
+            return r;
+        }
+    }
+    if (axera_queue.size() >= 2) {
+        if (const int r = axera_wait_oldest()) {
+            return r;
+        }
+    }
+    if (!k->actx[0]) {
+        for (auto & c : k->actx) {
+            if (const int r = AX_ENGINE_CreateContextV2(k->handle, &c)) {
+                return r;
+            }
+        }
+    }
+    axera_queue.emplace_back();
+    axera_inflight & f = axera_queue.back();
+    f.k                = k;
+    f.ctx              = k->actx[axera_ctx_next++ % 2];
+    f.in               = in;
+    f.out              = out;
+    memset(&f.io, 0, sizeof(f.io));
+    f.io.pInputs     = f.in.data();
+    f.io.nInputSize  = (uint32_t) f.in.size();
+    f.io.pOutputs    = f.out.data();
+    f.io.nOutputSize = (uint32_t) f.out.size();
+    const int ret    = AX_ENGINE_RunAsync(k->handle, f.ctx, &f.io, nullptr, nullptr);
+    if (ret != 0) {
+        axera_queue.pop_back();
+    }
+    return ret;
+}
+
 // GGML_AXERA_TEMPLATE=qwen35 (or qwen3): the graph template of Qwen3.5 and Qwen3 transformers (ggml-axera-q35.h)
 bool axera_template_qwen35() {
     static const bool on = [] {
@@ -143,6 +248,7 @@ bool axera_template_qwen35() {
 // GGML_AXERA_FLASH=1: split attention (flash decoding) even when a fused attention kernel holds the KV cache
 // GGML_AXERA_SPLIT_MIN: with a fused attention kernel, the KQ mask width (cells) from which a batch takes the split
 // attention kernels instead when they exist for the context (multi-core segment scan; default 4096, 0: always)
+
 int64_t axera_split_min() {
     static const int64_t n = [] {
         const char * e = std::getenv("GGML_AXERA_SPLIT_MIN");
@@ -185,12 +291,30 @@ int64_t axera_flash_seg(int64_t n) {
 
 // GGML_AXERA_WEIGHTS=mxfp8: the template quantizes the bf16 GGUF weights to MXFP8 at load (about half the bytes per
 // token; see docs/backend/AXERA.md for the accuracy cost)
+// GGML_AXERA_WEIGHTS=mxfp4: the layer weights in MXFP4 (kernels <name>_mx4), the output projection in MXFP4 when its
+// mul_mat_mx4 kernel exists (else MXFP8; GGML_AXERA_LMHEAD); the MXFP8 code paths otherwise (axera_weights_mx8 is
+// true for both)
 bool axera_weights_mx8() {
     static const bool on = [] {
         const char * e = std::getenv("GGML_AXERA_WEIGHTS");
-        return e != nullptr && strcmp(e, "mxfp8") == 0;
+        return e != nullptr && (strcmp(e, "mxfp8") == 0 || strcmp(e, "mxfp4") == 0 || strcmp(e, "mxfp4m") == 0);
     }();
     return on;
+}
+bool axera_weights_mx4() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_AXERA_WEIGHTS");
+        return e != nullptr && (strcmp(e, "mxfp4") == 0 || strcmp(e, "mxfp4m") == 0);
+    }();
+    return on;
+}
+// mxfp4m: the MLP weights in MXFP4, the other layer weights MXFP8 (kernels _mx4m)
+const char * axera_mx_sfx() {
+    static const char * sfx = [] {
+        const char * e = std::getenv("GGML_AXERA_WEIGHTS");
+        return e && strcmp(e, "mxfp4m") == 0 ? "_mx4m" : e && strcmp(e, "mxfp4") == 0 ? "_mx4" : "_mx8";
+    }();
+    return sfx;
 }
 float axera_rms_eps(const ggml_tensor * rms_norm) {
     float eps;

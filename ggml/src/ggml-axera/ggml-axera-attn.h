@@ -1,5 +1,8 @@
 // Axera NPU backend: attention on the llama.cpp KV cache for the graph templates (model independent)
 //
+// DEPRECATED: the split attention path (flash decoding) is kept only for the models not yet on the fused four-core
+// kernels (the Qwen3 family, Qwen3-ASR, Qwen3-TTS, Qwen3.5-0.8B); remove it with their migration. Qwen3.5 2B / 9B / 27B
+// and the 35B run fused at every context their kernel directories hold, and stop beyond it
 // Split attention (flash decoding): a head kernel (the new Q / K / V rows), one call of a segment kernel per KV segment
 // of S cells in use (partial m / l / o over the cells a token sees), merged on the CPU, and a tail kernel. The model's
 // layer kernels around it, the kernels' names and their binding belong to the template.

@@ -5,15 +5,17 @@
 
 const std::map<std::string, ggml_tensor *> & axera_graph_names(ggml_backend_axera_context * ctx,
                                                                struct ggml_cgraph * cgraph) {
-    axera_timer            tmap("graph name map");
-    std::vector<uintptr_t> key;
-    key.reserve((size_t) cgraph->n_nodes * (2 + GGML_MAX_SRC));
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        key.push_back((uintptr_t) node);
-        key.push_back((uintptr_t) node->op);
-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            key.push_back((uintptr_t) node->src[s]);
+    axera_timer tmap("graph name map");
+    // the graph's identity: its node pointers (the names only change with the nodes; a rebuilt graph of another
+    // topology has other nodes or another node count)
+    std::vector<uintptr_t> key((size_t) cgraph->n_nodes);
+    memcpy(key.data(), cgraph->nodes, key.size() * sizeof(uintptr_t));
+    if (std::getenv("GGML_AXERA_NAMEKEY_FULL")) {  // bisect: every node's op and sources too
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            key.push_back((uintptr_t) cgraph->nodes[i]->op);
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                key.push_back((uintptr_t) cgraph->nodes[i]->src[s]);
+            }
         }
     }
     std::map<std::string, ggml_tensor *> & t = ctx->graph_names;
@@ -41,7 +43,7 @@ ggml_tensor * axera_graph_find(const std::map<std::string, ggml_tensor *> & t, c
 }
 
 // the final norm rms_norm(h) * w (the MUL node): its weight and eps
-static const float * axera_final_norm(const ggml_tensor * mul, int H, float * eps) {
+const float * axera_final_norm(const ggml_tensor * mul, int H, float * eps) {
     GGML_ASSERT(mul->op == GGML_OP_MUL);
     ggml_tensor * rms = mul->src[0]->op == GGML_OP_RMS_NORM ? mul->src[0] : mul->src[1];
     ggml_tensor * onw = mul->src[0] == rms ? mul->src[1] : mul->src[0];
@@ -183,10 +185,11 @@ void axera_output_head(ggml_backend_axera_context * ctx, struct ggml_cgraph * cg
     void * lm_data = lm_q ? lm_q->vir : lm_bf ? lm_bf->vir : lm->data;
     auto   dst_of  = [&](int r) { return (float *) ((char *) logits->data + r * logits->nb[1]); };
     axera_timer tl("lm_head");
+    const bool  lm4 = lm_q && lm_q->size * 2 == (size_t) (lm->ne[1] * lm->ne[0]);  // MXFP4 (GGML_AXERA_LMHEAD=mxfp4)
     for (int r = 0; r < n_out;) {
         int done = 0;
         for (int Bn : { 8, 4, 2 }) {
-            if (done == 0 && lm_ctx && r + Bn <= n_out) {
+            if (done == 0 && lm_ctx && !lm4 && r + Bn <= n_out) {
                 float * dsts[8];
                 for (int b = 0; b < Bn; ++b) {
                     dsts[b] = dst_of(r + b);
@@ -200,7 +203,9 @@ void axera_output_head(ggml_backend_axera_context * ctx, struct ggml_cgraph * cg
             continue;
         }
         const float * y = hn.data() + (size_t) r * H;
-        if (lm_q) {
+        if (lm4) {
+            axera_gemv_mx4(ctx, lm_q, lm_s, lm->ne[1], H, y, logits, dst_of(r));
+        } else if (lm_q) {
             axera_gemv_mx8(ctx, lm_q, lm_s, lm->ne[1], H, y, logits, dst_of(r));
         } else if (lm_bf) {
             axera_gemv_raw(ctx, lm_bf, lm_bf->vir, lm->ne[1], H, y, logits, dst_of(r));
