@@ -7,8 +7,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -363,12 +366,43 @@ private:
         return true;
     }
 
-    // runs the reference wav through the speaker encoder, returns one x-vector embedding row
+    // runs the reference wav through the speaker encoder, returns one x-vector embedding row. The embeddings of the
+    // last few references are kept (by a hash of the bitmap's bytes and their count): a pipeline that serves several
+    // requests speaks with a few voices, the encoder then runs once per voice
     bool encode_speaker(mtmd_bitmap * bitmap, std::vector<float> & out) {
         if (!mtmd_support_audio(mctx)) {
             LOG_ERR("mtmd_helper_gen_audio: mmproj has no speaker/audio encoder\n");
             return false;
         }
+        const unsigned char * data = mtmd_bitmap_get_data(bitmap);
+        const size_t          n    = mtmd_bitmap_get_n_bytes(bitmap);
+        uint64_t              h    = 1469598103934665603ull;  // FNV-1a
+        for (size_t i = 0; i < n; i++) {
+            h = (h ^ data[i]) * 1099511628211ull;
+        }
+        const std::pair<uint64_t, size_t> key{ h, n };
+        {
+            std::lock_guard<std::mutex> lock(spk_mu);
+            for (auto it = spk_cache.begin(); it != spk_cache.end(); ++it) {
+                if (it->first == key) {
+                    out = it->second;
+                    spk_cache.splice(spk_cache.begin(), spk_cache, it);  // most recently used first
+                    return true;
+                }
+            }
+        }
+        if (!encode_speaker_uncached(bitmap, out)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(spk_mu);
+        spk_cache.emplace_front(key, out);
+        if (spk_cache.size() > 8) {
+            spk_cache.pop_back();
+        }
+        return true;
+    }
+
+    bool encode_speaker_uncached(mtmd_bitmap * bitmap, std::vector<float> & out) {
         const std::string  marker = mtmd_default_marker();
         mtmd_input_text     text{ marker.c_str(), marker.size(), false, true };
         mtmd_input_chunks * chunks = mtmd_input_chunks_init();
@@ -435,6 +469,10 @@ private:
 
     // must match hparams.wav_tfm_swa hardcoded in clip.cpp
     size_t window_frames = 72;
+
+    // speaker embeddings of the last references (encode_speaker), kept across reset()
+    std::mutex spk_mu;
+    std::list<std::pair<std::pair<uint64_t, size_t>, std::vector<float>>> spk_cache;
 
     // per-generation state, cleared by reset()
     llama_seq_id seq_id = 0;

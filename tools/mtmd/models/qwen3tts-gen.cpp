@@ -415,7 +415,7 @@ ggml_tensor * clip_graph_qwen3tts_gen::code2wav::quant_decode(ggml_tensor * inp_
     return hidden;
 }
 
-// one pre_transformer layer over a batch of N = sliding_window new frames
+// one pre_transformer layer over a batch of N new frames (N = sliding_window, or fewer for the last batch)
 // attention runs over [(W-1)-frame prefix from the last batch] + [N new frames]
 // RoPE positions come from a persisted counter, so phases line up across batches
 ggml_tensor * clip_graph_qwen3tts_gen::code2wav::tfm_layer_forward(ggml_tensor * cur, const clip_layer & layer, int il) const {
@@ -423,7 +423,7 @@ ggml_tensor * clip_graph_qwen3tts_gen::code2wav::tfm_layer_forward(ggml_tensor *
     const int     n_head_kv = hparams.wav_tfm_n_head_kv;
     const int64_t d_head    = layer.q_w->ne[1] / n_head;
     const float   kq_scale  = 1.0f / sqrtf((float) d_head);
-    const int64_t W         = hparams.wav_tfm_swa; // == N, frames per batch
+    const int64_t W         = hparams.wav_tfm_swa; // the attention window (N <= W frames per batch)
     const int64_t N         = cur->ne[1];
     const int64_t prefix    = W - 1;
     const int64_t total_kv  = prefix + N;
@@ -547,7 +547,7 @@ ggml_tensor * clip_graph_qwen3tts_gen::code2wav::dac_res_unit(ggml_tensor * x, c
     return ggml_add(ctx0, residual, h);
 }
 
-// RVQ codes -> raw PCM for a batch of N = sliding_window frames
+// RVQ codes -> raw PCM for a batch of N frames (the sliding window, or fewer for the last batch)
 ggml_tensor * clip_graph_qwen3tts_gen::code2wav::decode(ggml_tensor * inp_codes) const {
     const auto & c2w = model.c2w;
 
@@ -739,7 +739,7 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
     cb(out_embd, "gen_audio_out", -1);
 
     // ---- CLIP_GEN_PROCESS_GEN_WAV: 16 RVQ codes -> raw PCM ----
-    const int n_frames = hparams.wav_tfm_swa; // frames per batch, == the attention window
+    const int n_frames = n_wav_frames; // frames per batch: the attention window, or fewer for a last partial batch
 
     ggml_tensor * inp_codes = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_frames, n_codes);
     ggml_set_name(inp_codes, "inp_codes");
