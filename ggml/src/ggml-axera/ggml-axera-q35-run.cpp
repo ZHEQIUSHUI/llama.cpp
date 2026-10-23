@@ -47,6 +47,19 @@ void axera_q35_batch::run_layer(int il, int v, int t0, int64_t p) {
         out = &pr.rout;
         k   = m.pre[v].gdn_rs;
     }
+    // debugging (GGML_AXERA_DUMP_IN=<dir>): layer 0's first prefill GDN call, every input by name (<name>.bin)
+    if (const char * d = std::getenv("GGML_AXERA_DUMP_IN"); d && prefill && il == 0 && ly.gdn) {
+        static bool done = false;
+        for (uint32_t i = 0; i < k->info->nInputSize && !done; ++i) {
+            const auto & b = (*in)[i];
+            FILE * f = fopen((std::string(d) + "/" + k->info->pInputs[i].pName + ".bin").c_str(), "wb");
+            if (f) {
+                fwrite(b.pVirAddr, 1, b.nSize, f);  // (weights: written by the host and flushed; no NPU writes yet)
+                fclose(f);
+            }
+        }
+        done = true;
+    }
     int ret;
     {
         axera_timer tm(ly.gdn ? (prefill ? "gdn prefill" : "gdn decode") : (prefill ? "attn prefill" : "attn decode"));
