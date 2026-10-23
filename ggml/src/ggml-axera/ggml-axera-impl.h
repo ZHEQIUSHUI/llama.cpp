@@ -80,6 +80,9 @@ ggml_backend_buffer_type_t ggml_backend_axera_mapped_buffer_type(void);
 ggml_backend_buffer_t axera_mapped_buffer(void * ptr, size_t size);
 std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_alloc(size_t size);
 std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_alloc_nc(size_t size);
+// bytes off .. off + size of b as a buffer of its own (b outlives it)
+std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_view(const ggml_backend_axera_buffer_context * b, size_t off,
+                                                                  size_t size);
 AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint32_t size);
 bool axera_template_qwen35();
 int64_t axera_split_min();
@@ -88,6 +91,9 @@ bool axera_flash_forced();
 int64_t axera_flash_seg(int64_t n);
 bool axera_weights_mx8();
 void axera_quantize_mxfp8(const ggml_tensor * w, axera_cmm & q, axera_cmm & s);
+void axera_quantize_mxfp4(const ggml_tensor * w, axera_cmm & q, axera_cmm & s);
+void axera_quantize_nvfp4(const ggml_tensor * w, axera_cmm & q, axera_cmm & s, axera_cmm & s2);
+bool axera_nonexp_nv4();  // GGML_AXERA_NONEXP=nvfp4: the MoE models' layer kernels with NVFP4 projections (_nv4)
 axera_cmm axera_to_bf16(const ggml_tensor * w);
 void axera_gemv_raw(ggml_backend_axera_context * ctx, const ggml_backend_axera_buffer_context * wctx,
                     void * wdata, int64_t N, int64_t K, const float * x, ggml_tensor * dst, float * out);
@@ -102,6 +108,10 @@ void axera_gemv(ggml_backend_axera_context * ctx, const ggml_tensor * w, const f
 void axera_gemv_mx8(ggml_backend_axera_context * ctx, const ggml_backend_axera_buffer_context * q,
                     const ggml_backend_axera_buffer_context * sc, int64_t N, int64_t K, const float * x,
                     ggml_tensor * dst, float * out);
+void axera_gemv_mx4(ggml_backend_axera_context * ctx, const ggml_backend_axera_buffer_context * q,
+                    const ggml_backend_axera_buffer_context * sc, int64_t N, int64_t K, const float * x,
+                    ggml_tensor * dst, float * out);
+extern std::atomic<uint64_t> axera_graph_epoch;  // graphs computed so far (ggml_backend_axera_graph_compute)
 void ggml_backend_axera_mul_mat(ggml_backend_axera_context * ctx, ggml_tensor * dst);
 float axera_rms_eps(const ggml_tensor * rms_norm);
 void axera_mxfp4_rows(const uint8_t * src, int64_t rows, int64_t K, uint8_t * dq, uint8_t * ds);
@@ -169,6 +179,47 @@ struct axera_timer {
         }
     }
 };
+
+// GGML_AXERA_PROF=1: the host time between two template graphs split at the backend's entry points, for gaps under
+// 50 ms (decode steps): graph end -> first get_tensor (llama.cpp after compute), the get_tensor calls, their end ->
+// first set_tensor (sampling, the next graph's build and allocation), first set_tensor -> compute (inputs)
+struct axera_host_phase {
+    using clk = std::chrono::steady_clock;
+    clk::time_point end, get0, get1, set0;
+    void add(const char * what, clk::time_point a, clk::time_point b) {
+        auto & e = g_axera_prof.t[what];
+        e.first += std::chrono::duration<double, std::milli>(b - a).count();
+        e.second++;
+    }
+    void on_get(clk::time_point a, clk::time_point b) {
+        if (g_axera_prof.on && end.time_since_epoch().count()) {
+            get0 = get0 > end ? get0 : a;
+            get1 = b;
+        }
+    }
+    void on_set() {
+        if (g_axera_prof.on && end.time_since_epoch().count() && !(set0 > end)) {
+            set0 = clk::now();
+        }
+    }
+    void on_compute() {  // at the start of a graph
+        const clk::time_point now = clk::now();
+        if (!g_axera_prof.on || !end.time_since_epoch().count() || now - end > std::chrono::milliseconds(50)) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(g_axera_prof.mu);
+        const bool got = get0 > end, set = set0 > end && (!got || set0 > get1);
+        const clk::time_point a = got ? get1 : end, s = set ? set0 : now;
+        add("host 0: decode gap (all)", end, now);
+        if (got) {
+            add("host 1: graph end -> get_tensor", end, get0);
+            add("host 2: get_tensor calls", get0, get1);
+        }
+        add("host 3: -> first set_tensor", a, s);
+        add("host 4: first set_tensor -> graph", s, now);
+    }
+};
+inline axera_host_phase g_axera_host;
 
 // persistent workers for the template's host loops (masks, merges): run(n, fn) calls fn(0 .. n - 1) on the workers
 // and the caller, returning when all are done
@@ -424,9 +475,15 @@ struct ggml_backend_axera_buffer_context {
     void * vir  = nullptr;
     size_t size = 0;
     bool   nc   = false;  // non-cacheable: no cache maintenance (host writes only, e.g. gathered kernel inputs)
+    bool   view = false;  // a range of another buffer (axera_cmm_view): not freed
+    // a range the NPU wrote and the host invalidated in the current graph (axera_graph_epoch): read back without cache
+    // maintenance (the logits, 1 MB per token)
+    mutable const void * clean_p     = nullptr;
+    mutable size_t       clean_n     = 0;
+    mutable uint64_t     clean_epoch = 0;
 
     ~ggml_backend_axera_buffer_context() {
-        if (vir) {
+        if (vir && !view) {
             AX_SYS_MemFree(phy, vir);
         }
     }

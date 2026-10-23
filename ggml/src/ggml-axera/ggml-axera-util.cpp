@@ -98,6 +98,17 @@ std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_alloc_nc(size_t siz
     }
     return b;
 }
+std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_view(const ggml_backend_axera_buffer_context * b, size_t off,
+                                                                  size_t size) {
+    GGML_ASSERT(off + size <= b->size);
+    auto v  = std::make_unique<ggml_backend_axera_buffer_context>();
+    v->phy  = b->phy + off;
+    v->vir  = (char *) b->vir + off;
+    v->size = size;
+    v->nc   = b->nc;
+    v->view = true;
+    return v;
+}
 AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint32_t size) {
     AX_ENGINE_IO_BUFFER_T b;
     memset(&b, 0, sizeof(b));
@@ -143,6 +154,16 @@ bool axera_template_qwen35() {
 // GGML_AXERA_FLASH=1: split attention (flash decoding) even when a fused attention kernel holds the KV cache
 // GGML_AXERA_SPLIT_MIN: with a fused attention kernel, the KQ mask width (cells) from which a batch takes the split
 // attention kernels instead when they exist for the context (multi-core segment scan; default 4096, 0: always)
+std::atomic<uint64_t> axera_graph_epoch{ 0 };
+
+bool axera_nonexp_nv4() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_AXERA_NONEXP");
+        return e != nullptr && strcmp(e, "nvfp4") == 0;
+    }();
+    return on;
+}
+
 int64_t axera_split_min() {
     static const int64_t n = [] {
         const char * e = std::getenv("GGML_AXERA_SPLIT_MIN");

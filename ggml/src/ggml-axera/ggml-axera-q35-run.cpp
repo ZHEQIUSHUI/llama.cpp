@@ -3,19 +3,15 @@
 #include "ggml-axera-q35.h"
 
 bool axera_q35_batch::use_split(int R) const {
-    return m.kv_llama && m.fd.count(R) && m.fd.at(R).head && (m.flash || kv.W >= axera_split_min());
+    return m.kv_llama && m.fd.count(R) && m.fd.at(R).head && (m.flash || (!m.attn_all && kv.W >= axera_split_min()));
 }
 
 bool axera_q35_batch::pre_split(int v) const {
-    return use_split(m.pre[v].P) || (!m.pre[v].attn && !m.pre[v].mc);
+    return use_split(m.pre[v].P) || !m.pre[v].attn;
 }
 
 void axera_q35_batch::run_layer(int il, int v, int t0, int64_t p) {
     const bool        prefill = v >= 0;
-    if (prefill && m.moe && m.pre[v].mc) {  // MoE on the multi-core chain: the layer up to moe_pre_mc
-        run_mc(v, t0, il, il + 1);
-        return;
-    }
     const bool        split   = prefill ? pre_split(v) : use_split(1);
     axera_q35_layer & ly      = m.layers[il];
     if (split && !ly.gdn) {
@@ -68,11 +64,22 @@ void axera_q35_batch::run_layer(int il, int v, int t0, int64_t p) {
 
 void axera_q35_batch::run_layers(int v, int t0, int64_t p) {  // v: prefill chunk size index, -1: decode
     for (int il = 0; il < L; ++il) {
-        run_layer(il, v, t0, p);
+        if (v < 0 && m.moe && grouped(il)) {
+            run_grouped(il, p);
+            il += m.mgrp.G - 1;
+            continue;
+        }
+        if (v < 0 && m.moe && whole(il)) {
+            run_whole(il, p);
+            continue;
+        }
+        if (v >= 0 || !m.moe || !merged(il)) {  // else it ran with layer il - 1's experts
+            run_layer(il, v, t0, p);
+        }
         if (m.moe && v >= 0) {
             run_experts_pre(il, { v });
         } else if (m.moe) {
-            run_experts(il, p);
+            run_experts(il, p, merged(il + 1) ? il + 1 : -1);
         }
     }
 }
@@ -375,10 +382,6 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             }
             v = ok ? (int) c : -1;
         }
-        // else one token on the multi-core chain (P = 1), from its KV width on (axera_q35::mc_dec_min)
-        for (size_t c = 0; c < m.pre.size() && v < 0 && kv.W >= m.mc_dec_min; ++c) {
-            v = m.pre[c].P == 1 && chunk_fits(c) ? (int) c : -1;
-        }
         // a MoE group: as many of its chunks as fit, consecutive
         int ng = 1;
         while (v >= 0 && ng < (int) m.pre[v].group.size()) {
@@ -394,83 +397,10 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             }
             ng = n;
         }
-        if (ng > 1 || (v >= 0 && m.moe && m.pre[v].mc && !m.pre[v].group.empty())) {
-            const int        P = m.pre[v].P;
-            std::vector<int> vs(m.pre[v].group.begin(), m.pre[v].group.begin() + ng);
-            for (int c = 0; c < ng; ++c) {
-                axera_q35::prefill & pc = m.pre[vs[c]];
-                const int            tc = it + c * P;
-                for (int r = 0; r < P; ++r) {
-                    ggml_fp32_to_bf16_row(x0_row(tc + r),
-                                          (ggml_bf16_t *) pc.A->vir + (size_t) r * H, H);
-                }
-                pc.A->flush(pc.A->vir, (size_t) P * H * sizeof(ggml_bf16_t));
-                rope.rows(tc, P, pc.COS.get(), pc.SIN.get());
-                {
-                    const int key = axera_q35_fd_key(m, vs[c]);
-                    axera_flash_prepare(kv, m.fd.at(key), key % 1000, tc);
-                }
-            }
-            b.run_group(vs, it, p);
-            for (int c = 0; c < ng; ++c) {
-                auto * fin = (L % 2 == 0 ? m.pre[vs[c]].A : m.pre[vs[c]].B).get();
-                fin->invalidate(fin->vir, (size_t) P * H * sizeof(ggml_bf16_t));
-                ggml_bf16_to_fp32_row((const ggml_bf16_t *) fin->vir, h.data() + (size_t) (it + c * P) * H, (int64_t) P * H);
-            }
-            m.next_pos = p + (int64_t) ng * P;
-            it += ng * P;
-            continue;
-        }
-        if (v >= 0) {
-            axera_q35::prefill & pf    = m.pre[v];
-            const int            P     = pf.P;
-            const bool           split = !pf.mc && b.pre_split(v);
-            if (pf.batch) {
-                axera_q35_set_batch_rows(m, v, row_of(it));
-                for (int r = 1; r < P; ++r) {  // token it's row was cleared by begin()
-                    if (pos[it + r] == 0) {
-                        axera_q35_zero_row(m, row_of(it + r));
-                    }
-                }
-                for (int r = 0; r < P && !split; ++r) {
-                    ((int32_t *) pf.POS->vir)[r] = (int32_t) kv.cell_of(it + r);
-                }
-                if (!split) {
-                    pf.POS->flush(pf.POS->vir, pf.POS->size);
-                }
-            }
-            for (int r = 0; r < P; ++r) {
-                ggml_fp32_to_bf16_row(x0_row(it + r),
-                                      (ggml_bf16_t *) pf.A->vir + (size_t) r * H, H);
-            }
-            pf.A->flush(pf.A->vir, (size_t) P * H * sizeof(ggml_bf16_t));
-            rope.rows(it, P, pf.COS.get(), pf.SIN.get());
-            if (pf.mc) {
-                axera_flash_prepare(kv, m.fd.at(P), P, it);
-                b.run_mc(v, it);
-                auto * mk = &m.mc.at(P);
-                pf.A->invalidate(pf.A->vir, (size_t) P * H * sizeof(ggml_bf16_t));
-                mk->PART0->invalidate(mk->PART0->vir, mk->PART0->size);
-                const int    C    = (int) (mk->PART0->size / ((size_t) P * H * sizeof(float)));
-                const auto * base = (const ggml_bf16_t *) pf.A->vir;
-                const auto * part = (const float *) mk->PART0->vir;
-                axera_host_pool().run(P, [&](int64_t r) {
-                    for (int i = 0; i < H; ++i) {
-                        float x = ggml_bf16_to_fp32(base[r * H + i]);
-                        for (int c = 0; c < C; ++c) {
-                            x += part[((size_t) c * P + r) * H + i];
-                        }
-                        h[(size_t) (it + r) * H + i] = x;
-                    }
-                });
-                m.next_pos = p + P;
-                it += P;
-                continue;
-            }
-            if (split) {
-                const int key = axera_q35_fd_key(m, v);
-                axera_flash_prepare(kv, m.fd.at(key), key % 1000, it);
-            }
+        // a fused attention chunk's inputs: its mask, the cell to write and the KV blocks (pf's own for the copies in a
+        // MoE group, else the decode IO's)
+        auto fused_inputs = [&](axera_q35::prefill & pf, int it, int64_t p, bool split) {
+            const int P = pf.P;
             int nblk = (int) ((p + P - 1) / m.BC + 1);
             // chunk mask [N / BC][R][BC], row r = token r % P (of head r / P in older kernels): positions up to
             // p + token, or with the llama.cpp KV cache that token's KQ mask row over the cells
@@ -503,8 +433,10 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
                 }
             }
             if (!split) {
-                *(int32_t *) m.POS->vir  = (int32_t) (m.kv_llama ? kv.cell_of(it) : p);
-                *(int32_t *) m.NBLK->vir = nblk;
+                auto & pos_b = pf.CPOS ? pf.CPOS : m.POS;
+                auto & nblk_b = pf.CNBLK ? pf.CNBLK : m.NBLK;
+                *(int32_t *) pos_b->vir  = (int32_t) (m.kv_llama ? kv.cell_of(it) : p);
+                *(int32_t *) nblk_b->vir = nblk;
                 if (!m.kv_llama) {
                     for (int r = 0; r < P; ++r) {
                         ((ggml_bf16_t *) m.MASK->vir)[p + r] = zero;  // for the decode steps after the chunk
@@ -512,9 +444,68 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
                     m.MASK->flush(m.MASK->vir, m.MASK->size);
                 }
                 pf.MASK->flush(pf.MASK->vir, (size_t) nblk * R * m.BC * sizeof(ggml_bf16_t));
-                m.POS->flush(m.POS->vir, m.POS->size);
-                m.NBLK->flush(m.NBLK->vir, m.NBLK->size);
+                pos_b->flush(pos_b->vir, pos_b->size);
+                nblk_b->flush(nblk_b->vir, nblk_b->size);
             }
+        };
+        if (ng > 1) {
+            const int        P = m.pre[v].P;
+            std::vector<int> vs(m.pre[v].group.begin(), m.pre[v].group.begin() + ng);
+            for (int c = 0; c < ng; ++c) {
+                axera_q35::prefill & pc = m.pre[vs[c]];
+                const int            tc = it + c * P;
+                for (int r = 0; r < P; ++r) {
+                    ggml_fp32_to_bf16_row(x0_row(tc + r),
+                                          (ggml_bf16_t *) pc.A->vir + (size_t) r * H, H);
+                }
+                pc.A->flush(pc.A->vir, (size_t) P * H * sizeof(ggml_bf16_t));
+                rope.rows(tc, P, pc.COS.get(), pc.SIN.get());
+                if (b.pre_split(vs[c])) {
+                    const int key = axera_q35_fd_key(m, vs[c]);
+                    axera_flash_prepare(kv, m.fd.at(key), key % 1000, tc);
+                } else {
+                    fused_inputs(pc, tc, p + (int64_t) c * P, false);
+                }
+            }
+            b.run_group(vs, it, p);
+            for (int c = 0; c < ng; ++c) {
+                auto * fin = (L % 2 == 0 ? m.pre[vs[c]].A : m.pre[vs[c]].B).get();
+                fin->invalidate(fin->vir, (size_t) P * H * sizeof(ggml_bf16_t));
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) fin->vir, h.data() + (size_t) (it + c * P) * H, (int64_t) P * H);
+            }
+            m.next_pos = p + (int64_t) ng * P;
+            it += ng * P;
+            continue;
+        }
+        if (v >= 0) {
+            axera_q35::prefill & pf    = m.pre[v];
+            const int            P     = pf.P;
+            const bool           split = b.pre_split(v);
+            if (pf.batch) {
+                axera_q35_set_batch_rows(m, v, row_of(it));
+                for (int r = 1; r < P; ++r) {  // token it's row was cleared by begin()
+                    if (pos[it + r] == 0) {
+                        axera_q35_zero_row(m, row_of(it + r));
+                    }
+                }
+                for (int r = 0; r < P && !split; ++r) {
+                    ((int32_t *) pf.POS->vir)[r] = (int32_t) kv.cell_of(it + r);
+                }
+                if (!split) {
+                    pf.POS->flush(pf.POS->vir, pf.POS->size);
+                }
+            }
+            for (int r = 0; r < P; ++r) {
+                ggml_fp32_to_bf16_row(x0_row(it + r),
+                                      (ggml_bf16_t *) pf.A->vir + (size_t) r * H, H);
+            }
+            pf.A->flush(pf.A->vir, (size_t) P * H * sizeof(ggml_bf16_t));
+            rope.rows(it, P, pf.COS.get(), pf.SIN.get());
+            if (split) {
+                const int key = axera_q35_fd_key(m, v);
+                axera_flash_prepare(kv, m.fd.at(key), key % 1000, it);
+            }
+            fused_inputs(pf, it, p, split);
             // speculative decoding: a verification batch (all T <= snapshot count tokens in this chunk) also writes the
             // recurrent-state snapshots; without the snapshot kernel a rollback would restore wrong states
             b.rs_now = rs_written > 1 && it == 0 && P == T && rs_written == T && pf.gdn_rs != nullptr;
@@ -564,6 +555,18 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
         axera_output_norm(t, h, T);
     } else {
         axera_output_head(ctx, cgraph, t, h, T, m.lm_q.get(), m.lm_s.get(), m.lm_bf.get());
+        // nodes after the logits in this split: llama.cpp's backend sampler chain (-bs: top-k, argmax, ...) on the
+        // logits, on the CPU backend (one pass over the vocabulary instead of the host sampler's copy and sorts)
+        const ggml_tensor * lg = axera_graph_head(t);
+        int                 il = -1;
+        for (int i = 0; i < cgraph->n_nodes && lg; i++) {
+            il = cgraph->nodes[i] == lg ? i : il;
+        }
+        const ggml_tensor * padded = axera_graph_find(t, "result_output");  // Qwen3-TTS: padded logits, done above
+        if (il >= 0 && il + 1 < cgraph->n_nodes && (!padded || padded == lg)) {
+            axera_timer ts("sampler nodes (cpu)");
+            axera_cpu_compute_nodes(ctx, cgraph, cgraph->nodes + il + 1, cgraph->n_nodes - il - 1, "sampler (cpu)");
+        }
     }
     return GGML_STATUS_SUCCESS;
 }

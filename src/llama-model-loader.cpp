@@ -8,12 +8,18 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <future>
 #include <regex>
 #include <unordered_set>
+
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1564,6 +1570,17 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
+    // mmap'ed weights left on the CPU device (the token embeddings with every layer offloaded) locked in memory when a
+    // loaded backend asks for it (its registry's "ggml_backend_pin_host_weights" returns true): on a board whose memory
+    // the offloaded weights fill, page reclaim would evict them and every token's rows would fault in from storage
+    bool pin_host = false;
+    for (size_t i = 0; i < ggml_backend_reg_count() && use_mmap; ++i) {
+        auto * fn = (bool (*)(void)) ggml_backend_reg_get_proc_address(ggml_backend_reg_get(i), "ggml_backend_pin_host_weights");
+        pin_host  = pin_host || (fn && fn());
+    }
+    size_t       pinned  = 0;
+    const size_t pin_max = (size_t) 2 << 30;  // the CPU's share of an offloaded model, not a model kept on the CPU
+
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
@@ -1722,6 +1739,22 @@ bool llama_model_loader::load_all_data(
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
 
+#if !defined(_WIN32)
+                // the CPU's buffers over the mapping have no device (ggml_backend_cpu_buffer_from_ptr)
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf_mmap));
+                if (pin_host && !lazy.has(cur) && ggml_backend_buffer_is_host(buf_mmap) &&
+                    (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) && pinned + n_size <= pin_max) {
+                    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+                    uint8_t *    p0   = (uint8_t *) ((uintptr_t) data & ~(uintptr_t) (page - 1));
+                    const size_t len  = (size_t) (data + n_size - p0);
+                    if (mlock(p0, len) == 0) {
+                        pinned += n_size;
+                    } else {
+                        LLAMA_LOG_WARN("%s: could not lock %s in memory (%s)\n", __func__, ggml_get_name(cur), strerror(errno));
+                    }
+                }
+#endif
+
                 // locking a lazy tensor would fault all of it in, which is what lazy avoids
                 if (lmlocks && !lazy.has(cur)) {
                     const auto & lmlock = lmlocks->at(weight->idx);
@@ -1836,6 +1869,11 @@ bool llama_model_loader::load_all_data(
     }
     if (validation_failed) {
         throw std::runtime_error("found tensors with invalid data");
+    }
+
+    if (pinned > 0) {
+        LLAMA_LOG_INFO("%s: %.2f MiB of mmap'ed CPU weights locked in memory (backend request)\n", __func__,
+                       pinned / 1024.0 / 1024.0);
     }
 
     // check if this is the last call and do final cleanup

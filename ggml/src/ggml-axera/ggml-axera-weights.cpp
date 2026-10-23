@@ -16,6 +16,99 @@ void axera_quantize_mxfp8(const ggml_tensor * w, axera_cmm & q, axera_cmm & s) {
     s->flush(s->vir, s->size);
 }
 
+// [N, K] weight of any GGUF type -> NVFP4: E2M1 pairs [N, K / 2], E4M3 scales [N, K / 16] and the FP32 tensor scale
+// s2 = amax / (6 * 448) [1] in new CMM buffers (as the DSL kernels' quant_nvfp4)
+void axera_quantize_nvfp4(const ggml_tensor * w, axera_cmm & q, axera_cmm & s, axera_cmm & s2) {
+    GGML_ASSERT(w->ne[0] % AXERA_NV_GROUP == 0);
+    const int64_t K = w->ne[0], N = ggml_nrows(w);
+    std::vector<float> amax(N, 0.0f);
+    axera_for_rows_f32(w, [&](int64_t r, const float * row) {
+        for (int64_t i = 0; i < K; ++i) {
+            amax[r] = std::max(amax[r], fabsf(row[i]));
+        }
+    });
+    const float t = std::max(*std::max_element(amax.begin(), amax.end()) / (6.0f * 448.0f), ldexpf(1.0f, -126));
+    q  = axera_cmm_alloc(N * K / 2);
+    s  = axera_cmm_alloc(N * K / AXERA_NV_GROUP);
+    s2 = axera_cmm_alloc(sizeof(float));
+    *(float *) s2->vir = t;
+    axera_for_rows_f32(w, [&](int64_t r, const float * row) {
+        axera_quantize_row_nvfp4_f32(row, (uint8_t *) q->vir + r * (K / 2), (uint8_t *) s->vir + r * (K / AXERA_NV_GROUP),
+                                     K, t);
+    });
+    q->flush(q->vir, q->size);
+    s->flush(s->vir, s->size);
+    s2->flush(s2->vir, s2->size);
+    // debugging (GGML_AXERA_DUMP_NV=<dir>): the first NVFP4 weight's name and shape, its first rows as f32 and their
+    // codes and scales, and scale2, for a comparison with the DSL's quant_nvfp4
+    static bool dumped = false;
+    if (const char * d = std::getenv("GGML_AXERA_DUMP_NV"); d && !dumped) {
+        dumped        = true;
+        const int  R  = (int) std::min<int64_t>(N, 8);
+        std::vector<float> rows((size_t) R * K);
+        axera_for_rows_f32(w, [&](int64_t r, const float * row) {
+            if (r < R) {
+                memcpy(rows.data() + r * K, row, K * sizeof(float));
+            }
+        });
+        auto put = [&](const char * n, const void * p, size_t bytes) {
+            FILE * f = fopen((std::string(d) + "/" + n).c_str(), "wb");
+            if (f) {
+                fwrite(p, 1, bytes, f);
+                fclose(f);
+            }
+        };
+        put("rows_f32.bin", rows.data(), rows.size() * sizeof(float));
+        put("q.bin", q->vir, (size_t) R * K / 2);
+        put("s.bin", s->vir, (size_t) R * K / AXERA_NV_GROUP);
+        put("t.bin", s2->vir, sizeof(float));
+        const std::string meta = std::string(w->name) + " " + std::to_string(K) + " " + std::to_string(N) + " " +
+                                 ggml_type_name(w->type) + "\n";
+        put("meta.txt", meta.c_str(), meta.size());
+    }
+}
+
+// [N, K] weight of any GGUF type -> MXFP4 (as ggml's and the 35B experts' kernels): per 32 inputs the scale
+// 2^(floor(log2(amax)) - 2) (E8M0 byte e + 127) and E2M1 codes (nearest value, sign in bit 3), two per byte (the first in
+// the low nibble): elements [N, K / 2] and scales [N, K / 32] in new CMM buffers
+void axera_quantize_mxfp4(const ggml_tensor * w, axera_cmm & q, axera_cmm & s) {
+    GGML_ASSERT(w->ne[0] % AXERA_MX_GROUP == 0);
+    static const float e2m1[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    const int64_t K = w->ne[0], N = ggml_nrows(w);
+    q = axera_cmm_alloc(N * K / 2);
+    s = axera_cmm_alloc(N * K / AXERA_MX_GROUP);
+    axera_for_rows_f32(w, [&](int64_t r, const float * row) {
+        uint8_t * qr = (uint8_t *) q->vir + r * (K / 2);
+        uint8_t * sr = (uint8_t *) s->vir + r * (K / AXERA_MX_GROUP);
+        for (int64_t g = 0; g < K / AXERA_MX_GROUP; ++g) {
+            const float * v    = row + g * AXERA_MX_GROUP;
+            float         amax = 0.0f;
+            for (int i = 0; i < AXERA_MX_GROUP; ++i) {
+                amax = std::max(amax, fabsf(v[i]));
+            }
+            const int   e  = amax > 0.0f ? (int) floorf(log2f(amax)) - 2 : 0;
+            const float sc = ldexpf(1.0f, -e);
+            sr[g]          = (uint8_t) std::min(254, std::max(0, e + 127));
+            for (int i = 0; i < AXERA_MX_GROUP; i += 2) {
+                uint8_t c[2];
+                for (int h = 0; h < 2; ++h) {
+                    const float x    = v[i + h] * sc, a = fabsf(x);
+                    int         best = 0;
+                    for (int k = 1; k < 8; ++k) {
+                        if (fabsf(a - e2m1[k]) < fabsf(a - e2m1[best])) {
+                            best = k;
+                        }
+                    }
+                    c[h] = (uint8_t) (best | (x < 0.0f ? 8 : 0));
+                }
+                qr[(g * AXERA_MX_GROUP + i) / 2] = (uint8_t) (c[0] | (c[1] << 4));
+            }
+        }
+    });
+    q->flush(q->vir, q->size);
+    s->flush(s->vir, s->size);
+}
+
 // [N, K] weight of another GGUF type (quantized, f16, f32) -> bf16 copy in a new CMM buffer
 axera_cmm axera_to_bf16(const ggml_tensor * w) {
     const int64_t K = w->ne[0], N = ggml_nrows(w);
@@ -68,6 +161,38 @@ void axera_gemv_raw_to(ggml_backend_axera_context * ctx, const ggml_backend_axer
         }
     }
     dctx->invalidate(out, N * sizeof(float));
+    dctx->clean_p     = out;  // the host reads these logits back without more cache maintenance this graph
+    dctx->clean_n     = N * sizeof(float);
+    dctx->clean_epoch = axera_graph_epoch;
+}
+
+// out[0:N] = MXFP4 W[N, K] (elements q [N, K / 2], scales s [N, K / 32]) . x[0:K] in one call of mul_mat_mx4_n<N>_k<K>
+void axera_gemv_mx4(ggml_backend_axera_context * ctx, const ggml_backend_axera_buffer_context * q,
+                    const ggml_backend_axera_buffer_context * sc, int64_t N, int64_t K, const float * x,
+                    ggml_tensor * dst, float * out) {
+    ggml_axera_kernel * k  = axera_kernels().get("mul_mat_mx4_n" + std::to_string(N) + "_k" + std::to_string(K));
+    const int           ix = k->input("x"), iw = k->input("w"), is = k->input("s"), io = k->output("out");
+    GGML_ASSERT(ix >= 0 && iw >= 0 && is >= 0 && io >= 0 && k->info->pInputs[iw].nSize == N * K / 2 &&
+                k->info->pInputs[is].nSize == N * K / AXERA_MX_GROUP && k->info->pOutputs[io].nSize == N * sizeof(float));
+    auto * st   = ctx->staging_for(K * sizeof(ggml_bf16_t));
+    auto * xb   = (ggml_bf16_t *) st->vir;
+    auto * dctx = (ggml_backend_axera_buffer_context *) dst->buffer->context;
+    ggml_fp32_to_bf16_row(x, xb, K);
+    st->flush(xb, K * sizeof(ggml_bf16_t));
+    dctx->flush(out, N * sizeof(float));
+    std::vector<AX_ENGINE_IO_BUFFER_T> in(3), o(1);
+    in[ix]    = axera_io(st, xb, K * sizeof(ggml_bf16_t));
+    in[iw]    = axera_io(q, q->vir, (uint32_t) (N * K / 2));
+    in[is]    = axera_io(sc, sc->vir, (uint32_t) (N * K / AXERA_MX_GROUP));
+    o[io]     = axera_io(dctx, out, (uint32_t) (N * sizeof(float)));
+    const int ret = axera_run_sync(k, in, o);
+    if (ret != 0) {
+        GGML_ABORT("%s: RunSync failed (0x%x), n=%" PRId64 " k=%" PRId64 "\n", __func__, ret, N, K);
+    }
+    dctx->invalidate(out, N * sizeof(float));
+    dctx->clean_p     = out;
+    dctx->clean_n     = N * sizeof(float);
+    dctx->clean_epoch = axera_graph_epoch;
 }
 
 // rows out[b][0:N] = W[N, K] . x[b], b < Bn, through the batched GEMV mul_mat_<bf16|mx8>_b<Bn>_n<C>_k<K> (x [Bn, K]
