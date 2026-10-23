@@ -8,6 +8,22 @@
 #include <sstream>
 #include <sys/stat.h>
 
+// a convolution's epilogue the conv1d kernel can compute (its _b / _br variant): the ADD of its bias (a [1, OC] view
+// of an f32 weight) and, after it, the ADD of a residual [OW, OC] f32; their outputs written by the kernel
+struct axera_gen_conv_epi {
+    ggml_tensor *       cont = nullptr;  // ggml_conv_1d's CONT of its permuted result (a copy for one batch)
+    ggml_tensor *       add = nullptr, *radd = nullptr;
+    const ggml_tensor * bias = nullptr, *res = nullptr;
+};
+
+// a SnakeBeta whose output only a convolution reads (directly, or after the CONCAT of the convolution's left context,
+// whose tail the graph also keeps as state): computed by the host straight into the conv1d kernel's bf16 input, and
+// only that tail of the CONCAT in f32; the snake's own output and the CONCAT need not be written
+struct axera_gen_snake_fuse {
+    ggml_tensor *       concat = nullptr;  // nullptr: the IM2COL reads the snake's output
+    const ggml_tensor * ic = nullptr, *mm = nullptr;
+};
+
 // bf16 copies of the weights the NPU reads (any GGUF type), by data and size (views of a 3-D weight are separate)
 struct axera_gen {
     std::map<std::pair<const void *, size_t>, std::unique_ptr<ggml_backend_axera_buffer_context>> w;
@@ -19,6 +35,10 @@ struct axera_gen {
     std::map<std::vector<const void *>, axera_cmm>      wg;
     axera_cmm                                          gout;
     std::map<const ggml_tensor *, std::vector<float>>  pending;
+    std::set<const ggml_tensor *>                      done;  // nodes a kernel computed already (conv epilogues)
+    const std::map<const ggml_tensor *, axera_gen_conv_epi> * epi = nullptr;  // the running graph's, by MUL_MAT
+    const std::map<const ggml_tensor *, axera_gen_snake_fuse> * sfuse = nullptr;  // the running graph's, by snake start
+    const ggml_tensor * prebf16 = nullptr;  // the conv input tmp[1] holds as bf16 already (a fused snake's)
     // 1-D IM2COL nodes not run on the CPU, by the NPU GEMM that reads them (which writes their rows as bf16 itself)
     std::map<const ggml_tensor *, const ggml_tensor *> im2col;
     // the Qwen3-TTS code predictor's layers on the template's fused decode layer kernel of its shapes (Qwen3-0.6B's
@@ -247,12 +267,18 @@ static std::string axera_gen_conv_name(const ggml_tensor * ic, int64_t OC) {
 }
 
 // the MUL_MAT n after a 1-D IM2COL ic as one conv1d kernel call: the input converted to bf16, the kernel's taps
-// repacked once ([OC][IC][K] -> [K][OC][IC]), the output written into n
-static void axera_gen_conv(axera_gen & g, ggml_tensor * n, const ggml_tensor * ic, const std::string & name) {
+// repacked once ([OC][IC][K] -> [K][OC][IC]), the output written into n; or, with an epilogue e and the kernel's
+// variant of it (<name>_br: bias and residual, <name>_b: bias), into the epilogue's last ADD, the ADDs marked done
+static void axera_gen_conv(axera_gen & g, ggml_tensor * n, const ggml_tensor * ic, std::string name,
+                           const axera_gen_conv_epi * e) {
+    const bool br = e && e->radd && axera_gen_have(g, name + "_br");
+    const bool bo = e && !br && axera_gen_have(g, name + "_b");
+    name += br ? "_br" : bo ? "_b" : "";
+    ggml_tensor * dst = br ? e->radd : bo ? e->add : e && e->cont ? e->cont : n;
     const ggml_tensor * x  = ic->src[1];
     const ggml_tensor * w  = ic->src[0];
     const int64_t       KW = w->ne[0], IC = x->ne[1], L = x->ne[0], OC = n->ne[1];
-    auto *              dctx = (const ggml_backend_axera_buffer_context *) n->buffer->context;
+    auto *              dctx = (const ggml_backend_axera_buffer_context *) dst->buffer->context;
     axera_timer         tm(g.names.insert("gen " + name + " (npu)").first->c_str());
     auto &              wk = g.w[{ w->data, ggml_nbytes(w) + 1 }];  // (+1: not the GEMM's copy of the same weight)
     if (!wk) {
@@ -280,20 +306,44 @@ static void axera_gen_conv(axera_gen & g, ggml_tensor * n, const ggml_tensor * i
     if (!g.tmp[1] || g.tmp[1]->size < xb) {
         g.tmp[1] = axera_cmm_alloc_nc(xb);  // written by the host only: no cache to clean before the NPU reads it
     }
-    {
+    if (g.prebf16 != x) {
         axera_timer tx("gen conv: x (host)");
         axera_gen_to_bf16(x, IC, (ggml_bf16_t *) g.tmp[1]->vir);
     }
+    g.prebf16 = nullptr;
     ggml_axera_kernel * k  = axera_kernels().get(name);
     const int           ix = k->input("x"), iw = k->input("w"), io = k->output("out");
-    GGML_ASSERT(ix >= 0 && iw >= 0 && io >= 0 && k->info->nInputSize == 2 && k->info->nOutputSize == 1);
-    std::vector<AX_ENGINE_IO_BUFFER_T> in(2), out(1);
+    const int           ib = k->input("b"), ir = k->input("res");
+    const uint32_t      n_in = 2 + (br || bo) + br;
+    GGML_ASSERT(ix >= 0 && iw >= 0 && io >= 0 && k->info->nInputSize == n_in && k->info->nOutputSize == 1);
+    GGML_ASSERT((ib >= 0) == (br || bo) && (ir >= 0) == br);
+    std::vector<AX_ENGINE_IO_BUFFER_T> in(n_in), out(1);
     in[ix]  = axera_io(g.tmp[1].get(), g.tmp[1]->vir, (uint32_t) xb);
     in[iw]  = axera_io(wk.get(), wk->vir, (uint32_t) wk->size);
-    out[io] = axera_io(dctx, n->data, (uint32_t) ggml_nbytes(n));
+    out[io] = axera_io(dctx, dst->data, (uint32_t) ggml_nbytes(dst));
+    if (ib >= 0) {  // the bias, f32 (a CMM copy unless it is in CMM already)
+        const ggml_tensor * b  = e->bias;
+        const size_t        bs = ggml_nbytes(b);
+        if (b->buffer && ggml_backend_buffer_is_axera(b->buffer)) {
+            in[ib] = axera_io((const ggml_backend_axera_buffer_context *) b->buffer->context, b->data, (uint32_t) bs);
+        } else {
+            auto & c = g.w[{ b->data, bs + 2 }];  // (+2: not a bf16 copy of the same data)
+            if (!c) {
+                c = axera_cmm_alloc(bs);
+                memcpy(c->vir, b->data, bs);
+                c->flush(c->vir, bs);
+            }
+            in[ib] = axera_io(c.get(), c->vir, (uint32_t) bs);
+        }
+    }
+    if (ir >= 0) {  // the residual, the host's f32 written back to DRAM first
+        auto * rctx = (const ggml_backend_axera_buffer_context *) e->res->buffer->context;
+        rctx->flush(e->res->data, ggml_nbytes(e->res));
+        in[ir] = axera_io(rctx, e->res->data, (uint32_t) ggml_nbytes(e->res));
+    }
     {
         axera_timer tc("gen conv: cache (host)");
-        dctx->invalidate(n->data, ggml_nbytes(n));  // no dirty line of the output left to be written back over the NPU's
+        dctx->invalidate(dst->data, ggml_nbytes(dst));  // no dirty line of the output left to be written back over the NPU's
     }
     {
         axera_timer tr("gen conv: run (npu)");
@@ -302,7 +352,16 @@ static void axera_gen_conv(axera_gen & g, ggml_tensor * n, const ggml_tensor * i
         }
     }
     axera_timer tc("gen conv: cache (host)");
-    dctx->invalidate(n->data, ggml_nbytes(n));
+    dctx->invalidate(dst->data, ggml_nbytes(dst));
+    if (e && e->cont) {
+        g.done.insert(e->cont);
+    }
+    if (br || bo) {
+        g.done.insert(e->add);
+    }
+    if (br) {
+        g.done.insert(e->radd);
+    }
 }
 
 // the GEMM reading a 1-D IM2COL of node i within the next nodes, if a GEMM or conv1d kernel takes its shape: the
@@ -360,6 +419,17 @@ static bool axera_gen_const_skip(axera_gen & g, struct ggml_cgraph * cgraph, int
     return readers > 0;
 }
 
+// x + sin(al x)^2 be, sin by range reduction and a polynomial (vectorizes)
+static inline float axera_snake_val(float x, float al, float be) {
+    const float v  = al * x;
+    const float q  = floorf(v * 0.318309886f + 0.5f);  // v = q pi + r, |r| <= pi / 2
+    const float r  = (v - q * 3.14159274f) + q * 8.74227766e-8f;
+    const float r2 = r * r;
+    const float sv = r * (1.0f + r2 * (-1.66666667e-1f + r2 * (8.33333310e-3f + r2 * (-1.98412701e-4f +
+                         r2 * (2.75573137e-6f + r2 * -2.50521084e-8f)))));
+    return x + sv * sv * be;  // (the sign of sin(v) = (-1)^q sin(r) drops out of the square)
+}
+
 // SnakeBeta as mtmd builds it, nodes i .. i + 4: x * alpha -> sin -> sqr -> * beta -> + x (x [T, C], alpha / beta one
 // per channel), computed in one pass on the host workers after before() (the CPU nodes ahead); false if the nodes are
 // not that
@@ -393,16 +463,63 @@ template <typename F> static bool axera_gen_snake(struct ggml_cgraph * cgraph, i
         const float   al = ((const float *) a->data)[c], be = ((const float *) b->data)[c];
         const float * xr = (const float *) ((const char *) x->data + c * x->nb[1]);
         float *       y  = (float *) ((char *) n[4]->data + c * n[4]->nb[1]);
-        for (int64_t t = t0; t < t1; ++t) {  // (vectorized: sin(v)^2 by range reduction and a polynomial)
-            const float v  = al * xr[t];
-            const float q  = floorf(v * 0.318309886f + 0.5f);  // v = q pi + r, |r| <= pi / 2
-            const float r  = (v - q * 3.14159274f) + q * 8.74227766e-8f;
-            const float r2 = r * r;
-            const float sv = r * (1.0f + r2 * (-1.66666667e-1f + r2 * (8.33333310e-3f + r2 * (-1.98412701e-4f +
-                                 r2 * (2.75573137e-6f + r2 * -2.50521084e-8f)))));
-            y[t] = xr[t] + sv * sv * be;  // (the sign of sin(v) = (-1)^q sin(r) drops out of the square)
+        for (int64_t t = t0; t < t1; ++t) {
+            y[t] = axera_snake_val(xr[t], al, be);
         }
     });
+    return true;
+}
+
+// the snake at node i fused into its convolution's input (axera_gen_snake_fuse f): bf16 rows [IC][L] into tmp[1] (the
+// CONCAT's left context, then the snake), the CONCAT's last pad steps of each row in f32 (the state the graph keeps);
+// false if the nodes are not a snake or the convolution has no kernel
+template <typename F> static bool axera_gen_snake_fused(axera_gen & g, struct ggml_cgraph * cgraph, int i,
+                                                       const axera_gen_snake_fuse & f, F before) {
+    ggml_tensor ** n = cgraph->nodes + i;
+    const ggml_tensor * x = n[0]->src[0];
+    const ggml_tensor * a = n[0]->src[1];
+    const ggml_tensor * b = n[3]->src[1];
+    const std::string   conv = axera_gen_conv_name(f.ic, f.mm->ne[1]);
+    if (i + 4 >= cgraph->n_nodes || n[4]->op != GGML_OP_ADD || conv.empty() || !axera_gen_have(g, conv) ||
+        x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * left = f.concat ? f.concat->src[0] : nullptr;
+    const int64_t       T = x->ne[0], C = x->ne[1], P = left ? left->ne[0] : 0, L = P + T;
+    if ((left && (left->type != GGML_TYPE_F32 || !ggml_is_contiguous(left) || left->ne[1] != C ||
+                  f.concat->ne[0] != L || !ggml_is_contiguous(f.concat))) ||
+        f.ic->src[1] != (f.concat ? f.concat : n[4]) || f.ic->src[1]->ne[0] != L) {
+        return false;
+    }
+    before();
+    const size_t xb = (size_t) C * L * sizeof(ggml_bf16_t);
+    if (!g.tmp[1] || g.tmp[1]->size < xb) {
+        g.tmp[1] = axera_cmm_alloc_nc(xb);
+    }
+    auto *        dst = (ggml_bf16_t *) g.tmp[1]->vir;
+    const int64_t TB = 4096, nt = (L + TB - 1) / TB;
+    axera_timer   tm("gen snake + conv input (host)");
+    axera_host_pool().run(C * nt, [&](int64_t job) {
+        const int64_t c = job / nt, t0 = job % nt * TB, t1 = std::min(L, t0 + TB);
+        const float   al = ((const float *) a->data)[c], be = ((const float *) b->data)[c];
+        const float * xr = (const float *) ((const char *) x->data + c * x->nb[1]);
+        const float * lr = left ? (const float *) ((const char *) left->data + c * left->nb[1]) : nullptr;
+        float *       tail = f.concat ? (float *) ((char *) f.concat->data + c * f.concat->nb[1]) : nullptr;
+        ggml_bf16_t   row[TB];
+        float         v[TB];
+        for (int64_t t = t0; t < t1; ++t) {
+            v[t - t0] = t < P ? lr[t] : axera_snake_val(xr[t - P], al, be);
+        }
+        ggml_fp32_to_bf16_row(v, row, t1 - t0);
+        memcpy(dst + c * L + t0, row, (t1 - t0) * sizeof(ggml_bf16_t));
+        for (int64_t t = std::max(t0, L - P); tail && t < t1; ++t) {  // the state's steps
+            tail[t] = v[t - t0];
+        }
+    });
+    if (f.concat) {
+        g.done.insert(f.concat);
+    }
+    g.prebf16 = f.ic->src[1];
     return true;
 }
 
@@ -540,7 +657,8 @@ template <typename F> static bool axera_gen_mm(ggml_backend_axera_context * ctx,
         const std::string conv = axera_gen_conv_name(ic->second, M);
         if (!conv.empty() && axera_gen_have(g, conv)) {
             before();
-            axera_gen_conv(g, n, ic->second, conv);
+            const auto e = g.epi ? g.epi->find(n) : decltype(g.epi->end())();
+            axera_gen_conv(g, n, ic->second, conv, g.epi && e != g.epi->end() ? &e->second : nullptr);
             return true;
         }
     }
@@ -1028,6 +1146,8 @@ struct axera_gen_analysis {
     };
     std::vector<step>                                 steps;
     std::map<const ggml_tensor *, const step *>       step_at;
+    std::map<const ggml_tensor *, axera_gen_conv_epi> epi;  // the convolutions' bias / residual ADDs, by MUL_MAT
+    std::map<const ggml_tensor *, axera_gen_snake_fuse> sfuse;  // snakes fused into a conv input, by their first node
     // the whole frame on the frame kernel (on: none of the graph's nodes runs): the inputs mtmd sets (the talker's
     // hidden state, code 0, the draws), the weights the graph reads (heads, embedding tables, code 0's table), the
     // outputs it reads back (the codes, the next frame's embedding: the graph's last node)
@@ -1670,6 +1790,172 @@ static void axera_gen_step_run(ggml_backend_axera_context * ctx, axera_gen & g, 
     GGML_UNUSED(ctx);
 }
 
+// the epilogues of the graph's convolutions (MUL_MAT of a 1-D IM2COL): ggml_conv_1d's CONT of its permuted result (for
+// one batch a copy in the same order), then through views the one ADD of a bias (an f32 weight viewed as [1, OC]),
+// and if that ADD's only reader is an ADD of it and an f32 tensor of its shape, that one too (a residual)
+static void axera_gen_conv_epis(struct ggml_cgraph * cgraph, std::map<const ggml_tensor *, axera_gen_conv_epi> & epi) {
+    std::map<const ggml_tensor *, std::vector<ggml_tensor *>> users;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * n = cgraph->nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC && n->src[s]; ++s) {
+            users[n->src[s]].push_back(n);
+        }
+    }
+    auto only = [&](const ggml_tensor * t) -> ggml_tensor * {
+        auto it = users.find(t);
+        return it != users.end() && it->second.size() == 1 ? it->second[0] : nullptr;
+    };
+    auto same = [](const ggml_tensor * a, const ggml_tensor * b) {
+        return a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+               ggml_nelements(a) == ggml_nelements(b) && a->ne[0] == b->ne[0];
+    };
+    auto in_cmm = [](const ggml_tensor * t) {
+        return t->buffer && ggml_backend_buffer_is_axera(t->buffer);
+    };
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor *       n  = cgraph->nodes[i];
+        const ggml_tensor * s0 = n->op == GGML_OP_MUL_MAT ? n->src[0] : nullptr;  // the IM2COL, or a view of it
+        if (!s0 || !(s0->op == GGML_OP_IM2COL || (s0->view_src && s0->view_src->op == GGML_OP_IM2COL)) ||
+            n->type != GGML_TYPE_F32 || !ggml_is_contiguous(n)) {
+            continue;
+        }
+        // reshape [OL, 1, OC], permute to [OL, OC, 1], CONT
+        const ggml_tensor * u = n;
+        ggml_tensor *       c = only(u);
+        while (c && (c->op == GGML_OP_RESHAPE || c->op == GGML_OP_VIEW || c->op == GGML_OP_PERMUTE)) {
+            if (c->op == GGML_OP_PERMUTE) {
+                const int32_t * ax = (const int32_t *) c->op_params;
+                if (!(ax[0] == 0 && ax[1] == 2 && ax[2] == 1 && ax[3] == 3 && (u->ne[1] == 1 || u->ne[2] == 1))) {
+                    c = nullptr;
+                    break;
+                }
+            }
+            u = c;
+            c = only(u);
+        }
+        if (!c || c->op != GGML_OP_CONT || c->src[0] != u || !same(c, n) || !in_cmm(c)) {
+            continue;
+        }
+        axera_gen_conv_epi e;
+        e.cont                 = c;
+        epi[n]                 = e;
+        const ggml_tensor * ua = c;
+        ggml_tensor *       a  = only(c);
+        while (a && (a->op == GGML_OP_RESHAPE || a->op == GGML_OP_VIEW)) {
+            ua = a;
+            a  = only(a);
+        }
+        if (!a || a->op != GGML_OP_ADD || a->src[0] != ua || !same(a, n) || !in_cmm(a)) {
+            continue;
+        }
+        const ggml_tensor * b = a->src[1];
+        const ggml_tensor * w = b;
+        while (w->view_src) {
+            w = w->view_src;
+        }
+        if (b->ne[0] != 1 || b->ne[1] != n->ne[1] || ggml_nelements(b) != n->ne[1] || !axera_gen_is_weight(w) ||
+            w->type != GGML_TYPE_F32 || !ggml_is_contiguous(b)) {
+            continue;
+        }
+        e.add  = a;
+        e.bias = b;
+        ggml_tensor * r = only(a);
+        if (r && r->op == GGML_OP_ADD && same(r, a) && in_cmm(r)) {
+            const ggml_tensor * x = r->src[0] == a ? r->src[1] : r->src[0];
+            if ((r->src[0] == a) != (r->src[1] == a) && same(x, a) && in_cmm(x)) {
+                e.radd = r;
+                e.res  = x;
+            }
+        }
+        epi[n] = e;
+    }
+}
+
+// the snakes whose output only a convolution reads (axera_gen_snake_fuse): by the snake's first node (MUL x * alpha;
+// the snake's nodes as mtmd builds them: MUL, SIN, SQR, MUL beta, ADD x)
+static void axera_gen_snake_fuses(struct ggml_cgraph * cgraph, std::map<const ggml_tensor *, axera_gen_snake_fuse> & sf) {
+    std::map<const ggml_tensor *, std::vector<ggml_tensor *>> users;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * n = cgraph->nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC && n->src[s]; ++s) {
+            users[n->src[s]].push_back(n);
+        }
+    }
+    auto readers = [&](const ggml_tensor * t) -> const std::vector<ggml_tensor *> & {
+        static const std::vector<ggml_tensor *> none;
+        auto it = users.find(t);
+        return it == users.end() ? none : it->second;
+    };
+    auto snake_start = [](const ggml_tensor * h) -> const ggml_tensor * {  // h the snake's ADD
+        if (h->op != GGML_OP_ADD || !h->src[1] || h->src[1]->op != GGML_OP_MUL) {
+            return nullptr;
+        }
+        const ggml_tensor * sq = h->src[1]->src[0];
+        if (!sq || sq->op != GGML_OP_SQR || !sq->src[0] || sq->src[0]->op != GGML_OP_SIN) {
+            return nullptr;
+        }
+        const ggml_tensor * m = sq->src[0]->src[0];
+        return m && m->op == GGML_OP_MUL && m->src[0] == h->src[0] ? m : nullptr;
+    };
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * ic = cgraph->nodes[i];
+        if (ic->op != GGML_OP_IM2COL || readers(ic).size() != 1) {
+            continue;
+        }
+        const ggml_tensor * mm = readers(ic)[0];  // the MUL_MAT, through a view of the IM2COL
+        if (mm->op != GGML_OP_MUL_MAT && (mm->op == GGML_OP_RESHAPE || mm->op == GGML_OP_VIEW) && readers(mm).size() == 1) {
+            mm = readers(mm)[0];
+        }
+        if (mm->op != GGML_OP_MUL_MAT || (mm->src[0] != ic && mm->src[0]->view_src != ic) ||
+            readers(ic->src[1]).size() < 1) {
+            continue;
+        }
+        ggml_tensor *        in = ic->src[1];
+        axera_gen_snake_fuse f;
+        f.ic = ic;
+        f.mm = mm;
+        const ggml_tensor * h = in;
+        if (in->op == GGML_OP_CONCAT && ((const int32_t *) in->op_params)[0] == 0 && in->src[1]) {
+            // the CONCAT's readers: the IM2COL, and views of its tail read by CONTs only (the state)
+            for (const ggml_tensor * r : readers(in)) {
+                if (r == ic) {
+                    continue;
+                }
+                bool state = r->op == GGML_OP_VIEW;
+                for (const ggml_tensor * rr : readers(r)) {
+                    state = state && rr->op == GGML_OP_CONT;
+                }
+                if (!state) {
+                    h = nullptr;
+                    break;
+                }
+            }
+            f.concat = in;
+            h        = h ? in->src[1] : nullptr;
+            if (h && (readers(h).size() != 1 || readers(h)[0] != in)) {
+                h = nullptr;
+            }
+        } else if (readers(in).size() != 1) {
+            h = nullptr;
+        }
+        const ggml_tensor * st = h ? snake_start(h) : nullptr;
+        // no other matrix product between the snake and its convolution (they write tmp[1] too)
+        int is = -1, im = -1;
+        for (int j = 0; st && j < cgraph->n_nodes; j++) {
+            is = cgraph->nodes[j] == st ? j : is;
+            im = cgraph->nodes[j] == mm ? j : im;
+        }
+        for (int j = is + 5; st && j < im; j++) {
+            if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT) {
+                st = nullptr;
+            }
+        }
+        if (st && is >= 0 && im > is) {
+            sf[st] = f;
+        }
+    }
+}
+
 // the frame's tensors in a code generation graph of n_codes positions: mtmd's inputs (inp_raw, inp_code0,
 // inp_rand_<i>), the predictor's heads and embedding tables, the outputs (out_codes, the last node); its top_k (a
 // TOP_K node, no top_p: no ARGSORT). False if any is missing or of another shape
@@ -1717,6 +2003,16 @@ static void axera_gen_analyze(ggml_backend_axera_context * ctx, axera_gen & g, s
     std::vector<axera_gen_cp_call> & calls = an.calls;
     float &                          theta = an.theta;
     axera_timer ta("gen graph analysis (host)");
+    axera_gen_conv_epis(cgraph, an.epi);
+    axera_gen_snake_fuses(cgraph, an.sfuse);
+    if (axera_debug() && (!an.epi.empty() || !an.sfuse.empty())) {
+        size_t res = 0;
+        for (const auto & e : an.epi) {
+            res += e.second.radd != nullptr;
+        }
+        fprintf(stderr, "axera gen: %zu convolution epilogues (%zu with a residual), %zu snakes into a conv input\n",
+                an.epi.size(), res, an.sfuse.size());
+    }
     std::vector<const ggml_tensor *> first;  // stacked: layer 0's output per position
     if (!g.cp_off) {
         calls = axera_gen_cp_calls(cgraph, skip);
@@ -1862,6 +2158,8 @@ enum ggml_status axera_gen_compute(ggml_backend_axera_context * ctx, struct ggml
         g.key = std::move(key);
     }
     const axera_gen_analysis &            an    = *g.analysis;
+    g.epi                                       = &an.epi;
+    g.prebf16                                   = nullptr;
     if (an.frame.on && axera_gen_frame_run(g, an.frame)) {  // the whole code generation step on the frame kernel
         return GGML_STATUS_SUCCESS;
     }
@@ -1884,7 +2182,7 @@ enum ggml_status axera_gen_compute(ggml_backend_axera_context * ctx, struct ggml
     };
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * n = cgraph->nodes[i];
-        if (!(n->flags & GGML_TENSOR_FLAG_COMPUTE) || skip.count(n)) {
+        if (!(n->flags & GGML_TENSOR_FLAG_COMPUTE) || skip.count(n) || g.done.count(n)) {
             continue;
         }
         auto c = call_of.find(n);
@@ -1936,9 +2234,13 @@ enum ggml_status axera_gen_compute(ggml_backend_axera_context * ctx, struct ggml
         if (n->op == GGML_OP_CONT && axera_gen_const_skip(g, cgraph, i)) {  // a constant the NPU already has as bf16
             continue;
         }
-        if (n->op == GGML_OP_MUL && !axera_gen_prof_nodes() && axera_gen_snake(cgraph, i, cpu)) {
-            i += 4;
-            continue;
+        if (n->op == GGML_OP_MUL && !axera_gen_prof_nodes()) {
+            auto sf = an.sfuse.find(n);
+            if ((sf != an.sfuse.end() && axera_gen_snake_fused(g, cgraph, i, sf->second, cpu)) ||
+                axera_gen_snake(cgraph, i, cpu)) {
+                i += 4;
+                continue;
+            }
         }
         auto p = g.pending.find(n);
         if (p != g.pending.end()) {  // computed with an earlier node of its group
@@ -1963,6 +2265,7 @@ enum ggml_status axera_gen_compute(ggml_backend_axera_context * ctx, struct ggml
     }
     cpu();
     g.pending.clear();
+    g.done.clear();
     g.im2col.clear();
     return GGML_STATUS_SUCCESS;
 }

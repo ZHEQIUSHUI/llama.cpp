@@ -534,14 +534,18 @@ inside the backend and takes over what has an NPU kernel:
   (`conv1d_kernels.py`): per block of output channels and steps one matrix product over all taps (K x IC: the taps'
   matrices side by side on chip, the input's K shifted windows stacked on chip), no accumulation into an f32 output
   across products, on the input in ggml's [channels][time] layout, so the im2col never runs; the kernel's taps
-  repacked once;
+  repacked once. The kernel writes ggml_conv_1d's CONT of its permuted result directly (for one batch the same
+  order), and with a `_b` / `_br` variant in the directory (`EPI=b` / `br`) also the ADD of the bias and of a residual
+  after it (the DAC residual units' second convolution), in f32 as the CPU adds them: those nodes do not run;
 - the other matrix products: single rows on the GEMV kernels (one call for the q / k / v or gate / up of one input),
   several rows on `mm_bf16_m<M>_n<N>_k<K>` GEMM kernels of their shapes (`mm_kernels.py`; convolutions without a
   conv1d kernel there too, the backend writing their im2col rows as bf16). A weight the graph transposes on every run
   (a transposed convolution's kernel, `cont(transpose(w))`) is read once through the view's strides and kept as bf16;
   the CONT does not run;
 - SnakeBeta (x + sin²(αx) · β⁻¹ per channel) in one pass on the host workers instead of five CPU ops, sin by range
-  reduction and a polynomial (vectorized);
+  reduction and a polynomial (vectorized). A snake only a convolution reads (directly, or through the concat of the
+  convolution's left context) is written straight into the conv1d kernel's bf16 input, with the concat's last steps
+  (the state the graph keeps) in f32: neither the snake's f32 output, nor the concat, nor the conversion to bf16;
 - on the host workers too, instead of the CPU backend's element-by-element loops: the concats of the convolutions'
   left context (row copies), the transposes between the [time][channels] and [channels][time] layouts (64 x 64
   blocks), col2im of the transposed convolutions (blocks of output steps) and the ConvNeXt blocks' depthwise
