@@ -25,6 +25,7 @@ static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend,
             e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last).count();
             e.second++;
         }
+        const auto t_in = std::chrono::steady_clock::now();
         g_axera_host.on_compute();
         enum ggml_status st;
         {
@@ -40,10 +41,27 @@ static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend,
                 k.last  = cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1] : nullptr;
                 k.kind  = axera_vit_graph(cgraph) ? 0 : axera_audio_graph(cgraph) ? 1 : axera_llama_graph(cgraph) ? 2 : 3;
             }
+            if (g_axera_prof.on && last.time_since_epoch().count()) {  // the host time before a graph, by its kind
+                static const char * before[4] = { "host before vit graph", "host before audio graph",
+                                                  "host before llama graph", "host before gen graph" };
+                auto & e = g_axera_prof.t[before[k.kind]];
+                e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last).count();
+                e.second++;
+            }
+            static const char * kinds[4] = { "graph_compute vit", "graph_compute audio", "graph_compute llama",
+                                             "graph_compute gen" };
+            axera_timer tk(kinds[k.kind]);
             st = k.kind == 0 ? axera_vit_compute(ctx, cgraph) :
                  k.kind == 1 ? axera_audio_compute(ctx, cgraph) :
                  k.kind == 2 ? axera_q35_compute(ctx, cgraph) :
                                axera_gen_compute(ctx, cgraph);
+        }
+        static const bool trace = std::getenv("GGML_AXERA_TRACE") != nullptr;  // every graph: kind, nodes, host gap, run
+        if (trace) {
+            const auto now = std::chrono::steady_clock::now();
+            fprintf(stderr, "axera trace: kind %d nodes %d gap %.3f ms run %.3f ms\n", ctx->graph_kind.kind, cgraph->n_nodes,
+                    last.time_since_epoch().count() ? std::chrono::duration<double, std::milli>(t_in - last).count() : -1.0,
+                    std::chrono::duration<double, std::milli>(now - t_in).count());
         }
         last             = std::chrono::steady_clock::now();
         g_axera_host.end = last;
