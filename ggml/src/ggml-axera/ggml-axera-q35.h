@@ -70,6 +70,7 @@ struct axera_q35_layer {
     std::vector<axera_cmm>             own;                                // converted weights, state, KV cache
     axera_cmm                          whole_packs[4];  // a packed whole-layer kernel's pw / ps / pf / pb inputs
     std::map<std::string, std::pair<ggml_backend_axera_buffer_context *, ggml_backend_axera_buffer_context *>> mx;
+    std::map<std::string, ggml_backend_axera_buffer_context *> mx_t;  // NVFP4: the tensor scale2 of w_<x> (t_<x>)
     std::vector<ggml_backend_axera_buffer_context *> state;                // state buffers to clear on restart
     bool released = false;  // decode packs freed (axera_q35_release): the group runs every decode token
 };
@@ -308,6 +309,8 @@ const char * axera_q35_gguf_name(const axera_q35 & m, const std::string & n);
 AX_ENGINE_IO_BUFFER_T axera_q35_weight_bf16(axera_q35 & m, const ggml_tensor * w, uint32_t size);
 AX_ENGINE_IO_BUFFER_T axera_q35_gguf_input(axera_q35 & m, axera_q35_layer & ly, const ggml_tensor * w,
                                            const std::string & n, uint32_t size);
+// a quantized projection's kernel input of k: w_<x> / s_<x> (MX), also t_<x> (NVFP4: the kernel has t_<x>)
+bool axera_q35_mx_name(const ggml_axera_kernel * k, const std::string & n);
 AX_ENGINE_IO_BUFFER_T axera_q35_mx_input(axera_q35_layer & ly, const ggml_tensor * w, const std::string & n,
                                          uint32_t size, ggml_axera_kernel * k);
 void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::string, ggml_tensor *> & t);

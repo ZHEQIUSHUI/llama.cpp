@@ -57,6 +57,31 @@ void axera_quantize_mxfp4(const ggml_tensor * w, axera_cmm & q, axera_cmm & s) {
     s->flush(s->vir, s->size);
 }
 
+// [N, K] weight of any GGUF type -> NVFP4: E2M1 pairs [N, K / 2], E4M3 scales [N, K / 16] and the FP32 tensor scale
+// s2 = amax / (6 * 448) [1] in new CMM buffers (as the DSL kernels' quant_nvfp4)
+void axera_quantize_nvfp4(const ggml_tensor * w, axera_cmm & q, axera_cmm & s, axera_cmm & s2) {
+    GGML_ASSERT(w->ne[0] % AXERA_NV_GROUP == 0);
+    const int64_t      K = w->ne[0], N = ggml_nrows(w);
+    std::vector<float> amax(N, 0.0f);
+    axera_for_rows_f32(w, [&](int64_t r, const float * row) {
+        for (int64_t i = 0; i < K; ++i) {
+            amax[r] = std::max(amax[r], fabsf(row[i]));
+        }
+    });
+    const float t = std::max(*std::max_element(amax.begin(), amax.end()) / (6.0f * 448.0f), ldexpf(1.0f, -126));
+    q             = axera_cmm_alloc(N * K / 2);
+    s             = axera_cmm_alloc(N * K / AXERA_NV_GROUP);
+    s2            = axera_cmm_alloc(sizeof(float));
+    *(float *) s2->vir = t;
+    axera_for_rows_f32(w, [&](int64_t r, const float * row) {
+        axera_quantize_row_nvfp4_f32(row, (uint8_t *) q->vir + r * (K / 2), (uint8_t *) s->vir + r * (K / AXERA_NV_GROUP),
+                                     K, t);
+    });
+    q->flush(q->vir, q->size);
+    s->flush(s->vir, s->size);
+    s2->flush(s2->vir, s2->size);
+}
+
 // [N, K] weight of another GGUF type (quantized, f16, f32) -> bf16 copy in a new CMM buffer
 axera_cmm axera_to_bf16(const ggml_tensor * w) {
     const int64_t K = w->ne[0], N = ggml_nrows(w);
