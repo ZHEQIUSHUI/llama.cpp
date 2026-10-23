@@ -519,10 +519,9 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             for (int c = 0; c < ng; ++c) {
                 axera_q35::prefill & pc = m.pre[vs[c]];
                 const int            tc = it + c * P;
-                for (int r = 0; r < P; ++r) {
-                    ggml_fp32_to_bf16_row(x0_row(tc + r),
-                                          (ggml_bf16_t *) pc.A->vir + (size_t) r * H, H);
-                }
+                axera_host_pool().run(P, [&](int64_t r) {
+                    ggml_fp32_to_bf16_row(x0_row(tc + (int) r), (ggml_bf16_t *) pc.A->vir + (size_t) r * H, H);
+                });
                 pc.A->flush(pc.A->vir, (size_t) P * H * sizeof(ggml_bf16_t));
                 rope.rows(tc, P, pc.COS.get(), pc.SIN.get());
                 if (b.pre_split(vs[c])) {
@@ -560,10 +559,9 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
                     pf.POS->flush(pf.POS->vir, pf.POS->size);
                 }
             }
-            for (int r = 0; r < P; ++r) {
-                ggml_fp32_to_bf16_row(x0_row(it + r),
-                                      (ggml_bf16_t *) pf.A->vir + (size_t) r * H, H);
-            }
+            axera_host_pool().run(P, [&](int64_t r) {  // 0.5M elements for 9B P = 128: ~1 ms on one core
+                ggml_fp32_to_bf16_row(x0_row(it + (int) r), (ggml_bf16_t *) pf.A->vir + (size_t) r * H, H);
+            });
             pf.A->flush(pf.A->vir, (size_t) P * H * sizeof(ggml_bf16_t));
             rope.rows(it, P, pf.COS.get(), pf.SIN.get());
             if (split) {
@@ -583,7 +581,9 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             b.rs_now = false;
             auto * fin = (L % 2 == 0 ? pf.A : pf.B).get();
             fin->invalidate(fin->vir, (size_t) P * H * sizeof(ggml_bf16_t));
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) fin->vir, h.data() + (size_t) it * H, (int64_t) P * H);
+            axera_host_pool().run(P, [&](int64_t r) {
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) fin->vir + (size_t) r * H, h.data() + (size_t) (it + r) * H, H);
+            });
             m.next_pos = p + P;
             it += P;
             continue;

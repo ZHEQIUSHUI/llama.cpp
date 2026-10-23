@@ -1183,6 +1183,9 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
             m.lm_s = std::move(sc);
             sh     = { m.lm_q, m.lm_s };
         }
+        if (lm4) {  // the prompt's output row runs it: loaded now, not in the first prompt (~35 ms for 9B)
+            axera_kernels().get("mul_mat_mx4_n" + std::to_string(lm->ne[1]) + "_k" + std::to_string(lm->ne[0]));
+        }
     } else if (lm->type != GGML_TYPE_BF16 || !ggml_backend_buffer_is_axera(lm->buffer)) {  // or in the GGUF mapping
         m.lm_bf = axera_to_bf16(lm);
     }
