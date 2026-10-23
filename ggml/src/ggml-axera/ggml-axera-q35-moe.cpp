@@ -196,10 +196,81 @@ void axera_q35_batch::run_experts_px(int il, const std::vector<int> & vs) {
     const size_t      es = sk.ob ? sizeof(ggml_bf16_t) : sizeof(float);
     axera_timer       tr("moe prefill route (cpu)");
     axera_timer       tk("moe prefill route: top-k (cpu)");
-    m.GLOG->invalidate(m.GLOG->vir, (size_t) NT * NE * sizeof(float));
-    const float *      lgs = (const float *) m.GLOG->vir;
     std::vector<int>   ids((size_t) NT * K);
     std::vector<float> wts((size_t) NT * K);
+    // the layer kernel's own top-K (descending raw logits and their experts): the weights as below, from its values
+    const auto & pf0 = m.pre[vs[0]];
+    if (m.GTKV && (ly.gdn ? pf0.gdn_tk : pf0.attn_tk)) {
+        m.GTKV->invalidate(m.GTKV->vir, (size_t) NT * K * sizeof(float));
+        m.GTKI->invalidate(m.GTKI->vir, (size_t) NT * K * sizeof(int32_t));
+        const float *   tv = (const float *) m.GTKV->vir;
+        const int32_t * ti = (const int32_t *) m.GTKI->vir;
+        const int nbk = std::max(1, NT / 64);  // blocks of tokens on the host workers (the exps dominate)
+        axera_host_pool().run(nbk, [&](int64_t b) {
+            for (int64_t r = b * NT / nbk; r < (b + 1) * NT / nbk; ++r) {
+                float sum = 0.0f;
+                for (int i = 0; i < K; ++i) {
+                    ids[r * K + i] = ti[r * K + i];
+                    wts[r * K + i] = std::exp(tv[r * K + i] - tv[r * K]);
+                    sum += wts[r * K + i];
+                }
+                for (int i = 0; i < K; ++i) {
+                    wts[r * K + i] /= sum;
+                }
+            }
+        });
+        // GGML_AXERA_TK_CHECK=1: the host's top-K on the same logits too, rows compared bitwise (counts at exit)
+        static const bool check = [] {
+            const char * e = std::getenv("GGML_AXERA_TK_CHECK");
+            return e && atoi(e) != 0;
+        }();
+        if (check) {
+            static struct counts {
+                int64_t rows = 0, id_diff = 0, w_diff = 0;
+                ~counts() {
+                    fprintf(stderr, "axera top-K check: %lld rows, experts differ in %lld, weights differ in %lld\n",
+                            (long long) rows, (long long) id_diff, (long long) w_diff);
+                }
+            } cnt;
+            m.GLOG->invalidate(m.GLOG->vir, (size_t) NT * NE * sizeof(float));
+            const float * lgs = (const float *) m.GLOG->vir;
+            for (int64_t r = 0; r < NT; ++r) {
+                const float * lg = lgs + r * NE;
+                int           top[16];
+                float         val[16];
+                int           n = 0;
+                for (int e = 0; e < NE; ++e) {
+                    const float v = lg[e];
+                    if (n == K && v <= val[K - 1]) {
+                        continue;
+                    }
+                    int j = n < K ? n++ : K - 1;
+                    for (; j > 0 && val[j - 1] < v; --j) {
+                        val[j] = val[j - 1];
+                        top[j] = top[j - 1];
+                    }
+                    val[j] = v;
+                    top[j] = e;
+                }
+                float w[16], sum = 0.0f;
+                for (int i = 0; i < K; ++i) {
+                    w[i] = std::exp(val[i] - val[0]);
+                    sum += w[i];
+                }
+                bool di = false, dw = false;
+                for (int i = 0; i < K; ++i) {
+                    w[i] /= sum;
+                    di = di || top[i] != ids[r * K + i];
+                    dw = dw || memcmp(&w[i], &wts[r * K + i], sizeof(float)) != 0;
+                }
+                cnt.rows++;
+                cnt.id_diff += di;
+                cnt.w_diff += dw;
+            }
+        }
+    } else {
+    m.GLOG->invalidate(m.GLOG->vir, (size_t) NT * NE * sizeof(float));
+    const float *      lgs = (const float *) m.GLOG->vir;
     // per token (a block of tokens per worker): its top-K by a running insertion into K slots (NE >> K), the weights
     // softmax-renormalized over the K (as transformers' Qwen3_5MoeTopKRouter)
     GGML_ASSERT(K <= 16);
@@ -234,6 +305,7 @@ void axera_q35_batch::run_experts_px(int il, const std::vector<int> & vs) {
             }
         }
     });
+    }
     tk.stop();
     axera_timer tl("moe prefill route: layout (cpu)");
     // picks grouped by expert (counting sort, picks in token order within an expert), then the slots: per expert
@@ -276,9 +348,13 @@ void axera_q35_batch::run_experts_px(int il, const std::vector<int> & vs) {
             loc_h[(size_t) (pk % K) * cb.T + pk / K] = (int32_t) row;  // [K][T]
         }
     });
+    // TOK / SRW / LOC: cached CMM written by the host, flushed (copies to non-cached memory were the slow part)
     memcpy(m.TOK->vir, tok_h.data(), tok_h.size() * sizeof(int32_t));
     memcpy(m.SRW->vir, sw_h.data(), sw_h.size() * sizeof(float));
     memcpy(m.LOC->vir, loc_h.data(), loc_h.size() * sizeof(int32_t));
+    m.TOK->flush(m.TOK->vir, tok_h.size() * sizeof(int32_t));
+    m.SRW->flush(m.SRW->vir, sw_h.size() * sizeof(float));
+    m.LOC->flush(m.LOC->vir, loc_h.size() * sizeof(int32_t));
     auto * tok = (int32_t *) m.TOK->vir;
     auto * sw  = (float *) m.SRW->vir;
     tl.stop();
@@ -418,6 +494,9 @@ void axera_q35_batch::run_experts_pre(int il, const std::vector<int> & vs) {
         }
     });
     m.SRW->flush(m.SRW->vir, (size_t) calls * S * G * sizeof(float));
+    if (px) {  // TOK: cached CMM
+        m.TOK->flush(m.TOK->vir, (size_t) calls * S * (1 + G) * sizeof(int32_t));
+    }
     tg.stop();
     tr.stop();
     const auto & ec = ly.exps[0];  // gate-up

@@ -111,6 +111,10 @@ struct axera_q35 {
         axera_cmm           A, B, MASK, COS, SIN, POS;  // POS: the batch's P cells
         axera_cmm           CPOS, CNBLK;  // a MoE group's chunk copy with fused attention: its own pos / nblk inputs
         axera_cmm           BASE, H2, LOG;              // MoE: the layer kernel's base, h2 and router logits rows
+        // MoE: the router's top-K per token from the kernels built with it (_tk: topk_v raw logits descending,
+        // topk_i experts), for which kernel kinds
+        axera_cmm           TKV, TKI;
+        bool                gdn_tk = false, attn_tk = false;
         // speculative decoding (llama.cpp n_rs_seq > 0): the GDN kernel that also writes the recurrent state after
         // each of the P tokens (qwen35_gdn_prefill<P>[_mx8]_rs) into the cache's snapshot planes
         ggml_axera_kernel * gdn_rs = nullptr;
@@ -235,7 +239,7 @@ struct axera_q35 {
     combine_kernel comb;
     std::vector<combine_kernel> comb_small;  // the same for fewer tokens (T < comb.T), smallest first: a group that
                                              // fills only its first chunks adds only their rows
-    axera_cmm      GA, GB, GH2, GBASE, GLOG, TOK, LOC;
+    axera_cmm      GA, GB, GH2, GBASE, GLOG, TOK, LOC, GTKV, GTKI;
     axera_cmm    SX, SRW, SOUT;  // all slots of a chunk's layer: rows [slots][G][H] bf16, weights f32, results f32 / bf16
 };
 
