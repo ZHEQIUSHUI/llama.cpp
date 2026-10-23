@@ -395,6 +395,8 @@ slot rows. Each script checks its kernel on the simulator against the single-cor
 | `GGML_AXERA_PROF` | 0 | `1`: time per kernel at exit; `2`: also every CPU node |
 | `GGML_AXERA_TRACE` | unset | set: one line per graph (kind, nodes, host gap before it, run time) and the weight preparations of mtmd's matrix products |
 | `GGML_AXERA_CP_STEP` | 1 | `0`: Qwen3-TTS code predictor without its step kernel (stacked layers and GEMVs) |
+| `GGML_AXERA_CP_FRAME` | 0 | `1`: a Qwen3-TTS code predictor frame in one call on its frame kernel, sampling on chip |
+| `GGML_AXERA_CP_FRAME_CHECK` | 0 | `1`: log the frame kernel's codes whose draw lies near a cumulative sum, or that a host sampling of its logits picks differently |
 | `GGML_AXERA_CP_STACK` | 1 | `0`: one call per code predictor layer |
 | `GGML_AXERA_DEBUG` | 0 | `1`: log op shapes without a kernel |
 
@@ -512,7 +514,19 @@ inside the backend and takes over what has an NPU kernel:
   accumulation across calls or cores): the codes are the same as with the stacked four-core kernel. It has a mask and
   RoPE rows of its own. It is used whenever it is in the directory and fits the model (every layout member found with
   its size, the embedding row, head and logits of the model's sizes; otherwise the stacked kernel runs the positions;
-  `GGML_AXERA_CP_STEP=0`: the stacked kernel and the GEMVs);
+  `GGML_AXERA_CP_STEP=0`: the stacked kernel and the GEMVs).
+  With `GGML_AXERA_CP_FRAME=1` (off by default) and a frame kernel `qwen3tts_cp_frame5_mx8_h<HT>_k<top_k>_c16`
+  (`q3tts_cp_frame.py`, the step kernel's `.layout`) a whole frame is one call: its 16 positions, each code's
+  embedding row loaded by the code on chip, and the sampling on chip as mtmd's graph does it (the top_k largest logits,
+  ties to the lower id, the first two swapped as ggml's top_k leaves them, softmax and cumulative sum in f32, the first
+  candidate whose sum exceeds the position's draw; mtmd's draws passed in). The backend then runs none of the graph's
+  nodes: it writes the codes and the next frame's embedding (code 0's row plus each code's row, added in the graph's
+  order). Only for top_p 1 and the top_k it was built for; otherwise, or if it does not fit the model, the step kernel.
+  With `--top-k 1` the audio is identical to the step kernel's (both models, zh / en), with sampling 16 of 16
+  generations identical; in a 3-request run one of 6 differed from frame 9 of a request on, where the draw was 1e-7
+  from a cumulative sum (`GGML_AXERA_CP_FRAME_CHECK=1` logs every position whose draw lies within 1e-5 of one, and
+  the kernel's code against a double-precision sampling of its own logits). 9.1 ms per frame (0.6B) and 9.7 ms (1.7B)
+  instead of 16 step calls (14 - 15 ms) and the CPU's sampling slices (about 5 ms);
 - the convolutions (ggml's im2col and matrix product) as `conv1d_bf16_ic<IC>_oc<OC>_k<K>_d<D>_l<L>` kernels
   (`conv1d_kernels.py`): per block of output channels and steps one matrix product over all taps (K x IC: the taps'
   matrices side by side on chip, the input's K shifted windows stacked on chip), no accumulation into an f32 output
@@ -590,6 +604,10 @@ third without the one-time costs (0.4 s converting the codec decoder's weights, 
 |---|---|---|---|---|
 | Qwen3-TTS-1.7B | zh | 87 | 4.20 s + 0.48 s | 54 ms |
 | | en | 153 | 7.43 s + 0.50 s | 52 ms |
+
+With the frame kernel (`GGML_AXERA_CP_FRAME=1`, default sampling, the board's load 20), the second and third request:
+1.7B zh 90 / 88 frames 3.64 / 3.62 s + 0.48 / 0.47 s (46 ms per frame; 55 ms with the step kernel), en 67 / 63
+frames 2.04 / 1.90 s + 0.94 / 0.96 s (45 ms; 53 ms).
 
 The three requests give the same audio. mtmd's sampler keeps its random state across requests with the same seed,
 so sampled requests after the first differ from a fresh process.
