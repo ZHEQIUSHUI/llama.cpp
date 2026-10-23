@@ -465,18 +465,30 @@ padded, 13 rows per second of audio), the conv front-end before them and the pos
 the graph's own nodes, run by the CPU backend from inside the backend. Without kernels for the row count the whole
 encoder runs on the CPU.
 
-The matrix products of the front-end's two 480-channel convolutions (ggml's im2col rows times the kernel), most of its
-CPU time, run on `q3a_conv.py`'s kernels (`qwen3a_conv_o<OC>_k<K>_r<R>`, rows padded to R: 6400 and 1664 cover the
-8 one-second chunks of an encoder call); bias, GELU and the rest of the front-end stay on the CPU.
+The conv front-end runs on the NPU when its kernels are in the directory for the call's chunks (n of 100 frames,
+padded to 1, 2, 4 or 8): each 3 x 3 stride-2 convolution of 480 channels as one four-core call of `q3a_fe.py`'s
+kernels with its bias and GELU (erf) on chip and its output in bf16 for the next layer (`qwen3a_fe_o480_k<K>_r<R>`:
+the product of the host's bf16 im2col rows and the kernel, one product over the whole K per tile, conv2d.1's 9 taps
+padded to 16; `qwen3a_fe2_o480_n<n>`: conv2d.2 with its im2col on chip, the 9 taps' windows of conv2d.1's output,
+whose rows the host orders by column parity, stacked on chip [9 x 480, 100]), then conv_out on
+`mm_bf16_m<13 n>_n<H>_k7680` with its bias and the per-chunk positions on the host, into the layers' input. Without
+those kernels the graph's front-end runs as before (`q3a_conv.py`'s products of ggml's im2col rows on the NPU, the
+rest on the CPU). The encoder layers' matrices are converted to bf16 while the model loads (the first request does
+not wait for them).
 
-On AX8860 (text model MXFP8, mmproj Q8_0), per encoder call (8 s of audio):
+On AX8860 (text model MXFP8, mmproj Q8_0, the board's load 18), per encoder call of 8 one-second chunks, the calls
+after the first:
 
-| Model | Encoder, CPU | Encoder, NPU | Transcript of 60 s of Chinese speech |
+| Model | Encoder, CPU | Front-end on the CPU (q3a_conv) | Front-end on the NPU |
 |---|---|---|---|
-| Qwen3-ASR-0.6B | 2.8 s | 0.45 s | as on the CPU but for one interjection |
-| Qwen3-ASR-1.7B | 3.3 s | 0.47 s | as on the CPU |
+| Qwen3-ASR-0.6B | 2.8 s | 0.42 s | 66 ms |
+| Qwen3-ASR-1.7B | 3.3 s | 0.44 s | 83 ms |
 
-Of the 0.45 s about 0.35 s is the front-end's CPU part; the 18 (0.6B) / 24 (1.7B) layers take 33 / 47 ms.
+of which the 18 / 24 layers take about 33 / 45 ms, the projector on the CPU 9 ms, the front-end about 20 ms (conv2d.3's
+im2col on the host 8 ms). The first call takes 0.54 / 0.74 s (before: 1.5 / 2.2 s). 20 sentences spoken by
+Qwen3-TTS-1.7B (10 Chinese, 10 English) read back with a CER of 0 / 168 characters and a WER of 0 / 104 words on
+either front-end, but for one homophone of the 0.6B on the NPU front-end (预订 as 预定); 60 s of Chinese speech read
+back the same but for punctuation and one interjection.
 
 ### Speech synthesis: Qwen3-TTS
 

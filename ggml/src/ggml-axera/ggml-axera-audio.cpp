@@ -2,6 +2,8 @@
 
 #include "ggml-axera-impl.h"
 
+#include <mutex>
+
 // the Qwen3-ASR audio encoder (mtmd clip graph, projector qwen3a): the transformer layers on the q3a_audio.py kernels
 // (q35_vit.py's pre / attn / post on the audio tower: qwen3a_{pre,attn,post}<N>_h<H>, N rows padded, width H), the
 // conv front-end before them and the post norm and projector after them as the graph's own nodes on the CPU backend
@@ -13,7 +15,68 @@ struct axera_audio {
     std::map<std::string, std::pair<axera_cmm, axera_cmm>> cio;  // front-end GEMM x / out buffers by kernel
     std::map<std::string, axera_cmm> w;  // bf16 weights by name (q / k / v joined as attn_qkv), from bound's model
     const void *        bound = nullptr;  // data of a.blk.0.attn_q.weight
+    // the conv front-end on the NPU (axera_audio_frontend_npu): its buffers by name, the model its weights are of
+    std::map<std::string, axera_cmm> fe_io;
+    const void *                     fe_bound = nullptr;  // data of a.conv_out.weight
 };
+
+// a tensor of any type as bf16 into dst, by rows on the host workers
+static void axera_audio_to_bf16(const ggml_tensor * p, ggml_bf16_t * dst) {
+    const int64_t K = p->ne[0], rows = ggml_nelements(p) / K;
+    const auto *  tr = ggml_get_type_traits(p->type);
+    axera_host_pool().run(rows, [&](int64_t r) {
+        std::vector<float> f(K);
+        const char *       src = (const char *) p->data + r * ggml_row_size(p->type, K);
+        if (p->type == GGML_TYPE_F32) {
+            memcpy(f.data(), src, K * sizeof(float));
+        } else {
+            tr->to_float(src, f.data(), K);
+        }
+        ggml_fp32_to_bf16_row(f.data(), dst + r * K, K);
+    });
+}
+
+// the bf16 copies of the encoder layers' matrices made while the model loads (axera_audio_on_set), by their data
+static std::mutex                                      g_audio_pre_mu;
+static std::map<const void *, axera_cmm>               g_audio_pre;
+
+// a tensor the loader set whole: an audio encoder layer's matrix (a.blk.<i>.{attn_q,attn_k,attn_v,attn_out,ffn_up,
+// ffn_down}.weight) converted to bf16 now, so that the first request does not wait for it
+void axera_audio_on_set(const ggml_tensor * t) {
+    static const char * names[] = { ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_out.weight",
+                                    ".ffn_up.weight", ".ffn_down.weight" };
+    if (strncmp(t->name, "a.blk.", 6) != 0 || ggml_n_dims(t) != 2 || !ggml_is_contiguous(t) ||
+        (t->type != GGML_TYPE_F32 && !ggml_get_type_traits(t->type)->to_float)) {
+        return;
+    }
+    const size_t n = strlen(t->name);
+    bool         m = false;
+    for (const char * s : names) {
+        const size_t k = strlen(s);
+        m = m || (n > k && strcmp(t->name + n - k, s) == 0);
+    }
+    if (!m) {
+        return;
+    }
+    axera_timer tm("audio weights at load (host)");
+    axera_cmm   c = axera_cmm_alloc(ggml_nelements(t) * sizeof(ggml_bf16_t));
+    axera_audio_to_bf16(t, (ggml_bf16_t *) c->vir);
+    c->flush(c->vir, c->size);
+    std::lock_guard<std::mutex> lock(g_audio_pre_mu);
+    g_audio_pre[t->data] = std::move(c);
+}
+
+// the load-time bf16 copy of p, taken out of the registry (nullptr if there is none)
+static axera_cmm axera_audio_take_pre(const ggml_tensor * p) {
+    std::lock_guard<std::mutex> lock(g_audio_pre_mu);
+    auto                        it = g_audio_pre.find(p->data);
+    if (it == g_audio_pre.end() || it->second->size != (size_t) ggml_nelements(p) * sizeof(ggml_bf16_t)) {
+        return axera_cmm();
+    }
+    axera_cmm c = std::move(it->second);
+    g_audio_pre.erase(it);
+    return c;
+}
 
 // a graph is the audio encoder if it reads the conv front-end's output projection and the transformer layers (the
 // Qwen3-TTS speaker encoder has a conv_out too)
@@ -113,6 +176,268 @@ static void axera_audio_frontend(ggml_backend_axera_context * ctx, axera_audio &
     if (n > i0) {
         axera_cpu_compute(ctx, cgraph, i0, n, "audio front-end (cpu)");
     }
+}
+
+// the conv front-end on the NPU when its kernels exist for the call's chunks (n of 100 frames, padded to 1 / 2 / 4 / 8):
+// each 3 x 3 stride-2 convolution as one qwen3a_fe_o480_k<K>_r<R> call (q3a_fe.py: the product, bias and GELU, bf16
+// out), its im2col rows written by the host as bf16 from the previous output; then conv_out on mm_bf16_m<M>_n<H>_k7680
+// and its bias and the per-chunk positions on the host, into the layers' input x0. False (nothing written) without
+// those kernels: the graph's front-end runs as before
+static bool axera_audio_frontend_npu(axera_audio & a, const std::map<std::string, ggml_tensor *> & t, ggml_tensor * x0) {
+    auto find = [&](const std::string & n) -> ggml_tensor * {
+        auto it = t.find(n);
+        return it == t.end() ? nullptr : it->second;
+    };
+    const ggml_tensor * inp = find("inp_raw");
+    const ggml_tensor * w1 = find("a.conv2d.1.weight"), *w2 = find("a.conv2d.2.weight"), *w3 = find("a.conv2d.3.weight");
+    const ggml_tensor * b1 = find("a.conv2d.1.bias"), *b2 = find("a.conv2d.2.bias"), *b3 = find("a.conv2d.3.bias");
+    const ggml_tensor * wo = find("a.conv_out.weight"), *bo = find("a.conv_out.bias"), *pe = find("a.position_embd.weight");
+    if (!inp || !w1 || !w2 || !w3 || !b1 || !b2 || !b3 || !wo || !pe || inp->type != GGML_TYPE_F32 || !ggml_is_contiguous(inp)) {
+        return false;
+    }
+    const int64_t NF = inp->ne[0], MEL = inp->ne[1], CH = 100, H = x0->ne[0];
+    const int64_t C = w1->ne[3];  // 480
+    if (NF % CH != 0 || MEL != 128 || w1->ne[2] != 1 || w2->ne[2] != C || w3->ne[2] != C || wo->ne[0] != 16 * C ||
+        wo->ne[1] != H || x0->ne[1] != NF / CH * 13 || b1->type != GGML_TYPE_F32 || b2->type != GGML_TYPE_F32 ||
+        b3->type != GGML_TYPE_F32 || (bo && bo->type != GGML_TYPE_F32) || pe->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int64_t nch = NF / CH;
+    int64_t       n   = 0;
+    for (int64_t c : { 1, 2, 4, 8 }) {
+        n = n == 0 && c >= nch ? c : n;
+    }
+    const int64_t     R1 = 3200 * n, R2 = 800 * n, R3 = 208 * n, M = 13 * n, K1 = 16, K2 = 9 * C;
+    const std::string k1n = "qwen3a_fe_o" + std::to_string(C) + "_k16_r" + std::to_string(R1);
+    const std::string k2n = "qwen3a_fe_o" + std::to_string(C) + "_k" + std::to_string(K2) + "_r" + std::to_string(R2);
+    const std::string k3n = "qwen3a_fe_o" + std::to_string(C) + "_k" + std::to_string(K2) + "_r" + std::to_string(R3);
+    const std::string kon = "mm_bf16_m" + std::to_string(M) + "_n" + std::to_string(H) + "_k" + std::to_string(16 * C);
+    // conv2d.2 with its im2col on chip (qwen3a_fe2_o<C>_n<n>) where it exists: conv2d.1's rows then ordered (chunk, h,
+    // column parity, w / 2), its taps [OC][kh][kw][IC]
+    const std::string k2i  = "qwen3a_fe2_o" + std::to_string(C) + "_n" + std::to_string(n);
+    const bool        chip = n > 0 && std::ifstream(axera_kernels().path(k2i)).good();
+    for (const std::string & k : { k1n, chip ? k2i : k2n, k3n, kon }) {
+        if (n == 0 || !std::ifstream(axera_kernels().path(k)).good()) {
+            return false;
+        }
+    }
+    // the kernels' weights as bf16 rows [OC][IC * 9] (conv2d.1's 9 taps padded to 16), once per model
+    auto conv_w = [&](const ggml_tensor * w, int64_t K) -> axera_cmm & {
+        axera_cmm & c = a.w["fe:" + axera_base_name(w->name)];
+        if (!c || a.fe_bound != wo->data) {
+            const int64_t OC = w->ne[3], KK = w->ne[0] * w->ne[1] * w->ne[2];
+            c = axera_cmm_alloc((size_t) OC * K * sizeof(ggml_bf16_t));
+            auto * d = (ggml_bf16_t *) c->vir;
+            axera_host_pool().run(OC, [&](int64_t o) {
+                std::vector<float> f(KK);
+                const char *       src = (const char *) w->data + o * w->nb[3];
+                if (w->type == GGML_TYPE_F32) {
+                    memcpy(f.data(), src, KK * sizeof(float));
+                } else {
+                    ggml_get_type_traits(w->type)->to_float(src, f.data(), KK);
+                }
+                f.resize(K, 0.0f);
+                ggml_fp32_to_bf16_row(f.data(), d + o * K, K);
+            });
+            c->flush(c->vir, c->size);
+        }
+        return c;
+    };
+    axera_cmm & W1 = conv_w(w1, K1);
+    axera_cmm & W2 = chip ? a.w["fe:taps:a.conv2d.2.weight"] : conv_w(w2, K2);
+    if (chip && (!W2 || a.fe_bound != wo->data)) {  // [OC][IC][3][3] -> [OC][3][3][IC]
+        const int64_t IC = w2->ne[2];
+        W2 = axera_cmm_alloc((size_t) C * K2 * sizeof(ggml_bf16_t));
+        auto * d = (ggml_bf16_t *) W2->vir;
+        axera_host_pool().run(C, [&](int64_t o) {
+            std::vector<float> f(K2), g(K2);
+            const char *       src = (const char *) w2->data + o * w2->nb[3];
+            if (w2->type == GGML_TYPE_F32) {
+                memcpy(f.data(), src, K2 * sizeof(float));
+            } else {
+                ggml_get_type_traits(w2->type)->to_float(src, f.data(), K2);
+            }
+            for (int64_t ic = 0; ic < IC; ++ic) {
+                for (int64_t k = 0; k < 9; ++k) {
+                    g[k * IC + ic] = f[ic * 9 + k];
+                }
+            }
+            ggml_fp32_to_bf16_row(g.data(), d + o * K2, K2);
+        });
+        W2->flush(W2->vir, W2->size);
+    }
+    axera_cmm & W3 = conv_w(w3, K2);
+    axera_cmm & WO = a.w["fe:a.conv_out.weight"];
+    if (!WO || a.fe_bound != wo->data) {
+        WO = axera_cmm_alloc((size_t) H * 16 * C * sizeof(ggml_bf16_t));
+        const int64_t KO = wo->ne[0];
+        auto *        d  = (ggml_bf16_t *) WO->vir;
+        axera_host_pool().run(H, [&](int64_t r) {
+            std::vector<float> f(KO);
+            const char *       src = (const char *) wo->data + r * wo->nb[1];
+            if (wo->type == GGML_TYPE_F32) {
+                memcpy(f.data(), src, KO * sizeof(float));
+            } else {
+                ggml_get_type_traits(wo->type)->to_float(src, f.data(), KO);
+            }
+            ggml_fp32_to_bf16_row(f.data(), d + r * KO, KO);
+        });
+        WO->flush(WO->vir, WO->size);
+    }
+    a.fe_bound = wo->data;
+    auto buf = [&](const std::string & k, size_t bytes) -> axera_cmm & {
+        axera_cmm & b = a.fe_io[k];
+        if (!b || b->size < bytes) {
+            b = axera_cmm_alloc(bytes);
+        }
+        return b;
+    };
+    axera_cmm & X1 = buf("x1", (size_t) R1 * K1 * 2), &O1 = buf("o1", (size_t) C * R1 * 2);
+    axera_cmm & X2 = buf("x2", chip ? 64 : (size_t) R2 * K2 * 2), &O2 = buf("o2", (size_t) C * R2 * 2);
+    axera_cmm & X3 = buf("x3", (size_t) R3 * K2 * 2), &O3 = buf("o3", (size_t) C * R3 * 2);
+    axera_cmm & XO = buf("xo", (size_t) M * 16 * C * 2), &OO = buf("oo", (size_t) M * H * 4);
+    auto io = [](const axera_cmm & c, size_t bytes) { return axera_io(c.get(), c->vir, (uint32_t) bytes); };
+    auto bias_io = [&](const ggml_tensor * b) -> AX_ENGINE_IO_BUFFER_T {
+        axera_cmm & c = a.w["fe:" + axera_base_name(b->name)];
+        if (!c) {
+            c = axera_cmm_alloc(ggml_nbytes(b));
+            memcpy(c->vir, b->data, ggml_nbytes(b));
+            c->flush(c->vir, c->size);
+        }
+        return io(c, c->size);
+    };
+    auto run = [&](const std::string & kn, std::vector<std::pair<const char *, AX_ENGINE_IO_BUFFER_T>> ins,
+                   const char * out_name, AX_ENGINE_IO_BUFFER_T out, const char * what) {
+        ggml_axera_kernel * k = axera_kernels().get(kn);
+        std::vector<AX_ENGINE_IO_BUFFER_T> in(k->info->nInputSize), outs(k->info->nOutputSize);
+        GGML_ASSERT(ins.size() == in.size() && outs.size() == 1);
+        for (auto & p : ins) {
+            const int i = k->input(p.first);
+            GGML_ASSERT(i >= 0 && p.second.nSize >= k->info->pInputs[i].nSize);
+            in[i]       = p.second;
+            in[i].nSize = k->info->pInputs[i].nSize;
+        }
+        const int o = k->output(out_name);
+        GGML_ASSERT(o >= 0 && out.nSize >= k->info->pOutputs[o].nSize);
+        outs[o]       = out;
+        outs[o].nSize = k->info->pOutputs[o].nSize;
+        axera_timer tm(what);
+        const int   ret = axera_run_sync(k, in, outs);
+        if (ret != 0) {
+            GGML_ABORT("qwen3 audio: RunSync failed (0x%x) in %s\n", ret, kn.c_str());
+        }
+    };
+    // a 3 x 3 stride-2 pad-1 im2col of a bf16 map [IC][n][IH][IW] (rows (n, oh, ow), columns (ic, kh, kw)) into dst
+    auto im2col = [&](const ggml_bf16_t * src, int64_t IC, int64_t IH, int64_t IW, int64_t OH, int64_t OW, int64_t K,
+                      ggml_bf16_t * dst, const char * what) {
+        axera_timer tm(what);
+        const ggml_bf16_t zero = ggml_fp32_to_bf16(0.0f);
+        axera_host_pool().run(n * OH, [&](int64_t job) {
+            const int64_t c = job / OH, oh = job % OH;
+            ggml_bf16_t * row0 = dst + (c * OH + oh) * OW * K;
+            if (c >= nch) {  // a padding chunk
+                std::fill(row0, row0 + OW * K, zero);
+                return;
+            }
+            for (int64_t ow = 0; ow < OW; ++ow) {
+                ggml_bf16_t * d    = row0 + ow * K;
+                const int64_t w0   = 2 * ow - 1;
+                const bool    edge = w0 < 0 || w0 + 2 >= IW;
+                for (int64_t ic = 0; ic < IC; ++ic) {
+                    const ggml_bf16_t * s = src + (ic * n + c) * IH * IW;
+                    for (int64_t kh = 0; kh < 3; ++kh, d += 3) {
+                        const int64_t h = 2 * oh + kh - 1;
+                        if (h < 0 || h >= IH) {
+                            d[0] = d[1] = d[2] = zero;
+                            continue;
+                        }
+                        const ggml_bf16_t * r = s + h * IW;
+                        if (!edge) {
+                            d[0] = r[w0];
+                            d[1] = r[w0 + 1];
+                            d[2] = r[w0 + 2];
+                        } else {
+                            for (int64_t kw = 0; kw < 3; ++kw) {
+                                const int64_t w = w0 + kw;
+                                d[kw]           = w >= 0 && w < IW ? r[w] : zero;
+                            }
+                        }
+                    }
+                }
+                std::fill(d, row0 + (ow + 1) * K, zero);
+            }
+        });
+    };
+    // conv2d.1: the mel rows of each chunk, one input channel
+    {
+        axera_timer tm("audio fe im2col 1 (host)");
+        const float * mel  = (const float *) inp->data;
+        auto *        d    = (ggml_bf16_t *) X1->vir;
+        axera_host_pool().run(n * 64, [&](int64_t job) {
+            const int64_t c = job / 64, oh = job % 64;
+            for (int64_t ow = 0; ow < 50; ++ow) {
+                float v[16] = {};
+                for (int64_t kh = 0; kh < 3; ++kh) {
+                    for (int64_t kw = 0; kw < 3; ++kw) {
+                        const int64_t h = 2 * oh + kh - 1, f = 2 * ow + kw - 1;
+                        v[kh * 3 + kw] = c < nch && h >= 0 && h < MEL && f >= 0 && f < CH ? mel[h * NF + c * CH + f] : 0.0f;
+                    }
+                }
+                const int64_t col = chip ? (ow % 2) * 25 + ow / 2 : ow;  // (the parity-split columns for fe2)
+                ggml_fp32_to_bf16_row(v, d + ((c * 64 + oh) * 50 + col) * K1, K1);
+            }
+        });
+        X1->flush(X1->vir, (size_t) R1 * K1 * 2);
+    }
+    run(k1n, { { "x", io(X1, (size_t) R1 * K1 * 2) }, { "w", io(W1, W1->size) }, { "b", bias_io(b1) } }, "out",
+        io(O1, (size_t) C * R1 * 2), "audio fe conv 1 (npu)");
+    if (chip) {  // conv2d.1's output read by conv2d.2's kernel directly
+        run(k2i, { { "x", io(O1, (size_t) C * R1 * 2) }, { "w", io(W2, W2->size) }, { "b", bias_io(b2) } }, "out",
+            io(O2, (size_t) C * R2 * 2), "audio fe conv 2 (npu)");
+    } else {
+        O1->invalidate(O1->vir, (size_t) C * R1 * 2);
+        im2col((const ggml_bf16_t *) O1->vir, C, 64, 50, 32, 25, K2, (ggml_bf16_t *) X2->vir, "audio fe im2col 2 (host)");
+        X2->flush(X2->vir, (size_t) R2 * K2 * 2);
+        run(k2n, { { "x", io(X2, (size_t) R2 * K2 * 2) }, { "w", io(W2, W2->size) }, { "b", bias_io(b2) } }, "out",
+            io(O2, (size_t) C * R2 * 2), "audio fe conv 2 (npu)");
+    }
+    O2->invalidate(O2->vir, (size_t) C * R2 * 2);
+    im2col((const ggml_bf16_t *) O2->vir, C, 32, 25, 16, 13, K2, (ggml_bf16_t *) X3->vir, "audio fe im2col 3 (host)");
+    X3->flush(X3->vir, (size_t) R3 * K2 * 2);
+    run(k3n, { { "x", io(X3, (size_t) R3 * K2 * 2) }, { "w", io(W3, W3->size) }, { "b", bias_io(b3) } }, "out",
+        io(O3, (size_t) C * R3 * 2), "audio fe conv 3 (npu)");
+    O3->invalidate(O3->vir, (size_t) C * R3 * 2);
+    // conv_out's rows (n, ow), columns (oc, oh): the [OW, OH, OC, n] map permuted to [OH, OC, OW, n] as the graph does
+    {
+        axera_timer   tm("audio fe conv_out rows (host)");
+        const auto *  s = (const ggml_bf16_t *) O3->vir;
+        auto *        d = (ggml_bf16_t *) XO->vir;
+        axera_host_pool().run(M, [&](int64_t r) {
+            const int64_t c = r / 13, ow = r % 13;
+            for (int64_t oc = 0; oc < C; ++oc) {
+                for (int64_t oh = 0; oh < 16; ++oh) {
+                    d[r * 16 * C + oc * 16 + oh] = s[oc * R3 + (c * 16 + oh) * 13 + ow];
+                }
+            }
+        });
+        XO->flush(XO->vir, (size_t) M * 16 * C * 2);
+    }
+    run(kon, { { "x", io(XO, (size_t) M * 16 * C * 2) }, { "w", io(WO, WO->size) } }, "out", io(OO, (size_t) M * H * 4),
+        "audio fe conv_out (npu)");
+    OO->invalidate(OO->vir, (size_t) M * H * 4);
+    {
+        axera_timer   tm("audio fe positions (host)");
+        const auto *  y = (const float *) OO->vir;
+        auto *        x = (float *) x0->data;
+        const float * bb = bo ? (const float *) bo->data : nullptr;
+        for (int64_t r = 0; r < nch * 13; ++r) {
+            const float * p = (const float *) ((const char *) pe->data + (r % 13) * pe->nb[1]);
+            for (int64_t i = 0; i < H; ++i) {
+                x[r * H + i] = (y[r * H + i] + (bb ? bb[i] : 0.0f)) + p[i];
+            }
+        }
+    }
+    return true;
 }
 
 enum ggml_status axera_audio_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph) {
@@ -236,18 +561,21 @@ enum ggml_status axera_audio_compute(ggml_backend_axera_context * ctx, struct gg
             for (const ggml_tensor * p : parts) {
                 ne += ggml_nelements(p);
             }
-            c          = axera_cmm_alloc(ne * sizeof(ggml_bf16_t));
-            auto * dst = (ggml_bf16_t *) c->vir;
-            for (const ggml_tensor * p : parts) {
-                const int64_t      m = ggml_nelements(p);
-                std::vector<float> f(m);
-                if (p->type == GGML_TYPE_F32) {
-                    memcpy(f.data(), p->data, m * sizeof(float));
-                } else {
-                    ggml_get_type_traits(p->type)->to_float(p->data, f.data(), m);
+            if (parts.size() == 1) {
+                c = axera_audio_take_pre(parts[0]);  // (converted while loading)
+            }
+            if (!c) {
+                c          = axera_cmm_alloc(ne * sizeof(ggml_bf16_t));
+                auto * dst = (ggml_bf16_t *) c->vir;
+                for (const ggml_tensor * p : parts) {
+                    axera_cmm pre = axera_audio_take_pre(p);
+                    if (pre) {
+                        memcpy(dst, pre->vir, pre->size);
+                    } else {
+                        axera_audio_to_bf16(p, dst);
+                    }
+                    dst += ggml_nelements(p);
                 }
-                ggml_fp32_to_bf16_row(f.data(), dst, m);
-                dst += m;
             }
             c->flush(c->vir, c->size);
         }
@@ -255,7 +583,9 @@ enum ggml_status axera_audio_compute(ggml_backend_axera_context * ctx, struct gg
     };
 
     // the conv front-end, the per-chunk positions: the layers' input rows
-    axera_audio_frontend(ctx, a, cgraph, x0_node + 1);
+    if (!axera_audio_frontend_npu(a, t, x0)) {
+        axera_audio_frontend(ctx, a, cgraph, x0_node + 1);
+    }
     {
         axera_timer tm("audio prepare (cpu)");
         auto *      x = (ggml_bf16_t *) a.X[0]->vir;

@@ -24,6 +24,9 @@ static void ggml_backend_axera_buffer_set_tensor(ggml_backend_buffer_t buffer, g
     ctx->clean_n = 0;
     memcpy((char *) tensor->data + offset, data, size);
     ctx->flush((char *) tensor->data + offset, size);
+    if (offset == 0 && size == ggml_nbytes(tensor)) {
+        axera_audio_on_set(tensor);
+    }
 }
 
 static void ggml_backend_axera_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
@@ -183,6 +186,9 @@ static void ggml_backend_axera_mapped_memset_tensor(ggml_backend_buffer_t buffer
 static void ggml_backend_axera_mapped_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
                                                  size_t offset, size_t size) {
     memcpy((char *) tensor->data + offset, data, size);
+    if (offset == 0 && size == ggml_nbytes(tensor)) {
+        axera_audio_on_set(tensor);
+    }
     GGML_UNUSED(buffer);
 }
 
