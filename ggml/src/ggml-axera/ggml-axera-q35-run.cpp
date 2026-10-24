@@ -411,6 +411,23 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
     };
     const axera_rope rope(inp_pos, T, m.ROT, m.freq_scale, m.inv_freq, m.rope_mode, m.sections);
 
+    // GGML_AXERA_PAD_CHUNK=0: no padded chunks; GGML_AXERA_PAD_MIN: the fewest tokens one runs (default 2: a single
+    // token takes the decode kernels)
+    static const bool pad_env = [] {
+        const char * e = std::getenv("GGML_AXERA_PAD_CHUNK");
+        return e == nullptr || strcmp(e, "0") != 0;
+    }();
+    static const int pad_min = [] {
+        const char * e = std::getenv("GGML_AXERA_PAD_MIN");
+        return e ? std::max(1, atoi(e)) : 2;
+    }();
+    // GGML_AXERA_PAD_FILL=zero: padding rows of zeros instead (a check: the real rows' results do not depend on them)
+    static const bool pad_zero = [] {
+        const char * e = std::getenv("GGML_AXERA_PAD_FILL");
+        return e && strcmp(e, "zero") == 0;
+    }();
+    const bool pad_chunks = pad_env && !m.hybrid && !m.moe;
+
     axera_timer tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
     for (int it = 0; it < T;) {
         const int64_t p = pos[it];
@@ -435,6 +452,49 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             }
             return ok && (!m.kv_llama || kv.cell_of(it) + P <= m.N);
         };
+        // fewer consecutive tokens left than the largest chunk holds (a prompt's tail, or a short prompt): a pure
+        // attention model (no recurrent state a padding row would advance) runs them as one chunk of the smallest
+        // size that holds them, padded with copies of the last row. The padding rows' K / V go to the cells after the
+        // batch's: cells no token sees (the last token's KQ mask hides them, or they lie past the mask) and the next
+        // tokens overwrite before any reads them; else, or past the cache, the chunks that fit exactly as before
+        int pad_n = 0;  // the real tokens of a padded chunk
+        if (pad_chunks) {
+            int run = 1;  // consecutive tokens from it (cells or positions), within its sequence
+            while (it + run < T && it % n_seq_tokens + run < n_seq_tokens &&
+                   (m.kv_llama ? kv.stream_of(it + run) == kv.stream_of(it) && kv.cell_of(it + run) == kv.cell_of(it) + run :
+                                 pos[it + run] == p + run)) {
+                ++run;
+            }
+            int best = -1;  // the smallest chunk that holds run, if run is below the largest one (chunks largest first)
+            for (size_t c = 0; c < m.pre.size(); ++c) {
+                const int P = m.pre[c].P;
+                if (P <= 1 || m.pre[c].batch || m.pre[c].sub || m.pre[c].group.size() > 1 || b.pre_split((int) c)) {
+                    continue;
+                }
+                if (P < run) {
+                    break;
+                }
+                best = (int) c;
+            }
+            best = best >= 0 && m.pre[best].P == run ? -1 : best;  // a chunk fits exactly: as before
+            if (best >= 0 && run >= pad_min) {
+                const int     P   = m.pre[best].P;
+                const int64_t c0  = m.kv_llama ? kv.cell_of(it) : p;
+                bool          ok  = c0 + P <= (m.kv_llama ? m.N : m.LMAX);
+                if (ok && m.kv_llama) {
+                    std::vector<ggml_bf16_t> last(kv.W);
+                    kv.mask_row(it + run - 1, last.data());
+                    const uint16_t ninf = ggml_fp32_to_bf16(-3e38f).bits;
+                    for (int64_t c = c0 + run; ok && c < std::min<int64_t>(c0 + P, kv.W); ++c) {
+                        ok = last[c].bits == ninf;
+                    }
+                }
+                if (ok) {
+                    v     = best;
+                    pad_n = run;
+                }
+            }
+        }
         for (size_t c = 0; c < m.pre.size() && v < 0; ++c) {
             v = m.pre[c].P > 1 && chunk_fits(c) ? (int) c : -1;
         }
@@ -464,7 +524,8 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
         }
         // a fused attention chunk's inputs: its mask, the cell to write and the KV blocks (pf's own for the copies in a
         // MoE group, else the decode IO's)
-        auto fused_inputs = [&](axera_q35::prefill & pf, int it, int64_t p, bool split) {
+        // n: the chunk's real tokens (a padded chunk: fewer than P; its padding rows take the last real one's mask)
+        auto fused_inputs = [&](axera_q35::prefill & pf, int it, int64_t p, bool split, int n) {
             const int P = pf.P;
             int nblk = (int) ((p + P - 1) / m.BC + 1);
             // chunk mask [N / BC][R][BC], row r = token r % P (of head r / P in older kernels): positions up to
@@ -478,7 +539,9 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
                 axera_timer tm("mask (cpu)");
                 std::vector<ggml_bf16_t> rows((size_t) P * kv.W);
                 std::vector<int>         nb(P, 1);
-                axera_host_pool().run(P, [&](int64_t r) { nb[r] = kv.mask_row(it + (int) r, rows.data() + (size_t) r * kv.W); });
+                axera_host_pool().run(P, [&](int64_t r) {
+                    nb[r] = kv.mask_row(it + std::min((int) r, n - 1), rows.data() + (size_t) r * kv.W);
+                });
                 nblk = *std::max_element(nb.begin(), nb.end());
                 axera_host_pool().run(nblk, [&](int64_t blk) {
                     for (int64_t r = 0; r < R; ++r) {
@@ -503,7 +566,7 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
                 *(int32_t *) pos_b->vir  = (int32_t) (m.kv_llama ? kv.cell_of(it) : p);
                 *(int32_t *) nblk_b->vir = nblk;
                 if (!m.kv_llama) {
-                    for (int r = 0; r < P; ++r) {
+                    for (int r = 0; r < n; ++r) {
                         ((ggml_bf16_t *) m.MASK->vir)[p + r] = zero;  // for the decode steps after the chunk
                     }
                     m.MASK->flush(m.MASK->vir, m.MASK->size);
@@ -528,7 +591,7 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
                     const int key = axera_q35_fd_key(m, vs[c]);
                     axera_flash_prepare(kv, m.fd.at(key), key % 1000, tc);
                 } else {
-                    fused_inputs(pc, tc, p + (int64_t) c * P, false);
+                    fused_inputs(pc, tc, p + (int64_t) c * P, false, P);
                 }
             }
             b.run_group(vs, it, p);
@@ -544,6 +607,7 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
         if (v >= 0) {
             axera_q35::prefill & pf    = m.pre[v];
             const int            P     = pf.P;
+            const int            n     = pad_n > 0 ? pad_n : P;  // real tokens
             const bool           split = b.pre_split(v);
             if (pf.batch) {
                 axera_q35_set_batch_rows(m, v, row_of(it));
@@ -560,15 +624,33 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
                 }
             }
             axera_host_pool().run(P, [&](int64_t r) {  // 0.5M elements for 9B P = 128: ~1 ms on one core
-                ggml_fp32_to_bf16_row(x0_row(it + (int) r), (ggml_bf16_t *) pf.A->vir + (size_t) r * H, H);
+                auto * dst = (ggml_bf16_t *) pf.A->vir + (size_t) r * H;
+                if (r >= n && pad_zero) {
+                    memset(dst, 0, H * sizeof(ggml_bf16_t));
+                } else {
+                    ggml_fp32_to_bf16_row(x0_row(it + std::min((int) r, n - 1)), dst, H);
+                }
             });
             pf.A->flush(pf.A->vir, (size_t) P * H * sizeof(ggml_bf16_t));
-            rope.rows(it, P, pf.COS.get(), pf.SIN.get());
+            rope.rows(it, n, pf.COS.get(), pf.SIN.get());
+            if (n < P) {  // the padding rows' rotary rows: the last real token's
+                for (auto * cs : { pf.COS.get(), pf.SIN.get() }) {
+                    auto * r0 = (ggml_bf16_t *) cs->vir;
+                    for (int r = n; r < P; ++r) {
+                        if (pad_zero) {
+                            memset(r0 + (size_t) r * (m.ROT / 2), 0, (m.ROT / 2) * sizeof(ggml_bf16_t));
+                        } else {
+                            memcpy(r0 + (size_t) r * (m.ROT / 2), r0 + (size_t) (n - 1) * (m.ROT / 2), (m.ROT / 2) * sizeof(ggml_bf16_t));
+                        }
+                    }
+                    cs->flush(cs->vir, cs->size);
+                }
+            }
             if (split) {
                 const int key = axera_q35_fd_key(m, v);
                 axera_flash_prepare(kv, m.fd.at(key), key % 1000, it);
             }
-            fused_inputs(pf, it, p, split);
+            fused_inputs(pf, it, p, split, n);
             // speculative decoding: a verification batch (all T <= snapshot count tokens in this chunk) also writes the
             // recurrent-state snapshots; without the snapshot kernel a rollback would restore wrong states
             b.rs_now = rs_written > 1 && it == 0 && P == T && rs_written == T && pf.gdn_rs != nullptr;
@@ -581,11 +663,11 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             b.rs_now = false;
             auto * fin = (L % 2 == 0 ? pf.A : pf.B).get();
             fin->invalidate(fin->vir, (size_t) P * H * sizeof(ggml_bf16_t));
-            axera_host_pool().run(P, [&](int64_t r) {
+            axera_host_pool().run(n, [&](int64_t r) {
                 ggml_bf16_to_fp32_row((const ggml_bf16_t *) fin->vir + (size_t) r * H, h.data() + (size_t) (it + r) * H, H);
             });
-            m.next_pos = p + P;
-            it += P;
+            m.next_pos = p + n;
+            it += n;
             continue;
         }
         ggml_fp32_to_bf16_row(x0_row(it), (ggml_bf16_t *) m.A->vir, H);
