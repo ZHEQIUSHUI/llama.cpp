@@ -525,9 +525,10 @@ runs per audio give the same transcripts, and every layer and projector call run
 (`GGML_AXERA_AUDIO_TWICE=1`).
 
 As a resident service (`llama-server`, chat completions with `input_audio`, the second and third request of each
-audio; the server's timings, the board's load 2 - 11):
+audio; the server's timings, the board's load 2 - 11; before the projector on the NPU and the padded chunks; "server
+RTF" is the server's prompt + generation time over the audio's length, without the HTTP request):
 
-| Model | Audio | Prompt (encoder + prefill) | First token | RTF |
+| Model | Audio | Prompt (encoder + prefill) | First token | Server RTF |
 |---|---|---|---|---|
 | Qwen3-ASR-0.6B | 0.6 s | 180 - 214 ms | 187 - 221 ms | 0.37 - 0.42 |
 | | 3.3 s | 205 - 222 ms | 212 - 229 ms | 0.093 - 0.098 |
@@ -710,8 +711,8 @@ third without the one-time costs (0.4 s converting the codec decoder's weights, 
 | | en | 153 | 7.43 s + 0.50 s | 52 ms |
 
 Step kernel against frame kernel, alternating, two rounds each (default sampling, the second and third request of
-each process; the board's CPUs shared with other work, load 9 - 25: absolute times to be measured on an idle board),
-milliseconds per frame (generation and the last decoder batch over the frames):
+each process; the board's CPUs shared with other work, load 9 - 25; the idle board's numbers of the final build are
+in the table below), milliseconds per frame (generation and the last decoder batch over the frames):
 
 | Model | Sentence | Frames | Step kernel | Frame kernel |
 |---|---|---|---|---|
@@ -751,8 +752,33 @@ Reference outputs (`--top-k 1 -s 1`, the speaker breakthrough-3.wav, the sentenc
 | `MTMD_TTS_FIRST_WINDOW=0` | eb4a8a8f | e2540fd0 | ba0be7c8 | cf8ccfe9 |
 | `MTMD_TTS_FIRST_WINDOW=0 GGML_AXERA_PAD_CHUNK=0` | 50f39c57 | 336f7811 | 77d6cd3a | cf8ccfe9 |
 
-Per frame on the final build (talker group + frame kernel, `--top-k 1`, load 17 - 22): 1.7B 40 - 41 ms (the talker
-10.1 ms, the code predictor frame 9.8 ms), 0.6B 34 ms (5.0 / 9.2 ms).
+On an idle board (AX8860 .250, 7500 MT/s, load1 1 - 3, no other NPU process; axera-dev d7f66db, the default
+settings, `--top-k 1`, requests 2 and 3 of a process, the sentences above, 0.6B with `-n 160`):
+
+| Model | Sentence | Audio | Request | RTF | Per frame | First audio |
+|---|---|---|---|---|---|---|
+| Qwen3-TTS-1.7B | zh | 17.8 s (222 frames) | 9.65 - 9.97 s | 0.54 - 0.56 | 41.6 - 43.1 ms | 1.17 - 1.18 s |
+| | en | 12.2 s (152 frames) | 6.78 - 6.91 s | 0.56 - 0.57 | 42.0 - 42.6 ms | 1.15 - 1.17 s |
+| Qwen3-TTS-0.6B | zh | 12.8 s (160 frames) | 6.13 - 6.14 s | 0.48 | 35.6 ms | 1.02 - 1.03 s |
+| | en | 12.8 s (160 frames) | 6.11 - 6.12 s | 0.48 | 35.6 ms | 1.01 - 1.03 s |
+
+Per frame is the generation (with the codec decoder's windows) over the frames; the request adds the prompt and the last
+decoder batch. Of a frame of the 1.7B the talker takes about 10 ms and the code predictor frame about 10 ms; mtmd, the
+CPU slices and the decoder windows the rest. A process's first request also encodes the speaker reference (about 11 s
+on the CPU for a 22 s reference).
+
+ASR on an idle board (AX8860 .44, load1 2.7 - 3.0, no other NPU process; axera-dev d7f66db, `llama-server -np 1`, 2
+warm-ups then 5 requests per audio; end-to-end is the client's wall time of a request, RTF that over the audio's
+length):
+
+| Model | Audio | End to end | RTF | Prompt | First token |
+|---|---|---|---|---|---|
+| Qwen3-ASR-0.6B | 0.61 s | 150 - 170 ms | 0.25 - 0.28 | 87 - 94 ms | 94 - 101 ms |
+| | 3.28 s | 280 - 290 ms | 0.085 - 0.088 | 108 - 112 ms | 116 - 120 ms |
+| | 60 s | 2.47 - 2.50 s | 0.041 - 0.042 | 574 - 602 ms | 583 - 611 ms |
+| Qwen3-ASR-1.7B | 0.61 s | 200 - 230 ms | 0.33 - 0.38 | 113 - 118 ms | 125 - 131 ms |
+| | 3.28 s | 370 - 390 ms | 0.113 - 0.119 | 126 - 139 ms | 139 - 153 ms |
+| | 60 s | 3.60 - 3.66 s | 0.060 - 0.061 | 843 - 901 ms | 857 - 915 ms |
 
 ## Source layout
 
