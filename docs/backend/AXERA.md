@@ -380,6 +380,9 @@ slot rows. Each script checks its kernel on the simulator against the single-cor
 | `GGML_AXERA_WEIGHTS` | bf16 | `mxfp8`; `mxfp4`: MLP and output projection MXFP4; `mxfp4m`: MLP MXFP4, the rest MXFP8 |
 | `GGML_AXERA_LMHEAD` | `mxfp4` for MoE models and `WEIGHTS=mxfp4` when `mul_mat_mx4_n<C>_k<K>` exists, else `mxfp8` | output projection format |
 | `GGML_AXERA_PREFILL_WEIGHTS` | MXFP8 if the directory has MXFP8 prefill kernels | `mxfp8` / `bf16` |
+| `GGML_AXERA_PAD_CHUNK` | 1 | `0`: no padded prefill chunks (a prompt's tail in the chunks that fit exactly and single decode steps) |
+| `GGML_AXERA_PAD_MIN` | 2 | fewest tokens a padded chunk runs (fewer: decode steps) |
+| `GGML_AXERA_PAD_FILL` | copies of the last row | `zero`: padding rows of zeros (a check that the real rows do not depend on them) |
 | `GGML_AXERA_GROUP` | the largest group with a kernel (the whole model first) | layers per call; `0`: no groups |
 | `GGML_AXERA_GROUP_LM` | 1 | `0`: a whole-model group without the output projection |
 | `GGML_AXERA_GROUP_DIRECT` | 1 | `0`: a group's logits through an internal buffer, then copied |
@@ -468,7 +471,10 @@ before) and compares the two byte by byte. Without it the layers run on `q3a_aud
 (`qwen3a_{pre,attn,post}<N>_h<H>`: q35_vit.py's layer kernels without RoPE, GELU erf, LayerNorm 1e-5; N rows
 padded, 13 rows per second of audio), the conv front-end before them and the post norm and projector after them are
 the graph's own nodes, run by the CPU backend from inside the backend. Without kernels for the row count the whole
-encoder runs on the CPU.
+encoder runs on the CPU. After the layer kernel, the post norm and the projector (linear_1, GELU erf, linear_2) run on
+`q3a_proj.py`'s four-core kernel (`qwen3a_proj<N>_h<H>`, each core its N / 4 rows, nothing shared) from the last
+layer's rows on chip, its f32 rows the graph's output: 0.3 - 0.4 ms per call, against 3 - 40 ms on the CPU depending on
+the board's load (`GGML_AXERA_AUDIO_PROJ=0`: on the CPU; `GGML_AXERA_AUDIO_TWICE=1` compares its two runs too).
 
 The conv front-end runs on the NPU when its kernels are in the directory for the call's chunks (n of 100 frames,
 padded to 1, 2, 4 or 8): each 3 x 3 stride-2 convolution of 480 channels as one four-core call of `q3a_fe.py`'s
@@ -480,7 +486,7 @@ whose rows the host orders by column parity, stacked on chip [9 x 480, 100]), th
 those kernels the graph's front-end runs as before (`q3a_conv.py`'s products of ggml's im2col rows on the NPU, the
 rest on the CPU). The encoder layers' matrices are converted to bf16 while the model loads (when the loader sets them, or
 when mtmd's warmup reserves the encoder's graph for a mapped model), and the encoder's kernels are loaded then too:
-the first request does not wait for them.
+the first request does not wait for them (the projector's matrices too).
 
 On AX8860 (text model MXFP8, mmproj Q8_0, the board's load 18), per encoder call of 8 one-second chunks, the calls
 after the first:
@@ -491,8 +497,9 @@ after the first:
 | Qwen3-ASR-1.7B | 3.3 s | 0.44 s | 83 ms |
 
 of which the 18 / 24 layers took about 33 / 45 ms on the single-core kernels and take 11 / 18 ms on the layer kernel
-(the encoder call 46 / 55 ms), the projector on the CPU 9 ms, the front-end about 20 ms. Three runs per audio give the
-same transcripts, and every layer call run twice gave byte-identical outputs (`GGML_AXERA_AUDIO_TWICE=1`).
+(the encoder call 46 / 55 ms), the projector on the CPU 9 ms (now 0.3 ms on the NPU), the front-end about 20 ms. Three
+runs per audio give the same transcripts, and every layer and projector call run twice gave byte-identical outputs
+(`GGML_AXERA_AUDIO_TWICE=1`).
 
 As a resident service (`llama-server`, chat completions with `input_audio`, the second and third request of each
 audio; the server's timings, the board's load 2 - 11):
@@ -505,6 +512,20 @@ audio; the server's timings, the board's load 2 - 11):
 | Qwen3-ASR-1.7B | 0.6 s | 244 - 245 ms | 256 - 257 ms | 0.51 - 0.52 |
 | | 3.3 s | 284 - 288 ms | 296 - 300 ms | 0.138 |
 | | 60 s | 1.38 - 1.41 s | 1.39 - 1.42 s | 0.053 - 0.054 |
+
+With the projector on the NPU and the prompt's three parts (the text before the audio, the audio, the text after it)
+each one padded prefill chunk instead of 4-row chunks and decode steps (10 requests after 2 warm-ups, the board's load
+17 - 20; client wall time includes the HTTP request):
+
+| Model | Audio | Prompt | Client wall time | before |
+|---|---|---|---|---|
+| Qwen3-ASR-0.6B | 0.6 s | 89 - 104 ms | 150 - 170 ms | 230 - 280 ms |
+| | 3.3 s | 94 - 111 ms | 260 - 280 ms | 370 - 440 ms |
+| Qwen3-ASR-1.7B | 0.6 s | 116 - 130 ms | 200 - 220 ms | 300 - 380 ms |
+| | 3.3 s | 125 - 147 ms | 350 - 380 ms | 480 - 550 ms |
+
+Of the 1.7B's prompt for 0.6 s: the encoder graph 29 ms, the three prefill graphs 59 ms (each 28 layer calls of about
+0.6 ms, near the time to read a layer's weights), the host between them the rest.
 
 The first request after the server starts takes about 0.25 s more (0.32 / 0.50 s for 0.6 s of audio). 20 sentences spoken by
 Qwen3-TTS-1.7B (10 Chinese, 10 English) read back with a CER of 0 / 168 characters and a WER of 0 / 104 words on
