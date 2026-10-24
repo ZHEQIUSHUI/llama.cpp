@@ -439,6 +439,19 @@ void axera_q35_load_group(axera_q35 & m, const std::string & ctx_sfx) {
         }
     }
     if (name.empty()) {
+        if (!(ge && atoi(ge) == 0)) {  // decode then runs layer by layer: say which kernel it looked for
+            static std::once_flag once;
+            const bool lm4 = m.lm_q && m.lm_q->size * 2 == (size_t) (m.lm->ne[0] * m.lm->ne[1]);
+            std::string want = m.ap + "_group" + std::to_string(m.L) + "_";
+            for (int j = 0; j < m.L; ++j) {
+                want += m.layers[j].gdn ? "g" : "a";
+            }
+            want += std::string(axera_mx_sfx()) + (m.lm_q ? (lm4 ? "_lm4" : "_lm8") : "") + ctx_sfx;
+            std::call_once(once, [&] {
+                GGML_LOG_WARN("axera_q35_load_group: no layer group kernel (looked for %s and smaller groups): decode runs layer by layer\n",
+                              want.c_str());
+            });
+        }
         return;
     }
     std::string path = axera_kernels().path(name);
@@ -1172,8 +1185,15 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         // GGML_AXERA_WEIGHTS=mxfp4, else GGML_AXERA_LMHEAD=mxfp4; GGML_AXERA_LMHEAD=mxfp8 keeps MXFP8 (mxfp4m: MXFP8
         // unless asked)
         const char * lh  = std::getenv("GGML_AXERA_LMHEAD");
-        const bool   lm4 = (lh ? strcmp(lh, "mxfp4") == 0 : m.moe || strcmp(axera_mx_sfx(), "_mx4") == 0) &&
-                         axera_kernels().has("mul_mat_mx4_n" + std::to_string(lm->ne[1]) + "_k" + std::to_string(lm->ne[0]));
+        const std::string mx4k = "mul_mat_mx4_n" + std::to_string(lm->ne[1]) + "_k" + std::to_string(lm->ne[0]);
+        const bool        want4 = lh ? strcmp(lh, "mxfp4") == 0 : m.moe || strcmp(axera_mx_sfx(), "_mx4") == 0;
+        const bool        lm4   = want4 && axera_kernels().has(mx4k);
+        if (want4 && !lm4) {
+            static std::once_flag once;  // (a whole-model group of an MXFP4 output head is then not found either)
+            std::call_once(once, [&] {
+                GGML_LOG_WARN("axera_q35_init: the output projection stays MXFP8: no %s in the kernel directory\n", mx4k.c_str());
+            });
+        }
         auto & sh = shared[{ lm, lm4 }];
         m.lm_q    = sh.first.lock();
         m.lm_s    = sh.second.lock();
