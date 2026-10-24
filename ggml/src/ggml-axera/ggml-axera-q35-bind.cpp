@@ -1438,6 +1438,8 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
             }
         };
         m.slots_rem.clear();
+        m.slots_big = {};
+        m.slots_big_rem.clear();
         if (m.ex[1].k && !sn.empty()) {
             auto & sk = m.slots;
             setup(sk, sn);
@@ -1455,6 +1457,22 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
                         setup(m.slots_rem.back(), n);
                         GGML_ASSERT(m.slots_rem.back().tok >= 0 && m.slots_rem.back().G == sk.G &&
                                     m.slots_rem.back().ob == sk.ob);
+                    }
+                }
+                const char * be = std::getenv("GGML_AXERA_SLOTS_BIG");
+                const std::string gb = "_g" + std::to_string(2 * sk.G) + "_px_mxfp4" + (sk.ob ? "_bo" : "");
+                for (int s2 : { 64, 32 }) {
+                    const std::string n = "qwen35moe_slots" + std::to_string(s2) + gb;
+                    if (!m.slots_big.k && !(be && strcmp(be, "0") == 0) && axera_kernels().has(n)) {
+                        setup(m.slots_big, n);
+                        GGML_ASSERT(m.slots_big.tok >= 0 && m.slots_big.G == 2 * sk.G && m.slots_big.ob == sk.ob);
+                    }
+                }
+                for (int s2 = 8; m.slots_big.k && s2 < m.slots_big.S; s2 *= 2) {
+                    const std::string n = "qwen35moe_slots" + std::to_string(s2) + gb;
+                    if (axera_kernels().has(n)) {
+                        m.slots_big_rem.emplace_back();
+                        setup(m.slots_big_rem.back(), n);
                     }
                 }
             }
@@ -1784,8 +1802,10 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
                 m.GTKI = axera_cmm_alloc(tr * Q);
             }
             // TOK / SRW / LOC: cached, written by the host and flushed (run_experts_px)
-            if (m.TOK->size < (size_t) m.comb.R / G * (1 + G) * sizeof(int32_t)) {
-                m.TOK = axera_cmm_alloc((size_t) m.comb.R / G * (1 + G) * sizeof(int32_t));
+            // (with big slots: the two regions' rows within R, each slot's header word, both regions padded)
+            const size_t ntok = (size_t) m.comb.R / G * (1 + G) + (m.slots_big.k ? (size_t) 2 * m.slots_big.S * (1 + 2 * G) : 0);
+            if (m.TOK->size < ntok * sizeof(int32_t)) {
+                m.TOK = axera_cmm_alloc(ntok * sizeof(int32_t));
             }
             m.LOC   = axera_cmm_alloc((size_t) NT * m.top_k * sizeof(int32_t));
             for (int c = 0; c < Q; ++c) {
