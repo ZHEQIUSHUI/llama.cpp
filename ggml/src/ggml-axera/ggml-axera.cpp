@@ -2,6 +2,7 @@
 
 #include "ggml-axera-impl.h"
 
+#include <atomic>
 #include <unordered_map>
 
 static const char * ggml_backend_axera_get_name(ggml_backend_t backend) {
@@ -354,9 +355,25 @@ static bool ggml_backend_axera_pin_host_weights(void) {
     return e == nullptr || strcmp(e, "0") != 0;
 }
 
+// llama.cpp tells each context's sequence count: the largest is kept (a padded prefill chunk needs one sequence)
+static std::atomic<uint32_t> g_axera_n_seq_max{ 0 };
+
+static void ggml_backend_axera_set_n_seq_max(uint32_t n) {
+    uint32_t cur = g_axera_n_seq_max.load();
+    while (n > cur && !g_axera_n_seq_max.compare_exchange_weak(cur, n)) {
+    }
+}
+
+uint32_t axera_n_seq_max() {
+    return g_axera_n_seq_max.load();
+}
+
 static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_pin_host_weights") == 0) {
         return (void *) ggml_backend_axera_pin_host_weights;
+    }
+    if (strcmp(name, "ggml_backend_set_n_seq_max") == 0) {
+        return (void *) ggml_backend_axera_set_n_seq_max;
     }
     return NULL;
     GGML_UNUSED(reg);

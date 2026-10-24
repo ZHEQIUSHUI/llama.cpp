@@ -426,7 +426,9 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
         const char * e = std::getenv("GGML_AXERA_PAD_FILL");
         return e && strcmp(e, "zero") == 0;
     }();
-    const bool pad_chunks = pad_env && !m.hybrid && !m.moe;
+    // only with a single sequence (every llama.cpp context of the process made with n_seq_max 1): the cells after the
+    // batch's then belong to no other sequence
+    const bool pad_chunks = pad_env && !m.hybrid && !m.moe && axera_n_seq_max() == 1;
 
     axera_timer tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
     for (int it = 0; it < T;) {

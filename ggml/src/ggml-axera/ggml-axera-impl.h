@@ -148,6 +148,8 @@ bool axera_audio_graph(const struct ggml_cgraph * cgraph);
 enum ggml_status axera_audio_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph);
 // a tensor the model loader set whole: the audio encoder converts its layer matrices to bf16 now
 void axera_audio_on_set(const ggml_tensor * t);
+// the largest sequence count of any llama.cpp context made in this process (0: none told the backend)
+uint32_t axera_n_seq_max();
 bool axera_llama_graph(const struct ggml_cgraph * cgraph);
 enum ggml_status axera_gen_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph);
 void axera_cpu_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph, int i0, int i1, const char * what);

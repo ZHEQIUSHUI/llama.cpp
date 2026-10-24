@@ -393,6 +393,14 @@ llama_context::llama_context(
     }
 
     LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);
+    // a backend that wants the context's sequence count (its registry's "ggml_backend_set_n_seq_max"; ggml-axera: a
+    // single sequence lets it pad a prompt's tail into the cache cells after the batch)
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        auto * fn = (void (*)(uint32_t)) ggml_backend_reg_get_proc_address(ggml_backend_reg_get(i), "ggml_backend_set_n_seq_max");
+        if (fn) {
+            fn(cparams.n_seq_max);
+        }
+    }
     LLAMA_LOG_INFO("%s: n_ctx                 = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
     LLAMA_LOG_INFO("%s: n_batch               = %u\n",   __func__, cparams.n_batch);
