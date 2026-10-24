@@ -527,6 +527,13 @@ each one padded prefill chunk instead of 4-row chunks and decode steps (10 reque
 Of the 1.7B's prompt for 0.6 s: the encoder graph 29 ms, the three prefill graphs 59 ms (each 28 layer calls of about
 0.6 ms, near the time to read a layer's weights), the host between them the rest.
 
+Run a single-stream service with `-np 1`. Without `-np`, llama-server makes 4 slots in a unified KV cache
+(`n_parallel` auto: 4, `kv_unified`), and the padded prefill chunks are off whenever any context of the process has
+more than one sequence: the cells after a batch could belong to another sequence. A prompt's tail then runs as exact
+4 / 16-row chunks plus single decode steps again, and the numbers above go back to the table before them (the 1.7B's
+prompt for 0.6 s of audio about 250 ms instead of about 120 ms; Qwen3-1.7B, a 14-token chat prompt: 83 ms with `-np 2`,
+28 ms with `-np 1`). The same holds for a Qwen3 text model served by llama-server; llama-tts and the CLIs make one sequence.
+
 The first request after the server starts takes about 0.25 s more (0.32 / 0.50 s for 0.6 s of audio). 20 sentences spoken by
 Qwen3-TTS-1.7B (10 Chinese, 10 English) read back with a CER of 0 / 168 characters and a WER of 0 / 104 words on
 either front-end, but for one homophone of the 0.6B on the NPU front-end (预订 as 预定); 60 s of Chinese speech read
