@@ -37,9 +37,31 @@ static void axera_audio_to_bf16(const ggml_tensor * p, ggml_bf16_t * dst) {
     });
 }
 
-// the bf16 copies of the encoder layers' matrices made while the model loads (axera_audio_on_set), by their data
-static std::mutex                                      g_audio_pre_mu;
-static std::map<const void *, axera_cmm>               g_audio_pre;
+// the bf16 copies of the encoder layers' matrices made while the model loads (axera_audio_on_set), by their data, with
+// a fingerprint of the source bytes they were made from
+struct axera_audio_pre {
+    axera_cmm c;
+    uint64_t  fp = 0;
+};
+static std::mutex                               g_audio_pre_mu;
+static std::map<const void *, axera_audio_pre>  g_audio_pre;
+static std::map<const void *, uint64_t>         g_audio_seen;  // the fingerprint each source was last converted from
+
+// FNV-1a over 64 slices of 256 bytes spread over a tensor's data: the scheduler can ask about a weight before the loader
+// has read it (its buffer then holds whatever an earlier process left in that CMM: another model's data), so a copy is
+// made again when the source no longer matches what it was made from
+static uint64_t axera_audio_fingerprint(const ggml_tensor * t) {
+    const size_t    nb = ggml_nbytes(t), w = std::min<size_t>(256, nb);
+    const uint8_t * p  = (const uint8_t *) t->data;
+    uint64_t        h  = 1469598103934665603ull;
+    for (int i = 0; i < 64; ++i) {
+        const size_t o = nb > w ? (nb - w) * i / 63 : 0;
+        for (size_t j = 0; j < w; ++j) {
+            h = (h ^ p[o + j]) * 1099511628211ull;
+        }
+    }
+    return h;
+}
 
 // a tensor the loader set whole, or a source of an op the scheduler asks about (a mapped model's weights are never set:
 // mtmd's warmup reserves the encoder's graph while loading): an audio encoder layer's matrix (a.blk.<i>.{attn_q,attn_k,attn_v,attn_out,ffn_up,
@@ -49,7 +71,7 @@ void axera_audio_on_set(const ggml_tensor * t) {
     static const char * names[] = { ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_out.weight",
                                     ".ffn_up.weight", ".ffn_down.weight" };
     const bool proj = strncmp(t->name, "mm.a.mlp.", 9) == 0;
-    if ((strncmp(t->name, "a.blk.", 6) != 0 && !proj) || ggml_n_dims(t) != 2 || !ggml_is_contiguous(t) ||
+    if (t->data == nullptr || t->buffer == nullptr || (strncmp(t->name, "a.blk.", 6) != 0 && !proj) || ggml_n_dims(t) != 2 || !ggml_is_contiguous(t) ||
         (t->type != GGML_TYPE_F32 && !ggml_get_type_traits(t->type)->to_float)) {
         return;
     }
@@ -62,12 +84,14 @@ void axera_audio_on_set(const ggml_tensor * t) {
     if (!m) {
         return;
     }
+    const uint64_t fp = axera_audio_fingerprint(t);
     {
-        static std::set<const void *> seen;  // (a weight converted once, whichever hook sees it first)
-        std::lock_guard<std::mutex>   lock(g_audio_pre_mu);
-        if (!seen.insert(t->data).second) {
+        std::lock_guard<std::mutex> lock(g_audio_pre_mu);  // (converted again only if the source changed since)
+        auto                        it = g_audio_seen.find(t->data);
+        if (it != g_audio_seen.end() && it->second == fp) {
             return;
         }
+        g_audio_seen[t->data] = fp;
     }
     static std::once_flag kernels;  // the encoder's kernels loaded with the model too (the first one seen)
     std::call_once(kernels, [] {
@@ -89,18 +113,27 @@ void axera_audio_on_set(const ggml_tensor * t) {
     axera_audio_to_bf16(t, (ggml_bf16_t *) c->vir);
     c->flush(c->vir, c->size);
     std::lock_guard<std::mutex> lock(g_audio_pre_mu);
-    g_audio_pre[t->data] = std::move(c);
+    g_audio_pre[t->data] = { std::move(c), fp };
 }
 
 // the load-time bf16 copy of p, taken out of the registry (nullptr if there is none)
 static axera_cmm axera_audio_take_pre(const ggml_tensor * p) {
     std::lock_guard<std::mutex> lock(g_audio_pre_mu);
     auto                        it = g_audio_pre.find(p->data);
-    if (it == g_audio_pre.end() || it->second->size != (size_t) ggml_nelements(p) * sizeof(ggml_bf16_t)) {
+    if (it == g_audio_pre.end() || it->second.c->size != (size_t) ggml_nelements(p) * sizeof(ggml_bf16_t)) {
         return axera_cmm();
     }
-    axera_cmm c = std::move(it->second);
+    axera_cmm c  = std::move(it->second.c);
+    const bool ok = it->second.fp == axera_audio_fingerprint(p);
     g_audio_pre.erase(it);
+    if (!ok) {  // made from bytes the loader has overwritten since: made again by the caller
+        if (g_axera_prof.on) {
+            std::lock_guard<std::mutex> lp(g_axera_prof.mu);
+            g_axera_prof.t["audio copies made again (count)"].second++;
+        }
+        GGML_LOG_WARN("%s: the load-time copy of %s was made before its data was loaded, converting it again\n", __func__, p->name);
+        return axera_cmm();
+    }
     return c;
 }
 
