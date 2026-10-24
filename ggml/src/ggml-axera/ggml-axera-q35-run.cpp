@@ -2,6 +2,8 @@
 
 #include "ggml-axera-q35.h"
 
+#include <future>
+
 // DEPRECATED: the split attention path (flash decoding) is kept only for the models not yet on the fused four-core
 // kernels (the Qwen3 family, Qwen3-ASR, Qwen3-TTS, Qwen3.5-0.8B); remove it with their migration. Qwen3.5 2B / 9B / 27B
 // and the 35B run fused at every context their kernel directories hold, and stop beyond it
@@ -430,18 +432,13 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
     // batch's then belong to no other sequence
     const bool pad_chunks = pad_env && !m.hybrid && !m.moe && axera_n_seq_max() == 1;
 
-    axera_timer tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
-    for (int it = 0; it < T;) {
+    // the chunk that runs from token it: v (prefill chunk, -1: a decode step), pad_n (the real tokens of a padded chunk),
+    // ng (a MoE group's chunks); a function of the batch only, so the next chunk's is known while this one runs
+    struct chunk_pick {
+        int v, pad_n, ng;
+    };
+    auto choose = [&](int it) {
         const int64_t p = pos[it];
-        if (s0) {
-            axera_q35_set_row(m, row_of(it));
-        }
-        if (m.kv_llama && !m.flash) {
-            axera_q35_set_stream(m, kv.stream_of(it));
-        }
-        if (!begin(p)) {
-            return GGML_STATUS_FAILED;
-        }
         int v = -1;  // the largest prefill chunk that fits the remaining consecutive positions
         auto chunk_fits = [&](size_t c) {
             const int P  = m.pre[c].P;
@@ -524,28 +521,63 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             }
             ng = n;
         }
+        return chunk_pick{ v, pad_n, ng };
+    };
+
+    // GGML_AXERA_PREP_AHEAD=0: each prefill chunk's inputs prepared only when it runs
+    static const bool prep_ahead = [] {
+        const char * e = std::getenv("GGML_AXERA_PREP_AHEAD");
+        return e == nullptr || strcmp(e, "0") != 0;
+    }();
+    struct chunk_stage {  // a prefill chunk's inputs prepared ahead: from token it, chunk v, n real tokens
+        int                      it = -1, v = -1, n = 0, nblk = 0;
+        std::vector<ggml_bf16_t> x, cs, sn, mask;
+    } next_st;
+
+    axera_timer tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
+    for (int it = 0; it < T;) {
+        const int64_t p = pos[it];
+        if (s0) {
+            axera_q35_set_row(m, row_of(it));
+        }
+        if (m.kv_llama && !m.flash) {
+            axera_q35_set_stream(m, kv.stream_of(it));
+        }
+        if (!begin(p)) {
+            return GGML_STATUS_FAILED;
+        }
+        const chunk_pick pk = choose(it);
+        int              v  = pk.v;
+        const int        pad_n = pk.pad_n, ng = pk.ng;
         // a fused attention chunk's inputs: its mask, the cell to write and the KV blocks (pf's own for the copies in a
         // MoE group, else the decode IO's)
         // n: the chunk's real tokens (a padded chunk: fewer than P; its padding rows take the last real one's mask)
-        auto fused_inputs = [&](axera_q35::prefill & pf, int it, int64_t p, bool split, int n) {
-            const int P = pf.P;
-            int nblk = (int) ((p + P - 1) / m.BC + 1);
-            // chunk mask [N / BC][R][BC], row r = token r % P (of head r / P in older kernels): positions up to
-            // p + token, or with the llama.cpp KV cache that token's KQ mask row over the cells
+        // the chunk mask [N / BC][R][BC] into mask (pf.MASK's or a staging copy), row r = token r % P (of head r / P in
+        // older kernels): positions up to p + token, or with the llama.cpp KV cache that token's KQ mask row over the
+        // cells; returns the blocks it holds. pool: on the host pool (not while another thread uses it)
+        auto chunk_mask = [&](const axera_q35::prefill & pf, int it, int64_t p, int n, ggml_bf16_t * mask, bool pool) {
+            const int P    = pf.P;
+            int       nblk = (int) ((p + P - 1) / m.BC + 1);
             const int64_t R    = pf.R;
-            auto *        mask = pf.MASK ? (ggml_bf16_t *) pf.MASK->vir : nullptr;  // none with split attention
             const ggml_bf16_t zero = ggml_fp32_to_bf16(0.0f), ninf = ggml_fp32_to_bf16(-3e38f);
-            if (split) {
-                // the segments' masks: flash_prepare
-            } else if (m.kv_llama) {
-                axera_timer tm("mask (cpu)");
+            auto par = [pool](int64_t k, const std::function<void(int64_t)> & fn) {
+                if (pool) {
+                    axera_host_pool().run(k, fn);
+                } else {
+                    for (int64_t i = 0; i < k; ++i) {
+                        fn(i);
+                    }
+                }
+            };
+            if (m.kv_llama) {
+                axera_timer tm(pool ? "mask (cpu)" : "mask (cpu, ahead)");
                 std::vector<ggml_bf16_t> rows((size_t) P * kv.W);
                 std::vector<int>         nb(P, 1);
-                axera_host_pool().run(P, [&](int64_t r) {
+                par(P, [&](int64_t r) {
                     nb[r] = kv.mask_row(it + std::min((int) r, n - 1), rows.data() + (size_t) r * kv.W);
                 });
                 nblk = *std::max_element(nb.begin(), nb.end());
-                axera_host_pool().run(nblk, [&](int64_t blk) {
+                par(nblk, [&](int64_t blk) {
                     for (int64_t r = 0; r < R; ++r) {
                         memcpy(mask + (blk * R + r) * m.BC, rows.data() + (size_t) (r % P) * kv.W + blk * m.BC,
                                m.BC * sizeof(ggml_bf16_t));
@@ -562,6 +594,45 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
                     }
                 }
             }
+            return nblk;
+        };
+        // a prefill chunk's inputs into x / cs / sn / mask (pf's buffers, or staging copies): its rows (padding rows: the
+        // last real one's, or zeros), rotary rows (padding rows: the last real token's), the chunk mask unless split;
+        // returns the mask's blocks
+        auto chunk_prep = [&](const axera_q35::prefill & pf, int it, int64_t p, int n, bool split, ggml_bf16_t * x,
+                              ggml_bf16_t * cs, ggml_bf16_t * sn, ggml_bf16_t * mask, bool pool) {
+            const int P   = pf.P;
+            auto      row = [&](int64_t r) {  // 0.5M elements for 9B P = 128: ~1 ms on one core
+                auto * dst = x + (size_t) r * H;
+                if (r >= n && pad_zero) {
+                    memset(dst, 0, H * sizeof(ggml_bf16_t));
+                } else {
+                    ggml_fp32_to_bf16_row(x0_row(it + std::min((int) r, n - 1)), dst, H);
+                }
+            };
+            if (pool) {
+                axera_host_pool().run(P, row);
+            } else {
+                for (int64_t r = 0; r < P; ++r) {
+                    row(r);
+                }
+            }
+            rope.rows_to(it, n, cs, sn);
+            for (auto * r0 : { cs, sn }) {  // the padding rows' rotary rows: the last real token's
+                for (int r = n; r < P; ++r) {
+                    if (pad_zero) {
+                        memset(r0 + (size_t) r * (m.ROT / 2), 0, (m.ROT / 2) * sizeof(ggml_bf16_t));
+                    } else {
+                        memcpy(r0 + (size_t) r * (m.ROT / 2), r0 + (size_t) (n - 1) * (m.ROT / 2), (m.ROT / 2) * sizeof(ggml_bf16_t));
+                    }
+                }
+            }
+            return split ? 0 : chunk_mask(pf, it, p, n, mask, pool);
+        };
+        // a fused attention chunk's inputs (the chunk mask computed: nblk blocks of it in pf.MASK), else split
+        auto chunk_inputs = [&](axera_q35::prefill & pf, int it, int64_t p, bool split, int n, int nblk) {
+            const int64_t     R    = pf.R;
+            const ggml_bf16_t zero = ggml_fp32_to_bf16(0.0f);
             if (!split) {
                 auto & pos_b = pf.CPOS ? pf.CPOS : m.POS;
                 auto & nblk_b = pf.CNBLK ? pf.CNBLK : m.NBLK;
@@ -577,6 +648,10 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
                 pos_b->flush(pos_b->vir, pos_b->size);
                 nblk_b->flush(nblk_b->vir, nblk_b->size);
             }
+        };
+        auto fused_inputs = [&](axera_q35::prefill & pf, int it, int64_t p, bool split, int n) {
+            const int nblk = split ? 0 : chunk_mask(pf, it, p, n, (ggml_bf16_t *) pf.MASK->vir, true);
+            chunk_inputs(pf, it, p, split, n, nblk);
         };
         if (ng > 1) {
             const int        P = m.pre[v].P;
@@ -625,34 +700,52 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
                     pf.POS->flush(pf.POS->vir, pf.POS->size);
                 }
             }
-            axera_host_pool().run(P, [&](int64_t r) {  // 0.5M elements for 9B P = 128: ~1 ms on one core
-                auto * dst = (ggml_bf16_t *) pf.A->vir + (size_t) r * H;
-                if (r >= n && pad_zero) {
-                    memset(dst, 0, H * sizeof(ggml_bf16_t));
-                } else {
-                    ggml_fp32_to_bf16_row(x0_row(it + std::min((int) r, n - 1)), dst, H);
-                }
-            });
-            pf.A->flush(pf.A->vir, (size_t) P * H * sizeof(ggml_bf16_t));
-            rope.rows(it, n, pf.COS.get(), pf.SIN.get());
-            if (n < P) {  // the padding rows' rotary rows: the last real token's
-                for (auto * cs : { pf.COS.get(), pf.SIN.get() }) {
-                    auto * r0 = (ggml_bf16_t *) cs->vir;
-                    for (int r = n; r < P; ++r) {
-                        if (pad_zero) {
-                            memset(r0 + (size_t) r * (m.ROT / 2), 0, (m.ROT / 2) * sizeof(ggml_bf16_t));
-                        } else {
-                            memcpy(r0 + (size_t) r * (m.ROT / 2), r0 + (size_t) (n - 1) * (m.ROT / 2), (m.ROT / 2) * sizeof(ggml_bf16_t));
-                        }
-                    }
-                    cs->flush(cs->vir, cs->size);
-                }
+            // this chunk's inputs: prepared while the previous chunk ran (copied in), else now
+            const bool staged = next_st.it == it && next_st.v == v && next_st.n == n;
+            int        nblk   = 0;
+            if (staged) {
+                axera_timer tc("prefill inputs (copy in)");
+                memcpy(pf.A->vir, next_st.x.data(), next_st.x.size() * sizeof(ggml_bf16_t));
+                memcpy(pf.COS->vir, next_st.cs.data(), next_st.cs.size() * sizeof(ggml_bf16_t));
+                memcpy(pf.SIN->vir, next_st.sn.data(), next_st.sn.size() * sizeof(ggml_bf16_t));
+                nblk = next_st.nblk;
+                memcpy(pf.MASK->vir, next_st.mask.data(), (size_t) nblk * pf.R * m.BC * sizeof(ggml_bf16_t));
+            } else {
+                axera_timer tc("prefill inputs");
+                nblk = chunk_prep(pf, it, p, n, split, (ggml_bf16_t *) pf.A->vir, (ggml_bf16_t *) pf.COS->vir,
+                                  (ggml_bf16_t *) pf.SIN->vir, split ? nullptr : (ggml_bf16_t *) pf.MASK->vir, true);
             }
+            next_st.it = -1;
+            pf.A->flush(pf.A->vir, (size_t) P * H * sizeof(ggml_bf16_t));
+            pf.COS->flush(pf.COS->vir, pf.COS->size);
+            pf.SIN->flush(pf.SIN->vir, pf.SIN->size);
             if (split) {
                 const int key = axera_q35_fd_key(m, v);
                 axera_flash_prepare(kv, m.fd.at(key), key % 1000, it);
             }
-            fused_inputs(pf, it, p, split, n);
+            chunk_inputs(pf, it, p, split, n, nblk);
+            // the next chunk's inputs on another thread while the NPU runs this one (no host pool there: this thread
+            // converts the outputs on it); a plain chunk only (not batched decode rows, not split attention)
+            std::future<void> ahead;
+            if (prep_ahead && it + n < T) {
+                const int        it2 = it + n;
+                const chunk_pick q   = choose(it2);
+                if (q.v >= 0 && q.ng == 1 && !m.pre[q.v].batch && !b.pre_split(q.v)) {
+                    const axera_q35::prefill & p2 = m.pre[q.v];
+                    next_st.it = it2;
+                    next_st.v  = q.v;
+                    next_st.n  = q.pad_n > 0 ? q.pad_n : p2.P;
+                    next_st.x.resize((size_t) p2.P * H);
+                    next_st.cs.resize((size_t) p2.P * (m.ROT / 2));
+                    next_st.sn.resize((size_t) p2.P * (m.ROT / 2));
+                    next_st.mask.resize(p2.MASK->size / sizeof(ggml_bf16_t));
+                    ahead = std::async(std::launch::async, [&, it2, q] {
+                        axera_timer ta("prefill inputs (ahead)");
+                        next_st.nblk = chunk_prep(m.pre[q.v], it2, pos[it2], next_st.n, false, next_st.x.data(),
+                                                  next_st.cs.data(), next_st.sn.data(), next_st.mask.data(), false);
+                    });
+                }
+            }
             // speculative decoding: a verification batch (all T <= snapshot count tokens in this chunk) also writes the
             // recurrent-state snapshots; without the snapshot kernel a rollback would restore wrong states
             b.rs_now = rs_written > 1 && it == 0 && P == T && rs_written == T && pf.gdn_rs != nullptr;
@@ -668,6 +761,10 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             axera_host_pool().run(n, [&](int64_t r) {
                 ggml_bf16_to_fp32_row((const ggml_bf16_t *) fin->vir + (size_t) r * H, h.data() + (size_t) (it + r) * H, H);
             });
+            if (ahead.valid()) {
+                axera_timer tw("prefill inputs (ahead wait)");
+                ahead.get();
+            }
             m.next_pos = p + n;
             it += n;
             continue;

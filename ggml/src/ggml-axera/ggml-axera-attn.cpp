@@ -289,8 +289,12 @@ axera_rope::axera_rope(const ggml_tensor * inp_pos, int T, int ROT, float freq_s
 }
 
 void axera_rope::rows(int t0, int n, ggml_backend_axera_buffer_context * cb, ggml_backend_axera_buffer_context * sb) const {
-    auto * c = (ggml_bf16_t *) cb->vir;  // rows: the positions of tokens t0 .. t0 + n - 1
-    auto * s = (ggml_bf16_t *) sb->vir;
+    rows_to(t0, n, (ggml_bf16_t *) cb->vir, (ggml_bf16_t *) sb->vir);
+    cb->flush(cb->vir, cb->size);
+    sb->flush(sb->vir, sb->size);
+}
+
+void axera_rope::rows_to(int t0, int n, ggml_bf16_t * c, ggml_bf16_t * s) const {  // the positions of tokens t0 .. t0 + n - 1
     for (int r = 0; r < n; ++r) {
         for (int i = 0; i < ROT / 2; ++i) {
             const int32_t p        = pos[(mrope ? sect[i] * T : 0) + t0 + r];
@@ -299,6 +303,4 @@ void axera_rope::rows(int t0, int n, ggml_backend_axera_buffer_context * cb, ggm
             s[r * (ROT / 2) + i]   = ggml_fp32_to_bf16(std::sin(a));
         }
     }
-    cb->flush(cb->vir, cb->size);
-    sb->flush(sb->vir, sb->size);
 }

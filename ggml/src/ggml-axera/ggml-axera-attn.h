@@ -88,4 +88,5 @@ struct axera_rope {
     axera_rope(const ggml_tensor * inp_pos, int T, int ROT, float freq_scale, const std::vector<float> & inv_freq,
                int mode, const int sections[4]);
     void rows(int t0, int n, ggml_backend_axera_buffer_context * cb, ggml_backend_axera_buffer_context * sb) const;
+    void rows_to(int t0, int n, ggml_bf16_t * c, ggml_bf16_t * s) const;  // the same rows into host memory
 };
