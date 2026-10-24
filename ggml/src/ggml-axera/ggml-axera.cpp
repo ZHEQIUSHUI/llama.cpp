@@ -257,7 +257,8 @@ static bool axera_pooling_op(const ggml_tensor * op) {
 }
 
 static bool ggml_backend_axera_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    if (op->op == GGML_OP_MUL_MAT && op->src[0] && strncmp(op->src[0]->name, "a.blk.", 6) == 0) {
+    if (op->op == GGML_OP_MUL_MAT && op->src[0] &&
+        (strncmp(op->src[0]->name, "a.blk.", 6) == 0 || strncmp(op->src[0]->name, "mm.a.mlp.", 9) == 0)) {
         axera_audio_on_set(op->src[0]);  // (the audio encoders matrices to bf16 while mtmds warmup reserves its graph)
     }
     if (axera_template_qwen35()) {

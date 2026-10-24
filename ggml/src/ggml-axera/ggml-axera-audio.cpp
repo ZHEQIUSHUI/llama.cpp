@@ -43,16 +43,18 @@ static std::map<const void *, axera_cmm>               g_audio_pre;
 
 // a tensor the loader set whole, or a source of an op the scheduler asks about (a mapped model's weights are never set:
 // mtmd's warmup reserves the encoder's graph while loading): an audio encoder layer's matrix (a.blk.<i>.{attn_q,attn_k,attn_v,attn_out,ffn_up,
-// ffn_down}.weight) converted to bf16 now, so that the first request does not wait for it
+// ffn_down}.weight) or a projector matrix (mm.a.mlp.<i>.weight) converted to bf16 now, so that the first request does not
+// wait for it
 void axera_audio_on_set(const ggml_tensor * t) {
     static const char * names[] = { ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_out.weight",
                                     ".ffn_up.weight", ".ffn_down.weight" };
-    if (strncmp(t->name, "a.blk.", 6) != 0 || ggml_n_dims(t) != 2 || !ggml_is_contiguous(t) ||
+    const bool proj = strncmp(t->name, "mm.a.mlp.", 9) == 0;
+    if ((strncmp(t->name, "a.blk.", 6) != 0 && !proj) || ggml_n_dims(t) != 2 || !ggml_is_contiguous(t) ||
         (t->type != GGML_TYPE_F32 && !ggml_get_type_traits(t->type)->to_float)) {
         return;
     }
     const size_t n = strlen(t->name);
-    bool         m = false;
+    bool         m = proj && n > 7 && strcmp(t->name + n - 7, ".weight") == 0;
     for (const char * s : names) {
         const size_t k = strlen(s);
         m = m || (n > k && strcmp(t->name + n - k, s) == 0);
@@ -73,7 +75,7 @@ void axera_audio_on_set(const ggml_tensor * t) {
         std::vector<std::string> names;
         for (const auto & f : axera_kernels().files) {
             const std::string & n = f.first;
-            if (n.rfind("qwen3a_fe", 0) == 0 || n.rfind("qwen3a_layer", 0) == 0 ||
+            if (n.rfind("qwen3a_fe", 0) == 0 || n.rfind("qwen3a_layer", 0) == 0 || n.rfind("qwen3a_proj", 0) == 0 ||
                 (n.rfind("mm_bf16_m", 0) == 0 && n.size() > 6 && n.compare(n.size() - 6, 6, "_k7680") == 0)) {
                 names.push_back(n);
             }
@@ -703,10 +705,73 @@ enum ggml_status axera_audio_compute(ggml_backend_axera_context * ctx, struct gg
         if (twice) {
             GGML_LOG_INFO("axera audio: %d layer calls run twice, %d differed\n", n_twice, n_diff);
         }
-        (*LX[cur])->invalidate((*LX[cur])->vir, xb);
-        ggml_bf16_to_fp32_row((const ggml_bf16_t *) (*LX[cur])->vir, (float *) xl->data, (int64_t) n * H);
-        axera_cpu_compute(ctx, cgraph, post_norm, cgraph->n_nodes, "audio projector (cpu)");
-        ggml_tensor * out = cgraph->nodes[cgraph->n_nodes - 1];
+        // the post norm and the projector on the four-core qwen3a_proj<NF>_h<H> kernel (q3a_proj.py) from the last
+        // layer's rows on chip, its f32 rows [n][O] the graph's output; else (GGML_AXERA_AUDIO_PROJ=0, or no kernel)
+        // on the CPU
+        static const bool proj_env = [] {
+            const char * e = std::getenv("GGML_AXERA_AUDIO_PROJ");
+            return e == nullptr || strcmp(e, "0") != 0;
+        }();
+        ggml_tensor *     out = cgraph->nodes[cgraph->n_nodes - 1];
+        const std::string pn  = "qwen3a_proj" + std::to_string(NF) + "_h" + std::to_string(H);
+        const bool        npu_proj = proj_env && t.count("mm.a.mlp.1.weight") && t.count("mm.a.mlp.2.weight") &&
+                              out->type == GGML_TYPE_F32 && ggml_is_contiguous(out) && out->ne[1] == n &&
+                              std::ifstream(axera_kernels().path(pn)).good();
+        static bool told = false;
+        if (!npu_proj && proj_env && !told) {
+            told = true;
+            GGML_LOG_WARN("axera audio: the projector on the CPU (mm.1 %d, mm.2 %d, out %s [%lld, %lld] contiguous %d, n %d, %s %s)\n",
+                          (int) t.count("mm.a.mlp.1.weight"), (int) t.count("mm.a.mlp.2.weight"), ggml_type_name(out->type),
+                          (long long) out->ne[0], (long long) out->ne[1], (int) ggml_is_contiguous(out), n, pn.c_str(),
+                          std::ifstream(axera_kernels().path(pn)).good() ? "found" : "missing");
+        }
+        if (npu_proj) {
+            ggml_axera_kernel * kp = axera_kernels().get(pn);
+            const size_t        ob = (size_t) NF * out->ne[0] * sizeof(float);
+            GGML_ASSERT(kp->info->pOutputs[kp->output("out")].nSize == ob);
+            auto wt = [&](const std::string & key) -> AX_ENGINE_IO_BUFFER_T {  // a bf16 copy, once per model
+                axera_cmm & c = a.w[key];
+                if (!c) {
+                    const ggml_tensor * p = get(key);
+                    c = axera_audio_take_pre(p);
+                    if (!c) {
+                        c = axera_cmm_alloc(ggml_nelements(p) * sizeof(ggml_bf16_t));
+                        axera_audio_to_bf16(p, (ggml_bf16_t *) c->vir);
+                    }
+                    c->flush(c->vir, c->size);
+                }
+                return axera_io(c.get(), c->vir, (uint32_t) c->size);
+            };
+            axera_cmm & PO = a.fe_io["pout"];
+            if (!PO || PO->size < ob) {
+                PO = axera_cmm_alloc(ob);
+            }
+            io_map m = { { "x", cm_io(*LX[cur]) }, { "ln_w", wt("a.post_ln.weight") }, { "ln_b", wt("a.post_ln.bias") },
+                         { "w1", wt("mm.a.mlp.1.weight") }, { "b1", wt("mm.a.mlp.1.bias") },
+                         { "w2", wt("mm.a.mlp.2.weight") }, { "b2", wt("mm.a.mlp.2.bias") }, { "out", cm_io(PO) } };
+            run(kp, m, "audio projector (npu)");
+            const size_t rb = (size_t) n * out->ne[0] * sizeof(float);
+            PO->invalidate(PO->vir, rb);
+            if (twice) {
+                axera_cmm & S = a.fe_io["pout2"];
+                if (!S || S->size < ob) {
+                    S = axera_cmm_alloc(ob);
+                }
+                memset(S->vir, 0xff, ob);  // (f32 NaN)
+                S->flush(S->vir, ob);
+                m["out"] = cm_io(S);
+                run(kp, m, "audio projector, again (npu)");
+                S->invalidate(S->vir, rb);
+                if (memcmp(S->vir, PO->vir, rb) != 0) {
+                    GGML_LOG_WARN("axera audio: the projector gave different outputs on two runs\n");
+                }
+            }
+            memcpy(out->data, PO->vir, rb);
+        } else {
+            (*LX[cur])->invalidate((*LX[cur])->vir, xb);
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) (*LX[cur])->vir, (float *) xl->data, (int64_t) n * H);
+            axera_cpu_compute(ctx, cgraph, post_norm, cgraph->n_nodes, "audio projector (cpu)");
+        }
         if (ggml_backend_buffer_is_axera(out->buffer)) {
             ((ggml_backend_axera_buffer_context *) out->buffer->context)->flush(out->data, ggml_nbytes(out));
         }
