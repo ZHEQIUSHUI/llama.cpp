@@ -485,7 +485,8 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
     }();
     // only with a single sequence (every llama.cpp context of the process made with n_seq_max 1): the cells after the
     // batch's then belong to no other sequence
-    const bool pad_chunks = pad_env && !m.hybrid && !m.moe && axera_n_seq_max() == 1;
+    // (a hybrid model: with the GDN kernels that take a valid-row count, prefill::pv)
+    const bool pad_chunks = pad_env && (!m.hybrid || m.pad_gdn) && !m.moe && axera_n_seq_max() == 1;
 
     axera_timer tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
     for (int it = 0; it < T;) {
@@ -512,10 +513,12 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             return ok && (!m.kv_llama || kv.cell_of(it) + P <= m.N);
         };
         // fewer consecutive tokens left than the largest chunk holds (a prompt's tail, or a short prompt): a pure
-        // attention model (no recurrent state a padding row would advance) runs them as one chunk of the smallest
-        // size that holds them, padded with copies of the last row. The padding rows' K / V go to the cells after the
-        // batch's: cells no token sees (the last token's KQ mask hides them, or they lie past the mask) and the next
-        // tokens overwrite before any reads them; else, or past the cache, the chunks that fit exactly as before
+        // attention model (no recurrent state a padding row would advance), or a hybrid one whose GDN kernels take
+        // the valid-row count (the padding rows leave the recurrent and conv state alone), runs them as one chunk of
+        // the smallest size that holds them, padded with copies of the last row. The padding rows' K / V go to the
+        // cells after the batch's: cells no token sees (the last token's KQ mask hides them, or they lie past the
+        // mask) and the next tokens overwrite before any reads them; else, or past the cache, the chunks that fit
+        // exactly as before
         int pad_n = 0;  // the real tokens of a padded chunk
         if (pad_chunks) {
             int run = 1;  // consecutive tokens from it (cells or positions), within its sequence
@@ -527,7 +530,8 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             int best = -1;  // the smallest chunk that holds run, if run is below the largest one (chunks largest first)
             for (size_t c = 0; c < m.pre.size(); ++c) {
                 const int P = m.pre[c].P;
-                if (P <= 1 || m.pre[c].batch || m.pre[c].sub || m.pre[c].group.size() > 1 || b.pre_split((int) c)) {
+                if (P <= 1 || m.pre[c].batch || m.pre[c].sub || m.pre[c].group.size() > 1 || b.pre_split((int) c) ||
+                    (m.hybrid && !m.pre[c].pv)) {  // (a hybrid model: only the GDN kernels with a valid-row count)
                     continue;
                 }
                 if (P < run) {
@@ -693,6 +697,18 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
                 }
             });
             pf.A->flush(pf.A->vir, (size_t) P * H * sizeof(ggml_bf16_t));
+            if (pf.pv) {  // the GDN kernels' valid rows: n tokens, and the conv input rows after the last one
+                auto * rv  = (float *) pf.RV->vir;
+                auto * cix = (int32_t *) pf.CIX->vir;
+                for (int r = 0; r < P; ++r) {
+                    rv[r] = r < n ? 1.0f : 0.0f;
+                }
+                for (int j = 0; j < pf.cix_n; ++j) {
+                    cix[j] = n + j;
+                }
+                pf.RV->flush(pf.RV->vir, (size_t) P * sizeof(float));
+                pf.CIX->flush(pf.CIX->vir, (size_t) pf.cix_n * sizeof(int32_t));
+            }
             rope.rows(it, n, pf.COS.get(), pf.SIN.get());
             if (n < P) {  // the padding rows' rotary rows: the last real token's
                 for (auto * cs : { pf.COS.get(), pf.SIN.get() }) {

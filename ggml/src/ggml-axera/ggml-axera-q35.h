@@ -81,6 +81,7 @@ struct axera_q35 {
     // Qwen3.5 (gated delta net layers between gated attention layers: qwen35_* kernels) or a Qwen3 transformer
     // (attention layers only, no output gate: qwen3_* kernels; also the text model of Qwen3-VL / Qwen3-ASR)
     bool                  hybrid = true;
+    bool                  pad_gdn = false;  // some GDN prefill chunk kernels take a valid-row count (prefill::pv)
     std::string           ap     = "qwen35";  // kernel name prefix of the attention / dense layers
     int64_t               N = 0;  // KV cells in use: the llama.cpp cache size (<= LMAX), else LMAX
     double                THETA = 0;
@@ -146,6 +147,12 @@ struct axera_q35 {
         // speculative decoding (llama.cpp n_rs_seq > 0): the GDN kernel that also writes the recurrent state after
         // each of the P tokens (qwen35_gdn_prefill<P>[_mx8]_rs) into the cache's snapshot planes
         ggml_axera_kernel * gdn_rs = nullptr;
+        // GDN kernels with a valid-row count (qwen35_gdn_prefill<P><fmt>_pv): inputs rv (f32 [P], 1 for a token's
+        // row, 0 for padding) and cix (int32 [conv - 1]: the conv input rows after the last token), so a hybrid model's
+        // chunk can hold fewer tokens than P (the padding rows leave the recurrent and conv state as they are)
+        bool                pv = false;
+        axera_cmm           RV, CIX;
+        int                 cix_n = 0;  // cix entries (the CMM buffers may be larger)
         // MoE: chunks of a group run layer by layer, the routed experts once per layer for the whole group (each
         // expert's weights read once for more tokens). sub > 0: a copy of the group's first chunk (own buffers and
         // split attention state m.fd[fdk]), never picked alone; group: the chunks of the group, this one first

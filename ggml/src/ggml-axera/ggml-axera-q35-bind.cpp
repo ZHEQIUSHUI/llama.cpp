@@ -701,6 +701,12 @@ void axera_q35_bind_prefill(axera_q35 & m, int il, size_t v, const std::map<std:
             io.in[i] = axera_io(b, b->vir, size);
             continue;
         }
+        if (n == "rv" || n == "cix") {
+            auto * b = (n == "rv" ? pf.RV : pf.CIX).get();
+            GGML_ASSERT(b && b->size >= size);
+            io.in[i] = axera_io(b, b->vir, size);
+            continue;
+        }
         if (n == "x" || n == "mask" || n == "cos" || n == "sin" || (pf.batch && n == "pos")) {
             auto * b  = n == "x" ? xin : n == "mask" ? pf.MASK.get() : n == "cos" ? pf.COS.get() : n == "sin" ? pf.SIN.get() :
                                                                                                     pf.POS.get();
@@ -1657,13 +1663,27 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         }
         axera_q35::prefill pf;
         pf.P    = P;
-        pf.gdn  = m.hybrid ? axera_kernels().get("qwen35_gdn_prefill" + sfx) : nullptr;
+        // the valid-row count variant when the directory has it (GGML_AXERA_PAD_CHUNK=0: not)
+        const char *      pe  = std::getenv("GGML_AXERA_PAD_CHUNK");
+        const std::string gpv = "qwen35_gdn_prefill" + sfx + "_pv";
+        pf.pv   = m.hybrid && !(pe && strcmp(pe, "0") == 0) && std::ifstream(axera_kernels().path(gpv)).good();
+        const std::string gn  = pf.pv ? gpv : "qwen35_gdn_prefill" + sfx;
+        pf.gdn  = m.hybrid ? axera_kernels().get(gn) : nullptr;
         if (pf.gdn && std::ifstream(axera_kernels().path("qwen35_gdn_prefill" + sfx + "_rs")).good()) {
             pf.gdn_rs = axera_kernels().get("qwen35_gdn_prefill" + sfx + "_rs");
         }
+        if (pf.pv) {
+            pf.RV  = axera_cmm_alloc(size_of(pf.gdn, "rv"));
+            pf.CIX = axera_cmm_alloc(size_of(pf.gdn, "cix"));
+            pf.cix_n = (int) (size_of(pf.gdn, "cix") / sizeof(int32_t));
+            if (size_of(pf.gdn, "rv") != (size_t) P * sizeof(float) || pf.cix_n < 1) {
+                GGML_ABORT("qwen35 template: %s: rv %u bytes (want %d), cix %u bytes\n", gn.c_str(),
+                           (unsigned) size_of(pf.gdn, "rv"), (int) (P * sizeof(float)), (unsigned) size_of(pf.gdn, "cix"));
+            }
+        }
         pf.attn = !m.flash ? axera_kernels().get(m.ap + "_attn_prefill" + asfx) : nullptr;
         if (pre_mx) {  // packed variants (axera_q35_load_packed)
-            axera_q35_load_packed(pf.gdn_pk, pf.gdn ? "qwen35_gdn_prefill" + sfx + "_pk" : "", pf.gdn);
+            axera_q35_load_packed(pf.gdn_pk, pf.gdn ? gn + "_pk" : "", pf.gdn);
             axera_q35_load_packed(pf.attn_pk, pf.attn ? m.ap + "_attn_prefill" + sfx + "_pk" + m.ctx_sfx : "", pf.attn);
         }
         GGML_ASSERT(!pf.gdn || size_of(pf.gdn, "x") == (uint32_t) P * H * sizeof(ggml_bf16_t));
@@ -1679,6 +1699,11 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         pf.COS  = axera_cmm_alloc(size_of(rk, "cos"));
         pf.SIN  = axera_cmm_alloc(size_of(rk, "sin"));
         m.pre.push_back(std::move(pf));
+    }
+    // padded chunks of a hybrid model: through the GDN prefill chunk kernels that take the valid-row count
+    m.pad_gdn = false;
+    for (const auto & pf : m.pre) {
+        m.pad_gdn = m.pad_gdn || (pf.gdn && pf.pv);
     }
     // batched decode kernels (P = B tokens of B sequences, largest first): with the recurrent state and the KV cache
     // in the llama.cpp memory. In the decode weight format (_mx8); bf16 kernels next to MXFP8 decode kernels use the
