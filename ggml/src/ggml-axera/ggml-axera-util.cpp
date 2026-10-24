@@ -218,7 +218,7 @@ bool axera_weights_mx8() {
     static const bool on = [] {
         const char * e = std::getenv("GGML_AXERA_WEIGHTS");
         return e != nullptr && (strcmp(e, "mxfp8") == 0 || strcmp(e, "mxfp4") == 0 || strcmp(e, "mxfp4m") == 0 ||
-                                strcmp(e, "nvfp4") == 0);
+                                strcmp(e, "nvfp4") == 0 || strcmp(e, "nvfp4m") == 0);
     }();
     return on;
 }
@@ -229,11 +229,12 @@ bool axera_weights_mx4() {
     }();
     return on;
 }
-// GGML_AXERA_WEIGHTS=nvfp4: the projections in NVFP4 (E2M1, an E4M3 scale per 16 inputs, an FP32 tensor scale)
+// GGML_AXERA_WEIGHTS=nvfp4: the projections in NVFP4 (E2M1, an E4M3 scale per 16 inputs, an FP32 tensor scale);
+// nvfp4m: the MLP's, the attention / delta-net projections in MXFP8
 bool axera_weights_nv4() {
     static const bool on = [] {
         const char * e = std::getenv("GGML_AXERA_WEIGHTS");
-        return e != nullptr && strcmp(e, "nvfp4") == 0;
+        return e != nullptr && (strcmp(e, "nvfp4") == 0 || strcmp(e, "nvfp4m") == 0);
     }();
     return on;
 }
@@ -242,7 +243,7 @@ const char * axera_mx_sfx() {
     static const char * sfx = [] {
         const char * e = std::getenv("GGML_AXERA_WEIGHTS");
         return e && strcmp(e, "mxfp4m") == 0 ? "_mx4m" : e && strcmp(e, "mxfp4") == 0 ? "_mx4" :
-               e && strcmp(e, "nvfp4") == 0  ? "_nv4" : "_mx8";
+               e && strcmp(e, "nvfp4") == 0  ? "_nv4" : e && strcmp(e, "nvfp4m") == 0 ? "_nv4m" : "_mx8";
     }();
     return sfx;
 }

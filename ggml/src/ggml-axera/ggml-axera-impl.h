@@ -94,8 +94,8 @@ bool axera_flash_forced();
 int64_t axera_flash_seg(int64_t n);
 bool axera_weights_mx8();
 bool axera_weights_mx4();
-bool axera_weights_nv4();  // GGML_AXERA_WEIGHTS=nvfp4: the layer kernels' projections in NVFP4 (_nv4)
-const char * axera_mx_sfx();  // the layer kernels' weight format suffix: _mx8, _mx4 (GGML_AXERA_WEIGHTS=mxfp4)
+bool axera_weights_nv4();  // GGML_AXERA_WEIGHTS=nvfp4 / nvfp4m: NVFP4 projections (_nv4) / the MLP's (_nv4m)
+const char * axera_mx_sfx();  // the layer kernels' weight format suffix: _mx8, _mx4, _mx4m, _nv4, _nv4m
 void axera_quantize_mxfp8(const ggml_tensor * w, axera_cmm & q, axera_cmm & s);
 void axera_quantize_mxfp4(const ggml_tensor * w, axera_cmm & q, axera_cmm & s);
 void axera_quantize_nvfp4(const ggml_tensor * w, axera_cmm & q, axera_cmm & s, axera_cmm & s2);
