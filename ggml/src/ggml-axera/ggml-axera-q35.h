@@ -254,6 +254,10 @@ struct axera_q35 {
         std::vector<AX_ENGINE_IO_BUFFER_T> in, outs;
     };
     slots_kernel slots;
+    // the _px slots kernel with more rows per slot (qwen35moe_slots<S>_g<2 G>_px...) for the experts with more than G
+    // picks in a group, and its smaller-S builds for the last call (GGML_AXERA_SLOTS_BIG=0: not)
+    slots_kernel              slots_big;
+    std::vector<slots_kernel> slots_big_rem;
     std::vector<slots_kernel> slots_rem;  // the _px slots kernel with fewer slots per call, fewest first: a group's last
                                           // call takes the smallest that holds its remaining slots
     // MoE groups on the NPU (slots kernel _px, qwen35moe_combine<K>_t<T>_r<R>): the group's chunks' A / B / h2 / base /
