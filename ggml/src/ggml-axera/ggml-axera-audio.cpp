@@ -3,6 +3,7 @@
 #include "ggml-axera-impl.h"
 
 #include <mutex>
+#include <set>
 
 // the Qwen3-ASR audio encoder (mtmd clip graph, projector qwen3a): the transformer layers on the q3a_audio.py kernels
 // (q35_vit.py's pre / attn / post on the audio tower: qwen3a_{pre,attn,post}<N>_h<H>, N rows padded, width H), the
@@ -40,7 +41,8 @@ static void axera_audio_to_bf16(const ggml_tensor * p, ggml_bf16_t * dst) {
 static std::mutex                                      g_audio_pre_mu;
 static std::map<const void *, axera_cmm>               g_audio_pre;
 
-// a tensor the loader set whole: an audio encoder layer's matrix (a.blk.<i>.{attn_q,attn_k,attn_v,attn_out,ffn_up,
+// a tensor the loader set whole, or a source of an op the scheduler asks about (a mapped model's weights are never set:
+// mtmd's warmup reserves the encoder's graph while loading): an audio encoder layer's matrix (a.blk.<i>.{attn_q,attn_k,attn_v,attn_out,ffn_up,
 // ffn_down}.weight) converted to bf16 now, so that the first request does not wait for it
 void axera_audio_on_set(const ggml_tensor * t) {
     static const char * names[] = { ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_out.weight",
@@ -58,6 +60,28 @@ void axera_audio_on_set(const ggml_tensor * t) {
     if (!m) {
         return;
     }
+    {
+        static std::set<const void *> seen;  // (a weight converted once, whichever hook sees it first)
+        std::lock_guard<std::mutex>   lock(g_audio_pre_mu);
+        if (!seen.insert(t->data).second) {
+            return;
+        }
+    }
+    static std::once_flag kernels;  // the encoder's kernels loaded with the model too (the first one seen)
+    std::call_once(kernels, [] {
+        axera_timer tk("audio kernels at load (host)");
+        std::vector<std::string> names;
+        for (const auto & f : axera_kernels().files) {
+            const std::string & n = f.first;
+            if (n.rfind("qwen3a_fe", 0) == 0 || n.rfind("qwen3a_layer", 0) == 0 ||
+                (n.rfind("mm_bf16_m", 0) == 0 && n.size() > 6 && n.compare(n.size() - 6, 6, "_k7680") == 0)) {
+                names.push_back(n);
+            }
+        }
+        for (const std::string & n : names) {
+            axera_kernels().get(n);
+        }
+    });
     axera_timer tm("audio weights at load (host)");
     axera_cmm   c = axera_cmm_alloc(ggml_nelements(t) * sizeof(ggml_bf16_t));
     axera_audio_to_bf16(t, (ggml_bf16_t *) c->vir);
@@ -494,20 +518,27 @@ enum ggml_status axera_audio_compute(ggml_backend_axera_context * ctx, struct gg
     }
     GGML_ASSERT(x0_node >= 0 && "qwen3 audio: the layers' input is not a node before them");
 
-    // the smallest kernel row count that holds the n rows; none: the whole graph on the CPU
+    // the four-core layer kernel (q3a_layer.py, qwen3a_layer<NF>_h<H>) of the smallest row count that holds the n rows
+    int NF = 0;
+    for (int c : { 64, 128 }) {
+        if (NF == 0 && c >= n && std::ifstream(axera_kernels().path("qwen3a_layer" + std::to_string(c) + "_h" + std::to_string(H))).good()) {
+            NF = c;
+        }
+    }
+    // else the smallest pre / attn / post kernel row count that holds them; none: the whole graph on the CPU
     int N = 0;
     for (int c : { 256, 512, 1024, 2048, 4096 }) {
         if (N == 0 && c >= n && std::ifstream(axera_kernels().path("qwen3a_attn" + std::to_string(c) + "_h" + std::to_string(H))).good()) {
             N = c;
         }
     }
-    if (N == 0) {
+    if (N == 0 && NF == 0) {
         GGML_LOG_WARN("%s: no qwen3a_*<N>_h%d kernels for %d rows: the audio encoder on the CPU\n", __func__, H, n);
         axera_cpu_compute(ctx, cgraph, 0, cgraph->n_nodes, "audio (cpu)");
         return GGML_STATUS_SUCCESS;
     }
     auto name = [&](const char * k) { return std::string("qwen3a_") + k + std::to_string(N) + "_h" + std::to_string(H); };
-    if (a.N != N || a.H != H) {
+    if (N != 0 && (a.N != N || a.H != H)) {
         a.N    = N;
         a.H    = H;
         a.pre  = axera_kernels().get(name("pre"));
@@ -536,7 +567,7 @@ enum ggml_status axera_audio_compute(ggml_backend_axera_context * ctx, struct gg
         a.COS->flush(a.COS->vir, a.COS->size);
         a.SIN->flush(a.SIN->vir, a.SIN->size);
     }
-    GGML_ASSERT(axera_input_size(a.pre, "x") == (size_t) N * H * sizeof(ggml_bf16_t));
+    GGML_ASSERT(N == 0 || axera_input_size(a.pre, "x") == (size_t) N * H * sizeof(ggml_bf16_t));
 
     // the layer weights in bf16, converted once per model (q / k / v rows joined for the pre kernel's w_qkv)
     if (a.bound != get("a.blk.0.attn_q.weight")->data) {
@@ -586,24 +617,6 @@ enum ggml_status axera_audio_compute(ggml_backend_axera_context * ctx, struct gg
     if (!axera_audio_frontend_npu(a, t, x0)) {
         axera_audio_frontend(ctx, a, cgraph, x0_node + 1);
     }
-    {
-        axera_timer tm("audio prepare (cpu)");
-        auto *      x = (ggml_bf16_t *) a.X[0]->vir;
-        ggml_fp32_to_bf16_row((const float *) x0->data, x, (int64_t) n * H);
-        std::fill(x + (size_t) n * H, x + (size_t) N * H, ggml_fp32_to_bf16(0.0f));
-        a.X[0]->flush(a.X[0]->vir, a.X[0]->size);
-        *(int32_t *) a.NBLK->vir = (n + a.BC - 1) / a.BC;
-        a.NBLK->flush(a.NBLK->vir, a.NBLK->size);
-        auto * km = (ggml_bf16_t *) a.KMASK->vir;
-        for (int b = 0; b < N / a.BC; ++b) {
-            for (int r = 0; r < a.QB; ++r) {
-                for (int c = 0; c < a.BC; ++c) {
-                    km[((size_t) b * a.QB + r) * a.BC + c] = ggml_fp32_to_bf16(b * a.BC + c < n ? 0.0f : -3e38f);
-                }
-            }
-        }
-        a.KMASK->flush(a.KMASK->vir, a.KMASK->size);
-    }
     // a kernel call with its IO by name
     using io_map = std::map<std::string, AX_ENGINE_IO_BUFFER_T>;
     auto cm_io = [](const axera_cmm & c) { return axera_io(c.get(), c->vir, (uint32_t) c->size); };
@@ -628,6 +641,95 @@ enum ggml_status axera_audio_compute(ggml_backend_axera_context * ctx, struct gg
             GGML_ABORT("qwen3 audio: RunSync failed (0x%x) in %s\n", ret, what);
         }
     };
+    if (NF != 0) {  // the layers on the four-core layer kernel
+        ggml_axera_kernel * k  = axera_kernels().get("qwen3a_layer" + std::to_string(NF) + "_h" + std::to_string(H));
+        const size_t        xb = (size_t) NF * H * sizeof(ggml_bf16_t);
+        for (int i = 0; i < 3; ++i) {
+            axera_cmm & b = a.fe_io["lx" + std::to_string(i)];
+            if (!b || b->size < xb) {
+                b = axera_cmm_alloc(xb);
+            }
+        }
+        axera_cmm & KM = a.fe_io["lmask"];
+        if (!KM || KM->size < (size_t) NF * sizeof(ggml_bf16_t)) {
+            KM = axera_cmm_alloc((size_t) NF * sizeof(ggml_bf16_t));
+        }
+        axera_cmm * LX[2] = { &a.fe_io["lx0"], &a.fe_io["lx1"] };
+        {
+            axera_timer tm("audio prepare (cpu)");
+            auto *      x = (ggml_bf16_t *) (*LX[0])->vir;
+            ggml_fp32_to_bf16_row((const float *) x0->data, x, (int64_t) n * H);
+            std::fill(x + (size_t) n * H, x + (size_t) NF * H, ggml_fp32_to_bf16(0.0f));
+            (*LX[0])->flush((*LX[0])->vir, xb);
+            auto * km = (ggml_bf16_t *) KM->vir;
+            for (int c = 0; c < NF; ++c) {
+                km[c] = ggml_fp32_to_bf16(c < n ? 0.0f : -3e38f);
+            }
+            KM->flush(KM->vir, KM->size);
+        }
+        // GGML_AXERA_AUDIO_TWICE=1: every layer call run twice, the second into a spare buffer poisoned before, the two
+        // outputs compared byte by byte (a race between the cores shows as a difference)
+        static const bool twice = [] {
+            const char * e = std::getenv("GGML_AXERA_AUDIO_TWICE");
+            return e && strcmp(e, "1") == 0;
+        }();
+        static int n_twice = 0, n_diff = 0;
+        int        cur     = 0;
+        for (int il = 0; il < L; ++il) {
+            io_map m = { { "x", cm_io(*LX[cur]) }, { "ln1_w", weight(il, "ln1.weight") }, { "ln1_b", weight(il, "ln1.bias") },
+                         { "w_qkv", weight(il, "attn_qkv.weight") }, { "b_qkv", weight(il, "attn_qkv.bias") },
+                         { "w_o", weight(il, "attn_out.weight") }, { "b_o", weight(il, "attn_out.bias") },
+                         { "ln2_w", weight(il, "ln2.weight") }, { "ln2_b", weight(il, "ln2.bias") },
+                         { "w_up", weight(il, "ffn_up.weight") }, { "b_up", weight(il, "ffn_up.bias") },
+                         { "w_down", weight(il, "ffn_down.weight") }, { "b_down", weight(il, "ffn_down.bias") },
+                         { "kmask", cm_io(KM) }, { "out", cm_io(*LX[1 - cur]) } };
+            run(k, m, "audio layer (npu)");
+            if (twice) {
+                axera_cmm & S = a.fe_io["lx2"];
+                memset(S->vir, 0xff, xb);  // (bf16 NaN)
+                S->flush(S->vir, xb);
+                m["out"] = cm_io(S);
+                run(k, m, "audio layer, again (npu)");
+                S->invalidate(S->vir, xb);
+                (*LX[1 - cur])->invalidate((*LX[1 - cur])->vir, xb);
+                ++n_twice;
+                if (memcmp(S->vir, (*LX[1 - cur])->vir, (size_t) n * H * sizeof(ggml_bf16_t)) != 0) {
+                    GGML_LOG_WARN("axera audio: layer %d gave different outputs on two runs (%d of %d calls)\n", il,
+                                  ++n_diff, n_twice);
+                }
+            }
+            cur = 1 - cur;
+        }
+        if (twice) {
+            GGML_LOG_INFO("axera audio: %d layer calls run twice, %d differed\n", n_twice, n_diff);
+        }
+        (*LX[cur])->invalidate((*LX[cur])->vir, xb);
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) (*LX[cur])->vir, (float *) xl->data, (int64_t) n * H);
+        axera_cpu_compute(ctx, cgraph, post_norm, cgraph->n_nodes, "audio projector (cpu)");
+        ggml_tensor * out = cgraph->nodes[cgraph->n_nodes - 1];
+        if (ggml_backend_buffer_is_axera(out->buffer)) {
+            ((ggml_backend_axera_buffer_context *) out->buffer->context)->flush(out->data, ggml_nbytes(out));
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+    {
+        axera_timer tm("audio prepare (cpu)");
+        auto *      x = (ggml_bf16_t *) a.X[0]->vir;
+        ggml_fp32_to_bf16_row((const float *) x0->data, x, (int64_t) n * H);
+        std::fill(x + (size_t) n * H, x + (size_t) N * H, ggml_fp32_to_bf16(0.0f));
+        a.X[0]->flush(a.X[0]->vir, a.X[0]->size);
+        *(int32_t *) a.NBLK->vir = (n + a.BC - 1) / a.BC;
+        a.NBLK->flush(a.NBLK->vir, a.NBLK->size);
+        auto * km = (ggml_bf16_t *) a.KMASK->vir;
+        for (int b = 0; b < N / a.BC; ++b) {
+            for (int r = 0; r < a.QB; ++r) {
+                for (int c = 0; c < a.BC; ++c) {
+                    km[((size_t) b * a.QB + r) * a.BC + c] = ggml_fp32_to_bf16(b * a.BC + c < n ? 0.0f : -3e38f);
+                }
+            }
+        }
+        a.KMASK->flush(a.KMASK->vir, a.KMASK->size);
+    }
     int cur = 0;
     for (int il = 0; il < L; ++il) {
         run(a.pre, { { "x", cm_io(a.X[cur]) }, { "ln1_w", weight(il, "ln1.weight") }, { "ln1_b", weight(il, "ln1.bias") },

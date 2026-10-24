@@ -459,7 +459,12 @@ tower as `model.audio_tower.*` and the projector as `model.multi_modal_projector
 model plain RoPE; the converter maps them to the Qwen3-Omni names and writes M-RoPE sections that are plain RoPE for
 the sequential positions of audio and text.
 
-The audio encoder's 18 (0.6B) / 24 (1.7B) transformer layers run on `q3a_audio.py`'s kernels
+The audio encoder's 18 (0.6B) / 24 (1.7B) transformer layers run one call each on `q3a_layer.py`'s four-core
+layer kernel where it is in the directory for the rows (`qwen3a_layer<N>_h<H>`, N 64 / 128: up to 4 / 8 one-second
+chunks of 13 rows): each core its N / 4 rows through the whole layer, only the K / V rows exchanged through shared OCM
+(read once more before the output is stored, KEEP_SHM), every product over the whole K, each core reading back from
+DRAM only the rows it wrote. `GGML_AXERA_AUDIO_TWICE=1` runs every layer call twice (the second output poisoned
+before) and compares the two byte by byte. Without it the layers run on `q3a_audio.py`'s kernels
 (`qwen3a_{pre,attn,post}<N>_h<H>`: q35_vit.py's layer kernels without RoPE, GELU erf, LayerNorm 1e-5; N rows
 padded, 13 rows per second of audio), the conv front-end before them and the post norm and projector after them are
 the graph's own nodes, run by the CPU backend from inside the backend. Without kernels for the row count the whole
@@ -473,8 +478,9 @@ padded to 16; `qwen3a_fe2_o480_n<n>`: conv2d.2 with its im2col on chip, the 9 ta
 whose rows the host orders by column parity, stacked on chip [9 x 480, 100]), then conv_out on
 `mm_bf16_m<13 n>_n<H>_k7680` with its bias and the per-chunk positions on the host, into the layers' input. Without
 those kernels the graph's front-end runs as before (`q3a_conv.py`'s products of ggml's im2col rows on the NPU, the
-rest on the CPU). The encoder layers' matrices are converted to bf16 while the model loads (the first request does
-not wait for them).
+rest on the CPU). The encoder layers' matrices are converted to bf16 while the model loads (when the loader sets them, or
+when mtmd's warmup reserves the encoder's graph for a mapped model), and the encoder's kernels are loaded then too:
+the first request does not wait for them.
 
 On AX8860 (text model MXFP8, mmproj Q8_0, the board's load 18), per encoder call of 8 one-second chunks, the calls
 after the first:
@@ -484,8 +490,23 @@ after the first:
 | Qwen3-ASR-0.6B | 2.8 s | 0.42 s | 66 ms |
 | Qwen3-ASR-1.7B | 3.3 s | 0.44 s | 83 ms |
 
-of which the 18 / 24 layers take about 33 / 45 ms, the projector on the CPU 9 ms, the front-end about 20 ms (conv2d.3's
-im2col on the host 8 ms). The first call takes 0.54 / 0.74 s (before: 1.5 / 2.2 s). 20 sentences spoken by
+of which the 18 / 24 layers took about 33 / 45 ms on the single-core kernels and take 11 / 18 ms on the layer kernel
+(the encoder call 46 / 55 ms), the projector on the CPU 9 ms, the front-end about 20 ms. Three runs per audio give the
+same transcripts, and every layer call run twice gave byte-identical outputs (`GGML_AXERA_AUDIO_TWICE=1`).
+
+As a resident service (`llama-server`, chat completions with `input_audio`, the second and third request of each
+audio; the server's timings, the board's load 2 - 11):
+
+| Model | Audio | Prompt (encoder + prefill) | First token | RTF |
+|---|---|---|---|---|
+| Qwen3-ASR-0.6B | 0.6 s | 180 - 214 ms | 187 - 221 ms | 0.37 - 0.42 |
+| | 3.3 s | 205 - 222 ms | 212 - 229 ms | 0.093 - 0.098 |
+| | 60 s | 1.10 - 1.11 s | 1.10 - 1.11 s | 0.036 |
+| Qwen3-ASR-1.7B | 0.6 s | 244 - 245 ms | 256 - 257 ms | 0.51 - 0.52 |
+| | 3.3 s | 284 - 288 ms | 296 - 300 ms | 0.138 |
+| | 60 s | 1.38 - 1.41 s | 1.39 - 1.42 s | 0.053 - 0.054 |
+
+The first request after the server starts takes about 0.25 s more (0.32 / 0.50 s for 0.6 s of audio). 20 sentences spoken by
 Qwen3-TTS-1.7B (10 Chinese, 10 English) read back with a CER of 0 / 168 characters and a WER of 0 / 104 words on
 either front-end, but for one homophone of the 0.6B on the NPU front-end (预订 as 预定); 60 s of Chinese speech read
 back the same but for punctuation and one interjection.
