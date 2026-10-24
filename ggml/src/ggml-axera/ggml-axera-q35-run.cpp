@@ -13,6 +13,62 @@ bool axera_q35_batch::pre_split(int v) const {
     return use_split(m.pre[v].P) || !m.pre[v].attn;
 }
 
+// the fused attention mask of a prefill chunk of P tokens it .. it + P - 1 (R == P rows) from two KQ mask rows: when its
+// tokens are one sequence's, in consecutive cells c0 .. c0 + P - 1 at consecutive positions, and the last token's row is
+// the first's with exactly those cells visible, token r's row is the first's plus cells c0 + 1 .. c0 + r (llama.cpp's
+// causal mask: the other cells are seen alike by all of them). Writes [nblk][R][BC] into mask, false (nothing
+// written) when the chunk is not of that kind (GGML_AXERA_MASK_ROWS=1: never)
+static bool axera_q35_causal_chunk_mask(const axera_kv_batch & kv, const int32_t * pos, int it, int P, int64_t R, int BC,
+                                        ggml_bf16_t * mask, int & nblk) {
+    static const bool off = [] {
+        const char * e = std::getenv("GGML_AXERA_MASK_ROWS");
+        return e && strcmp(e, "1") == 0;
+    }();
+    if (off || !mask || R != P || P < 2) {
+        return false;
+    }
+    axera_timer   tm("mask (cpu, causal chunk)");
+    const int64_t c0 = kv.cell_of(it);
+    if (c0 + P > kv.W) {
+        return false;
+    }
+    for (int r = 1; r < P; ++r) {
+        if (kv.stream_of(it + r) != kv.stream_of(it) || kv.cell_of(it + r) != c0 + r || pos[it + r] != pos[it] + r) {
+            return false;
+        }
+    }
+    std::vector<ggml_bf16_t> first(kv.W), last(kv.W);
+    kv.mask_row(it, first.data());
+    const int nb = kv.mask_row(it + P - 1, last.data());
+    const uint16_t z = ggml_fp32_to_bf16(0.0f).bits, ninf = ggml_fp32_to_bf16(-3e38f).bits;
+    if (first[c0].bits != z || last[c0].bits != z) {
+        return false;
+    }
+    for (int64_t c = c0 + 1; c < c0 + P; ++c) {
+        if (first[c].bits != ninf || last[c].bits != z) {
+            return false;
+        }
+    }
+    if (memcmp(first.data(), last.data(), c0 * sizeof(ggml_bf16_t)) != 0 ||
+        memcmp(first.data() + c0 + P, last.data() + c0 + P, (kv.W - c0 - P) * sizeof(ggml_bf16_t)) != 0) {
+        return false;
+    }
+    nblk = nb;
+    axera_host_pool().run(nblk, [&](int64_t blk) {
+        const int64_t b0 = blk * BC;
+        for (int64_t r = 0; r < R; ++r) {
+            ggml_bf16_t * dst = mask + (blk * R + r) * BC;
+            memcpy(dst, first.data() + b0, BC * sizeof(ggml_bf16_t));
+            // cells c0 + 1 .. c0 + r of this block: visible to token r
+            const int64_t lo = std::max<int64_t>(c0 + 1, b0), hi = std::min<int64_t>(c0 + r + 1, b0 + BC);
+            for (int64_t c = lo; c < hi; ++c) {
+                dst[c - b0].bits = z;
+            }
+        }
+    });
+    return true;
+}
+
 void axera_q35_batch::run_layer(int il, int v, int t0, int64_t p) {
     const bool        prefill = v >= 0;
     const bool        split   = prefill ? pre_split(v) : use_split(1);
@@ -537,6 +593,8 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             const ggml_bf16_t zero = ggml_fp32_to_bf16(0.0f), ninf = ggml_fp32_to_bf16(-3e38f);
             if (split) {
                 // the segments' masks: flash_prepare
+            } else if (m.kv_llama && axera_q35_causal_chunk_mask(kv, pos, it, P, R, m.BC, mask, nblk)) {
+                // (one sequence's consecutive cells and positions: the chunk's rows from its first and last)
             } else if (m.kv_llama) {
                 axera_timer tm("mask (cpu)");
                 std::vector<ggml_bf16_t> rows((size_t) P * kv.W);
