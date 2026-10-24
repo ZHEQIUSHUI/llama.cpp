@@ -46,6 +46,7 @@ struct axera_audio_pre {
 static std::mutex                               g_audio_pre_mu;
 static std::map<const void *, axera_audio_pre>  g_audio_pre;
 static std::map<const void *, uint64_t>         g_audio_seen;  // the fingerprint each source was last converted from
+static std::set<const void *>                   g_audio_done;  // sources whose copy is in use: not looked at again
 
 // FNV-1a over 64 slices of 256 bytes spread over a tensor's data: the scheduler can ask about a weight before the loader
 // has read it (its buffer then holds whatever an earlier process left in that CMM: another model's data), so a copy is
@@ -54,7 +55,7 @@ static uint64_t axera_audio_fingerprint(const ggml_tensor * t) {
     const size_t    nb = ggml_nbytes(t), w = std::min<size_t>(256, nb);
     const uint8_t * p  = (const uint8_t *) t->data;
     uint64_t        h  = 1469598103934665603ull;
-    for (int i = 0; i < 64; ++i) {
+    for (int i = 0; i < (nb > w ? 64 : 1); ++i) {
         const size_t o = nb > w ? (nb - w) * i / 63 : 0;
         for (size_t j = 0; j < w; ++j) {
             h = (h ^ p[o + j]) * 1099511628211ull;
@@ -83,6 +84,12 @@ void axera_audio_on_set(const ggml_tensor * t) {
     }
     if (!m) {
         return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_audio_pre_mu);
+        if (g_audio_done.count(t->data)) {  // (its copy taken by the encoder: no fingerprint per scheduler question)
+            return;
+        }
     }
     const uint64_t fp = axera_audio_fingerprint(t);
     {
@@ -119,6 +126,7 @@ void axera_audio_on_set(const ggml_tensor * t) {
 // the load-time bf16 copy of p, taken out of the registry (nullptr if there is none)
 static axera_cmm axera_audio_take_pre(const ggml_tensor * p) {
     std::lock_guard<std::mutex> lock(g_audio_pre_mu);
+    g_audio_done.insert(p->data);  // its copy made now or here: the hooks leave it alone from now on
     auto                        it = g_audio_pre.find(p->data);
     if (it == g_audio_pre.end() || it->second.c->size != (size_t) ggml_nelements(p) * sizeof(ggml_bf16_t)) {
         return axera_cmm();
