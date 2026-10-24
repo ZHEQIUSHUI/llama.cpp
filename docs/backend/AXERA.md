@@ -454,6 +454,29 @@ same ranking of documents for each query, Qwen3-Embedding-8B (Q8_0 GGUF, on Qwen
 same rankings (six inputs, 114 tokens, in 1.2 s; converting its weights to MXFP8 at the first graph takes 19 s); Qwen3-Reranker-0.6B (`--pooling rank`) gives the same relevance decisions
 as on the CPU.
 
+The embeddings run on the same four-core prefill layer kernels as the text model (no decode, so no layer group),
+pooling and normalization on the CPU. A retrieval check (60 queries, 30 Chinese / 30 English, over 240 documents: four
+facts per city or animal, the other facts of the same entity and the same fact of the others as distractors),
+Qwen3-Embedding-0.6B:
+
+| Weights of the prefill kernels | recall@1 / @5, MRR | cosine to the CPU's, min / mean | pairwise similarity, Spearman to the CPU's | 300 texts (5042 tokens) |
+|---|---|---|---|---|
+| CPU (16 threads) | 1 / 1, 1 | | | 1299 s |
+| MXFP8 (default) | 1 / 1, 1 | 0.9941 / 0.9968 | 0.99876 | 1.23 s of graphs (0.78 ms per layer call) |
+| bf16 (`GGML_AXERA_PREFILL_WEIGHTS=bf16`, `qwen3_attn_prefill<P>_kvc_c4096_npu4` from `q35_layer_mc.py WFMT=bf16`) | 1 / 1, 1 | 0.9979 / 0.9998 | 0.99990 | 1.45 s (0.95 ms) |
+
+Every query ranks the documents as on the CPU in both, so MXFP8 stays the default; two runs give byte-identical
+output. As a service (`llama-server --embedding -np 1`, one query per request, client wall time, load 16 - 19): 0.6B
+20 - 30 ms, Qwen3-Embedding-8B (Q8_0 GGUF, Qwen3-8B's kernels) 70 - 80 ms.
+
+### Backend sampling (`-bs`)
+
+With `--backend-sampling` llama.cpp appends its sampler chain (top-k, top-p, softmax over the 151936 logits) to the
+graph; the backend leaves the template's logits in place and runs those nodes on the CPU backend. The tokens are the
+host sampler's (greedy and seeded top-k / top-p give the same text), but on Qwen3-1.7B a token takes 25 ms instead of
+12.7 ms (the chain 12.4 ms per token against about 1.4 ms of the host sampler): not recommended. (Before a025eda the
+template claimed the sampler nodes without running them, and every token came out as token 0, "!", fast.)
+
 ### Speech recognition: Qwen3-ASR
 
 `llama-mtmd-cli -m qwen3-asr.gguf --mmproj mmproj-qwen3-asr.gguf --audio speech.wav -p "Transcribe the audio."`. The
@@ -525,7 +548,20 @@ each one padded prefill chunk instead of 4-row chunks and decode steps (10 reque
 | | 3.3 s | 125 - 147 ms | 350 - 380 ms | 480 - 550 ms |
 
 Of the 1.7B's prompt for 0.6 s: the encoder graph 29 ms, the three prefill graphs 59 ms (each 28 layer calls of about
-0.6 ms, near the time to read a layer's weights), the host between them the rest.
+0.6 ms, near the time to read a layer's weights), the host between them the rest. The final build (axera-dev 97135d9,
+the KEEP_SHM kernels; requests 2 - 6 of one server, `-np 1`, the board's load 17 - 22), prompt / client wall time:
+
+| Model | 0.6 s | 3.3 s | 60 s |
+|---|---|---|---|
+| Qwen3-ASR-0.6B | 87 - 93 / 160 - 180 ms | 97 - 110 / 270 - 300 ms | 0.59 - 0.63 / 2.47 - 2.53 s |
+| Qwen3-ASR-1.7B | 113 - 125 / 210 - 230 ms | 131 - 145 / 380 - 400 ms | 0.76 - 0.86 / 3.50 - 3.61 s |
+
+Every new kernel and load-time preparation is also checked across processes: a run right after a process of another
+model (other hidden size, another kind) must give the same output as a run after itself. The encoder's load-time bf16
+copies were first made when the scheduler asked supports_op about the weights, before mtmd had read them: their CMM
+then held what the process before had left there, and after another model every encoder layer gave inf ("GGGG"
+transcripts, always on the first run after a 1.7B process, never in a loop of one model, invisible to a run-twice
+check). The copies now carry a fingerprint of their source and are made again when it changed.
 
 Run a single-stream service with `-np 1`. Without `-np`, llama-server makes 4 slots in a unified KV cache
 (`n_parallel` auto: 4, `kv_unified`), and the padded prefill chunks are off whenever any context of the process has
@@ -686,6 +722,36 @@ milliseconds per frame (generation and the last decoder batch over the frames):
 
 With `--top-k 1` the three requests of a process give the same audio (both models, zh / en, frame kernel on). mtmd's sampler keeps its random state across requests with the same seed,
 so sampled requests after the first differ from a fresh process.
+
+The first audio comes from the codec decoder's first batch, which is 24 frames (`MTMD_TTS_FIRST_WINDOW`, 0: a whole
+window of 72), and the next batch completes the window, so the windows after it are as before. `MTMD_TTS_TIMING=1`
+logs when the first audio came and what it took. 1.7B, `--top-k 1`, requests 2 - 3 of a process, the board's load
+22 - 26:
+
+| First batch | First audio | Prompt | Frames before it | Codec decoder | Whole request (zh, 222 frames) |
+|---|---|---|---|---|---|
+| 72 frames | 2.94 - 2.99 s | 57 ms | 2.24 s | 0.64 - 0.68 s | 9.42 s |
+| 24 frames | 1.15 - 1.20 s | 56 - 69 ms | 0.77 s | 0.33 - 0.36 s | 9.85 s |
+
+The audio is not bit-identical to the 72-frame first batch (zh dd389531 / en 5a21d28a instead of eb4a8a8f /
+e2540fd0) and reads back the same. A process's first request also encodes the speaker reference on the CPU (about
+11 s for a 22 s reference; cached afterwards).
+
+The talker's prompt runs as one padded prefill chunk (see the Qwen3 template): over the 20 sentences of the ASR check
+(1.7B, the eval's settings) its prompt evaluation takes 66 ms on average instead of 94 ms, with frame counts within a few
+frames of each other and every sentence read back exactly by Qwen3-ASR-1.7B in both cases.
+
+Reference outputs (`--top-k 1 -s 1`, the speaker breakthrough-3.wav, the sentences "今天天气很好，我们一起去公园散步吧。
+明天如果下雨的话，我们就在家里看书。" / "The quick brown fox jumps over the lazy dog, and then it runs into the forest.",
+0.6B with `-n 160`, a 72-frame first batch: `MTMD_TTS_FIRST_WINDOW=0`), WAV md5:
+
+| | 1.7B zh | 1.7B en | 0.6B zh | 0.6B en |
+|---|---|---|---|---|
+| default (padded prefill chunks) | eb4a8a8f | e2540fd0 | ba0be7c8 | cf8ccfe9 |
+| `GGML_AXERA_PAD_CHUNK=0` | 50f39c57 | 336f7811 | 77d6cd3a | cf8ccfe9 |
+
+Per frame on the final build (talker group + frame kernel, `--top-k 1`, load 17 - 22): 1.7B 40 - 41 ms (the talker
+10.1 ms, the code predictor frame 9.8 ms), 0.6B 34 ms (5.0 / 9.2 ms).
 
 ## Source layout
 
