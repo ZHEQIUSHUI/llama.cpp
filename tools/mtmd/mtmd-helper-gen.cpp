@@ -5,6 +5,7 @@
 #include "../src/llama-ext.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -124,6 +125,10 @@ public:
         prompt_batch.reset();
         n_prompt = 0;
         prompt_pos = 0;
+        frames_out = 0;
+        frames_gen = 0;
+        t_start    = std::chrono::steady_clock::now();
+        t_prompt   = t_start;
     }
 
     int32_t set_input(const mtmd_helper_gen_audio_inp * inp) override {
@@ -243,6 +248,7 @@ public:
             // prompt fully processed, its embedding buffer is no longer needed
             prompt_batch.reset();
             prompt_embd_buf.clear();
+            t_prompt = std::chrono::steady_clock::now();
             return 0;
         }
         return n_prompt - prompt_pos;
@@ -275,7 +281,9 @@ public:
         }
 
         codes_buf.insert(codes_buf.end(), out.codes, out.codes + out.n_codes);
-        if (out.n_codes > 0 && codes_buf.size() / out.n_codes >= window_frames) {
+        frames_gen++;
+        n_codes_frame = out.n_codes > 0 ? (size_t) out.n_codes : n_codes_frame;
+        if (out.n_codes > 0 && codes_buf.size() / out.n_codes >= next_window()) {
             if (!flush_gen_wav()) {
                 return 1;
             }
@@ -431,10 +439,22 @@ private:
     }
 
     // one GEN_WAV process() call over the buffered codes, state is carried across batches
+    // frames of the codec decoder's next batch: the first audio as soon as first_window_frames are generated, the
+    // next batch the rest of the first window, then whole windows (window boundaries as without the short start)
+    size_t next_window() const {
+        const size_t done = frames_out % window_frames;
+        if (frames_out == 0 && first_window_frames > 0 && first_window_frames < window_frames) {
+            return first_window_frames;
+        }
+        return done ? window_frames - done : window_frames;
+    }
+
     bool flush_gen_wav() {
         if (codes_buf.empty()) {
             return true;
         }
+        const auto   t0     = std::chrono::steady_clock::now();
+        const size_t frames = n_codes_frame > 0 ? codes_buf.size() / n_codes_frame : 0;
         mtmd_gen_inp inp = mtmd_gen_inp_default(mctx);
         inp.type       = MTMD_GEN_PROCESS_TYPE_GEN_WAV;
         inp.codes      = codes_buf.data();
@@ -450,6 +470,16 @@ private:
         audio_pcm.insert(audio_pcm.end(), out.audio, out.audio + out.n_samples);
         c2w_state.assign(out.state_data, out.state_data + out.state_size);
         codes_buf.clear();
+        static const bool timing = getenv("MTMD_TTS_TIMING") != nullptr;
+        if (frames_out == 0 && timing) {  // MTMD_TTS_TIMING: when the first playable audio came, and what it took
+            const auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            const auto t1 = std::chrono::steady_clock::now();
+            LOG_WRN("mtmd_helper_gen_audio: first audio after %.0f ms: prompt %.0f ms, %zu frames %.0f ms, codec decoder %.0f ms (%lld samples)\n",
+                    ms(t_start, t1), ms(t_start, t_prompt), frames, ms(t_prompt, t0), ms(t0, t1), (long long) out.n_samples);
+        }
+        frames_out += frames;
         return true;
     }
 
@@ -469,6 +499,16 @@ private:
 
     // must match hparams.wav_tfm_swa hardcoded in clip.cpp
     size_t window_frames = 72;
+    // the codec decoder's first batch (MTMD_TTS_FIRST_WINDOW, default 24 frames; 0: a whole window): the first audio
+    // after 24 frames instead of 72, the decoder's state carrying over into the batch that completes the window
+    size_t first_window_frames = [] {
+        const char * e = getenv("MTMD_TTS_FIRST_WINDOW");
+        return e ? (size_t) std::max(0, atoi(e)) : (size_t) 24;
+    }();
+    size_t frames_out = 0;  // frames decoded to audio in this request
+    size_t frames_gen = 0;
+    size_t n_codes_frame = 0;  // codes per frame (the codebooks)
+    std::chrono::steady_clock::time_point t_start, t_prompt;
 
     // speaker embeddings of the last references (encode_speaker), kept across reset()
     std::mutex spk_mu;
