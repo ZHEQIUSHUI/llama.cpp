@@ -743,12 +743,13 @@ frames of each other and every sentence read back exactly by Qwen3-ASR-1.7B in b
 
 Reference outputs (`--top-k 1 -s 1`, the speaker breakthrough-3.wav, the sentences "今天天气很好，我们一起去公园散步吧。
 明天如果下雨的话，我们就在家里看书。" / "The quick brown fox jumps over the lazy dog, and then it runs into the forest.",
-0.6B with `-n 160`, a 72-frame first batch: `MTMD_TTS_FIRST_WINDOW=0`), WAV md5:
+0.6B with `-n 160`), WAV md5 (axera-dev d7f66db):
 
 | | 1.7B zh | 1.7B en | 0.6B zh | 0.6B en |
 |---|---|---|---|---|
-| default (padded prefill chunks) | eb4a8a8f | e2540fd0 | ba0be7c8 | cf8ccfe9 |
-| `GGML_AXERA_PAD_CHUNK=0` | 50f39c57 | 336f7811 | 77d6cd3a | cf8ccfe9 |
+| default (24-frame first batch, padded prefill chunks) | dd389531 | 5a21d28a | 5ba30acf | cf8ccfe9 |
+| `MTMD_TTS_FIRST_WINDOW=0` | eb4a8a8f | e2540fd0 | ba0be7c8 | cf8ccfe9 |
+| `MTMD_TTS_FIRST_WINDOW=0 GGML_AXERA_PAD_CHUNK=0` | 50f39c57 | 336f7811 | 77d6cd3a | cf8ccfe9 |
 
 Per frame on the final build (talker group + frame kernel, `--top-k 1`, load 17 - 22): 1.7B 40 - 41 ms (the talker
 10.1 ms, the code predictor frame 9.8 ms), 0.6B 34 ms (5.0 / 9.2 ms).
