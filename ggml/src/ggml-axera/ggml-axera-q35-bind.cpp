@@ -1285,7 +1285,7 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
             auto &              mk   = m.mx[a];
             ggml_axera_kernel * body = a == 0 ? m.gdn : m.attn;
             const std::string   name = "qwen35moe_experts" + std::to_string(m.top_k) + "_gu_" + (a == 0 ? "gdn" : "attn") +
-                                     (mx8 ? "_mx8" : "") + (a == 0 ? "" : m.ctx_sfx);
+                                     (mx8 ? axera_mx_sfx() : "") + (a == 0 ? "" : m.ctx_sfx);
             mk = {};
             if (!m.ex[1].k || !body || !axera_kernels().has(name)) {
                 continue;
@@ -1307,7 +1307,7 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
         for (int a = 0; a < 2; ++a) {  // whole layers: the layer kernel's IO by name, the expert planes, the packs
             auto &              fk   = m.full[a];
             ggml_axera_kernel * body = a == 0 ? m.gdn : m.attn;
-            const std::string   base = std::string("qwen35moe_layer_") + (a == 0 ? "gdn" : "attn") + (mx8 ? "_mx8" : "");
+            const std::string   base = std::string("qwen35moe_layer_") + (a == 0 ? "gdn" : "attn") + (mx8 ? axera_mx_sfx() : "");
             const std::string   sfx  = a == 0 ? "" : m.ctx_sfx;
             std::string         name = base + "_pkc" + sfx;  // the packed build with column blocks first, then packed
             fk = {};
@@ -1584,7 +1584,9 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
             // context (m.flash), never in place of a missing chunk size of a fused tier
             // the GDN layer in MXFP8 where that kernel exists (prefill reads the weights: about 20% faster)
             std::string gn = "qwen35moe_gdn_prefill" + std::to_string(P);
-            gn += mx8 && (axera_kernels().has(gn + "_mx8") || axera_kernels().has(gn + "_mx8_tk")) ? "_mx8" : "";
+            // (GGML_AXERA_WEIGHTS=nvfp4: the NVFP4 build, _nv4)
+            const std::string ws = axera_mx_sfx();
+            gn += mx8 && (axera_kernels().has(gn + ws) || axera_kernels().has(gn + ws + "_tk")) ? ws : "";
             // the builds that also output the router's top-K (_tk) first (GGML_AXERA_PREFILL_TK=0: not)
             const char * tke = std::getenv("GGML_AXERA_PREFILL_TK");
             const bool   tk  = !(tke && strcmp(tke, "0") == 0);
@@ -1882,7 +1884,7 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
                 same = same && kinds[il % G] == c;
             }
         }
-        const std::string name = "qwen35moe_group" + std::to_string(G) + "_" + kinds + "_mx8" + m.ctx_sfx;
+        const std::string name = "qwen35moe_group" + std::to_string(G) + "_" + kinds + axera_mx_sfx() + m.ctx_sfx;
         if (!same || !mx8 || !axera_kernels().has(name)) {
             continue;
         }
