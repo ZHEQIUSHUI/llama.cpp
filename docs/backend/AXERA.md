@@ -275,6 +275,21 @@ takes 22.7 s instead of 41.0 s with BF16 chunks of 64 (2.9 ms per token), the an
 kernels), with a 128-row segment kernel for the chunks of 128: 15888 tokens in 44.9 s instead of 82.8 s and 39666 tokens
 in 134 s instead of 229 s, the number found in both; decode at 40k context 209 ms per token instead of 248.
 
+Prompt tails: a prompt's last tokens short of a whole chunk run as one padded chunk through the delta-net prefill
+kernels with a valid-row count (`qwen35_gdn_prefill<P><fmt>_pv`, `q35_layer_pk.py` with `PAD=1`; inputs `rv`, f32
+[P], 1 for a token's row, and `cix`, int32 [conv - 1], the conv input rows after the last token): the padding rows get
+decay 0 and write strength 0, so the recurrent state and the conv state are those of the real tokens (bit for bit
+whatever the padding rows hold, on the simulator), and the attention rows follow the padded chunks of the attention
+models (one sequence, the cells after the batch's). Without `_pv` kernels in the directory a hybrid model's tail runs in
+the chunks that fit exactly, as before. With the MXFP4 kernels on AX8860 a 1717-token prompt (13 chunks of 128 and 53
+tokens: one padded chunk of 64 instead of 16 + 16 + 16 + 4 and a decode step) takes 753 ms instead of 853 (llama-bench
+pp500 2519 instead of 1701 t/s, pp1717 2649 instead of 2310). The tail's arithmetic changes with its chunking (as the
+exact chunks' sizes change it): 1717 + 256 greedy tokens bf673549 with padding, ca6db2da with `GGML_AXERA_PAD_CHUNK=0`;
+PPL (zh, 2 x 512) 20.8628 either way, with 500-token chunks 23.8701 / 23.8551. Prefill kernels of 512 rows per call
+(`PCHUNK=512 PBLK=128`: 128-row blocks inside the call, each block's arithmetic the 128-row kernel's, so the text and
+PPL above stay the same) cut the calls per layer for that prompt from 17 to 6: 698 ms, llama-bench pp512 2909, pp2048
+2895 t/s (2388 with chunks of 128). The 16k / 32k context tiers keep their 128-row chunks.
+
 The text matches llama.cpp on the CPU. The cat photo above (limited to 512 image tokens) encodes in 1.1 s on the NPU
 (attention in blocks of 512 query rows; 1.8 s before; 2.0 s with up to 768 image tokens) and is described as "A stylish gray-and-white cat wearing oversized round sunglasses and a shiny pink hooded jacket
 with white drawstrings, set against a soft pink background."
@@ -380,7 +395,7 @@ slot rows. Each script checks its kernel on the simulator against the single-cor
 | `GGML_AXERA_WEIGHTS` | bf16 | `mxfp8`; `mxfp4`: MLP and output projection MXFP4; `mxfp4m`: MLP MXFP4, the rest MXFP8 |
 | `GGML_AXERA_LMHEAD` | `mxfp4` for MoE models and `WEIGHTS=mxfp4` when `mul_mat_mx4_n<C>_k<K>` exists, else `mxfp8` | output projection format |
 | `GGML_AXERA_PREFILL_WEIGHTS` | MXFP8 if the directory has MXFP8 prefill kernels | `mxfp8` / `bf16` |
-| `GGML_AXERA_PAD_CHUNK` | 1 | `0`: no padded prefill chunks (a prompt's tail in the chunks that fit exactly and single decode steps) |
+| `GGML_AXERA_PAD_CHUNK` | 1 | `0`: no padded prefill chunks (a prompt's tail in the chunks that fit exactly and single decode steps; Qwen3.5 hybrid models pad only with `_pv` delta-net kernels) |
 | `GGML_AXERA_PAD_MIN` | 2 | fewest tokens a padded chunk runs (fewer: decode steps) |
 | `GGML_AXERA_PAD_FILL` | copies of the last row | `zero`: padding rows of zeros (a check that the real rows do not depend on them) |
 | `GGML_AXERA_GROUP` | the largest group with a kernel (the whole model first) | layers per call; `0`: no groups |
