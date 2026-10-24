@@ -1605,7 +1605,7 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
     pre_mx = mx8 && (pw != nullptr ? strcmp(pw, "mxfp8") == 0 : pre_mx);
     m.pre_mx = pre_mx;
     m.pre.clear();
-    for (int P : { 256, 128, 64, 32, 16, 8, 4, 3, 2, 1 }) {
+    for (int P : { 512, 256, 128, 64, 32, 16, 8, 4, 3, 2, 1 }) {
         if (m.moe) {  // MoE: qwen35moe_{gdn,attn}_prefill<P> (bf16 weights) with the slots kernel
             // attention: the fused kernel of the context tier; split (flash) only when no fused kernel holds the
             // context (m.flash), never in place of a missing chunk size of a fused tier
