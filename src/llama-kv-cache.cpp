@@ -1568,6 +1568,11 @@ struct args_set_input_kq_mask {
     int64_t n_tps;
 };
 
+// LLAMA_KQ_MASK_CHECK=1: every KQ mask filled a second time without the incremental rows and compared (aborts on a
+// difference); kq_mask_reference: that second fill
+static thread_local bool    kq_mask_reference = false;
+static thread_local int64_t kq_mask_incremental_rows = 0;  // (LLAMA_KQ_MASK_CHECK's report)
+
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
   //const auto & hparams = args.hparams;
@@ -1596,10 +1601,19 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
     }
 
+    // causal masks without SWA / ALiBi: a token whose position is not below the previous one of its sequence takes that
+    // token's row and decides again only the recorded cells (sorted by position) of positions in (previous, its own]
+    // -- with M-RoPE [previous, its own]: cells at its own position are masked by the 2D comparison -- the other cells
+    // are decided alike for all of them
+    const bool incremental = causal && !swa && !alibi && !kq_mask_reference;
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
+        // incremental: per sequence its last row (token, position) and the recorded cells as (position, cell)
+        std::unordered_map<llama_seq_id, std::pair<uint32_t, llama_pos>>             seq_last;
+        std::unordered_map<llama_seq_id, std::vector<std::pair<llama_pos, uint32_t>>> seq_sorted;
 
         for (uint32_t ii = 0; ii < n_tps; ++ii) {
             const uint32_t i = s*n_tps + ii;
@@ -1626,6 +1640,27 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             bool prev = false;
 
             auto & idxs = seq_idxs[seq_id];
+
+            if (incremental) {
+                auto last = seq_last.find(seq_id);
+                if (last != seq_last.end() && p1 >= last->second.second) {
+                    const llama_pos pl = last->second.second;
+                    std::copy(data + n_kv*last->second.first, data + n_kv*last->second.first + n_kv, data + idst);
+                    const auto & srt = seq_sorted[seq_id];
+                    auto it = is_2d ? std::lower_bound(srt.begin(), srt.end(), std::make_pair(pl, (uint32_t) 0)) :
+                                      std::upper_bound(srt.begin(), srt.end(), std::make_pair(pl, UINT32_MAX));
+                    for (; it != srt.end() && it->first <= p1; ++it) {
+                        bool keep = true;
+                        if (is_2d && it->first == p1) {
+                            keep = !cells.ext_get(it->second).is_2d_gt(p1_x, p1_y);
+                        }
+                        data[idst + it->second] = keep ? mask_keep : mask_drop;
+                    }
+                    last->second = { i, p1 };
+                    kq_mask_incremental_rows++;
+                    continue;
+                }
+            }
 
             if (!alibi) {
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
@@ -1715,6 +1750,19 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 skip:
                 data[idst + j] = mask_drop;
             }
+
+            if (incremental) {
+                if (!prev) {  // the sequence's first row: its recorded cells by position
+                    auto & srt = seq_sorted[seq_id];
+                    srt.clear();
+                    srt.reserve(idxs.size());
+                    for (const uint32_t j : idxs) {
+                        srt.emplace_back(cells.pos_get(j), j);
+                    }
+                    std::sort(srt.begin(), srt.end());
+                }
+                seq_last[seq_id] = { i, p1 };
+            }
         }
     }
 }
@@ -1795,6 +1843,33 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
     } else {
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+    }
+
+    static const bool check = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_CHECK");
+        return e && atoi(e) != 0;
+    }();
+    if (check) {
+        std::vector<uint8_t> ref(ggml_nbytes(dst));
+        kq_mask_reference = true;
+        if (dst->type == GGML_TYPE_F16) {
+            set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) ref.data(), causal_attn);
+        } else {
+            set_input_kq_mask_impl<float>(args, (float *) ref.data(), causal_attn);
+        }
+        kq_mask_reference = false;
+        // (the mask rows of the ubatch's tokens: n_kv * n_tokens values; padding rows untouched by both)
+        const size_t used = (size_t) n_kv * n_tokens * ggml_element_size(dst);
+        if (memcmp(ref.data(), dst->data, used) != 0) {
+            fprintf(stderr, "%s: LLAMA_KQ_MASK_CHECK: the incremental KQ mask differs (n_kv %lld, n_tokens %u)\n",
+                    __func__, (long long) n_kv, n_tokens);
+            GGML_ABORT("KQ mask check failed");
+        }
+        static int64_t n_checked = 0;
+        if (++n_checked % 64 == 1) {
+            fprintf(stderr, "%s: LLAMA_KQ_MASK_CHECK: %lld masks equal (n_kv %lld, n_tokens %u, %lld incremental rows)\n",
+                    __func__, (long long) n_checked, (long long) n_kv, n_tokens, (long long) kq_mask_incremental_rows);
+        }
     }
 
     //const int64_t t_end = ggml_time_us();
