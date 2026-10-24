@@ -1998,6 +1998,17 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
                     pk->flush(pk->vir, pk->size);
                 }
             }
+            if (const char * d = std::getenv("GGML_AXERA_DUMP_GRP"); d && g == 0) {  // DIAG: group 0's packs
+                for (int pi = 0; pi < 4; ++pi) {
+                    if (gk.packs[g][pi]) {
+                        FILE * f = fopen((std::string(d) + "/" + packs[pi] + ".bin").c_str(), "wb");
+                        if (f) {
+                            fwrite(gk.packs[g][pi]->vir, 1, gk.pack_bytes[pi], f);
+                            fclose(f);
+                        }
+                    }
+                }
+            }
         }
         GGML_LOG_INFO("%s: %s: %d layers per call\n", __func__, name.c_str(), G);
     }

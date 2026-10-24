@@ -91,8 +91,62 @@ void axera_q35_batch::run_grouped(int il, int64_t p) {
     for (size_t i = 0; i < gk.out.size(); ++i) {
         gk.out[i] = io(gk.outs[i], true);
     }
+    // DIAG (GGML_AXERA_DUMP_GIO=<dir>): group 0's IO of the first decode call, inputs before and outputs after it
+    static int  gio_calls = 0;
+    const int    gio_c = il == 0 ? gio_calls++ : -1;
+    const char * gio = gio_c >= 0 && gio_c < 4 ? std::getenv("GGML_AXERA_DUMP_GIO") : nullptr;
+    auto gio_put = [&](const std::string & n, const AX_ENGINE_IO_BUFFER_T & b) {
+        AX_SYS_MinvalidateCache(b.phyAddr, b.pVirAddr, b.nSize);
+        if (FILE * f = fopen((std::string(gio) + "/c" + std::to_string(gio_c) + "_" + n + ".bin").c_str(), "wb")) {
+            fwrite(b.pVirAddr, 1, b.nSize, f);
+            fclose(f);
+        }
+    };
+    if (gio) {
+        for (size_t i = 0; i < gk.out.size(); ++i) {  // the in-place outputs (state, KV) before the call
+            gio_put(std::string("pre_") + gk.k->info->pOutputs[i].pName, gk.out[i]);
+        }
+        for (size_t i = 0; i < gk.in.size(); ++i) {
+            gio_put(gk.k->info->pInputs[i].pName, gk.in[i]);
+        }
+    }
+    // DIAG (GGML_AXERA_GRP_TWICE=1): each group call run twice from the same in-place outputs, the results compared
+    static const bool twice = std::getenv("GGML_AXERA_GRP_TWICE") != nullptr;
+    std::vector<std::vector<char>> keep;
+    if (twice) {
+        for (auto & b : gk.out) {
+            AX_SYS_MinvalidateCache(b.phyAddr, b.pVirAddr, b.nSize);
+            keep.emplace_back((char *) b.pVirAddr, (char *) b.pVirAddr + b.nSize);
+        }
+        axera_run_sync(gk.k, gk.in, gk.out);
+        std::vector<std::vector<char>> first;
+        for (size_t i = 0; i < gk.out.size(); ++i) {
+            auto & b = gk.out[i];
+            AX_SYS_MinvalidateCache(b.phyAddr, b.pVirAddr, b.nSize);
+            first.emplace_back((char *) b.pVirAddr, (char *) b.pVirAddr + b.nSize);
+            memcpy(b.pVirAddr, keep[i].data(), b.nSize);
+            AX_SYS_MflushCache(b.phyAddr, b.pVirAddr, b.nSize);
+        }
+        keep.swap(first);
+    }
     axera_timer tm("moe layer group");
     const int   ret = axera_run_sync(gk.k, gk.in, gk.out);
+    if (twice) {
+        std::string diff;
+        for (size_t i = 0; i < gk.out.size(); ++i) {
+            auto & b = gk.out[i];
+            AX_SYS_MinvalidateCache(b.phyAddr, b.pVirAddr, b.nSize);
+            if (memcmp(b.pVirAddr, keep[i].data(), b.nSize) != 0) {
+                diff += std::string(" ") + gk.k->info->pOutputs[i].pName;
+            }
+        }
+        fprintf(stderr, "grp twice il %d p %lld:%s\n", il, (long long) p, diff.empty() ? " same" : diff.c_str());
+    }
+    if (gio) {
+        for (size_t i = 0; i < gk.out.size(); ++i) {
+            gio_put(std::string("be_out_") + gk.k->info->pOutputs[i].pName, gk.out[i]);
+        }
+    }
     if (ret != 0) {
         GGML_ABORT("qwen35 template: RunSync failed (0x%x) in the MoE layers %d .. %d, position %" PRId64 "\n", ret, il,
                    il + gk.G - 1, p);
