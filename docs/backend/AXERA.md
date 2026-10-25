@@ -392,7 +392,7 @@ slot rows. Each script checks its kernel on the simulator against the single-cor
 | `GGML_AXERA_TEMPLATE` | per op | `qwen35` / `qwen3`: the graph template |
 | `GGML_AXERA_KERNEL_DIR` | `./axera_kernels` | kernel directory |
 | `GGML_AXERA_CORES` | 4 | cores per kernel (`_npu<N>`); a kernel without that build runs on one core with a warning at its first call |
-| `GGML_AXERA_WEIGHTS` | bf16 | `mxfp8`; `mxfp4`: MLP and output projection MXFP4; `mxfp4m`: MLP MXFP4, the rest MXFP8 |
+| `GGML_AXERA_WEIGHTS` | bf16 | `mxfp8`; `mxfp4`: every layer projection (attention, delta-net, MLP) and the output projection MXFP4; `mxfp4m`: the MLP MXFP4, the attention / delta-net projections and the output projection MXFP8 |
 | `GGML_AXERA_LMHEAD` | `mxfp4` for MoE models and `WEIGHTS=mxfp4` when `mul_mat_mx4_n<C>_k<K>` exists, else `mxfp8` | output projection format |
 | `GGML_AXERA_PREFILL_WEIGHTS` | MXFP8 if the directory has MXFP8 prefill kernels | `mxfp8` / `bf16` |
 | `GGML_AXERA_PAD_CHUNK` | 1 | `0`: no padded prefill chunks (a prompt's tail in the chunks that fit exactly and single decode steps; Qwen3.5 hybrid models pad only with `_pv` delta-net kernels) |
