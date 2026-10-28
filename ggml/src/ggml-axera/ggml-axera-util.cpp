@@ -35,6 +35,27 @@ bool axera_runtime_init() {
         }
         ok = true;
     });
+    // GGML_AXERA_PRELOAD (default on): every kernel of the directory loaded right after the engine's init, before the
+    // model's tensors: the engine of SDK V0.4.0 crashed creating a handle later in the process (AX_NPU_Create_handle,
+    // a stale pointer in its IO table) while the same kernels load in a fresh process
+    static std::once_flag pre;
+    if (ok) {
+        std::call_once(pre, [] {
+            const char * e = std::getenv("GGML_AXERA_PRELOAD");
+            if (e && strcmp(e, "0") == 0) {
+                return;
+            }
+            std::vector<std::string> names;
+            for (const auto & f : axera_kernels().files) {
+                names.push_back(f.first);
+            }
+            const int64_t t0 = ggml_time_us();
+            for (const auto & n : names) {
+                axera_kernels().get(n);
+            }
+            GGML_LOG_INFO("%s: %zu kernels preloaded in %.1f s\n", __func__, names.size(), (ggml_time_us() - t0) / 1e6);
+        });
+    }
     return ok;
 }
 

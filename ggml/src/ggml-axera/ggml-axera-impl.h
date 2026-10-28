@@ -321,6 +321,9 @@ struct ggml_axera_kernel {
     // a single-core build loaded for lack of the multi-core one: warned at its first run (axera_run_sync),
     // not at load (a template also loads unpacked kernels for their IO only, running the packed ones)
     std::string           one_core;
+    // the model file's bytes, kept for the handle's lifetime: the AX8860 engine of SDK V0.4.0 keeps pointers into
+    // them (a later CreateHandle reads the names of the models before it: freed bytes crash it)
+    std::vector<char>     model;
 
     ~ggml_axera_kernel() {
         if (handle) {
@@ -462,7 +465,8 @@ struct ggml_axera_kernel_registry {
         std::ifstream f(path(name), std::ios::binary);
         std::vector<char> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         auto k = std::make_unique<ggml_axera_kernel>();
-        int ret = data.empty() ? -1 : AX_ENGINE_CreateHandle(&k->handle, data.data(), data.size());
+        k->model = std::move(data);
+        int ret = k->model.empty() ? -1 : AX_ENGINE_CreateHandle(&k->handle, k->model.data(), k->model.size());
         if (ret == 0) {
             ret = AX_ENGINE_CreateContext(k->handle);
         }
@@ -498,6 +502,10 @@ struct ggml_backend_axera_buffer_context {
 
     ~ggml_backend_axera_buffer_context() {
         if (vir && !view) {
+            if (!nc && size) {  // no dirty line of ours may reach the memory after its next owner (the engine) writes it
+                AX_SYS_MflushCache(phy, vir, (AX_U32) size);
+                AX_SYS_MinvalidateCache(phy, vir, (AX_U32) size);
+            }
             AX_SYS_MemFree(phy, vir);
         }
     }
