@@ -216,6 +216,48 @@ void axera_q35_batch::run_group(const std::vector<int> & vs, int t0, int64_t p) 
     }
 }
 
+// after the layers: the final norm (embeddings) or the output head and the sampler nodes after it
+static void axera_q35_finish(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph,
+                             const std::map<std::string, ggml_tensor *> & t, axera_q35 & m, std::vector<float> & h, int T,
+                             bool embd) {
+    if (embd) {
+        axera_output_norm(t, h, T);
+    } else {
+        // the whole-model kernel computed the logits of this (single-token) batch: written in place (or copied) unless
+        // the graph wants more than the logits (normed rows, MTP input)
+        ggml_tensor * lg = m.grp.ran ? axera_group_logits(m, t, T) : nullptr;
+        if (lg && lg == m.grp.dst) {  // written in place: drop the cached lines, get_tensor reads without maintenance
+            axera_timer tl("lm_head (group)");
+            auto * dctx = (ggml_backend_axera_buffer_context *) lg->buffer->context;
+            dctx->invalidate(lg->data, ggml_nbytes(lg));
+            dctx->clean_p     = lg->data;
+            dctx->clean_n     = ggml_nbytes(lg);
+            dctx->clean_epoch = axera_graph_epoch;
+        } else if (lg) {
+            axera_timer tl("lm_head (group)");
+            m.grp.LOGITS->invalidate(m.grp.LOGITS->vir, m.grp.LOGITS->size);
+            memcpy(lg->data, m.grp.LOGITS->vir, ggml_nbytes(lg));
+            ((ggml_backend_axera_buffer_context *) lg->buffer->context)->flush(lg->data, ggml_nbytes(lg));
+        } else {
+            axera_output_head(ctx, cgraph, t, h, T, m.lm_q.get(), m.lm_s.get(), m.lm_bf.get());
+        }
+        m.grp.ran = false;
+        m.grp.dst = nullptr;
+        // nodes after the logits in this split: llama.cpp's backend sampler chain (-bs: top-k, argmax, ...) on the
+        // logits, on the CPU backend (one pass over the vocabulary instead of the host sampler's copy and sorts)
+        const ggml_tensor * head = axera_graph_head(t);
+        int                 il   = -1;
+        for (int i = 0; i < cgraph->n_nodes && head; i++) {
+            il = cgraph->nodes[i] == head ? i : il;
+        }
+        const ggml_tensor * padded = axera_graph_find(t, "result_output");  // Qwen3-TTS: padded logits, done above
+        if (il >= 0 && il + 1 < cgraph->n_nodes && (!padded || padded == head)) {
+            axera_timer ts("sampler nodes (cpu)");
+            axera_cpu_compute_nodes(ctx, cgraph, cgraph->nodes + il + 1, cgraph->n_nodes - il - 1, "sampler (cpu)");
+        }
+    }
+}
+
 enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph) {
     const std::map<std::string, ggml_tensor *> & t = axera_graph_names(ctx, cgraph);
     auto find = [&](const char * name) { return axera_graph_find(t, name); };
@@ -489,7 +531,28 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
     const bool pad_chunks = pad_env && (!m.hybrid || m.pad_gdn) && !m.moe && axera_n_seq_max() == 1;
 
     axera_timer tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
-    for (int it = 0; it < T;) {
+    // GGML_AXERA_SGL: a new prompt through the whole-model prefill kernels (chunks of 256 rows, the last one of fewer
+    // valid rows), their state into the template's caches, the rest (fewer rows than any chunk kernel, decode) through
+    // the template's kernels
+    int it0 = 0;
+    if (axera_sgl_on() && T > 1 && pos[0] == 0 && n_seqs == 1 && m.kv_llama && in_place && !m.mtp) {
+        if (s0) {
+            axera_q35_set_row(m, row_of(0));
+        }
+        if (!m.flash) {
+            axera_q35_set_stream(m, kv.stream_of(0));
+        }
+        axera_q35_zero_row(m, m.layers[0].row);
+        it0 = axera_sgl_layers(m.sgl, pos, T, H, x0_row, h, true);
+        if (it0 < 0) {
+            return GGML_STATUS_FAILED;
+        }
+        if (it0 > 0) {
+            axera_sgl_to_q35(*m.sgl, m, it0, [&](int64_t t) { return (int64_t) kv.cell_of((int) t); });
+            m.next_pos = it0;
+        }
+    }
+    for (int it = it0; it < T;) {
         const int64_t p = pos[it];
         if (s0) {
             axera_q35_set_row(m, row_of(it));
@@ -790,41 +853,6 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
         m.next_pos = p + 1;
         ++it;
     }
-    if (embd) {
-        axera_output_norm(t, h, T);
-    } else {
-        // the whole-model kernel computed the logits of this (single-token) batch: written in place (or copied) unless
-        // the graph wants more than the logits (normed rows, MTP input)
-        ggml_tensor * lg = m.grp.ran ? axera_group_logits(m, t, T) : nullptr;
-        if (lg && lg == m.grp.dst) {  // written in place: drop the cached lines, get_tensor reads without maintenance
-            axera_timer tl("lm_head (group)");
-            auto * dctx = (ggml_backend_axera_buffer_context *) lg->buffer->context;
-            dctx->invalidate(lg->data, ggml_nbytes(lg));
-            dctx->clean_p     = lg->data;
-            dctx->clean_n     = ggml_nbytes(lg);
-            dctx->clean_epoch = axera_graph_epoch;
-        } else if (lg) {
-            axera_timer tl("lm_head (group)");
-            m.grp.LOGITS->invalidate(m.grp.LOGITS->vir, m.grp.LOGITS->size);
-            memcpy(lg->data, m.grp.LOGITS->vir, ggml_nbytes(lg));
-            ((ggml_backend_axera_buffer_context *) lg->buffer->context)->flush(lg->data, ggml_nbytes(lg));
-        } else {
-            axera_output_head(ctx, cgraph, t, h, T, m.lm_q.get(), m.lm_s.get(), m.lm_bf.get());
-        }
-        m.grp.ran = false;
-        m.grp.dst = nullptr;
-        // nodes after the logits in this split: llama.cpp's backend sampler chain (-bs: top-k, argmax, ...) on the
-        // logits, on the CPU backend (one pass over the vocabulary instead of the host sampler's copy and sorts)
-        const ggml_tensor * head = axera_graph_head(t);
-        int                 il   = -1;
-        for (int i = 0; i < cgraph->n_nodes && head; i++) {
-            il = cgraph->nodes[i] == head ? i : il;
-        }
-        const ggml_tensor * padded = axera_graph_find(t, "result_output");  // Qwen3-TTS: padded logits, done above
-        if (il >= 0 && il + 1 < cgraph->n_nodes && (!padded || padded == head)) {
-            axera_timer ts("sampler nodes (cpu)");
-            axera_cpu_compute_nodes(ctx, cgraph, cgraph->nodes + il + 1, cgraph->n_nodes - il - 1, "sampler (cpu)");
-        }
-    }
+    axera_q35_finish(ctx, cgraph, t, m, h, T, embd);
     return GGML_STATUS_SUCCESS;
 }

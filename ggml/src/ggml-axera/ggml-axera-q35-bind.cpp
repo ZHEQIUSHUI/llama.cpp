@@ -384,7 +384,8 @@ void axera_q35_bind_layer(axera_q35 & m, int il, const std::map<std::string, ggm
     ly.packs.clear();
     const axera_q35::packed & pk = ly.gdn ? m.gdn_pk : m.attn_pk;
     const bool in_place_ok = !ly.gdn || ly.in_place || std::find(pk.in.begin(), pk.in.end(), k->input("state_in")) != pk.in.end();
-    if (pk.k && in_place_ok) {  // a kernel with state / conv outputs only needs the state in place
+    // (GGML_AXERA_SGL: the whole-model group runs every decode token, no layer packs: room for the prefill weights)
+    if (pk.k && in_place_ok && !axera_sgl_on()) {  // a kernel with state / conv outputs only needs the state in place
         axera_q35_bind_packed(pk, k, ly, ly.in, ly.pin, ly.pout);
         for (size_t i = 0; i < pk.in.size(); ++i) {
             if (pk.in[i] == -4 || pk.in[i] == -5) {
@@ -1082,6 +1083,11 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
     m.L    = L;
     m.H    = H;
     const bool mx8 = axera_weights_mx8();
+    // GGML_AXERA_SGL: the whole-model prefill kernels' weights (ggml-axera-sgl.cpp, ~14 GiB in banks of up to 0.7 GiB)
+    // first, while the CMM has the contiguous room (~1 min)
+    if (axera_sgl_on() && !m.sgl) {
+        m.sgl = axera_sgl_load(H);
+    }
     m.moe          = t.count("blk." + std::to_string(m.off) + ".ffn_gate_inp.weight") > 0;  // Qwen3.5 MoE: qwen35moe_* kernels
     // Qwen3.5 or Qwen3 by the layers (the MTP graph holds the Qwen3.5 NextN attention block alone)
     m.hybrid = m.mtp || m.moe;

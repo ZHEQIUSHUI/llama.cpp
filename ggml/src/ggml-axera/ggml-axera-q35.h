@@ -20,6 +20,9 @@
 #include "ggml-axera-attn.h"
 
 #include <array>
+#include <functional>
+
+struct axera_sgl;
 
 struct axera_q35_layer {
     bool                               gdn = false;
@@ -171,6 +174,7 @@ struct axera_q35 {
     axera_cmm   eh_bf, EH;  // eh_proj in bf16, its output row
     std::vector<float>    inv_freq;
     int64_t               next_pos = 0;
+    std::shared_ptr<axera_sgl> sgl;  // GGML_AXERA_SGL: the layers in the whole-model kernels (ggml-axera-sgl.cpp)
     bool                  rollback = false;  // all GDN state lives in the llama.cpp cache: earlier positions resumable
     bool                  kv_llama = false;  // attention kernels on the llama.cpp KV cache (cells, f16) and its KQ mask
     std::string           ctx_sfx;           // attention kernel name suffix: "_kvc_c<LMAX>" on the llama.cpp KV cache
@@ -337,3 +341,9 @@ void axera_q35_set_batch_rows(axera_q35 & m, size_t v, int64_t row0);
 void axera_q35_zero_row(axera_q35 & m, int64_t row);
 void axera_q35_set_stream(axera_q35 & m, int64_t s);
 void axera_q35_restart(axera_q35 & m);
+// ggml-axera-sgl.cpp
+bool axera_sgl_on();
+std::shared_ptr<axera_sgl> axera_sgl_load(int H);
+int axera_sgl_layers(std::shared_ptr<axera_sgl> & s, const int32_t * pos, int T, int H,
+                     const std::function<const float *(int)> & x0, std::vector<float> & h, bool prefill_only = false);
+void axera_sgl_to_q35(axera_sgl & s, axera_q35 & m, int64_t n, const std::function<int64_t(int64_t)> & cell_of);

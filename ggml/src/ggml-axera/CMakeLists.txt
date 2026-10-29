@@ -18,6 +18,7 @@ ggml_add_backend_library(ggml-axera
                          ggml-axera-q35-bind.cpp
                          ggml-axera-q35-run.cpp
                          ggml-axera-q35-moe.cpp
+                         ggml-axera-sgl.cpp
                          ggml-axera-vit.cpp
                          ggml-axera-audio.cpp
                          ggml-axera-gen.cpp
