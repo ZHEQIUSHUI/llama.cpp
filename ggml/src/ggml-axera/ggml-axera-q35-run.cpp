@@ -556,6 +556,10 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
             m.next_pos = pos[0] + it0;
         }
     }
+    // GGML_AXERA_SGL with a decode kernel (35B): a single-token batch of one sequence through it
+    const bool sgl_dec = axera_sgl_on() && T == 1 && n_seqs == 1 && m.kv_llama && in_place && !m.mtp &&
+                         axera_sgl_has_decode(m.sgl.get());
+    bool       tpl_ran = false;
     for (int it = it0; it < T;) {
         const int64_t p = pos[it];
         if (s0) {
@@ -567,6 +571,18 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
         if (!begin(p)) {
             return GGML_STATUS_FAILED;
         }
+        if (sgl_dec) {
+            if (!axera_sgl_decode(*m.sgl, m, p, x0_row(it), h.data() + (size_t) it * H)) {
+                return GGML_STATUS_FAILED;
+            }
+            m.next_pos = p + 1;
+            ++it;
+            continue;
+        }
+        if (m.sgl && !tpl_ran) {  // the state of the whole-model kernels' last tokens, if they ran last
+            axera_sgl_sync(*m.sgl, m, p, false);
+        }
+        tpl_ran = true;
         int v = -1;  // the largest prefill chunk that fits the remaining consecutive positions
         auto chunk_fits = [&](size_t c) {
             const int P  = m.pre[c].P;
@@ -856,6 +872,9 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
         ggml_bf16_to_fp32_row((const ggml_bf16_t *) fin->vir, h.data() + (size_t) it * H, H);
         m.next_pos = p + 1;
         ++it;
+    }
+    if (tpl_ran) {
+        axera_sgl_template_ran(m.sgl.get(), m.next_pos);
     }
     axera_q35_finish(ctx, cgraph, t, m, h, T, embd);
     return GGML_STATUS_SUCCESS;
