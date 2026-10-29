@@ -22,5 +22,6 @@ std::shared_ptr<model> make_model(const manifest & m);
 
 std::shared_ptr<model> make_qwen35_moe(const manifest & m);
 std::shared_ptr<model> make_qwen35_dense(const manifest & m);
+std::shared_ptr<model> make_qwen35_vit(const manifest & m);  // the mmproj vision encoder (roles vit.*)
 
 }  // namespace axera
