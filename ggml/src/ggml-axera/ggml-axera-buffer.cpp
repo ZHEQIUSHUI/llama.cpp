@@ -1,6 +1,7 @@
 // Axera NPU backend: CMM buffers and buffer type
 
 #include "ggml-axera-impl.h"
+#include "core/manifest.h"
 
 static void ggml_backend_axera_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     delete (ggml_backend_axera_buffer_context *) buffer->context;
@@ -124,6 +125,11 @@ bool ggml_backend_buffer_is_axera(ggml_backend_buffer_t buffer) {
 // holds it, after its last stream
 static size_t ggml_backend_axera_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * t) {
     const size_t n = ggml_nbytes(t);
+    const bool   kv = t->type == GGML_TYPE_F16 && t->ne[3] == 1 &&
+                    (strncmp(t->name, "cache_k_l", 9) == 0 || strncmp(t->name, "cache_v_l", 9) == 0);
+    if (const axera::manifest * m = axera::kernels()) {  // the kernels' context, after the last stream
+        return kv ? std::max(n, (size_t) (t->ne[2] - 1) * t->nb[2] + (size_t) m->context * t->nb[1]) : n;
+    }
     if (!axera_template_qwen35() || t->type != GGML_TYPE_F16 || t->ne[3] != 1 ||
         (strncmp(t->name, "cache_k_l", 9) != 0 && strncmp(t->name, "cache_v_l", 9) != 0)) {
         return n;

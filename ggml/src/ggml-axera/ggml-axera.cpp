@@ -1,6 +1,7 @@
 // Axera NPU backend: backend, device and registry (the design: ggml-axera-impl.h)
 
 #include "ggml-axera-impl.h"
+#include "models/model.h"
 
 #include <atomic>
 #include <unordered_map>
@@ -18,6 +19,28 @@ static void ggml_backend_axera_free(ggml_backend_t backend) {
 static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * ctx = (ggml_backend_axera_context *) backend->context;
     ++axera_graph_epoch;
+
+    if (const axera::manifest * man = axera::kernels()) {  // the directory's model adapter runs the whole graph
+        static std::chrono::steady_clock::time_point last;
+        const auto                                   t0 = std::chrono::steady_clock::now();
+        if (!ctx->model) {
+            ctx->model = axera::make_model(*man);
+        }
+        enum ggml_status st;
+        {
+            axera_timer tm("graph_compute");
+            st = ctx->model->compute(cgraph);
+        }
+        static const bool trace = std::getenv("GGML_AXERA_TRACE") != nullptr;  // every graph: nodes, host gap, run
+        if (trace) {
+            const auto now = std::chrono::steady_clock::now();
+            fprintf(stderr, "axera trace: nodes %d gap %.3f ms run %.3f ms\n", cgraph->n_nodes,
+                    last.time_since_epoch().count() ? std::chrono::duration<double, std::milli>(t0 - last).count() : -1.0,
+                    std::chrono::duration<double, std::milli>(now - t0).count());
+        }
+        last = std::chrono::steady_clock::now();
+        return st;
+    }
 
     if (axera_template_qwen35()) {
         static std::chrono::steady_clock::time_point last;  // profiling: host time between graphs
@@ -164,7 +187,7 @@ static enum ggml_backend_dev_type ggml_backend_axera_device_get_type(ggml_backen
 // overrides.
 static bool axera_mmap() {
     static const char * e  = getenv("GGML_AXERA_MMAP");
-    static const bool   on = e ? atoi(e) != 0 : axera_template_qwen35();
+    static const bool   on = e ? atoi(e) != 0 : axera::kernels() != nullptr || axera_template_qwen35();
     return on;
 }
 
@@ -262,8 +285,8 @@ static bool ggml_backend_axera_device_supports_op(ggml_backend_dev_t dev, const 
         (strncmp(op->src[0]->name, "a.blk.", 6) == 0 || strncmp(op->src[0]->name, "mm.a.mlp.", 9) == 0)) {
         axera_audio_on_set(op->src[0]);  // (the audio encoders matrices to bf16 while mtmds warmup reserves its graph)
     }
-    if (axera_template_qwen35()) {
-        // the template runs the whole graph up to the logits or, for pooled embeddings, the final norm: the pooling
+    if (axera::kernels() || axera_template_qwen35()) {
+        // the model adapter (or the template) runs the whole graph up to the logits or, for pooled embeddings, the final norm: the pooling
         // stays on the CPU. Weights must still be in CMM (or the mapped GGUF) to be offloaded
         return !axera_pooling_op(op);
     }
@@ -330,7 +353,14 @@ static const char * ggml_backend_axera_reg_get_name(ggml_backend_reg_t reg) {
 }
 
 static size_t ggml_backend_axera_reg_get_device_count(ggml_backend_reg_t reg) {
-    return axera_runtime_init() ? 1 : 0;
+    if (!axera_runtime_init()) {
+        return 0;
+    }
+    // the kernels before the model's tensors: the manifest's, else (no manifest) every kernel of the directory
+    if (!axera::kernels()) {
+        axera_legacy_preload();
+    }
+    return 1;
     GGML_UNUSED(reg);
 }
 

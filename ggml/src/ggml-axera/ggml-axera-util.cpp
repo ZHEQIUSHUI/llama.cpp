@@ -11,81 +11,27 @@ bool axera_debug() {
     }();
     return debug;
 }
-axera_pool & axera_host_pool() {
-    static axera_pool pool(std::min(15, std::max(1, (int) std::thread::hardware_concurrency() - 1)));
-    return pool;
-}
-
-// AX_SYS / AX_ENGINE are process-wide; initialized once, never torn down while tensors may still live in CMM
-bool axera_runtime_init() {
-    static std::once_flag once;
-    static bool ok = false;
-    std::call_once(once, [] {
-        if (AX_SYS_Init() != 0) {
-            GGML_LOG_WARN("%s: AX_SYS_Init failed, Axera NPU unavailable\n", __func__);
-            return;
-        }
-        AX_ENGINE_NPU_ATTR_T attr;
-        memset(&attr, 0, sizeof(attr));
-        attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
-        const int ret = AX_ENGINE_Init(&attr);
-        if (ret != 0) {
-            GGML_LOG_WARN("%s: AX_ENGINE_Init failed (0x%x), Axera NPU unavailable\n", __func__, ret);
-            return;
-        }
-        ok = true;
-    });
-    // GGML_AXERA_PRELOAD (default on): every kernel of the directory loaded right after the engine's init, before the
-    // model's tensors: the engine of SDK V0.4.0 crashed creating a handle later in the process (AX_NPU_Create_handle,
-    // a stale pointer in its IO table) while the same kernels load in a fresh process
+// the kernel directory without a manifest (the models not on the manifest yet): every kernel of it loaded right
+// after the engine's init, before the model's tensors
+void axera_legacy_preload() {
     static std::once_flag pre;
-    if (ok) {
-        std::call_once(pre, [] {
-            const char * e = std::getenv("GGML_AXERA_PRELOAD");
-            if (e && strcmp(e, "0") == 0) {
-                return;
-            }
-            std::vector<std::string> names;
-            for (const auto & f : axera_kernels().files) {
-                names.push_back(f.first);
-            }
-            const int64_t t0 = ggml_time_us();
-            for (const auto & n : names) {
-                axera_kernels().get(n);
-            }
-            GGML_LOG_INFO("%s: %zu kernels preloaded in %.1f s\n", __func__, names.size(), (ggml_time_us() - t0) / 1e6);
-        });
-    }
-    return ok;
+    std::call_once(pre, [] {
+        const char * e = std::getenv("GGML_AXERA_PRELOAD");
+        if (e && strcmp(e, "0") == 0) {
+            return;
+        }
+        std::vector<std::string> names;
+        for (const auto & f : axera_kernels().files) {
+            names.push_back(f.first);
+        }
+        const int64_t t0 = ggml_time_us();
+        for (const auto & n : names) {
+            axera_kernels().get(n);
+        }
+        GGML_LOG_INFO("%s: %zu kernels preloaded in %.1f s\n", __func__, names.size(), (ggml_time_us() - t0) / 1e6);
+    });
 }
 
-// CMM total/free from /proc/ax_proc/mem_cmm_info (sum over partitions)
-void axera_cmm_memory(size_t * free, size_t * total) {
-    *free  = 0;
-    *total = 0;
-    std::ifstream f("/proc/ax_proc/mem_cmm_info");
-    std::string line;
-    while (std::getline(f, line)) {
-        size_t p = line.find("PARTITION:");
-        if (p != std::string::npos) {
-            size_t s = line.find("Size=", p);
-            if (s != std::string::npos) {
-                const size_t kb = std::strtoull(line.c_str() + s + 5, nullptr, 10);
-                *total += kb * 1024;
-                *free  += kb * 1024;
-            }
-            continue;
-        }
-        p = line.find("nbytes(");
-        if (p != std::string::npos) {
-            size_t c = line.find("Cur=", p);
-            if (c != std::string::npos) {
-                const size_t used = std::strtoull(line.c_str() + c + 4, nullptr, 10);
-                *free -= std::min(*free, used);
-            }
-        }
-    }
-}
 ggml_axera_kernel_registry & axera_kernels() {
     static ggml_axera_kernel_registry registry;
     return registry;
@@ -94,52 +40,6 @@ std::string axera_mul_mat_kernel_name(int64_t c, int64_t k, bool mx8) {
     char name[96];
     snprintf(name, sizeof(name), "mul_mat_%s_n%" PRId64 "_k%" PRId64, mx8 ? "mx8" : "bf16", c, k);
     return name;
-}
-
-//
-// backend
-//
-
-// CMM owned by the backend (staging, template state); same cache rules as the buffers above
-std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_alloc(size_t size) {
-    auto b  = std::make_unique<ggml_backend_axera_buffer_context>();
-    b->size = GGML_PAD(std::max<size_t>(size, 1), AXERA_ALIGNMENT);
-    if (AX_SYS_MemAllocCached(&b->phy, &b->vir, (AX_U32) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera") != 0) {
-        GGML_ABORT("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
-    }
-    memset(b->vir, 0, b->size);
-    b->flush(b->vir, b->size);
-    return b;
-}
-
-// non-cacheable CMM for buffers the host only writes (no flushes; host reads from it are slow)
-std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_alloc_nc(size_t size) {
-    auto b  = std::make_unique<ggml_backend_axera_buffer_context>();
-    b->size = GGML_PAD(std::max<size_t>(size, 1), AXERA_ALIGNMENT);
-    b->nc   = true;
-    if (AX_SYS_MemAlloc(&b->phy, &b->vir, (AX_U32) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera-nc") != 0) {
-        GGML_ABORT("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
-    }
-    return b;
-}
-std::unique_ptr<ggml_backend_axera_buffer_context> axera_cmm_view(const ggml_backend_axera_buffer_context * b, size_t off,
-                                                                  size_t size) {
-    GGML_ASSERT(off + size <= b->size);
-    auto v  = std::make_unique<ggml_backend_axera_buffer_context>();
-    v->phy  = b->phy + off;
-    v->vir  = (char *) b->vir + off;
-    v->size = size;
-    v->nc   = b->nc;
-    v->view = true;
-    return v;
-}
-AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint32_t size) {
-    AX_ENGINE_IO_BUFFER_T b;
-    memset(&b, 0, sizeof(b));
-    b.phyAddr  = ctx->phy_of(p);
-    b.pVirAddr = p;
-    b.nSize    = size;
-    return b;
 }
 
 // one kernel call; the AX_ENGINE_RunSync status
@@ -174,8 +74,6 @@ int axera_run_sync(ggml_axera_kernel * k, std::vector<AX_ENGINE_IO_BUFFER_T> & i
     }
     return ret;
 }
-
-std::atomic<uint64_t> axera_graph_epoch{ 0 };
 
 // GGML_AXERA_TEMPLATE=qwen35 (or qwen3): the graph template of Qwen3.5 and Qwen3 transformers (ggml-axera-q35.h)
 bool axera_template_qwen35() {

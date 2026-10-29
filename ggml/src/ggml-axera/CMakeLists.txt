@@ -10,6 +10,14 @@ message(STATUS "Axera BSP: ${GGML_AXERA_BSP_DIR}")
 
 ggml_add_backend_library(ggml-axera
                          ggml-axera.cpp
+                         core/runtime.cpp
+                         core/manifest.cpp
+                         core/quant.cpp
+                         core/params.cpp
+                         ops/ops.cpp
+                         models/model.cpp
+                         models/qwen35_moe/qwen35_moe.cpp
+                         models/qwen35_dense/qwen35_dense.cpp
                          ggml-axera-util.cpp
                          ggml-axera-buffer.cpp
                          ggml-axera-weights.cpp
@@ -23,7 +31,7 @@ ggml_add_backend_library(ggml-axera
                          ggml-axera-gen.cpp
                         )
 
-target_include_directories(ggml-axera PRIVATE ${AXERA_INCLUDE_DIR})
+target_include_directories(ggml-axera PRIVATE ${AXERA_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../../../vendor)
 target_link_libraries(ggml-axera PRIVATE ${AXERA_ENGINE_LIB} ${AXERA_INTERPRETER_LIB} ${AXERA_SYS_LIB})
 # the BSP libraries depend on further board libraries (/opt/lib) that are only resolved at run time
 target_link_options(ggml-axera PUBLIC -Wl,--allow-shlib-undefined)
