@@ -1083,11 +1083,6 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
     m.L    = L;
     m.H    = H;
     const bool mx8 = axera_weights_mx8();
-    // GGML_AXERA_SGL: the whole-model prefill kernels' weights (ggml-axera-sgl.cpp, ~14 GiB in banks of up to 0.7 GiB)
-    // first, while the CMM has the contiguous room (~1 min)
-    if (axera_sgl_on() && !m.sgl) {
-        m.sgl = axera_sgl_load(H);
-    }
     m.moe          = t.count("blk." + std::to_string(m.off) + ".ffn_gate_inp.weight") > 0;  // Qwen3.5 MoE: qwen35moe_* kernels
     // Qwen3.5 or Qwen3 by the layers (the MTP graph holds the Qwen3.5 NextN attention block alone)
     m.hybrid = m.mtp || m.moe;
@@ -1108,6 +1103,11 @@ void axera_q35_init(axera_q35 & m, int L, int H, const std::map<std::string, ggm
     }
     m.ROT        = rp[1];
     m.THETA      = base;
+    // GGML_AXERA_SGL: the whole-model kernels' weight banks (ggml-axera-sgl.cpp, ~14 GiB in banks of up to 0.7 GiB)
+    // first, while the CMM has the contiguous room
+    if (axera_sgl_on() && !m.sgl) {
+        m.sgl = axera_sgl_load(H, t, L, m.THETA, m.ROT);
+    }
     m.freq_scale = scale;
     m.rope_mode  = rp[2];
     memcpy(m.sections, rp + 11, sizeof(m.sections));

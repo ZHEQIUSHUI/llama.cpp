@@ -343,7 +343,7 @@ void axera_q35_set_stream(axera_q35 & m, int64_t s);
 void axera_q35_restart(axera_q35 & m);
 // ggml-axera-sgl.cpp
 bool axera_sgl_on();
-std::shared_ptr<axera_sgl> axera_sgl_load(int H);
+std::shared_ptr<axera_sgl> axera_sgl_load(int H, const std::map<std::string, ggml_tensor *> & t, int L, double theta, int rot);
 int axera_sgl_layers(std::shared_ptr<axera_sgl> & s, const int32_t * pos, int T, int H,
                      const std::function<const float *(int)> & x0, std::vector<float> & h, bool prefill_only = false);
 int64_t axera_sgl_next(const axera_sgl * s);  // the position after its last run (-1: none)
