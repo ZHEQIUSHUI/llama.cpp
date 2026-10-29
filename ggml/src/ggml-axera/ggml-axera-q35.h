@@ -346,4 +346,5 @@ bool axera_sgl_on();
 std::shared_ptr<axera_sgl> axera_sgl_load(int H);
 int axera_sgl_layers(std::shared_ptr<axera_sgl> & s, const int32_t * pos, int T, int H,
                      const std::function<const float *(int)> & x0, std::vector<float> & h, bool prefill_only = false);
-void axera_sgl_to_q35(axera_sgl & s, axera_q35 & m, int64_t n, const std::function<int64_t(int64_t)> & cell_of);
+int64_t axera_sgl_next(const axera_sgl * s);  // the position after its last run (-1: none)
+void axera_sgl_to_q35(axera_sgl & s, axera_q35 & m, int64_t p0, int64_t n, const std::function<int64_t(int64_t)> & cell_of);

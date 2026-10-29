@@ -2,12 +2,14 @@
 // models/qwen38_27b: Qwen3.8-27B), GGML_AXERA_SGL=<dir> with the qwen35 template
 //
 // One kernel call runs all layers (a runtime loop over blocks of three GDN + MLP and one gated attention + MLP layers)
-// on 256 rows (prefill) or 1 row (decode). Weights, recurrent state and the paged KV cache (pages of 256 cells) are
-// the kernels' inputs; <dir> holds them as the offline packer wrote them (pack_sgl27.py: <name>.bin of every weight
-// bank, manifest.txt "<name> <bytes> <state>"), and the kernels sgl27_r<rows>_v<valid>_h<history>_npu4.axmodel in
-// GGML_AXERA_KERNEL_DIR (loaded with the others at initialization). The state banks (GDN state pools, KV pages) are
-// allocated here and cleared at position 0. A prompt runs in chunks of 256 positions from a page start (the chunk
-// kernels with valid < 256 take a shorter last chunk), the rest token by token through the decode kernel.
+// on 256 rows. Weights, recurrent state and the paged KV cache (pages of 256 cells) are the kernels' inputs; <dir> holds
+// the weight banks as the offline packer wrote them (pack_sgl27.py: <name>.bin of every bank, manifest.txt "<name>
+// <bytes> <state>"), the kernels sgl27_r256_v256_h<history>_npu4.axmodel are in GGML_AXERA_KERNEL_DIR (loaded with the
+// others at initialization). The state banks (GDN state pools, KV pages) are allocated here and cleared at position 0.
+// The template (ggml-axera-q35-run.cpp) runs a prompt's whole 256-position chunks here, takes over the state
+// (axera_sgl_to_q35) and runs the rest of the prompt and decode with its own kernels. (The kernels' decode variant
+// r1_v1_h1 reads every block's attention Q/K/V weights of block 0 (flash_attn.py project_token's NVFP4 path drops the
+// banks offset), their chunk variants of fewer valid rows compute NaN: neither is used.)
 
 #include "ggml-axera-q35.h"
 
@@ -85,6 +87,10 @@ std::shared_ptr<axera_sgl> axera_sgl_load(int H) {
     for (const auto & f : axera_kernels().files) {
         int rows, valid, hist, len = 0;
         if (sscanf(f.first.c_str(), "sgl27_r%d_v%d_h%d%n", &rows, &valid, &hist, &len) != 3 || (size_t) len != f.first.size()) {
+            continue;
+        }
+        if (rows > 1 && valid != rows) {  // NaN (sglang runs a partial chunk through its per-layer kernels)
+            GGML_LOG_WARN("axera sgl: %s skipped: a chunk of fewer valid rows computes NaN\n", f.first.c_str());
             continue;
         }
         axera_sgl::variant v;
@@ -166,6 +172,10 @@ int axera_sgl_layers(std::shared_ptr<axera_sgl> & sp, const int32_t * pos, int T
     }
     axera_sgl & s = *sp;
     GGML_ASSERT(s.H == H);
+    static const bool unaligned = [] {
+        const char * e = std::getenv("GGML_AXERA_SGL_UNALIGNED");
+        return e == nullptr || strcmp(e, "0") != 0;
+    }();
     for (int it = 0; it < T;) {
         const int64_t p = pos[it];
         if (p == 0) {
@@ -182,7 +192,9 @@ int axera_sgl_layers(std::shared_ptr<axera_sgl> & sp, const int32_t * pos, int T
         axera_sgl::variant * v = nullptr;
         for (auto & c : s.vars) {
             const bool hist_ok = c.hist == (p > 0);
-            if (p % 256 == 0 && c.rows > 1 && hist_ok && c.valid <= T - it && p + c.valid <= (int64_t) s.pages * 256 &&
+            // also from inside a page, within it (the last chunk after a shorter one; GGML_AXERA_SGL_UNALIGNED=0: off)
+            const bool start_ok = p % 256 == 0 || (unaligned && p % 256 + c.valid <= 256);
+            if (start_ok && c.rows > 1 && hist_ok && c.valid <= T - it && p + c.valid <= (int64_t) s.pages * 256 &&
                 (!v || c.valid > v->valid)) {
                 v = &c;
             }
@@ -237,12 +249,17 @@ int axera_sgl_layers(std::shared_ptr<axera_sgl> & sp, const int32_t * pos, int T
     return T;
 }
 
-// after the whole-model kernels ran positions 0 .. n-1: their recurrent state and KV cache into the template's
+// after the whole-model kernels ran a prompt (or its next batch): their recurrent state and KV cache into the template's
 // (the llama.cpp recurrent cache rows and KV cache cells), so that its own kernels continue at position n.
 // GDN value heads: the kernels' HF order (key head kh, its value head vo: kh * 3 + vo), the template's GGUF order
 // (vo * 16 + kh); the conv state q | k | v in one row per step. KV: pages [page][K, V][256 cells][heads x dim] bf16 into
 // [cell][heads x dim] f16 at the cells of the batch's tokens.
-void axera_sgl_to_q35(axera_sgl & s, axera_q35 & m, int64_t n, const std::function<int64_t(int64_t)> & cell_of) {
+int64_t axera_sgl_next(const axera_sgl * s) {
+    return s ? s->next_pos : -1;
+}
+
+// positions p0 .. p0 + n - 1 (batch tokens 0 .. n - 1) just ran: the whole state, those positions' KV cells
+void axera_sgl_to_q35(axera_sgl & s, axera_q35 & m, int64_t p0, int64_t n, const std::function<int64_t(int64_t)> & cell_of) {
     axera_timer tm("sgl state -> template");
     auto bank = [&](const char * name) -> const char * {
         auto & b = s.banks.at(name);
@@ -302,7 +319,8 @@ void axera_sgl_to_q35(axera_sgl & s, axera_q35 & m, int64_t n, const std::functi
                 char *       base = kr.base + stream * kr.stride;
                 const auto * src  = (const ggml_bf16_t *) kv + (size_t) a * s.pages_kv * 2 * 256 * KVW;
                 for (int64_t t = 0; t < n; ++t) {
-                    const ggml_bf16_t * row = src + (((t / 256) * 2 + (kr.v ? 1 : 0)) * 256 + t % 256) * (size_t) KVW;
+                    const int64_t       q   = p0 + t;
+                    const ggml_bf16_t * row = src + (((q / 256) * 2 + (kr.v ? 1 : 0)) * 256 + q % 256) * (size_t) KVW;
                     auto *              out = (ggml_fp16_t *) (base + cell_of(t) * kr.row);
                     for (int i = 0; i < KVW; ++i) {
                         out[i] = ggml_fp32_to_fp16(ggml_bf16_to_fp32(row[i]));

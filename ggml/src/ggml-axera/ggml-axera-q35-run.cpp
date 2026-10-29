@@ -535,21 +535,25 @@ enum ggml_status axera_q35_compute(ggml_backend_axera_context * ctx, struct ggml
     // valid rows), their state into the template's caches, the rest (fewer rows than any chunk kernel, decode) through
     // the template's kernels
     int it0 = 0;
-    if (axera_sgl_on() && T > 1 && pos[0] == 0 && n_seqs == 1 && m.kv_llama && in_place && !m.mtp) {
+    // (a prompt's next batch too, while the whole-model kernels ran all positions before it)
+    if (axera_sgl_on() && T > 1 && (pos[0] == 0 || (pos[0] == m.next_pos && pos[0] == axera_sgl_next(m.sgl.get()))) &&
+        n_seqs == 1 && m.kv_llama && in_place && !m.mtp) {
         if (s0) {
             axera_q35_set_row(m, row_of(0));
         }
         if (!m.flash) {
             axera_q35_set_stream(m, kv.stream_of(0));
         }
-        axera_q35_zero_row(m, m.layers[0].row);
+        if (pos[0] == 0) {
+            axera_q35_zero_row(m, m.layers[0].row);
+        }
         it0 = axera_sgl_layers(m.sgl, pos, T, H, x0_row, h, true);
         if (it0 < 0) {
             return GGML_STATUS_FAILED;
         }
         if (it0 > 0) {
-            axera_sgl_to_q35(*m.sgl, m, it0, [&](int64_t t) { return (int64_t) kv.cell_of((int) t); });
-            m.next_pos = it0;
+            axera_sgl_to_q35(*m.sgl, m, pos[0], it0, [&](int64_t t) { return (int64_t) kv.cell_of((int) t); });
+            m.next_pos = pos[0] + it0;
         }
     }
     for (int it = it0; it < T;) {
