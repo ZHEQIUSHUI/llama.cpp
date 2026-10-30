@@ -61,6 +61,7 @@ static void experts_to_cmm(const ggml_tensor * w[3]) {
                 c.data        = p;
                 c.view_src    = nullptr;
                 ggml_backend_tensor_set(&c, w[g]->data, 0, ggml_nbytes(w[g]));
+                axera_drop_mapped(w[g]);
                 copy.emplace(w[g], c);
                 p += ggml_nbytes(w[g]);
             }
@@ -177,6 +178,7 @@ AX_ENGINE_IO_BUFFER_T params::get(const std::map<std::string, ggml_tensor *> & t
         auto it = bf16.find(w);
         if (it == bf16.end()) {
             it = bf16.emplace(w, axera_to_bf16(w)).first;
+            axera_drop_mapped(w);
         }
         return axera_io(it->second, size);
     };
@@ -201,7 +203,10 @@ AX_ENGINE_IO_BUFFER_T params::get(const std::map<std::string, ggml_tensor *> & t
         if (ggml_backend_buffer_is_axera(w->buffer)) {
             return axera_io((ggml_backend_axera_buffer_context *) w->buffer->context, w->data, size);
         }
-        return owned([&](void * d) { memcpy(d, w->data, size); });  // not in CMM (the GGUF mapping)
+        return owned([&](void * d) {  // not in CMM (the GGUF mapping)
+            memcpy(d, w->data, size);
+            axera_drop_mapped(w);
+        });
     }
     if (p.convert == "bf16") {
         return bf16_of();
@@ -215,6 +220,7 @@ AX_ENGINE_IO_BUFFER_T params::get(const std::map<std::string, ggml_tensor *> & t
             } else {
                 axera_quantize_mxfp8(w, q.q, q.s);
             }
+            axera_drop_mapped(w);
         }
         const axera_cmm & b = p.convert.size() > 5 ? q.s : q.q;
         if (b->size < size) {
@@ -327,7 +333,29 @@ void params::release(const std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> 
     };
     drop(bf16);
     drop(own);
-    GGML_LOG_INFO("axera: %.1f MiB of converted parameters freed (read only through packs)\n", freed / 1048576.0);
+    size_t pk = 0, kept = 0, ex = 0;  // what stays: the packs, the conversions kernels read directly, expert copies
+    for (const auto & [sig, b] : packs) {
+        pk += b->size;
+    }
+    for (const auto & [k, q] : mx) {
+        kept += q.q->size + q.s->size;
+    }
+    for (const auto * map : { &bf16 }) {
+        for (const auto & [k, b] : *map) {
+            kept += b->size;
+        }
+    }
+    for (const auto & [k, b] : own) {
+        kept += b->size;
+    }
+    for (const auto & b : exp_own) {
+        ex += b->size;
+    }
+    size_t cmm_free, cmm_total;
+    axera_cmm_memory(&cmm_free, &cmm_total);
+    GGML_LOG_INFO("axera: parameters: %.1f MiB freed (read only through packs); kept: packs %.1f MiB, direct %.1f MiB, "
+                  "expert copies %.1f MiB; CMM in use %.1f of %.1f MiB\n", freed / 1048576.0, pk / 1048576.0,
+                  kept / 1048576.0, ex / 1048576.0, (cmm_total - cmm_free) / 1048576.0, cmm_total / 1048576.0);
 }
 
 }  // namespace axera

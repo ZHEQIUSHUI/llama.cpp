@@ -37,6 +37,9 @@ bool ggml_backend_buffer_is_axera(struct ggml_backend_buffer * buffer);
 bool axera_runtime_init();
 // CMM total / free (/proc/ax_proc/mem_cmm_info)
 void axera_cmm_memory(size_t * free, size_t * total);
+// a weight in the GGUF file mapping whose data has been converted into CMM: its pages dropped from the process (they
+// are the file's, read only: a later read faults them in again). Nothing for any other buffer
+void axera_drop_mapped(const struct ggml_tensor * t);
 // the largest sequence count of any llama.cpp context made in this process (0: none told the backend): a padded
 // prefill chunk writes K / V into the cells after its batch's, which only one sequence leaves free
 uint32_t axera_n_seq_max();

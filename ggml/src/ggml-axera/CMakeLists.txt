@@ -22,17 +22,7 @@ ggml_add_backend_library(ggml-axera
                          models/qwen3_asr/qwen3_asr.cpp
                          models/qwen3_tts/qwen3_tts.cpp
                          models/qwen35_vit/qwen35_vit.cpp
-                         ggml-axera-util.cpp
                          ggml-axera-buffer.cpp
-                         ggml-axera-weights.cpp
-                         ggml-axera-graph.cpp
-                         ggml-axera-attn.cpp
-                         ggml-axera-q35-bind.cpp
-                         ggml-axera-q35-run.cpp
-                         ggml-axera-q35-moe.cpp
-                         ggml-axera-vit.cpp
-                         ggml-axera-audio.cpp
-                         ggml-axera-gen.cpp
                         )
 
 target_include_directories(ggml-axera PRIVATE ${AXERA_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../../../vendor)

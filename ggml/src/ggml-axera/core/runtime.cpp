@@ -2,7 +2,13 @@
 
 #include "runtime.h"
 
+#include "ggml-axera.h"
+#include "ggml-backend.h"
+
 #include <fstream>
+
+#include <sys/mman.h>
+#include <unistd.h>
 
 std::atomic<uint64_t> axera_graph_epoch{ 0 };
 
@@ -26,6 +32,20 @@ bool axera_runtime_init() {
         ok = true;
     });
     return ok;
+}
+
+void axera_drop_mapped(const ggml_tensor * t) {
+    const ggml_tensor * s = t->view_src ? t->view_src : t;
+    if (!s->buffer || strcmp(ggml_backend_buffer_name(s->buffer), GGML_AXERA_NAME "_Mapped") != 0 ||
+        strncmp(s->name, "token_embd", 10) == 0) {  // (the token embedding: a row read on the CPU per token)
+        return;
+    }
+    static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t        a  = ((uintptr_t) t->data + pg - 1) & ~(pg - 1);  // whole pages within the tensor
+    const uintptr_t        b  = ((uintptr_t) t->data + ggml_nbytes(t)) & ~(pg - 1);
+    if (b > a) {
+        madvise((void *) a, b - a, MADV_DONTNEED);
+    }
 }
 
 // CMM total / free from /proc/ax_proc/mem_cmm_info (sum over partitions)

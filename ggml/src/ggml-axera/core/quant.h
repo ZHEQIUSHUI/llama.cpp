@@ -2,7 +2,7 @@
 #pragma once
 
 #include "runtime.h"
-#include "../mx.h"
+#include "mx.h"
 
 #include "ggml-backend-impl.h"
 

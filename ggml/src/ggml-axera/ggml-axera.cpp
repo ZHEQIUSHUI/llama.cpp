@@ -16,107 +16,29 @@ static void ggml_backend_axera_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// the whole graph on the kernel directory's model adapter
 static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * ctx = (ggml_backend_axera_context *) backend->context;
     ++axera_graph_epoch;
-
-    if (const axera::manifest * man = axera::kernels()) {  // the directory's model adapter runs the whole graph
-        static std::chrono::steady_clock::time_point last;
-        const auto                                   t0 = std::chrono::steady_clock::now();
-        if (!ctx->model) {
-            ctx->model = axera::make_model(*man);
-        }
-        enum ggml_status st;
-        {
-            axera_timer tm("graph_compute");
-            st = ctx->model->compute(cgraph);
-        }
-        static const bool trace = std::getenv("GGML_AXERA_TRACE") != nullptr;  // every graph: nodes, host gap, run
-        if (trace) {
-            const auto now = std::chrono::steady_clock::now();
-            fprintf(stderr, "axera trace: nodes %d gap %.3f ms run %.3f ms\n", cgraph->n_nodes,
-                    last.time_since_epoch().count() ? std::chrono::duration<double, std::milli>(t0 - last).count() : -1.0,
-                    std::chrono::duration<double, std::milli>(now - t0).count());
-        }
-        last = std::chrono::steady_clock::now();
-        return st;
+    static std::chrono::steady_clock::time_point last;
+    const auto                                   t0 = std::chrono::steady_clock::now();
+    if (!ctx->model) {
+        ctx->model = axera::make_model(*axera::kernels());
     }
-
-    if (axera_template_qwen35()) {
-        static std::chrono::steady_clock::time_point last;  // profiling: host time between graphs
-        if (g_axera_prof.on && last.time_since_epoch().count()) {
-            auto & e = g_axera_prof.t["between graphs (host)"];
-            e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last).count();
-            e.second++;
-        }
-        const auto t_in = std::chrono::steady_clock::now();
-        g_axera_host.on_compute();
-        enum ggml_status st;
-        {
-            axera_timer tm("graph_compute (all)");
-            // which template: kept for the same graph (mtmd's and llama.cpp's graphs come again every token / frame,
-            // and telling them apart reads every node's sources by name)
-            auto & k = ctx->graph_kind;
-            if (k.g != cgraph || k.n != cgraph->n_nodes || k.first != (cgraph->n_nodes ? cgraph->nodes[0] : nullptr) ||
-                k.last != (cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1] : nullptr)) {
-                k.g     = cgraph;
-                k.n     = cgraph->n_nodes;
-                k.first = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
-                k.last  = cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1] : nullptr;
-                k.kind  = axera_vit_graph(cgraph) ? 0 : axera_audio_graph(cgraph) ? 1 : axera_llama_graph(cgraph) ? 2 : 3;
-            }
-            if (g_axera_prof.on && last.time_since_epoch().count()) {  // the host time before a graph, by its kind
-                static const char * before[4] = { "host before vit graph", "host before audio graph",
-                                                  "host before llama graph", "host before gen graph" };
-                auto & e = g_axera_prof.t[before[k.kind]];
-                e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last).count();
-                e.second++;
-            }
-            static const char * kinds[4] = { "graph_compute vit", "graph_compute audio", "graph_compute llama",
-                                             "graph_compute gen" };
-            axera_timer tk(kinds[k.kind]);
-            st = k.kind == 0 ? axera_vit_compute(ctx, cgraph) :
-                 k.kind == 1 ? axera_audio_compute(ctx, cgraph) :
-                 k.kind == 2 ? axera_q35_compute(ctx, cgraph) :
-                               axera_gen_compute(ctx, cgraph);
-        }
-        static const bool trace = std::getenv("GGML_AXERA_TRACE") != nullptr;  // every graph: kind, nodes, host gap, run
-        if (trace) {
-            const auto now = std::chrono::steady_clock::now();
-            fprintf(stderr, "axera trace: kind %d nodes %d gap %.3f ms run %.3f ms\n", ctx->graph_kind.kind, cgraph->n_nodes,
-                    last.time_since_epoch().count() ? std::chrono::duration<double, std::milli>(t_in - last).count() : -1.0,
-                    std::chrono::duration<double, std::milli>(now - t_in).count());
-        }
-        last             = std::chrono::steady_clock::now();
-        g_axera_host.end = last;
-        return st;
+    enum ggml_status st;
+    {
+        axera_timer tm("graph_compute");
+        st = ctx->model->compute(cgraph);
     }
-
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_tensor * node = cgraph->nodes[i];
-
-        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-            continue;
-        }
-
-        switch (node->op) {
-            case GGML_OP_MUL_MAT:
-                ggml_backend_axera_mul_mat(ctx, node);
-                break;
-
-            case GGML_OP_NONE:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
-                break;
-
-            default:
-                GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
-        }
+    static const bool trace = std::getenv("GGML_AXERA_TRACE") != nullptr;  // every graph: nodes, host gap, run
+    if (trace) {
+        const auto now = std::chrono::steady_clock::now();
+        fprintf(stderr, "axera trace: nodes %d gap %.3f ms run %.3f ms\n", cgraph->n_nodes,
+                last.time_since_epoch().count() ? std::chrono::duration<double, std::milli>(t0 - last).count() : -1.0,
+                std::chrono::duration<double, std::milli>(now - t0).count());
     }
-
-    return GGML_STATUS_SUCCESS;
+    last = std::chrono::steady_clock::now();
+    return st;
 }
 
 static struct ggml_backend_i axera_backend_i = {
@@ -181,16 +103,6 @@ static enum ggml_backend_dev_type ggml_backend_axera_device_get_type(ggml_backen
     GGML_UNUSED(dev);
 }
 
-// weights left in the GGUF file mapping (llama.cpp mmap, unless --no-mmap) instead of a CMM copy: with a template,
-// which converts the weights it runs into CMM itself (MXFP8, bf16, copies) and so never reads the GGUF tensors on the
-// NPU. Without one, the bf16 MUL_MAT kernels read the weights in CMM, so they are loaded there. GGML_AXERA_MMAP=0/1
-// overrides.
-static bool axera_mmap() {
-    static const char * e  = getenv("GGML_AXERA_MMAP");
-    static const bool   on = e ? atoi(e) != 0 : axera::kernels() != nullptr || axera_template_qwen35();
-    return on;
-}
-
 static ggml_backend_buffer_t ggml_backend_axera_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr,
                                                                             size_t size, size_t max_tensor_size) {
     return axera_mapped_buffer(ptr, size);
@@ -207,9 +119,9 @@ static void ggml_backend_axera_device_get_props(ggml_backend_dev_t dev, struct g
     props->caps = {
         /* .async                 = */ false,
         /* .host_buffer           = */ false,
-        /* .buffer_from_host_ptr  = */ axera_mmap(),
-        /* .events                = */ false,
-        /* .mmap_support          = */ axera_mmap(),
+        /* .buffer_from_host_ptr  = */ true,  // the weights stay in the GGUF file mapping: the adapters convert what
+        /* .events                = */ false,  // their kernels read into CMM
+        /* .mmap_support          = */ true,
     };
 }
 
@@ -283,37 +195,11 @@ static bool axera_pooling_op(const ggml_tensor * op) {
 static bool ggml_backend_axera_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     if (op->op == GGML_OP_MUL_MAT && op->src[0] &&
         (strncmp(op->src[0]->name, "a.blk.", 6) == 0 || strncmp(op->src[0]->name, "mm.a.mlp.", 9) == 0)) {
-        axera_audio_on_set(op->src[0]);  // (the audio encoders matrices to bf16 while mtmds warmup reserves its graph)
+        axera::qwen3_asr_on_set(op->src[0]);  // (the audio encoder's matrices to bf16 while mtmd's warmup reserves its graph)
     }
-    if (axera::kernels() || axera_template_qwen35()) {
-        // the model adapter (or the template) runs the whole graph up to the logits or, for pooled embeddings, the final norm: the pooling
-        // stays on the CPU. Weights must still be in CMM (or the mapped GGUF) to be offloaded
-        return !axera_pooling_op(op);
-    }
-    switch (op->op) {
-        case GGML_OP_NONE:
-        case GGML_OP_RESHAPE:
-        case GGML_OP_VIEW:
-        case GGML_OP_PERMUTE:
-        case GGML_OP_TRANSPOSE:
-            return true;
-
-        case GGML_OP_MUL_MAT:
-        {
-            const ggml_tensor * src0 = op->src[0];
-            const ggml_tensor * src1 = op->src[1];
-            // bf16 weights resident in CMM, f32 activation rows (any count: llama.cpp probes weight placement with a
-            // batch of rows, and the weights must be in CMM for decode)
-            return ggml_backend_buffer_is_axera(src0->buffer) && src0->type == GGML_TYPE_BF16 &&
-                   src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) &&
-                   ggml_is_contiguous(src1) && ggml_is_contiguous(op) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
-                   src1->ne[2] == 1 && src1->ne[3] == 1 && axera_kernels().mul_mat_chunk(src0->ne[1], src0->ne[0]) > 0;
-        }
-
-        default:
-            return false;
-    }
-
+    // the model adapter runs the whole graph up to the logits or, for pooled embeddings, the final norm: the pooling
+    // stays on the CPU
+    return !axera_pooling_op(op);
     GGML_UNUSED(dev);
 }
 
@@ -353,12 +239,9 @@ static const char * ggml_backend_axera_reg_get_name(ggml_backend_reg_t reg) {
 }
 
 static size_t ggml_backend_axera_reg_get_device_count(ggml_backend_reg_t reg) {
-    if (!axera_runtime_init()) {
+    // the manifest's kernels loaded before the model's tensors; no manifest, no device
+    if (!axera_runtime_init() || !axera::kernels()) {
         return 0;
-    }
-    // the kernels before the model's tensors: the manifest's, else (no manifest) every kernel of the directory
-    if (!axera::kernels()) {
-        axera_legacy_preload();
     }
     return 1;
     GGML_UNUSED(reg);
@@ -379,10 +262,9 @@ static ggml_backend_dev_t ggml_backend_axera_reg_get_device(ggml_backend_reg_t r
 
 // the weights left on the CPU (the token embeddings: one row read per token) kept resident when the model is mmap'ed:
 // the NPU weights take most of the board's memory, page reclaim evicts the embedding pages, and every token's row
-// then faults in from storage (~2 ms per token on a 16 GB board with a 20 GB model). GGML_AXERA_PIN_HOST=0: off
+// then faults in from storage (~2 ms per token on a 16 GB board with a 20 GB model)
 static bool ggml_backend_axera_pin_host_weights(void) {
-    const char * e = std::getenv("GGML_AXERA_PIN_HOST");
-    return e == nullptr || strcmp(e, "0") != 0;
+    return true;
 }
 
 // llama.cpp tells each context's sequence count: the largest is kept (a padded prefill chunk needs one sequence)

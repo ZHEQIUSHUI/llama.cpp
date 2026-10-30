@@ -3,6 +3,9 @@
 #include "ggml-axera-impl.h"
 #include "core/manifest.h"
 
+#include <chrono>
+#include <cstring>
+
 static void ggml_backend_axera_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     delete (ggml_backend_axera_buffer_context *) buffer->context;
 }
@@ -21,35 +24,28 @@ static void ggml_backend_axera_buffer_memset_tensor(ggml_backend_buffer_t buffer
 static void ggml_backend_axera_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
                                                  size_t offset, size_t size) {
     auto * ctx = (ggml_backend_axera_buffer_context *) buffer->context;
-    g_axera_host.on_set();
     ctx->clean_n = 0;
     memcpy((char *) tensor->data + offset, data, size);
     ctx->flush((char *) tensor->data + offset, size);
     if (offset == 0 && size == ggml_nbytes(tensor)) {
-        axera_audio_on_set(tensor);
+        axera::qwen3_asr_on_set(tensor);  // (the audio encoder's matrices converted while the model loads)
     }
 }
 
 static void ggml_backend_axera_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
                                                  size_t offset, size_t size) {
-    // the range may hold NPU results not invalidated yet (template state read for a checkpoint) or CPU writes not
-    // flushed yet (CPU backend ops on CMM): write back, then drop the cached lines, then read
+    // the range may hold NPU results not invalidated yet (adapter state read for a checkpoint) or CPU writes not
+    // flushed yet (CPU backend ops on CMM): write back, then drop the cached lines, then read; but not the logits the
+    // NPU wrote this graph, already invalidated
     auto * ctx = (ggml_backend_axera_buffer_context *) buffer->context;
     char * p   = (char *) tensor->data + offset;
     axera_timer tm("get_tensor");
-    const auto  t0 = std::chrono::steady_clock::now();
-    // the logits the NPU wrote this graph, already invalidated: no cache maintenance (GGML_AXERA_LOGITS_CLEAN=0 keeps it)
-    static const bool skip = [] {
-        const char * e = std::getenv("GGML_AXERA_LOGITS_CLEAN");
-        return e == nullptr || strcmp(e, "0") != 0;
-    }();
-    if (!(skip && ctx->clean_epoch == axera_graph_epoch && p >= (const char *) ctx->clean_p &&
+    if (!(ctx->clean_epoch == axera_graph_epoch && p >= (const char *) ctx->clean_p &&
           p + size <= (const char *) ctx->clean_p + ctx->clean_n)) {
         ctx->flush(p, size);
         ctx->invalidate(p, size);
     }
     memcpy(data, p, size);
-    g_axera_host.on_get(t0, std::chrono::steady_clock::now());
 }
 
 static bool ggml_backend_axera_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src,
@@ -120,32 +116,14 @@ bool ggml_backend_buffer_is_axera(ggml_backend_buffer_t buffer) {
     return buffer != nullptr && buffer->buft == ggml_backend_axera_buffer_type();
 }
 
-// the qwen35 template's attention kernels (qwen35_*, qwen3_*) address the KV cache as one IO of their context LMAX: a
-// llama.cpp KV cache tensor (cache_k_l* / cache_v_l*) of fewer cells gets room for the smallest kernel context that
-// holds it, after its last stream
+// the adapters' attention kernels address a KV cache tensor (cache_k_l* / cache_v_l*) as one IO of the manifest's
+// context: a cache of fewer cells gets room up to that context after its last stream
 static size_t ggml_backend_axera_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * t) {
-    const size_t n = ggml_nbytes(t);
+    const size_t n  = ggml_nbytes(t);
     const bool   kv = t->type == GGML_TYPE_F16 && t->ne[3] == 1 &&
                     (strncmp(t->name, "cache_k_l", 9) == 0 || strncmp(t->name, "cache_v_l", 9) == 0);
-    if (const axera::manifest * m = axera::kernels()) {  // the kernels' context, after the last stream
-        return kv ? std::max(n, (size_t) (t->ne[2] - 1) * t->nb[2] + (size_t) m->context * t->nb[1]) : n;
-    }
-    if (!axera_template_qwen35() || t->type != GGML_TYPE_F16 || t->ne[3] != 1 ||
-        (strncmp(t->name, "cache_k_l", 9) != 0 && strncmp(t->name, "cache_v_l", 9) != 0)) {
-        return n;
-    }
-    // dense or MoE attention kernels (a kernel directory holds one model's; no graph yet to tell), in the weight
-    // format's kernels (_mx8 / _mx4 / _mx4m) or else the MXFP8 ones
-    const std::string fmt = axera_weights_mx8() ? std::string(axera_mx_sfx()) : "";
-    int64_t           ctx = 0;
-    for (const char * kp : { "qwen35", "qwen35moe", "qwen3" }) {
-        for (const std::string & f : { fmt, std::string(fmt.empty() ? "" : "_mx8") }) {
-            ctx = ctx > 0 ? ctx : axera_kernels().ctx_for(kp + std::string("_attn") + f + "_kvc", t->ne[1]);
-        }
-    }
-    const int64_t S       = axera_flash_seg(t->ne[1]);  // split attention: whole segments
-    const int64_t c   = S > 0 && (ctx == 0 || axera_flash_forced()) ? (t->ne[1] + S - 1) / S * S : ctx;
-    return std::max(n, (size_t) (t->ne[2] - 1) * t->nb[2] + (size_t) c * t->nb[1]);  // ne[2]: per-sequence streams
+    const axera::manifest * m = axera::kernels();
+    return kv && m ? std::max(n, (size_t) (t->ne[2] - 1) * t->nb[2] + (size_t) m->context * t->nb[1]) : n;
     GGML_UNUSED(buft);
 }
 ggml_backend_buffer_type_t ggml_backend_axera_buffer_type(void) {
@@ -167,7 +145,7 @@ ggml_backend_buffer_type_t ggml_backend_axera_buffer_type(void) {
 }
 
 // mapped buffers: the GGUF file mapping (llama.cpp mmap) wrapped as weights of this device, so the graph stays whole.
-// Not CMM: the NPU cannot read them, and ggml_backend_buffer_is_axera is false for them, so the templates take these
+// Not CMM: the NPU cannot read them, and ggml_backend_buffer_is_axera is false for them, so the adapters take these
 // weights the way they take weights kept on the CPU (converted, or copied into CMM once). The mapping is read only.
 
 struct ggml_backend_axera_mapped_context {
@@ -193,7 +171,7 @@ static void ggml_backend_axera_mapped_set_tensor(ggml_backend_buffer_t buffer, g
                                                  size_t offset, size_t size) {
     memcpy((char *) tensor->data + offset, data, size);
     if (offset == 0 && size == ggml_nbytes(tensor)) {
-        axera_audio_on_set(tensor);
+        axera::qwen3_asr_on_set(tensor);  // (the audio encoder's matrices converted while the model loads)
     }
     GGML_UNUSED(buffer);
 }
