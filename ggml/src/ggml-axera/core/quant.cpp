@@ -26,6 +26,21 @@ void axera_quantize_mxfp4(const ggml_tensor * w, axera_cmm & q, axera_cmm & s) {
     const int64_t K = w->ne[0], N = ggml_nrows(w);
     q = axera_cmm_alloc(N * K / 2);
     s = axera_cmm_alloc(N * K / AXERA_MX_GROUP);
+    if (w->type == GGML_TYPE_MXFP4 && ggml_is_contiguous(w)) {  // already MXFP4: the same values, rows rearranged
+        const int                n_threads = std::max(1u, std::thread::hardware_concurrency());
+        std::vector<std::thread> pool;
+        for (int t = 0; t < n_threads; ++t) {
+            pool.emplace_back([&, t] {
+                const int64_t r0 = N * t / n_threads, r1 = N * (t + 1) / n_threads;
+                axera_mxfp4_rows((const uint8_t *) w->data + r0 * w->nb[1], r1 - r0, K, (uint8_t *) q->vir + r0 * (K / 2),
+                                 (uint8_t *) s->vir + r0 * (K / AXERA_MX_GROUP));
+            });
+        }
+        for (auto & th : pool) {
+            th.join();
+        }
+        return;
+    }
     axera_for_rows_f32(w, [&](int64_t r, const float * row) {
         uint8_t * qr = (uint8_t *) q->vir + r * (K / 2);
         uint8_t * sr = (uint8_t *) s->vir + r * (K / AXERA_MX_GROUP);

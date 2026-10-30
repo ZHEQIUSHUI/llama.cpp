@@ -71,18 +71,19 @@ std::shared_ptr<model> make_model(const manifest & m) {
     } else {
         GGML_ABORT("axera: %s/manifest.json: no adapter for model %s\n", m.dir.c_str(), m.model.c_str());
     }
-    bool vision = false, audio = false, gen = false;
+    bool vision = false, vision1 = false, audio = false, gen = false;
     for (const auto & [role, k] : m.kernels) {
-        vision = vision || role.rfind("vit.", 0) == 0;
+        vision  = vision || role.rfind("vit.", 0) == 0;
+        vision1 = vision1 || role == "vit";  // the whole vision encoder in one kernel
         audio  = audio || role.rfind("audio.", 0) == 0;
         gen    = gen || role.rfind("cp.", 0) == 0;
     }
-    if (!vision && !audio && !gen) {
+    if (!vision && !vision1 && !audio && !gen) {
         return llm;
     }
     auto c   = std::make_shared<composite>();
     c->llm   = llm;
-    c->vit   = vision ? make_qwen35_vit(m) : nullptr;
+    c->vit   = vision1 ? make_qwen38_27b_vit(m) : vision ? make_qwen35_vit(m) : nullptr;
     c->audio = audio ? make_qwen3_asr(m) : nullptr;
     c->gen   = gen ? make_qwen3_tts(m) : nullptr;
     return c;
