@@ -64,16 +64,27 @@ struct rope {
     void rows(int t0, int n, ggml_backend_axera_buffer_context * cb, ggml_backend_axera_buffer_context * sb) const;
 };
 
-// the output head: the final norm of the output rows of h ([T][H] f32, the last layer's) and the MXFP4 output
-// projection (role lm_head: x [K] bf16, w [N, K / 2], s [N, K / 32] -> out [N] f32) into the graph's logits; then the
-// graph's nodes after the logits (llama.cpp's backend sampler chain) on the CPU
+// the output projection of a graph: result_output, or the codec head (Qwen3-TTS) whose logits llama.cpp pads to the
+// text vocabulary with -inf in front (result_output = concat(pad, head)); nullptr if none (pooled embeddings)
+ggml_tensor * graph_head(const graph_names & names);
+
+// pooled embeddings (no output projection): the final norm of every row of h ([T][H] f32) into result_norm (or
+// result_embd_pooled); the pooling after it stays on the CPU
+void output_norm(const graph_names & names, const std::vector<float> & h, int T);
+
+// the output head: the final norm of the output rows of h ([T][H] f32, the last layer's) and the output projection
+// (role lm_head: x [K] bf16, w [N, K] MXFP8 or [N, K / 2] MXFP4, s [N, K / 32] -> out [N] f32) into the graph's
+// logits (and its padded copy); then the graph's nodes after the logits (llama.cpp's backend sampler chain) on the CPU
 struct output_head {
     const kernel * k = nullptr;
     const ggml_tensor * w = nullptr;  // output.weight
-    axera_cmm  q, s, x;               // the projection in MXFP4, the bf16 input row
+    axera_cmm  q, s, x;               // the projection in the kernel's format, the bf16 input row
+    bool       mx4 = false;
 
     void bind(const kernel & lm, const ggml_tensor * output_weight);
     void run(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T);
+    // the logits the caller wrote (a whole-model kernel's) into the graph's: the sampler nodes after them
+    static void after(ggml_cgraph * g, const graph_names & names);
 };
 
 // nodes of the graph on the CPU backend (their tensors are host memory: CMM or the CPU's)

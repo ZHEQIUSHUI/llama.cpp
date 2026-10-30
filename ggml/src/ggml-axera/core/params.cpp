@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 
 namespace axera {
 
@@ -16,6 +17,21 @@ static ggml_tensor * tensor_of(const std::map<std::string, ggml_tensor *> & t, i
         GGML_ABORT("axera: tensor %s not in the graph\n", key.c_str());
     }
     return it->second;
+}
+
+// a whole-model tensor (parameter kind "out": the output head's): the first of "a|b|..." in the graph (output.weight,
+// or the tied token_embd.weight); nullptr if none (a graph without the output head: pooled embeddings)
+static ggml_tensor * model_tensor(const std::map<std::string, ggml_tensor *> & t, const std::string & names) {
+    size_t a = 0;
+    while (a <= names.size()) {
+        const size_t b  = std::min(names.find('|', a), names.size());
+        auto         it = t.find(names.substr(a, b - a));
+        if (it != t.end()) {
+            return it->second;
+        }
+        a = b + 1;
+    }
+    return nullptr;
 }
 
 // experts in the GGUF file mapping (read only) get a CMM copy, once per tensor (shared by the model's contexts): a
@@ -131,7 +147,25 @@ AX_ENGINE_IO_BUFFER_T params::get(const std::map<std::string, ggml_tensor *> & t
         GGML_ASSERT((codes ? e.n * e.data[g] : e.n * e.scale[g]) == size);
         return axera_io(e.b[g], codes ? e.base[g] : e.base[g] + e.n * e.data[g], size);
     }
-    ggml_tensor * w = tensor_of(t, il, p.gguf);
+    // the tensor: blk.<il>.<gguf>, or a name of its own ("{L}" the layer: a.gen.code.blk.{L}.*; whole-model kinds out /
+    // cp_out)
+    ggml_tensor * w = nullptr;
+    if (p.gguf.find("{L}") != std::string::npos) {
+        std::string n = p.gguf;
+        n.replace(n.find("{L}"), 3, std::to_string(il));
+        w = model_tensor(t, n);
+        if (!w) {
+            GGML_ABORT("axera: tensor %s not in the graph\n", n.c_str());
+        }
+    } else {
+        w = kind == "out" || kind == "cp_out" ? model_tensor(t, p.gguf) : tensor_of(t, il, p.gguf);
+    }
+    if (!w && kind == "out") {  // the output head's weights where the graph has no output head: nothing (pack members
+        return {};              // stay zero)
+    }
+    if (!w) {
+        GGML_ABORT("axera: none of %s in the graph\n", p.gguf.c_str());
+    }
     auto bf16_of = [&]() -> AX_ENGINE_IO_BUFFER_T {  // the tensor as bf16: itself if bf16 in CMM, else a copy
         if (w->type == GGML_TYPE_BF16 && ggml_nbytes(w) == size && ggml_backend_buffer_is_axera(w->buffer)) {
             return axera_io((ggml_backend_axera_buffer_context *) w->buffer->context, w->data, size);
@@ -230,6 +264,11 @@ const axera_cmm & params::pack(const std::map<std::string, ggml_tensor *> & t, c
             continue;
         }
         const AX_ENGINE_IO_BUFFER_T src = get(t, il0 + std::max(mb.layer, 0), mb.kind, mb.param);
+        if (!src.pVirAddr && mb.kind == "out") {  // (a whole-model group's logits are then not read)
+            static std::once_flag once;
+            std::call_once(once, [] { GGML_LOG_INFO("axera: no output head in the graph: the group's head members left zero\n"); });
+            continue;
+        }
         GGML_ASSERT(src.pVirAddr && src.nSize == mb.bytes && mb.offset + mb.bytes <= b->size);
         char *       dst = (char *) b->vir + mb.offset;
         const char * sp  = (const char *) src.pVirAddr;

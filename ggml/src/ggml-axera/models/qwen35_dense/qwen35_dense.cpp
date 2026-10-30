@@ -1,8 +1,10 @@
-// Axera NPU backend: Qwen3.8-27B (qwen35: gated delta net and gated attention layers, dense MLP)
+// Axera NPU backend: Qwen3.5 dense models, Qwen3.5-9B and Qwen3.8-27B (gated delta net and gated attention layers,
+// dense MLP)
 //
 // One path, the manifest's kernels (ax-dsl-kernels tools/manifest, model qwen35_dense):
-//   decode   decode.group: G consecutive layers per call (the layers' weights in packs), L / G calls per token; then
-//            lm_head
+//   decode   decode.group: G consecutive layers per call (the layers' weights in packs), L / G calls per token; a
+//            whole-model group with the output head (9B: a logits output) writes a single token's logits straight
+//            into the graph's, else lm_head after the final norm
 //   prefill  chunks of P consecutive cells, largest first: prefill128.*, 64, 16, 4. A prompt's tail of fewer tokens
 //            than the largest chunk runs as one chunk of the smallest size that holds it, padded with copies of its
 //            last row: the delta-net kernels take the valid rows (rv / cix: the padding leaves the state alone), the
@@ -28,6 +30,7 @@ struct call {
         int  idx, layer, what;  // what: 0 state, 1 conv, 2 kc, 3 vc
     };
     std::vector<dyn> d;
+    int              logits = -1;  // the output index of a whole-model group's logits
 };
 
 struct chunk {  // one prefill size's buffers
@@ -60,7 +63,7 @@ class qwen35_dense final : public model {
     int64_t            row = 0, stream = 0;
 
     std::vector<call> dec;
-    axera_cmm         A, COS, SIN, CS, PN, MASK;
+    axera_cmm         A, COS, SIN, CS, PN, MASK, LOGITS;
     output_head       head;
     std::vector<chunk> sizes;  // largest first
 
@@ -69,6 +72,7 @@ class qwen35_dense final : public model {
     void set_place(int64_t r, int64_t s);
     void zero_row(int64_t r);
     call bind_layer(const std::map<std::string, ggml_tensor *> & t, const kernel & k, int il, chunk & c);
+    ggml_tensor * group_logits(int T) const;
 };
 
 AX_ENGINE_IO_BUFFER_T qwen35_dense::cache_io(int il, int what) const {
@@ -229,6 +233,7 @@ void qwen35_dense::init(const std::map<std::string, ggml_tensor *> & t, int L_, 
     CS   = axera_cmm_alloc(csb);
     PN   = axera_cmm_alloc(2 * sizeof(int32_t));
     MASK = axera_cmm_alloc(dk.in_bytes("mask"));
+    LOGITS = {};
     GGML_ASSERT(G % 2 == 0 && dk.in_bytes("pn") == 2 * sizeof(int32_t));
     dec.assign(L / G, {});
     for (int gi = 0; gi < L / G; ++gi) {
@@ -252,13 +257,19 @@ void qwen35_dense::init(const std::map<std::string, ggml_tensor *> & t, int L_, 
                 c.out.push_back(axera_io(A, d.bytes));
                 continue;
             }
+            if (n == "logits") {  // a whole-model group: by default into LOGITS, a single token's into the graph's
+                GGML_ASSERT(G == L);
+                LOGITS   = axera_cmm_alloc(d.bytes);
+                c.logits = (int) c.out.size();
+                c.out.push_back(axera_io(LOGITS, d.bytes));
+                continue;
+            }
             const int j = atoi(n.c_str() + 2), il = gi * G + j;
             const int w = n.rfind("st", 0) == 0 ? 0 : n.rfind("cv", 0) == 0 ? 1 : n.rfind("kc", 0) == 0 ? 2 : 3;
             c.d.push_back({ true, (int) c.out.size(), il, w });
             c.out.push_back(cache_io(il, w));
         }
     }
-    head.bind(man.get("lm_head"), t.at("output.weight"));
 
     // prefill sizes, largest first
     sizes.clear();
@@ -299,6 +310,13 @@ void qwen35_dense::init(const std::map<std::string, ggml_tensor *> & t, int L_, 
     prm.release(live);
     GGML_LOG_INFO("axera qwen35_dense: %d layers (%s per decode call), KV cache %lld cells (kernels %lld)\n", L,
                   pat.c_str(), (long long) N, (long long) LMAX);
+}
+
+// the graph's logits a whole-model group can write: a one-token batch whose graph wants only its logits
+ggml_tensor * qwen35_dense::group_logits(int T) const {
+    ggml_tensor * lg = LOGITS && T == 1 ? graph_head(names) : nullptr;
+    return lg && lg->ne[1] == 1 && lg->type == GGML_TYPE_F32 && ggml_backend_buffer_is_axera(lg->buffer) &&
+                   ggml_nbytes(lg) == LOGITS->size && names.find("result_output") == lg ? lg : nullptr;
 }
 
 ggml_status qwen35_dense::compute(ggml_cgraph * g) {
@@ -406,6 +424,7 @@ ggml_status qwen35_dense::compute(ggml_cgraph * g) {
     std::vector<float> h((size_t) T * H);
     axera_timer        tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
     const uint16_t     ninf = ggml_fp32_to_bf16(-3e38f).bits;
+    bool               group_ran = false;  // the whole-model group computed the (single) token's logits
     for (int it = 0; it < T;) {
         const int64_t p = pos[it];
         set_place(rs_head, kv.stream_of(it));
@@ -418,13 +437,14 @@ ggml_status qwen35_dense::compute(ggml_cgraph * g) {
             ++run;
         }
         int v = -1, n = 0;  // the chunk size, its real tokens
-        // fewer than the largest chunk: the smallest size that holds them, padded, if its padding cells are hidden
-        // from the last token (and so from every token) and lie within the cache
+        // fewer than the largest chunk: the smallest size that holds them, padded, if the contexts hold one sequence
+        // (the cells after the batch's are free), its padding cells are hidden from the last token (and so from every
+        // token) and lie within the cache
         int fit = -1;
         for (size_t s = 0; s < sizes.size() && sizes[s].P >= run; ++s) {
             fit = (int) s;
         }
-        if (fit >= 0 && sizes[fit].P != run && run >= 2) {
+        if (fit >= 0 && sizes[fit].P != run && run >= 2 && axera_n_seq_max() == 1) {
             const int     P  = sizes[fit].P;
             const int64_t c0 = kv.cell_of(it);
             bool          ok = c0 + P <= N;
@@ -506,17 +526,38 @@ ggml_status qwen35_dense::compute(ggml_cgraph * g) {
         ((int32_t *) PN->vir)[0] = (int32_t) kv.cell_of(it);
         ((int32_t *) PN->vir)[1] = nblk;
         PN->flush();
+        ggml_tensor * direct = group_logits(T);
+        if (direct) {  // no dirty lines left to be written back over the kernel's logits
+            auto * dctx = (ggml_backend_axera_buffer_context *) direct->buffer->context;
+            dctx->flush(direct->data, ggml_nbytes(direct));
+            dec.back().out[dec.back().logits] = axera_io(dctx, direct->data, (uint32_t) ggml_nbytes(direct));
+        }
         {
             axera_timer tl("layers (decode)");
             for (auto & c : dec) {
                 c.k->run(c.in, c.out, "decode group");
             }
         }
+        if (direct) {
+            dec.back().out[dec.back().logits] = axera_io(LOGITS, (uint32_t) LOGITS->size);
+        }
+        group_ran = direct != nullptr;
         A->invalidate(A->vir, H * sizeof(ggml_bf16_t));
         ggml_bf16_to_fp32_row((const ggml_bf16_t *) A->vir, h.data() + (size_t) it * H, H);
         ++it;
     }
-    head.run(g, names, h, T);
+    if (group_ran) {  // written in place: drop the cached lines, get_tensor reads without maintenance
+        axera_timer tl("lm_head (group)");
+        auto *      dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+        dctx->invalidate(logits->data, ggml_nbytes(logits));
+        dctx->clean_p     = logits->data;
+        dctx->clean_n     = ggml_nbytes(logits);
+        dctx->clean_epoch = axera_graph_epoch;
+        output_head::after(g, names);
+    } else {
+        head.bind(man.get("lm_head"), logits->src[0]);
+        head.run(g, names, h, T);
+    }
     return GGML_STATUS_SUCCESS;
 }
 

@@ -1,6 +1,7 @@
 // Axera NPU backend: the Qwen3-ASR audio encoder
 
 #include "ggml-axera-impl.h"
+#include "models/model.h"
 
 #include <mutex>
 #include <set>
@@ -69,6 +70,10 @@ static uint64_t axera_audio_fingerprint(const ggml_tensor * t) {
 // ffn_down}.weight) or a projector matrix (mm.a.mlp.<i>.weight) converted to bf16 now, so that the first request does not
 // wait for it
 void axera_audio_on_set(const ggml_tensor * t) {
+    if (axera::kernels()) {  // a manifest's directory: the audio encoder's adapter (models/qwen3_asr)
+        axera::qwen3_asr_on_set(t);
+        return;
+    }
     static const char * names[] = { ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_out.weight",
                                     ".ffn_up.weight", ".ffn_down.weight" };
     const bool proj = strncmp(t->name, "mm.a.mlp.", 9) == 0;

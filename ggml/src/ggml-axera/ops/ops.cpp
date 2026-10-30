@@ -225,22 +225,68 @@ void rope::rows(int t0, int n, ggml_backend_axera_buffer_context * cb, ggml_back
 // output head
 //
 
+ggml_tensor * graph_head(const graph_names & names) {
+    ggml_tensor * r = names.find("result_output");
+    if (r && r->op == GGML_OP_CONCAT && r->src[1] && r->src[1]->op == GGML_OP_MUL_MAT) {
+        return r->src[1];
+    }
+    return r;
+}
+
+// the graph's normed rows: result_norm, named result_embd_pooled when the context keeps unpooled embeddings
+static ggml_tensor * normed_rows(const graph_names & names) {
+    ggml_tensor * rn = names.find("result_norm");
+    if (!rn) {
+        ggml_tensor * p = names.find("result_embd_pooled");
+        rn              = p && p->op == GGML_OP_MUL && p->src[0]->op == GGML_OP_RMS_NORM ? p : nullptr;
+    }
+    return rn;
+}
+
+void output_norm(const graph_names & names, const std::vector<float> & h, int T) {
+    ggml_tensor * rn = normed_rows(names);
+    GGML_ASSERT(rn && rn->type == GGML_TYPE_F32 && rn->ne[1] == T && (size_t) T * rn->ne[0] <= h.size());
+    const int     H = (int) rn->ne[0];
+    float         eps;
+    const float * gw = final_norm(rn, H, &eps);
+    axera_host_pool().run(T, [&](int64_t r) {
+        const float * x  = h.data() + (size_t) r * H;
+        float *       y  = (float *) ((char *) rn->data + r * rn->nb[1]);
+        double        ss = 0;
+        for (int i = 0; i < H; ++i) {
+            ss += (double) x[i] * x[i];
+        }
+        const float scale = 1.0f / sqrtf((float) (ss / H) + eps);
+        for (int i = 0; i < H; ++i) {
+            y[i] = x[i] * scale * gw[i];
+        }
+    });
+    if (ggml_backend_buffer_is_axera(rn->buffer)) {
+        ((ggml_backend_axera_buffer_context *) rn->buffer->context)->flush(rn->data, ggml_nbytes(rn));
+    }
+}
+
 void output_head::bind(const kernel & lm, const ggml_tensor * output_weight) {
     k = &lm;
     if (w == output_weight) {
         return;
     }
-    w = output_weight;
-    axera_quantize_mxfp4(w, q, s);
+    w                = output_weight;
     const int64_t N = w->ne[1], K = w->ne[0];
-    GGML_ASSERT(lm.in_bytes("w") == N * K / 2 && lm.in_bytes("s") == N * K / AXERA_MX_GROUP &&
+    mx4              = lm.in_bytes("w") == N * K / 2;
+    GGML_ASSERT((mx4 || lm.in_bytes("w") == N * K) && lm.in_bytes("s") == N * K / AXERA_MX_GROUP &&
                 lm.in_bytes("x") == K * sizeof(ggml_bf16_t) && lm.out_bytes("out") == N * sizeof(float));
+    if (mx4) {
+        axera_quantize_mxfp4(w, q, s);
+    } else {
+        axera_quantize_mxfp8(w, q, s);
+    }
     x = axera_cmm_alloc(K * sizeof(ggml_bf16_t));
 }
 
 void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T) {
-    ggml_tensor * logits = names.at("result_output");
-    GGML_ASSERT(logits->op == GGML_OP_MUL_MAT && logits->src[0] == w && logits->type == GGML_TYPE_F32 &&
+    ggml_tensor * logits = graph_head(names);
+    GGML_ASSERT(logits && logits->op == GGML_OP_MUL_MAT && logits->src[0] == w && logits->type == GGML_TYPE_F32 &&
                 ggml_backend_buffer_is_axera(logits->buffer));
     const int64_t N = w->ne[1], K = w->ne[0];
     // final norm: the head's input is [get_rows(] rms_norm(h) * output_norm [, inp_out_ids)]
@@ -263,6 +309,9 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
     if (n_out < T && !out_ids) {
         GGML_ABORT("axera: %d of %d rows requested but no output row index in the graph\n", n_out, T);
     }
+    ggml_tensor *      rn = normed_rows(names);  // the normed rows, when the graph keeps them (embeddings: the
+                                                 // TTS talker's hidden state for the code predictor)
+    rn                    = rn && rn->type == GGML_TYPE_F32 && rn->ne[0] == K && rn->ne[1] == n_out ? rn : nullptr;
     std::vector<float> y((size_t) n_out * K);
     for (int r = 0; r < n_out; ++r) {
         const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : r;
@@ -277,12 +326,18 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         for (int i = 0; i < K; ++i) {
             yr[i] = xr[i] * scale * gw[i];
         }
+        if (rn) {
+            memcpy((char *) rn->data + r * rn->nb[1], yr, K * sizeof(float));
+        }
+    }
+    if (rn && ggml_backend_buffer_is_axera(rn->buffer)) {
+        ((ggml_backend_axera_buffer_context *) rn->buffer->context)->flush(rn->data, ggml_nbytes(rn));
     }
     axera_timer tl("lm_head");
     auto *      dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
     std::vector<AX_ENGINE_IO_BUFFER_T> in(k->info->nInputSize), out(k->info->nOutputSize);
     in[k->input("x")] = axera_io(x);
-    in[k->input("w")] = axera_io(q, N * K / 2);
+    in[k->input("w")] = axera_io(q, mx4 ? N * K / 2 : N * K);
     in[k->input("s")] = axera_io(s, N * K / AXERA_MX_GROUP);
     for (int r = 0; r < n_out; ++r) {
         float * o = (float *) ((char *) logits->data + r * logits->nb[1]);
@@ -297,12 +352,29 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         dctx->clean_epoch = axera_graph_epoch;
     }
     tl.stop();
-    // the nodes after the logits in this split: llama.cpp's backend sampler chain, on the CPU
-    int il = -1;
-    for (int i = 0; i < g->n_nodes; i++) {
-        il = g->nodes[i] == logits ? i : il;
+    ggml_tensor * padded = names.find("result_output");  // the codec head's logits padded in front with -inf
+    if (padded && padded != logits) {
+        const int64_t pad = padded->ne[0] - logits->ne[0];
+        GGML_ASSERT(padded->type == GGML_TYPE_F32 && padded->ne[1] == n_out && pad >= 0);
+        for (int r = 0; r < n_out; ++r) {
+            float * d = (float *) ((char *) padded->data + r * padded->nb[1]);
+            std::fill(d, d + pad, -INFINITY);
+            memcpy(d + pad, (const char *) logits->data + r * logits->nb[1], logits->ne[0] * sizeof(float));
+        }
     }
-    if (il >= 0 && il + 1 < g->n_nodes) {
+    after(g, names);
+}
+
+void output_head::after(ggml_cgraph * g, const graph_names & names) {
+    // the nodes after the logits in this split: llama.cpp's backend sampler chain, on the CPU (not after the codec
+    // head's logits: their padded copy is written above)
+    const ggml_tensor * head   = graph_head(names);
+    const ggml_tensor * padded = names.find("result_output");
+    int                 il     = -1;
+    for (int i = 0; i < g->n_nodes; i++) {
+        il = g->nodes[i] == head ? i : il;
+    }
+    if (il >= 0 && il + 1 < g->n_nodes && padded == head) {
         cpu_compute(g, g->nodes + il + 1, g->n_nodes - il - 1, "sampler (cpu)");
     }
 }

@@ -126,8 +126,6 @@ bool axera_audio_graph(const struct ggml_cgraph * cgraph);
 enum ggml_status axera_audio_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph);
 // a tensor the model loader set whole: the audio encoder converts its layer matrices to bf16 now
 void axera_audio_on_set(const ggml_tensor * t);
-// the largest sequence count of any llama.cpp context made in this process (0: none told the backend)
-uint32_t axera_n_seq_max();
 bool axera_llama_graph(const struct ggml_cgraph * cgraph);
 enum ggml_status axera_gen_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph);
 void axera_cpu_compute(ggml_backend_axera_context * ctx, struct ggml_cgraph * cgraph, int i0, int i1, const char * what);
@@ -340,6 +338,9 @@ struct ggml_axera_kernel_registry {
         }
         if (ret != 0) {
             GGML_ABORT("%s: failed to load kernel %s (0x%x)\n", __func__, path(name).c_str(), ret);
+        }
+        if (axera_debug()) {  // (which kernels a model uses: GGML_AXERA_PRELOAD=0 GGML_AXERA_DEBUG=1)
+            GGML_LOG_WARN("axera: kernel %s\n", path(name).c_str());
         }
         k->cores = atoi(file(name).c_str() + file(name).rfind("_npu") + 4);
         if (axera_cores() > 1 && file(name) == name + "_npu1") {  // no build for all cores: runs on one

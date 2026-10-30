@@ -37,6 +37,9 @@ bool ggml_backend_buffer_is_axera(struct ggml_backend_buffer * buffer);
 bool axera_runtime_init();
 // CMM total / free (/proc/ax_proc/mem_cmm_info)
 void axera_cmm_memory(size_t * free, size_t * total);
+// the largest sequence count of any llama.cpp context made in this process (0: none told the backend): a padded
+// prefill chunk writes K / V into the cells after its batch's, which only one sequence leaves free
+uint32_t axera_n_seq_max();
 
 // a CMM range: a ggml buffer's (the model's tensors), or the backend's own (axera_cmm)
 struct ggml_backend_axera_buffer_context {
