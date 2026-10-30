@@ -147,6 +147,7 @@ static std::unique_ptr<manifest> load_manifest(const std::string & dir) {
             d.bytes   = p.at("bytes").get<uint32_t>();
             d.dtype   = p.at("dtype").get<int>();
             d.shape   = p.at("shape").get<std::vector<int64_t>>();
+            d.vperm   = p.value("vperm", std::string());
             m->params[kind][name] = std::move(d);
         }
     }

@@ -46,6 +46,9 @@ struct param_desc {
     uint32_t             bytes = 0;
     int                  dtype = 0;
     std::vector<int64_t> shape;
+    std::string          vperm;    // after the conversion, value heads from GGUF's tiled order to HF's grouped one:
+                                   // "rows:<r0>:<VH>:<KH>" (rows from r0 on: VH head blocks), "cols:<VH>:<KH>" (each
+                                   // row: VH column blocks); none: as converted
 };
 
 struct kernel_desc {

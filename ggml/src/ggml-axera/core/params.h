@@ -49,6 +49,8 @@ class params {
     std::vector<axera_cmm> exp_own;  // gate-up experts whose gate and up are not back to back
 
     const experts & experts_of(const std::map<std::string, ggml_tensor *> & t, int il);
+    AX_ENGINE_IO_BUFFER_T convert(const std::map<std::string, ggml_tensor *> & t, int il, const std::string & kind,
+                                  const std::string & name, const param_desc & p);
 };
 
 }  // namespace axera

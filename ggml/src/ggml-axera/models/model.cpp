@@ -64,6 +64,8 @@ std::shared_ptr<model> make_model(const manifest & m) {
         llm = make_qwen35_moe(m);
     } else if (m.model == "qwen35_dense") {
         llm = make_qwen35_dense(m);
+    } else if (m.model == "qwen38_27b") {
+        llm = make_qwen38_27b(m);
     } else if (m.model == "qwen3") {
         llm = make_qwen3(m);
     } else {

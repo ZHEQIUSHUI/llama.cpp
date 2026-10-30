@@ -137,10 +137,56 @@ const params::experts & params::experts_of(const std::map<std::string, ggml_tens
     return exps[il] = e;
 }
 
+// value heads from GGUF's tiled order (head r * KH + k, llama.cpp's converter) to HF's grouped one (k * REP + r, REP =
+// VH / KH), the order of kernels that give each core whole key-head groups
+static void vheads_grouped(const param_desc & p, const std::string & name, const uint8_t * src, uint8_t * dst) {
+    int        r0 = 0, VH = 0, KH = 0;
+    const bool rows = sscanf(p.vperm.c_str(), "rows:%d:%d:%d", &r0, &VH, &KH) == 3;
+    if ((!rows && sscanf(p.vperm.c_str(), "cols:%d:%d", &VH, &KH) != 2) || KH <= 0 || VH % KH != 0 || p.shape.empty()) {
+        GGML_ABORT("axera: parameter %s: bad vperm %s\n", name.c_str(), p.vperm.c_str());
+    }
+    const int     REP = VH / KH;
+    const int64_t N   = p.shape[0];
+    const size_t  rb  = p.bytes / N;
+    GGML_ASSERT((size_t) N * rb == p.bytes);
+    auto from = [&](int g) { return (g % REP) * KH + g / REP; };  // the tiled head of grouped head g
+    if (rows) {
+        const int64_t hr = (N - r0) / VH;
+        GGML_ASSERT(r0 >= 0 && r0 + hr * VH == N);
+        memcpy(dst, src, (size_t) r0 * rb);
+        for (int g = 0; g < VH; ++g) {
+            memcpy(dst + (size_t) (r0 + g * hr) * rb, src + (size_t) (r0 + from(g) * hr) * rb, (size_t) hr * rb);
+        }
+        return;
+    }
+    const size_t cb = rb / VH;
+    GGML_ASSERT(cb * VH == rb);
+    for (int64_t r = 0; r < N; ++r) {
+        for (int g = 0; g < VH; ++g) {
+            memcpy(dst + r * rb + g * cb, src + r * rb + from(g) * cb, cb);
+        }
+    }
+}
+
 AX_ENGINE_IO_BUFFER_T params::get(const std::map<std::string, ggml_tensor *> & t, int il, const std::string & kind,
                                   const std::string & name) {
-    const param_desc & p = m.param(kind, name);
-    const uint32_t     size = p.bytes;
+    const param_desc &          p  = m.param(kind, name);
+    const AX_ENGINE_IO_BUFFER_T io = convert(t, il, kind, name, p);
+    if (p.vperm.empty() || !io.pVirAddr) {
+        return io;
+    }
+    auto & c = own[{ il, kind + "/" + name + "/vperm" }];
+    if (!c) {
+        c = axera_cmm_alloc(p.bytes);
+        vheads_grouped(p, name, (const uint8_t *) io.pVirAddr, (uint8_t *) c->vir);
+        c->flush();
+    }
+    return axera_io(c, p.bytes);
+}
+
+AX_ENGINE_IO_BUFFER_T params::convert(const std::map<std::string, ggml_tensor *> & t, int il, const std::string & kind,
+                                      const std::string & name, const param_desc & p) {
+    const uint32_t size = p.bytes;
     if (p.convert == "mxfp4_planar_codes" || p.convert == "mxfp4_planar_scales") {
         const experts & e = experts_of(t, il);
         const int       g = name == "e_gw" || name == "e_gs" ? 0 : 1;
