@@ -32,8 +32,5 @@ std::shared_ptr<model> make_qwen3_tts(const manifest & m);
 // a graph is the Qwen3-ASR audio encoder's: it reads the conv front-end's output projection and the layers (the
 // Qwen3-TTS speaker encoder has a conv_out too)
 bool qwen3_asr_graph(const ggml_cgraph * g);
-// a tensor the model loader set (or the scheduler asks about): an audio encoder matrix converted to bf16 now, so that
-// the first request does not wait for it
-void qwen3_asr_on_set(const ggml_tensor * t);
 
 }  // namespace axera

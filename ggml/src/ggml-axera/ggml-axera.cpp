@@ -193,10 +193,6 @@ static bool axera_pooling_op(const ggml_tensor * op) {
 }
 
 static bool ggml_backend_axera_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    if (op->op == GGML_OP_MUL_MAT && op->src[0] &&
-        (strncmp(op->src[0]->name, "a.blk.", 6) == 0 || strncmp(op->src[0]->name, "mm.a.mlp.", 9) == 0)) {
-        axera::qwen3_asr_on_set(op->src[0]);  // (the audio encoder's matrices to bf16 while mtmd's warmup reserves its graph)
-    }
     // the model adapter runs the whole graph up to the logits or, for pooled embeddings, the final norm: the pooling
     // stays on the CPU
     return !axera_pooling_op(op);
