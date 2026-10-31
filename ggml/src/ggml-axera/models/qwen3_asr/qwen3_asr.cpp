@@ -1,7 +1,8 @@
 // Axera NPU backend: the Qwen3-ASR audio encoder (mtmd's graph of the audio tower, projector qwen3a)
 //
-// The whole encoder in one call of the manifest's kernel audio.enc.n<n> (ax-dsl-kernels models/qwen3_asr, asr_kernel.py)
-// for n chunks of 100 mel frames (the call's chunks padded to n = 1 / 2 / 4 / 8): the mel frames in, on chip the
+// The whole encoder in one call of the manifest's kernel audio.enc (ax-dsl-kernels models/qwen3_asr, asr_kernel.py) for
+// n chunks of 100 mel frames (n = 8; the call's chunks padded with zeros, their rows hidden from the attention by the
+// key mask): the mel frames in, on chip the
 // three 3 x 3 stride-2 convolutions with GELU, conv_out, the positions, all encoder layers (a runtime loop over weight
 // banks [L, ...]), the post norm and the projector; out the projector rows (the first 13 per chunk valid).
 // The weights: bf16 copies of the mmproj's tensors, the layers' stacked by layer (q / k / v joined), made by the first
@@ -191,14 +192,12 @@ ggml_status qwen3_asr::compute(ggml_cgraph * g) {
     const ggml_tensor * inp = t.at("inp_raw");
     const int64_t       NF = inp->ne[0], MEL = inp->ne[1], CH = 100, nch = NF / CH;
     GGML_ASSERT(inp->type == GGML_TYPE_F32 && ggml_is_contiguous(inp) && NF % CH == 0 && MEL == 128);
-    int n = 0;  // the kernel's chunks: the fewest that hold the call's
-    for (int c : { 1, 2, 4, 8 }) {
-        n = n == 0 && c >= nch ? c : n;
+    const kernel & k = man.get("audio.enc");
+    const int64_t  n = (int64_t) (k.in_bytes("mel") / (CH * MEL * sizeof(ggml_bf16_t)));  // the kernel's chunks
+    if (nch > n) {
+        GGML_ABORT("axera qwen3_asr: %lld chunks of audio in one call; the kernel takes up to %lld\n", (long long) nch,
+                   (long long) n);
     }
-    if (n == 0) {
-        GGML_ABORT("axera qwen3_asr: %lld chunks of audio in one call; the kernels take up to 8\n", (long long) nch);
-    }
-    const kernel & k = man.get("audio.enc.n" + std::to_string(n));
     if (bound != t.at("a.blk.0.attn_q.weight")->data) {
         w.clear();
         bound = t.at("a.blk.0.attn_q.weight")->data;
@@ -221,11 +220,18 @@ ggml_status qwen3_asr::compute(ggml_cgraph * g) {
         });
         X->flush(X->vir, k.in_bytes("mel"));
     }
+    // the key mask: the padding chunks' rows hidden
+    axera_cmm &   M = buffer("kmask", k.in_bytes("kmask"));
+    const int64_t P = (int64_t) (k.in_bytes("kmask") / sizeof(ggml_bf16_t));
+    for (int64_t r = 0; r < P; ++r) {
+        ((ggml_bf16_t *) M->vir)[r] = ggml_fp32_to_bf16(r < nch * 13 ? 0.0f : -3e38f);
+    }
+    M->flush();
     ggml_tensor * out = g->nodes[g->n_nodes - 1];
     GGML_ASSERT(out->type == GGML_TYPE_F32 && ggml_is_contiguous(out) && out->ne[1] == nch * 13 &&
                 k.out_bytes("out") % (out->ne[0] * sizeof(float)) == 0);
     axera_cmm & O = buffer("out", k.out_bytes("out"));
-    io_map      io{ { "mel", cm_io(X) }, { "out", cm_io(O) } };
+    io_map      io{ { "mel", cm_io(X) }, { "kmask", cm_io(M) }, { "out", cm_io(O) } };
     for (auto & [name, c] : w) {
         io[name] = cm_io(c);
     }
