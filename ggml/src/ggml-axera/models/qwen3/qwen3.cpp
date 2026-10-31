@@ -5,15 +5,18 @@
 //   prefill  role prefill: one call per page of 256 cells (a runtime loop over the layers, their weights in banks
 //            [L / 4, ...] per phase), the last page of a batch padded (valid_tokens). Its history is whole pages: a batch
 //            that starts inside a page restarts at the page's first cell with the page's earlier inputs (kept)
-//   decode   role decode: one token, the same banks and KV cache
+//   decode   role decode: one token through all layers (a decode group: the layers' weights in packs) on the same KV
+//            cache; with the output head inside (ASR) it also gives a prompt's last token's logits
 //   output   the logits (lm_head, the TTS codec head's padded to the text vocabulary), or for pooled embeddings the
 //            final norm of every row (the pooling on the CPU)
-// The kernels end with an RMS norm of unit weight; the output head applies the model's final norm (the RMS norm of
-// normed rows changes nothing).
+// The prefill kernel ends with an RMS norm of unit weight, the decode group with the model's final norm when its head
+// is inside, else of unit weight: the host's output head applies the model's final norm (the RMS norm of normed rows
+// changes nothing).
 // The KV cache is this adapter's: paged [L][pages][K, V][256][KV heads][128] bf16. One sequence at a time (pooled
 // embeddings: the batch's sequences one after another, each from its first cell). Weights only from the GGUF.
 
 #include "../model.h"
+#include "../../core/params.h"
 #include "../../core/mx.h"
 #include "../../core/quant.h"
 #include "../../ops/ops.h"
@@ -33,11 +36,12 @@ struct call {
 
 class qwen3 final : public model {
   public:
-    explicit qwen3(const manifest & m) : man(m) {}
+    explicit qwen3(const manifest & m) : man(m), prm(m) {}
     ggml_status compute(ggml_cgraph * g) override;
 
   private:
     const manifest & man;
+    params           prm;
     graph_names      names;
     const void *     bound = nullptr;
     int              L = 0, H = 0, NBLK = 0, AX = 1;  // AX: position axes (1 RoPE, 3 M-RoPE)
@@ -45,7 +49,8 @@ class qwen3 final : public model {
     axera_cmm                        KV;
     std::map<std::string, axera_cmm> banks;
     call                             pre, dec;
-    axera_cmm PX, POS, VALID, POUT, DX, DPOS, DOUT, INDPTR, INDICES, LASTLEN, CLOC;
+    axera_cmm PX, POS, VALID, POUT, INDPTR, INDICES, LASTLEN, CLOC;
+    axera_cmm DX, DOUT, COS, SIN, CS, PN, MASK, FNORM, HBUF, LOGITS;  // the decode group's (LOGITS: its head's)
     // the inputs of the current page's cells so far (from its first cell page_cell) and their positions [cells][4]
     int64_t                  page_cell = -1;
     std::vector<ggml_bf16_t> page_x;
@@ -56,7 +61,7 @@ class qwen3 final : public model {
     axera_cmm bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d, const rope & rp);
     void      paging(int64_t hist, int64_t write_cell);
     void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0);
-    void      decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h);
+    void      decode(int64_t c, int t, const ggml_bf16_t * x, const int32_t * p4, const rope & rp, float * h);
 };
 
 // a [rows] or [rows][cols] f32 view of any small GGUF tensor
@@ -180,18 +185,15 @@ void qwen3::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tens
     }
     GGML_ASSERT(kv && kv->shape[0] == L && kv->shape[3] == PG);
     NBLK = (int) kv->shape[1];
-    GGML_ASSERT((int64_t) NBLK * PG == man.context && (!dk || dk->in_bytes("b0_kv") == kv->bytes));
+    GGML_ASSERT((int64_t) NBLK * PG == man.context && (!dk || dk->in_bytes("kv") == kv->bytes));
     AX = (int) (pk.in_bytes("position_ids") / (PG * sizeof(int32_t)));
     GGML_ASSERT((AX == 1 || AX == 3) && pk.in_bytes("x") == (size_t) PG * H * sizeof(ggml_bf16_t) &&
-                (!dk || (dk->in_bytes("x") == (size_t) H * sizeof(ggml_bf16_t) && dk->in_bytes("position_ids") == AX * sizeof(int32_t))));
+                (!dk || dk->in_bytes("x") == (size_t) H * sizeof(ggml_bf16_t)));
     KV      = axera_cmm_alloc(kv->bytes);
     PX      = axera_cmm_alloc(pk.in_bytes("x"));
     POUT    = axera_cmm_alloc(pk.out_bytes("output"));
     POS     = axera_cmm_alloc(pk.in_bytes("position_ids"));
     VALID   = axera_cmm_alloc(sizeof(int32_t));
-    DX      = axera_cmm_alloc((size_t) H * sizeof(ggml_bf16_t));
-    DOUT    = axera_cmm_alloc((size_t) H * sizeof(ggml_bf16_t));
-    DPOS    = axera_cmm_alloc(AX * sizeof(int32_t));
     INDPTR  = axera_cmm_alloc(2 * sizeof(int32_t));
     INDICES = axera_cmm_alloc((size_t) NBLK * sizeof(int32_t));
     LASTLEN = axera_cmm_alloc(sizeof(int32_t));
@@ -212,31 +214,68 @@ void qwen3::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tens
         ((ggml_bf16_t *) banks["final_norm"]->vir)[i] = ggml_fp32_to_bf16(1.0f);
     }
     banks["final_norm"]->flush();
-    // both kernels: the same banks, KV cache and paging, their own rows
-    dec = {};
-    for (const kernel * k : { &pk, dk }) {
-        if (!k) {
-            continue;
+    // prefill: the weight banks, the KV cache, one page's rows
+    pre   = {};
+    pre.k = &pk;
+    for (const auto & d : pk.desc->in) {
+        const std::string & n = d.name;
+        const axera_cmm *   b = n == "x" ? &PX : n == "position_ids" ? &POS : n == "valid_tokens" ? &VALID :
+                                n == "indptr" ? &INDPTR : n == "indices" ? &INDICES : n == "last_page_len" ? &LASTLEN :
+                                n == "cache_location" ? &CLOC : n == "b0_kv" ? &KV : nullptr;
+        if (!b) {
+            auto it = banks.find(n);
+            b       = it != banks.end() ? &it->second : &(banks[n] = bank(t, d, rp));
         }
-        call & c = k == &pk ? pre : dec;
-        c        = {};
-        c.k      = k;
-        for (const auto & d : k->desc->in) {
+        GGML_ASSERT((*b)->size >= d.bytes);
+        pre.in.push_back(axera_io(*b, d.bytes));
+    }
+    GGML_ASSERT(pk.desc->out.size() == 1 && pk.desc->out[0].name == "output");
+    pre.out.push_back(axera_io(POUT, pk.desc->out[0].bytes));
+    // decode: the group's packs from the GGUF, the same KV cache; cs = cos | sin, pn = cell | blocks | the K row of the
+    // cell, the final norm the model's when the head is inside
+    dec    = {};
+    LOGITS = {};
+    if (dk) {
+        dec.k = dk;
+        bool head_in = false;
+        for (const auto & d : dk->desc->out) {
+            head_in = head_in || d.name == "logits";
+        }
+        const uint32_t csb = dk->in_bytes("cs");
+        DX    = axera_cmm_alloc(dk->in_bytes("x"));
+        DOUT  = axera_cmm_alloc(dk->out_bytes("out"));
+        COS   = axera_cmm_alloc(csb / 2);
+        SIN   = axera_cmm_alloc(csb / 2);
+        CS    = axera_cmm_alloc(csb);
+        PN    = axera_cmm_alloc(3 * sizeof(int32_t));
+        MASK  = axera_cmm_alloc(dk->in_bytes("mask"));
+        HBUF  = axera_cmm_alloc(dk->in_bytes("hbuf"));
+        FNORM = axera_cmm_alloc(dk->in_bytes("fnorm"));
+        GGML_ASSERT(dk->in_bytes("pn") == 3 * sizeof(int32_t) && dk->in_bytes("mask") == (size_t) man.context * sizeof(ggml_bf16_t) &&
+                    dk->in_bytes("fnorm") == (size_t) H * sizeof(ggml_bf16_t) && csb / sizeof(ggml_bf16_t) == 2 * rp.inv_freq.size());
+        const std::vector<float> fn = head_in ? f32_of(t.at("output_norm.weight")) : std::vector<float>(H, 1.0f);
+        ggml_fp32_to_bf16_row(fn.data(), (ggml_bf16_t *) FNORM->vir, H);
+        FNORM->flush();
+        for (const auto & d : dk->desc->in) {
             const std::string & n = d.name;
-            const bool          p = k == &pk;
-            const axera_cmm *   b = n == "x" ? (p ? &PX : &DX) : n == "position_ids" ? (p ? &POS : &DPOS) :
-                                    n == "valid_tokens" ? &VALID : n == "indptr" ? &INDPTR : n == "indices" ? &INDICES :
-                                    n == "last_page_len" ? &LASTLEN : n == "cache_location" ? &CLOC : n == "b0_kv" ? &KV :
-                                    nullptr;
-            if (!b) {
-                auto it = banks.find(n);
-                b       = it != banks.end() ? &it->second : &(banks[n] = bank(t, d, rp));
+            if (dk->desc->packs.count(n)) {
+                dec.in.push_back(axera_io(prm.pack(t, *dk->desc, n, 0), d.bytes));
+                continue;
             }
-            GGML_ASSERT((*b)->size >= d.bytes);
-            c.in.push_back(axera_io(*b, d.bytes));
+            const axera_cmm * b = n == "x" ? &DX : n == "cs" ? &CS : n == "pn" ? &PN : n == "mask" ? &MASK : n == "kv" ? &KV :
+                                  n == "fnorm" ? &FNORM : n == "hbuf" ? &HBUF : nullptr;
+            if (!b) {
+                GGML_ABORT("axera qwen3: decode: unexpected input %s\n", n.c_str());
+            }
+            dec.in.push_back(axera_io(*b, d.bytes));
         }
-        GGML_ASSERT(k->desc->out.size() == 1 && k->desc->out[0].name == "output");
-        c.out.push_back(axera_io(k == &pk ? POUT : DOUT, k->desc->out[0].bytes));
+        for (const auto & d : dk->desc->out) {
+            if (d.name == "logits") {
+                LOGITS = axera_cmm_alloc(d.bytes);
+            }
+            dec.out.push_back(axera_io(d.name == "logits" ? LOGITS : DOUT, d.bytes));
+        }
+        prm.release({ &dec.in });
     }
     size_t bb = 0;
     for (const auto & [n, b] : banks) {
@@ -295,15 +334,26 @@ void qwen3::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4
     }
 }
 
-// one token at cell c > 0, its history the c cells before it
-void qwen3::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h) {
+// one token at cell c > 0 (the batch's token t), its history the c cells before it
+void qwen3::decode(int64_t c, int t, const ggml_bf16_t * x, const int32_t * p4, const rope & rp, float * h) {
     memcpy(DX->vir, x, H * sizeof(ggml_bf16_t));
     DX->flush();
-    for (int s = 0; s < AX; ++s) {
-        ((int32_t *) DPOS->vir)[s] = p4[s];
+    rp.rows(t, 1, COS.get(), SIN.get());
+    const size_t half = CS->size / 2;
+    memcpy(CS->vir, COS->vir, half);
+    memcpy((char *) CS->vir + half, SIN->vir, half);
+    CS->flush();
+    ((int32_t *) PN->vir)[0] = (int32_t) c;
+    ((int32_t *) PN->vir)[1] = (int32_t) (c / PG + 1);
+    ((int32_t *) PN->vir)[2] = (int32_t) ((c / PG) * 2 * PG + c % PG);
+    PN->flush();
+    auto *         m    = (ggml_bf16_t *) MASK->vir;  // causal over the flat cells of the populated pages
+    const int64_t  w    = (c / PG + 1) * PG;
+    const uint16_t ninf = ggml_fp32_to_bf16(-3e38f).bits;
+    for (int64_t i = 0; i < w; ++i) {
+        m[i].bits = i <= c ? 0 : ninf;
     }
-    DPOS->flush();
-    paging(c, c);
+    MASK->flush(MASK->vir, (size_t) w * sizeof(ggml_bf16_t));
     {
         axera_timer tl("layers (decode)");
         dec.k->run(dec.in, dec.out, "decode");
@@ -326,10 +376,6 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
     ggml_tensor * inp_pos = names.find("inp_pos");
     if (!norm0 || !inp_pos || (!logits && !names.find("result_norm") && !names.find("result_embd_pooled"))) {
         GGML_LOG_ERROR("axera qwen3: a graph of %d nodes that is not the whole model (-ngl 99)\n", g->n_nodes);
-        return GGML_STATUS_FAILED;
-    }
-    if (logits && !man.kernels.count("lm_head")) {
-        GGML_LOG_ERROR("axera qwen3: the graph wants logits; the kernel directory has no lm_head\n");
         return GGML_STATUS_FAILED;
     }
     ggml_tensor * x0 = norm0;
@@ -378,6 +424,13 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
     });
     std::vector<float> h((size_t) T * H);
     axera_timer        tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
+    const rope         rp(rope_node, inp_pos, T);
+    // the logits of the batch's last token only, and a decode group with the head: that token through the group
+    const bool group_head = logits && LOGITS && logits->ne[1] == 1;
+    if (logits && logits->ne[1] > 0 && !group_head && !man.kernels.count("lm_head")) {
+        GGML_LOG_ERROR("axera qwen3: logits of %lld rows; the kernel directory has no lm_head\n", (long long) logits->ne[1]);
+        return GGML_STATUS_FAILED;
+    }
     // token t sees cell c (llama.cpp may keep several sequences in one stream, one after another: a sequence's cells
     // are this cache's from its first on)
     auto sees = [&](int t, int64_t c) {
@@ -403,9 +456,12 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
             return GGML_STATUS_FAILED;
         }
         if (run == 1 && c0 > 0 && dec.k) {  // one token: the decode kernel
-            decode(c0, xb.data() + (size_t) it * H, pb.data() + (size_t) it * 4, h.data() + (size_t) it * H);
+            decode(c0, it, xb.data() + (size_t) it * H, pb.data() + (size_t) it * 4, rp, h.data() + (size_t) it * H);
             ++it;
             continue;
+        }
+        if (group_head && it + run == T && run > 1) {  // the last token through the group (its head)
+            --run;
         }
         // from the run's page start: the page's earlier inputs before the run's
         const int64_t s0 = c0 - c0 % PG;
@@ -425,6 +481,15 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
     }
     if (!logits) {
         output_norm(names, h, T);
+    } else if (logits->ne[1] == 0) {  // a batch whose logits nobody reads (mtmd's prompt chunks before the last)
+    } else if (group_head) {  // the group's logits of the last token
+        GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_nbytes(logits) == LOGITS->size);
+        LOGITS->invalidate();
+        memcpy(logits->data, LOGITS->vir, LOGITS->size);
+        if (ggml_backend_buffer_is_axera(logits->buffer)) {
+            ((ggml_backend_axera_buffer_context *) logits->buffer->context)->flush(logits->data, ggml_nbytes(logits));
+        }
+        output_head::after(g, names);
     } else {
         head.bind(man.get("lm_head"), logits->src[0]);  // output.weight, or the tied token_embd.weight
         head.run(g, names, h, T);
