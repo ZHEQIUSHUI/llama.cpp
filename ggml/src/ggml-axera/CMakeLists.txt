@@ -22,6 +22,7 @@ ggml_add_backend_library(ggml-axera
                          models/qwen3/qwen3.cpp
                          models/qwen3_asr/qwen3_asr.cpp
                          models/qwen3_tts/qwen3_tts.cpp
+                         models/qwen3_tts/codec.cpp
                          models/qwen35_vit/qwen35_vit.cpp
                          models/qwen35_vit/qwen35_vit_full.cpp
                          ggml-axera-buffer.cpp

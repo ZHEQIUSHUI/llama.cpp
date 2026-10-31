@@ -4,12 +4,14 @@
 // The code predictor: one frame (its 16 codes, sampled with the graph's top-k) in one call of the frame kernel (role
 // cp.frame.k<top_k>, q3tts_cp_frame.py: the predictor's layers and heads, the sampling on chip), its packs filled from
 // the predictor's weights (params kinds cp, cp_out). A graph that samples otherwise (top-p) is not run.
+// The codec decoder (code2wav) in one call of its kernel per window when the manifest has role gen.codec (codec.cpp).
 // The other graphs node by node: a convolution (IM2COL + MUL_MAT) on its conv1d kernel (role gen.conv1d_*, the _b /
 // _br variants computing the bias / residual ADDs after it), a matrix product on its GEMM (gen.mm_bf16_m<M>_n<N>_k<K>)
 // where the manifest has that shape, SnakeBeta / CONCAT / transposes / COL2IM / depthwise convolutions on the host
 // workers, the rest on the CPU backend.
 
 #include "../model.h"
+#include "codec.h"
 #include "../../core/params.h"
 #include "../../ops/ops.h"
 
@@ -567,6 +569,7 @@ class qwen3_tts final : public model {
     std::vector<uintptr_t>                                     key;  // the last graph's nodes, and its analysis
     std::shared_ptr<analysis>                                  an;
     std::map<std::vector<uintptr_t>, std::shared_ptr<analysis>> analyses;  // of the last few graphs
+    std::unique_ptr<tts_codec>                                 codec;     // the codec decoder's kernel (role gen.codec)
 
     bool have(const std::string & name) const { return man.has("gen." + name); }
     const char * label(const std::string & s) { return labels.insert(s).first->c_str(); }
@@ -1043,6 +1046,13 @@ void qwen3_tts::frame_run(const frame_io & fr) {
 
 ggml_status qwen3_tts::compute(ggml_cgraph * cgraph) {
     names.of(cgraph);
+    if (man.has("gen.codec") && tts_codec::graph(names)) {  // code2wav in one kernel call
+        if (!codec) {
+            codec = std::make_unique<tts_codec>(man);
+        }
+        codec->run(names);
+        return GGML_STATUS_SUCCESS;
+    }
     // analyzed once per graph (mtmd builds the same graph in the same memory for every frame; the code generation and
     // code2wav graphs alternate)
     std::vector<uintptr_t> k;
