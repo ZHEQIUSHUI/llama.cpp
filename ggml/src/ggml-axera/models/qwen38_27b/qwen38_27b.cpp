@@ -611,10 +611,12 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
         // from the batch's page start: the page's earlier inputs (and the state saved there) before the batch's
         const int64_t s0 = c0 - c0 % PG;
         const int     k  = (int) (c0 - s0);
-        if (k > 0 && (snap_cell != s0 || (int) (page_x.size() / H) != k)) {
+        if (k > 0 && (snap_cell != s0 || (int) (page_x.size() / H) < k)) {
             GGML_LOG_ERROR("axera qwen38_27b: a prompt from cell %lld, inside a page whose state is not kept\n", (long long) c0);
             return GGML_STATUS_FAILED;
         }
+        page_x.resize((size_t) k * H);  // (a kept prefix, e.g. the server's prompt cache: the cells after it are gone)
+        page_p.resize((size_t) k * 4);
         std::vector<ggml_bf16_t> xs;
         std::vector<int32_t>     ps;
         if (k > 0) {

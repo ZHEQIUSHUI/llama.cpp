@@ -466,10 +466,12 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
         // from the run's page start: the page's earlier inputs before the run's
         const int64_t s0 = c0 - c0 % PG;
         const int     k  = (int) (c0 - s0);
-        if (k > 0 && (page_cell != s0 || (int) (page_x.size() / H) != k)) {
+        if (k > 0 && (page_cell != s0 || (int) (page_x.size() / H) < k)) {
             GGML_LOG_ERROR("axera qwen3: a batch from cell %lld, inside a page whose inputs are not kept\n", (long long) c0);
             return GGML_STATUS_FAILED;
         }
+        page_x.resize((size_t) k * H);  // (a kept prefix, e.g. the server's prompt cache: the cells after it are gone)
+        page_p.resize((size_t) k * 4);
         std::vector<ggml_bf16_t> xs(page_x.begin(), page_x.begin() + (size_t) k * H);
         std::vector<int32_t>     ps(page_p.begin(), page_p.begin() + (size_t) k * 4);
         xs.insert(xs.end(), xb.begin() + (size_t) it * H, xb.begin() + (size_t) (it + run) * H);
