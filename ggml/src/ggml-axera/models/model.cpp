@@ -83,7 +83,7 @@ std::shared_ptr<model> make_model(const manifest & m) {
     }
     auto c   = std::make_shared<composite>();
     c->llm   = llm;
-    c->vit   = vision1 ? make_qwen38_27b_vit(m) : vision ? make_qwen35_vit(m) : nullptr;
+    c->vit   = vision1 ? make_qwen35_vit_full(m) : vision ? make_qwen35_vit(m) : nullptr;
     c->audio = audio ? make_qwen3_asr(m) : nullptr;
     c->gen   = gen ? make_qwen3_tts(m) : nullptr;
     return c;

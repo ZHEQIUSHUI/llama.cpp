@@ -1,6 +1,7 @@
-// Axera NPU backend: the Qwen3.8-27B vision encoder (mtmd clip graph, projector qwen3vl: 27 layers of 1152, 16 heads
-// of 72) in one call of the manifest's role vit (ax-dsl-kernels models/qwen38_27b, vit_full: patch embedding, every
-// layer, the 2 x 2 merge and projector for N patches, an image padded to N).
+// Axera NPU backend: the Qwen3.5 / Qwen3.8 vision encoder (mtmd clip graph, projector qwen3vl: 27 layers of 1152, 16
+// heads of 72; 27B, 35B-A3B) in one call of the manifest's role vit (ax-dsl-kernels models/<model>/vit, vit_full: patch
+// embedding, every layer, the 2 x 2 merge and projector for N patches, an image padded to N; the projector's width
+// from the kernel's output).
 //
 // The host orders the patches in 2 x 2 merge order (as clip_graph_qwen3vl), resizes the learned position table
 // (bilinear, align corners), makes the 2-D RoPE tables and the key mask: those depend on the image's size only and are
@@ -15,9 +16,9 @@
 namespace axera {
 namespace {
 
-class qwen38_27b_vit final : public model {
+class qwen35_vit_full final : public model {
   public:
-    explicit qwen38_27b_vit(const manifest & m) : man(m), k(man.get("vit")) {}
+    explicit qwen35_vit_full(const manifest & m) : man(m), k(man.get("vit")) {}
     ggml_status compute(ggml_cgraph * g) override;
 
   private:
@@ -55,7 +56,7 @@ void to_bf16(const ggml_tensor * w, ggml_bf16_t * dst) {
     }
 }
 
-void qwen38_27b_vit::weights(int L, int H) {
+void qwen35_vit_full::weights(int L, int H) {
     axera_timer tm("vit weights (load)");
     // stacked per layer: kernel input -> mmproj tensor of v.blk.<l>.
     static const std::pair<const char *, const char *> per_layer[] = {
@@ -97,7 +98,7 @@ void qwen38_27b_vit::weights(int L, int H) {
 }
 
 // the tables of an image of gh x gw patches (n real): merge order, positions, RoPE, key mask
-void qwen38_27b_vit::tables(int gh, int gw, int n, const ggml_tensor * pe, int H) {
+void qwen35_vit_full::tables(int gh, int gw, int n, const ggml_tensor * pe, int H) {
     axera_timer tm("vit tables (cpu)");
     py.assign(N, 0);
     px.assign(N, 0);
@@ -162,7 +163,7 @@ void qwen38_27b_vit::tables(int gh, int gw, int n, const ggml_tensor * pe, int H
     io("kmask")->flush();
 }
 
-ggml_status qwen38_27b_vit::compute(ggml_cgraph * g) {
+ggml_status qwen35_vit_full::compute(ggml_cgraph * g) {
     names.of(g);
     ggml_tensor * raw = names.at("inp_raw");  // [W, H, 3, frames] f32, normalized
     ggml_tensor * pe  = names.at("v.position_embd.weight");
@@ -184,7 +185,7 @@ ggml_status qwen38_27b_vit::compute(ggml_cgraph * g) {
         GGML_ASSERT(km.pShape[0] * BC == N && k.in_bytes("px") == (size_t) N * CP * sizeof(ggml_bf16_t));
     }
     if (raw->ne[3] != 1 || gw % 2 || gh % 2 || n > N) {
-        GGML_LOG_ERROR("axera qwen38_27b_vit: %d frame(s) of %d x %d patches: still images of even patch counts, at most %d "
+        GGML_LOG_ERROR("axera qwen35_vit_full: %d frame(s) of %d x %d patches: still images of even patch counts, at most %d "
                        "patches (mtmd --image-max-tokens)\n", (int) raw->ne[3], gw, gh, N);
         return GGML_STATUS_FAILED;
     }
@@ -246,8 +247,8 @@ ggml_status qwen38_27b_vit::compute(ggml_cgraph * g) {
 
 }  // namespace
 
-std::shared_ptr<model> make_qwen38_27b_vit(const manifest & m) {
-    return std::make_shared<qwen38_27b_vit>(m);
+std::shared_ptr<model> make_qwen35_vit_full(const manifest & m) {
+    return std::make_shared<qwen35_vit_full>(m);
 }
 
 }  // namespace axera

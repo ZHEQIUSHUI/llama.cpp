@@ -23,9 +23,9 @@ std::shared_ptr<model> make_model(const manifest & m);
 std::shared_ptr<model> make_qwen35_moe(const manifest & m);
 std::shared_ptr<model> make_qwen35_dense(const manifest & m);
 std::shared_ptr<model> make_qwen38_27b(const manifest & m);  // Qwen3.8-27B: the whole-model prefill kernel
-std::shared_ptr<model> make_qwen38_27b_vit(const manifest & m);  // its vision encoder in one call (role vit)
 std::shared_ptr<model> make_qwen3(const manifest & m);  // Qwen3 text decoders (Embedding, ASR text, TTS talker)
 std::shared_ptr<model> make_qwen35_vit(const manifest & m);  // the mmproj vision encoder (roles vit.*)
+std::shared_ptr<model> make_qwen35_vit_full(const manifest & m);  // the same in one call (role vit)
 std::shared_ptr<model> make_qwen3_asr(const manifest & m);  // the Qwen3-ASR audio encoder (roles audio.*)
 // the Qwen3-TTS generation graphs: code predictor frames, codec decoder, speaker encoder (roles cp.*, gen.*)
 std::shared_ptr<model> make_qwen3_tts(const manifest & m);
