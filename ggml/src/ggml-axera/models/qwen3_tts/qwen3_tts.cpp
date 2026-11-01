@@ -499,8 +499,8 @@ void snake_fuses(ggml_cgraph * cgraph, std::map<const ggml_tensor *, snake_fuse>
 bool frame_find(ggml_cgraph * cgraph, const graph_names & names, frame_io & fr) {
     fr                  = frame_io();
     const ggml_tensor * oc = names.find("out_codes");
-    if (!oc || !(oc->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-        return false;
+    if (!oc || !(oc->flags & GGML_TENSOR_FLAG_COMPUTE) || !names.find("a.gen.code.head.weight")) {
+        return false;  // (also the speech tokenizer encoder's graph: its codes, node by node)
     }
     fr.n_codes = (int) ggml_nelements(oc);
     for (int i = 0; i < cgraph->n_nodes; i++) {

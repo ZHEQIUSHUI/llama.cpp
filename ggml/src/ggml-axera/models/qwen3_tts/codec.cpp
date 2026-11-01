@@ -244,52 +244,57 @@ void tts_codec::run(const graph_names & names) {
     }
     const ggml_tensor * codes = names.at("inp_codes");
     ggml_tensor *       out   = names.at("out_audio");
-    const int64_t       P = (int64_t) *(const float *) names.at("state_in_tfm_pos")->data;  // frames decoded before
-    const int64_t       n = codes->ne[0], a = P % WIN, b = a + n;
-    GGML_ASSERT(codes->type == GGML_TYPE_I32 && codes->ne[1] == CODES && b <= WIN && out->type == GGML_TYPE_F32 &&
+    const int64_t       P0 = (int64_t) *(const float *) names.at("state_in_tfm_pos")->data;  // frames decoded before
+    const int64_t       n  = codes->ne[0];
+    GGML_ASSERT(codes->type == GGML_TYPE_I32 && codes->ne[1] == CODES && out->type == GGML_TYPE_F32 &&
                 ggml_nelements(out) == n * HOP);
-    if (P == 0) {  // a new utterance
+    if (P0 == 0) {  // a new utterance
         reset();
     }
-    auto * cb = (int32_t *) CODES_B->vir;
-    if (a == 0) {
-        memset(cb, 0, WIN * CODES * sizeof(int32_t));
-    }
-    for (int64_t t = 0; t < n; ++t) {
-        for (int g = 0; g < CODES; ++g) {
-            cb[(a + t) * CODES + g] = ((const int32_t *) codes->data)[g * n + t];
+    // the batch window by window (more frames than a window: e.g. ICL's reference codes as the decoder's context)
+    for (int64_t t0 = 0; t0 < n;) {
+        const int64_t P = P0 + t0, a = P % WIN, m = std::min<int64_t>(n - t0, WIN - a), b = a + m;
+        auto *        cb = (int32_t *) CODES_B->vir;
+        if (a == 0) {
+            memset(cb, 0, WIN * CODES * sizeof(int32_t));
         }
-    }
-    CODES_B->flush();
-    *(int32_t *) POS->vir = (int32_t) (P - a);
-    POS->flush();
-    std::vector<AX_ENGINE_IO_BUFFER_T> in(k.info->nInputSize), outs(k.info->nOutputSize);
-    for (int i = 0; i < (int) k.info->nInputSize; ++i) {
-        const std::string n_ = k.info->pInputs[i].pName;
-        const axera_cmm * c  = n_ == "codes" ? &CODES_B : n_ == "pos" ? &POS : n_ == "quant_w" ? &QW : n_ == "up_w" ? &UW :
-                               n_ == "dac_w" ? &DW : cur.count(n_) ? &cur.at(n_) : nxt.count(n_) ? &nxt.at(n_) : nullptr;
-        if (!c) {
-            GGML_ABORT("axera qwen3_tts codec: unexpected input %s\n", n_.c_str());
+        for (int64_t t = 0; t < m; ++t) {
+            for (int g = 0; g < CODES; ++g) {
+                cb[(a + t) * CODES + g] = ((const int32_t *) codes->data)[g * n + t0 + t];
+            }
         }
-        in[i] = axera_io(*c, k.info->pInputs[i].nSize);
+        CODES_B->flush();
+        *(int32_t *) POS->vir = (int32_t) (P - a);
+        POS->flush();
+        std::vector<AX_ENGINE_IO_BUFFER_T> in(k.info->nInputSize), outs(k.info->nOutputSize);
+        for (int i = 0; i < (int) k.info->nInputSize; ++i) {
+            const std::string n_ = k.info->pInputs[i].pName;
+            const axera_cmm * c  = n_ == "codes" ? &CODES_B : n_ == "pos" ? &POS : n_ == "quant_w" ? &QW : n_ == "up_w" ? &UW :
+                                   n_ == "dac_w" ? &DW : cur.count(n_) ? &cur.at(n_) : nxt.count(n_) ? &nxt.at(n_) : nullptr;
+            if (!c) {
+                GGML_ABORT("axera qwen3_tts codec: unexpected input %s\n", n_.c_str());
+            }
+            in[i] = axera_io(*c, k.info->pInputs[i].nSize);
+        }
+        outs[k.output("wav")] = axera_io(WAV, k.out_bytes("wav"));
+        {
+            axera_timer tm("codec window (npu)");
+            k.run(in, outs, "codec");
+        }
+        WAV->invalidate(WAV->vir, (size_t) b * HOP * sizeof(float));
+        memcpy((float *) out->data + t0 * HOP, (const float *) WAV->vir + a * HOP, (size_t) m * HOP * sizeof(float));
+        if (b == WIN) {  // a complete window: its end state is the next window's start
+            for (auto & [s_, nn] : pair) {
+                std::swap(cur.at(s_), nxt.at(nn));
+            }
+        }
+        t0 += m;
     }
-    outs[k.output("wav")] = axera_io(WAV, k.out_bytes("wav"));
-    {
-        axera_timer tm("codec window (npu)");
-        k.run(in, outs, "codec");
-    }
-    WAV->invalidate(WAV->vir, (size_t) b * HOP * sizeof(float));
-    memcpy(out->data, (const float *) WAV->vir + a * HOP, (size_t) n * HOP * sizeof(float));
     if (ggml_backend_buffer_is_axera(out->buffer)) {
         ((ggml_backend_axera_buffer_context *) out->buffer->context)->flush(out->data, ggml_nbytes(out));
     }
-    if (b == WIN) {  // a complete window: its end state is the next window's start
-        for (auto & [s, nn] : pair) {
-            std::swap(cur.at(s), nxt.at(nn));
-        }
-    }
     if (ggml_tensor * po = names.find("state_out_tfm_pos")) {
-        *(float *) po->data = (float) (P + n);
+        *(float *) po->data = (float) (P0 + n);
         if (ggml_backend_buffer_is_axera(po->buffer)) {
             ((ggml_backend_axera_buffer_context *) po->buffer->context)->flush(po->data, ggml_nbytes(po));
         }
