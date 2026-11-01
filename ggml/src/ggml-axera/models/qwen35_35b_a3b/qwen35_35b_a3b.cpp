@@ -39,21 +39,25 @@ inline int tiled(int g) {
 }
 
 // rows of an [N, K] weight of the GGUF in the kernels' MXFP4 layout (codes [K / 2], scales [K / 32]): an MXFP4 tensor's
-// converted row by row as read, any other type quantized once
+// converted row by row as read, any other type quantized once; or in MXFP8 (codes [K], scales [K / 32]), quantized once
 struct mx4 {
     const ggml_tensor * w;
     axera_cmm           q, s;
     int64_t             N = 0, K = 0;
-    explicit mx4(const ggml_tensor * w) : w(w), N(ggml_nrows(w)), K(w->ne[0]) {
-        if (w->type != GGML_TYPE_MXFP4) {
+    bool                fp8 = false;
+    mx4(const ggml_tensor * w, bool fp8) : w(w), N(ggml_nrows(w)), K(w->ne[0]), fp8(fp8) {
+        if (fp8) {
+            axera_quantize_mxfp8(w, q, s);
+        } else if (w->type != GGML_TYPE_MXFP4) {
             axera_quantize_mxfp4(w, q, s);
         }
     }
+    int64_t code_bytes() const { return fp8 ? K : K / 2; }  // per row
     // row r: its codes and its scales (either may be null)
     void row(int64_t r, uint8_t * codes, uint8_t * scales) const {
         if (q) {
             if (codes) {
-                memcpy(codes, (const uint8_t *) q->vir + r * (K / 2), K / 2);
+                memcpy(codes, (const uint8_t *) q->vir + r * code_bytes(), code_bytes());
             }
             if (scales) {
                 memcpy(scales, (const uint8_t *) s->vir + r * (K / 32), K / 32);
@@ -125,11 +129,41 @@ void qwen35_35b_a3b::fill(const std::map<std::string, ggml_tensor *> & t, const 
         }
         return t.at(nm);
     };
+    // a weight's codes [.., K] MXFP8 (else [.., K / 2] MXFP4): by its codes input's last dimension against its scales'
+    // (scales input w_<p>_scale / w_scale_<p> of codes w_<p>)
+    auto io = [&](const std::string & n) -> const io_desc * {
+        for (const auto & e : dk.desc->in) {
+            if (e.name == n) {
+                return &e;
+            }
+        }
+        return nullptr;
+    };
+    auto is_fp8 = [&](const std::string & name) {
+        std::string c = name, sc;
+        const size_t i = name.find("w_scale_");
+        if (i != std::string::npos) {
+            c  = name.substr(0, i) + "w_" + name.substr(i + 8);
+            sc = name;
+        } else if (name.size() > 6 && name.compare(name.size() - 6, 6, "_scale") == 0) {
+            c  = name.substr(0, name.size() - 6);
+            sc = name;
+        } else {
+            const size_t j = name.find("w_");
+            sc             = j == std::string::npos ? "" : name + "_scale";
+            if (!io(sc)) {
+                sc = name.substr(0, j) + "w_scale_" + name.substr(j + 2);
+            }
+        }
+        const io_desc * a = io(c), * b = io(sc);
+        return a && b && a->shape.back() == 32 * b->shape.back();
+    };
     for (const auto & d : dk.desc->in) {
         std::smatch mt;
         if (banks.count(d.name)) {
             continue;
         }
+        const bool f8 = is_fp8(d.name);
         if (!std::regex_match(d.name, mt, re)) {
             if (d.name == "b3_kv") {  // the KV cache pool: zero
                 banks[d.name] = axera_cmm_alloc(d.bytes);
@@ -175,7 +209,7 @@ void qwen35_35b_a3b::fill(const std::map<std::string, ggml_tensor *> & t, const 
             // MXFP4 rows of a weight into this input (codes or scales): rows r0 .. r0 + nr, value heads (of hr rows)
             // from row vrow on in HF order
             auto rows = [&](const mx4 & w, int64_t r0, int64_t nr, bool scales, int64_t vrow = -1, int64_t hr = 0) {
-                const size_t rb = scales ? w.K / 32 : w.K / 2;
+                const size_t rb = scales ? w.K / 32 : w.code_bytes();
                 GGML_ASSERT((size_t) nr * rb == bb);
                 axera_host_pool().run(nr, [&](int64_t r) {
                     int64_t src = r0 + r;
@@ -187,7 +221,7 @@ void qwen35_35b_a3b::fill(const std::map<std::string, ggml_tensor *> & t, const 
                 });
             };
             auto cols = [&](const mx4 & w, bool scales) {  // value heads of the input (columns) in HF order
-                const size_t rb = scales ? w.K / 32 : w.K / 2, cb = rb / VH;
+                const size_t rb = scales ? w.K / 32 : w.code_bytes(), cb = rb / VH;
                 GGML_ASSERT((size_t) w.N * rb == bb);
                 axera_host_pool().run(w.N, [&](int64_t r) {
                     thread_local std::vector<uint8_t> src;
@@ -223,9 +257,9 @@ void qwen35_35b_a3b::fill(const std::map<std::string, ggml_tensor *> & t, const 
                 } else if (n == "w_scale_route") {
                     fill_v(1.0f);
                 } else if (n == "w_gate" || n == "w_scale_gate") {  // per expert: gate rows, then up rows
-                    const mx4     g(T(il, "ffn_gate_exps.weight")), u(T(il, "ffn_up_exps.weight"));
+                    const mx4     g(T(il, "ffn_gate_exps.weight"), f8), u(T(il, "ffn_up_exps.weight"), f8);
                     const bool    sc = n != "w_gate";
-                    const int64_t E = g.w->ne[2], F = g.w->ne[1], rb = sc ? g.K / 32 : g.K / 2;
+                    const int64_t E = g.w->ne[2], F = g.w->ne[1], rb = sc ? g.K / 32 : g.code_bytes();
                     GGML_ASSERT((size_t) E * 2 * F * rb == bb);
                     axera_host_pool().run(E * 2 * F, [&](int64_t r) {
                         const int64_t e = r / (2 * F), j = r % (2 * F);
@@ -233,7 +267,7 @@ void qwen35_35b_a3b::fill(const std::map<std::string, ggml_tensor *> & t, const 
                         w.row(e * F + j % F, sc ? nullptr : dst + r * rb, sc ? dst + r * rb : nullptr);
                     });
                 } else if (n == "w_down" || n == "w_scale_down") {
-                    const mx4 w(T(il, "ffn_down_exps.weight"));
+                    const mx4 w(T(il, "ffn_down_exps.weight"), f8);
                     rows(w, 0, w.N, n != "w_down");
                 } else {
                     static const std::map<std::string, const char *> S = { { "gate", "ffn_gate_shexp.weight" },
@@ -243,7 +277,7 @@ void qwen35_35b_a3b::fill(const std::map<std::string, ggml_tensor *> & t, const 
                     if (n.find("shared_expert_mlp_") == std::string::npos || !S.count(n.substr(p + 1))) {
                         GGML_ABORT("axera qwen35_35b_a3b: unexpected MoE input %s\n", d.name.c_str());
                     }
-                    const mx4 w(T(il, S.at(n.substr(p + 1))));
+                    const mx4 w(T(il, S.at(n.substr(p + 1))), f8);
                     rows(w, 0, w.N, n.rfind("w_scale_", 0) == 0);
                 }
             } else if (phase == 3) {  // gated attention
@@ -257,7 +291,7 @@ void qwen35_35b_a3b::fill(const std::map<std::string, ggml_tensor *> & t, const 
                 } else if (n == "w_norm_k") {
                     vec("attn_k_norm.weight", false);
                 } else if (W.count(p) && (n == "w_" + p || n == "w_scale_" + p)) {
-                    const mx4 w(T(il, W.at(p)));
+                    const mx4 w(T(il, W.at(p)), f8);
                     rows(w, 0, w.N, n != "w_" + p);
                 } else {
                     GGML_ABORT("axera qwen35_35b_a3b: unexpected attention input %s\n", d.name.c_str());
@@ -293,7 +327,7 @@ void qwen35_35b_a3b::fill(const std::map<std::string, ggml_tensor *> & t, const 
                 const bool        scales = suffix == "_scale";
                 GGML_ASSERT(suffix.empty() || scales);
                 if (p == 'q' || p == 'k' || p == 'v') {
-                    const mx4     w(T(il, "attn_qkv.weight"));
+                    const mx4     w(T(il, "attn_qkv.weight"), f8);
                     const int64_t nr = d.shape[1];  // rows q, k (nr each), then v (the rest)
                     if (p == 'v') {
                         rows(w, w.N - nr, nr, scales, w.N - nr, nr / VH);
@@ -301,13 +335,13 @@ void qwen35_35b_a3b::fill(const std::map<std::string, ggml_tensor *> & t, const 
                         rows(w, p == 'q' ? 0 : nr, nr, scales);
                     }
                 } else if (p == 'z') {
-                    const mx4 w(T(il, "attn_gate.weight"));
+                    const mx4 w(T(il, "attn_gate.weight"), f8);
                     rows(w, 0, w.N, scales, 0, w.N / VH);
                 } else if (p == 'a' || p == 'b') {
-                    const mx4 w(T(il, p == 'a' ? "ssm_alpha.weight" : "ssm_beta.weight"));
+                    const mx4 w(T(il, p == 'a' ? "ssm_alpha.weight" : "ssm_beta.weight"), f8);
                     rows(w, 0, w.N, scales, 0, 1);
                 } else if (p == 'o') {
-                    const mx4 w(T(il, "ssm_out.weight"));
+                    const mx4 w(T(il, "ssm_out.weight"), f8);
                     cols(w, scales);
                 } else {
                     GGML_ABORT("axera qwen35_35b_a3b: unexpected delta-net input %s\n", d.name.c_str());
