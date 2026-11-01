@@ -5,6 +5,9 @@
 
 #include "model.h"
 
+#include <map>
+#include <mutex>
+
 #include <cstring>
 
 namespace axera {
@@ -58,7 +61,7 @@ struct composite final : model {
 
 }  // namespace
 
-std::shared_ptr<model> make_model(const manifest & m) {
+static std::shared_ptr<model> make_model_of(const manifest & m) {
     std::shared_ptr<model> llm;
     if (m.model == "qwen35_moe") {
         llm = make_qwen35_moe(m);
@@ -89,6 +92,20 @@ std::shared_ptr<model> make_model(const manifest & m) {
     c->audio = audio ? make_qwen3_asr(m) : nullptr;
     c->gen   = gen ? make_qwen3_tts(m) : nullptr;
     return c;
+}
+
+// one adapter per kernel directory in the process: every backend (llama.cpp's contexts of the model, e.g. a
+// speculative draft context next to the target, mtmd's) shares its weights, state and kernels
+std::shared_ptr<model> make_model(const manifest & m) {
+    static std::mutex                                           mu;
+    static std::map<const manifest *, std::weak_ptr<model>> made;
+    std::lock_guard<std::mutex>                                 lock(mu);
+    std::shared_ptr<model>                                      p = made[&m].lock();
+    if (!p) {
+        p        = make_model_of(m);
+        made[&m] = p;
+    }
+    return p;
 }
 
 }  // namespace axera

@@ -27,6 +27,19 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
     if (k == key) {
         return t;
     }
+    for (auto & r : recent) {
+        if (r.first == k) {
+            std::swap(r.first, key);
+            std::swap(r.second, t);
+            return t;
+        }
+    }
+    if (!key.empty()) {
+        if (recent.size() >= 4) {
+            recent.erase(recent.begin());
+        }
+        recent.emplace_back(std::move(key), std::move(t));
+    }
     // each tensor once (in the order met: the first of a name wins), sorted by name into the map
     std::unordered_set<const ggml_tensor *>             seen;
     std::vector<std::pair<std::string, ggml_tensor *>> named;
@@ -436,8 +449,86 @@ void output_head::after(ggml_cgraph * g, const graph_names & names) {
     for (int i = 0; i < g->n_nodes; i++) {
         il = g->nodes[i] == head ? i : il;
     }
-    if (il >= 0 && il + 1 < g->n_nodes && padded == head) {
-        cpu_compute(g, g->nodes + il + 1, g->n_nodes - il - 1, "sampler (cpu)");
+    if (il < 0 || il + 1 >= g->n_nodes || padded != head) {
+        return;
+    }
+    // (a TOP_K over the vocabulary on the host's workers: the CPU backend's runs one row on one thread)
+    int i0 = il + 1;
+    for (int i = il + 1; i < g->n_nodes; i++) {
+        ggml_tensor * n = g->nodes[i];
+        if (n->op == GGML_OP_TOP_K && n->src[0]->type == GGML_TYPE_F32 && n->type == GGML_TYPE_I32 &&
+            (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            cpu_compute(g, g->nodes + i0, i - i0, "sampler (cpu)");
+            axera_timer tk("sampler: top_k (host)");
+            top_k_rows(n);
+            i0 = i + 1;
+        } else if (n->op == GGML_OP_PAD && i == i0 && pad_rows(n)) {  // (the sampler's padded logits: a copy)
+            i0 = i + 1;
+        }
+    }
+    cpu_compute(g, g->nodes + i0, g->n_nodes - i0, "sampler (cpu)");
+}
+
+// a PAD of f32 2-D rows at the end of each dimension (zero), on the host; false if not that
+bool pad_rows(ggml_tensor * n) {
+    const ggml_tensor * x = n->src[0];
+    const int32_t *     p = (const int32_t *) n->op_params;  // lp0, rp0, lp1, rp1, ...
+    if (x->type != GGML_TYPE_F32 || n->type != GGML_TYPE_F32 || x->ne[2] != 1 || x->ne[3] != 1 || p[0] != 0 || p[2] != 0 ||
+        p[4] != 0 || p[6] != 0 || p[8] != 0 || x->nb[0] != sizeof(float) || n->nb[0] != sizeof(float) || !(n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return false;
+    }
+    axera_timer tp("sampler: pad (host)");
+    for (int64_t r = 0; r < n->ne[1]; ++r) {
+        float * d = (float *) ((char *) n->data + r * n->nb[1]);
+        if (r < x->ne[1]) {
+            memcpy(d, (const char *) x->data + r * x->nb[1], x->ne[0] * sizeof(float));
+            std::fill(d + x->ne[0], d + n->ne[0], 0.0f);
+        } else {
+            std::fill(d, d + n->ne[0], 0.0f);
+        }
+    }
+    if (ggml_backend_buffer_is_axera(n->buffer)) {
+        ((ggml_backend_axera_buffer_context *) n->buffer->context)->flush(n->data, ggml_nbytes(n));
+    }
+    return true;
+}
+
+// ggml's TOP_K: the k largest of each row, the first two swapped ("no particular order"), as the CPU backend
+void top_k_rows(ggml_tensor * n) {
+    const ggml_tensor * src = n->src[0];
+    const int64_t       N = src->ne[0], K = n->ne[0];
+    const int           P = (int) std::min<int64_t>(16, std::max<int64_t>(1, N / 4096));
+    auto greater = [](const float * d) {
+        return [d](int32_t a, int32_t b) { return d[a] > d[b] || (d[a] == d[b] && a < b); };
+    };
+    for (int64_t r = 0; r < ggml_nrows(src); ++r) {
+        const float *        d = (const float *) ((const char *) src->data + r * src->nb[1]);
+        std::vector<int32_t> cand((size_t) P * K);
+        std::vector<int>     cn(P, 0);
+        axera_host_pool().run(P, [&](int64_t p) {
+            const int64_t        a = N * p / P, b = N * (p + 1) / P;
+            std::vector<int32_t> idx((size_t) (b - a));
+            for (int64_t j = a; j < b; ++j) {
+                idx[(size_t) (j - a)] = (int32_t) j;
+            }
+            const int64_t m = std::min<int64_t>(K, b - a);
+            std::partial_sort(idx.begin(), idx.begin() + m, idx.end(), greater(d));
+            std::copy(idx.begin(), idx.begin() + m, cand.begin() + p * K);
+            cn[p] = (int) m;
+        });
+        std::vector<int32_t> all;
+        for (int p = 0; p < P; ++p) {
+            all.insert(all.end(), cand.begin() + p * K, cand.begin() + p * K + cn[p]);
+        }
+        std::partial_sort(all.begin(), all.begin() + K, all.end(), greater(d));
+        int32_t * o = (int32_t *) ((char *) n->data + r * n->nb[1]);
+        std::copy(all.begin(), all.begin() + K, o);
+        if (K > 1) {
+            std::swap(o[0], o[1]);
+        }
+    }
+    if (ggml_backend_buffer_is_axera(n->buffer)) {
+        ((ggml_backend_axera_buffer_context *) n->buffer->context)->flush(n->data, ggml_nbytes(n));
     }
 }
 

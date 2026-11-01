@@ -596,7 +596,11 @@ void qwen35_35b_a3b::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int
         {
             axera_timer tl("prefill (page)");
             for (int il = 0; il < L; ++il) {
-                pre_attn[il].k->run(pre_attn[il].in, pre_attn[il].out, il % 4 == 3 ? "prefill attn" : "prefill gdn");
+                {
+                    axera_timer ta(il % 4 == 3 ? "prefill: attn (page, layer)" : "prefill: gdn (page, layer)");
+                    pre_attn[il].k->run(pre_attn[il].in, pre_attn[il].out, il % 4 == 3 ? "prefill attn" : "prefill gdn");
+                }
+                axera_timer tm("prefill: moe (page, layer)");
                 pre_moe[il].k->run(pre_moe[il].in, pre_moe[il].out, "prefill moe");
             }
         }

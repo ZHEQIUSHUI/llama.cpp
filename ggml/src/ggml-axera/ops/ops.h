@@ -18,6 +18,8 @@ namespace axera {
 struct graph_names {
     std::vector<uintptr_t>               key;
     std::map<std::string, ggml_tensor *> t;
+    // the maps of the last few other graphs (llama.cpp alternates a few: a speculative target's and draft's)
+    std::vector<std::pair<std::vector<uintptr_t>, std::map<std::string, ggml_tensor *>>> recent;
 
     const std::map<std::string, ggml_tensor *> & of(const ggml_cgraph * g);
     ggml_tensor * find(const std::string & name) const;
@@ -91,6 +93,12 @@ struct output_head {
     // the logits the caller wrote (a whole-model kernel's) into the graph's: the sampler nodes after them
     static void after(ggml_cgraph * g, const graph_names & names);
 };
+
+// a PAD node of f32 rows (zeros after each dimension) on the host; false if not that shape
+bool pad_rows(ggml_tensor * n);
+
+// ggml's TOP_K of a node (its F32 rows) on the host's workers
+void top_k_rows(ggml_tensor * n);
 
 // nodes of the graph on the CPU backend (their tensors are host memory: CMM or the CPU's)
 void cpu_compute(ggml_cgraph * g, ggml_tensor ** nodes, int n, const char * what);
