@@ -82,7 +82,9 @@ void output_norm(const graph_names & names, const std::vector<float> & h, int T)
 struct output_head {
     const kernel * k = nullptr;
     const ggml_tensor * w = nullptr;  // output.weight
-    axera_cmm  q, s, x;               // the projection in the kernel's format, the bf16 input row
+    axera_cmm  q, s, x;               // the projection in the kernel's format, the bf16 input row(s)
+    axera_cmm  yk, mk;                // a kernel of R rows per call (input m: the valid ones): its output, m
+    int        R   = 1;
     bool       mx4 = false;
     std::vector<float> wf;            // the projection in f32 (the CPU's)
 
