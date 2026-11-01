@@ -62,6 +62,12 @@ class qwen38_27b final : public model {
     std::vector<uint8_t>     snap;
     int64_t                  snap_cell = -1;
     std::vector<ggml_bf16_t> page_x;  // [cells][H] from snap_cell
+    // a second restart point kept: the page where the last prompt ended (a server's next turn restarts inside it)
+    std::vector<uint8_t>     ksnap;
+    int64_t                  ksnap_cell  = -1;
+    bool                     snap_prompt = false;  // the current restart point is that page's
+    std::vector<ggml_bf16_t> kpage_x;
+    std::vector<int32_t>     kpage_p;
     std::vector<int32_t>     page_p;  // their M-RoPE positions [cells][4]
 
     std::vector<call>              dec;
@@ -107,6 +113,8 @@ class qwen38_27b final : public model {
     void      zero_state();
     void      save_state(int64_t cell);
     void      load_state();
+    void      swap_kept();
+    bool      restart_point(int64_t s0, int k);
     void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0);
 };
 
@@ -608,15 +616,42 @@ void qwen38_27b::zero_state() {
         memset((*p)->vir, 0, (*p)->size);
         (*p)->flush();
     }
-    snap_cell = -1;
+    snap_cell   = -1;
+    ksnap_cell  = -1;
+    snap_prompt = false;
     page_x.clear();
     page_p.clear();
+}
+
+void qwen38_27b::swap_kept() {
+    std::swap(snap, ksnap);
+    std::swap(snap_cell, ksnap_cell);
+    std::swap(page_x, kpage_x);
+    std::swap(page_p, kpage_p);
+}
+
+// the restart point of the page from s0 with its first k inputs (the current one, or the kept one made current)
+bool qwen38_27b::restart_point(int64_t s0, int k) {
+    if (snap_cell == s0 && (int) (page_x.size() / H) >= k) {
+        return true;
+    }
+    if (ksnap_cell == s0 && (int) (kpage_x.size() / H) >= k) {
+        swap_kept();
+        snap_prompt = true;
+        return true;
+    }
+    return false;
 }
 
 // the recurrent state (before cell `cell`, the first of its page) and the page's inputs from there
 void qwen38_27b::save_state(int64_t cell) {
     GGML_ASSERT(cell % PG == 0);
     axera_timer tl("state save");
+    if (snap_prompt && snap_cell >= 0) {  // the last prompt's page: kept
+        swap_kept();
+    }
+    snap_prompt = false;
+    snap.resize(ksnap.size() ? ksnap.size() : snap.size());
     size_t o = 0;
     for (int k = 0; k < 4; ++k) {  // from where the state is, in the pools' layout
         for (const place & w : where[k]) {
@@ -823,7 +858,11 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
     if (ver_c0 >= 0 && c0 > ver_c0 && c0 < ver_c0 + ver_T) {
         // the last verification's rows from c0 on rejected: its state after row c0 - 1, its inputs up to there
         state_at(ver_set, (int) (c0 - ver_c0 - 1));
-        if (snap_cell > c0) {  // (a page start inside the rejected rows: no restart point kept)
+        if (snap_cell > c0 && ksnap_cell >= 0 && ksnap_cell <= c0 && c0 < ksnap_cell + PG) {
+            swap_kept();  // (a page start inside the rejected rows: the kept one, the page of c0)
+            snap_prompt = true;
+        }
+        if (snap_cell > c0) {  // (no restart point of c0's page kept)
             snap_cell = -1;
             page_x.clear();
             page_p.clear();
@@ -854,7 +893,7 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
         // from the batch's page start: the page's earlier inputs (and the state saved there) before the batch's
         const int64_t s0 = c0 - c0 % PG;
         const int     k  = (int) (c0 - s0);
-        if (k > 0 && (snap_cell != s0 || (int) (page_x.size() / H) < k)) {
+        if (k > 0 && !restart_point(s0, k)) {
             GGML_LOG_ERROR("axera qwen38_27b: a prompt from cell %lld, inside a page whose state is not kept\n", (long long) c0);
             return GGML_STATUS_FAILED;
         }
@@ -871,6 +910,7 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
         ps.insert(ps.end(), pb.begin(), pb.end());
         axera_timer tp("prefill (all pages)");
         prefill(s0, k + T, xs.data(), ps.data(), h, k);
+        snap_prompt = true;  // (its page's restart point outlives the decode's next pages)
     } else {
         // one token through the decode groups; at a page's first cell the state there is the restart point
         if (c0 % PG == 0) {
