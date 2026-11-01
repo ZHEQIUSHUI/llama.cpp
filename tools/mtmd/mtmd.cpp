@@ -2220,6 +2220,42 @@ int32_t mtmd_gen_audio_process(mtmd_context * ctx, const struct mtmd_gen_inp * i
     }
 }
 
+int32_t mtmd_gen_audio_encode_codes(mtmd_context * ctx, const float * samples, size_t n_samples,
+                                    const int32_t ** out_codes, size_t * out_n_codes) {
+    if (!ctx->ctx_gen_a) {
+        LOG_ERR("%s: model does not support audio generation\n", __func__);
+        return 1;
+    }
+    std::vector<int32_t> codes;
+    if (!clip_qwen3tts_audio_encode_codes(ctx->ctx_gen_a, ctx->n_threads, samples, n_samples, codes)) {
+        LOG_ERR("%s: speech tokenizer encode failed\n", __func__);
+        return 1;
+    }
+    ctx->gen_out_codes = std::move(codes);
+    *out_codes   = ctx->gen_out_codes.data();
+    *out_n_codes = ctx->gen_out_codes.size();
+    return 0;
+}
+
+int32_t mtmd_gen_audio_codec_embd(mtmd_context * ctx, const int32_t * codes, size_t n_codes,
+                                  float * out_embd, size_t n_embd) {
+    if (!ctx->ctx_gen_a) {
+        LOG_ERR("%s: model does not support audio generation\n", __func__);
+        return 1;
+    }
+    if (n_embd != (size_t) clip_n_mmproj_embd(ctx->ctx_gen_a)) {
+        LOG_ERR("%s: embedding size mismatch\n", __func__);
+        return 1;
+    }
+    std::vector<float> embd;
+    if (!clip_qwen3tts_codec_embd(ctx->ctx_gen_a, codes, n_codes, embd)) {
+        LOG_ERR("%s: codec embedding lookup failed\n", __func__);
+        return 1;
+    }
+    memcpy(out_embd, embd.data(), embd.size() * sizeof(float));
+    return 0;
+}
+
 mtmd_batch * mtmd_batch_init(mtmd_context * ctx) {
     return new mtmd_batch(ctx);
 }

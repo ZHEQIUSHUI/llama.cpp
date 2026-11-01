@@ -482,6 +482,17 @@ MTMD_API int32_t mtmd_gen_audio_process(mtmd_context * ctx,
                                 const struct mtmd_gen_inp * inp,
                                 struct mtmd_gen_out * out);
 
+// qwen3tts ICL: raw 24 kHz mono PCM -> n_frames * 16 speech-tokenizer codes, frame-major
+// output is owned by the context and valid until the next call
+MTMD_API int32_t mtmd_gen_audio_encode_codes(mtmd_context * ctx,
+                                const float * samples, size_t n_samples,
+                                const int32_t ** out_codes, size_t * out_n_codes);
+
+// qwen3tts ICL: sum of the 15 acoustic codebook embeddings for one frame
+MTMD_API int32_t mtmd_gen_audio_codec_embd(mtmd_context * ctx,
+                                const int32_t * codes, size_t n_codes,
+                                float * out_embd, size_t n_embd);
+
 /////////////////////////////////////////
 
 // test function, to be used in test-mtmd-c-api.c

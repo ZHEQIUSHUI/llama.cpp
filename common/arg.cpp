@@ -4484,6 +4484,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.tts_speaker_file = value;
         }
     ).set_examples({LLAMA_EXAMPLE_TTS}));
+    add_opt(common_arg(
+        {"--tts-ref-text"}, "TEXT",
+        "transcript of --tts-speaker-file, enables in-context (ICL) voice cloning",
+        [](common_params & params, const std::string & value) {
+            params.tts_ref_text = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TTS}));
 
     //
     // diffusion params

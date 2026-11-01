@@ -210,6 +210,8 @@ struct mtmd_helper_gen_audio_inp {
     size_t       prompt_len;
 
     mtmd_bitmap * speaker_ref; // optional, can be NULL
+    const char * ref_text;     // optional ICL transcript of speaker_ref; enables full voice clone
+    size_t       ref_text_len;
     const char * lang; // optional, can be NULL
 
     int32_t  top_k;

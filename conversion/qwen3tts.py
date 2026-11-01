@@ -10,7 +10,7 @@ import torch.nn.functional as F
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import ModelBase, MmprojModel, TextModel, gguf
+from .base import LazyTorchTensor, ModelBase, MmprojModel, TextModel, gguf
 
 # Tricks being used to support this model via existing llama.cpp code paths:
 # - Text projection MLP is folded into the embedding table
@@ -223,7 +223,27 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
         if "speaker_encoder_config" in hparams:
             hparams["speaker_encoder_config"]["n_layers"] = 4
         super().__init__(dir_model, *args, hparams=hparams, **kwargs)
+        self._load_encoder_tensors()
         self._wav_config_cache = None
+
+    def _load_encoder_tensors(self) -> None:
+        # The 12 Hz tokenizer lives in a separate safetensors file under speech_tokenizer/.
+        # Keep it lazy: conversion already walks a large talker checkpoint, and only the
+        # encoder (not the code2wav decoder) is needed in the mmproj.
+        path = self.dir_model / "speech_tokenizer" / "model.safetensors"
+        if not path.is_file():
+            return
+        part = gguf.utility.SafetensorsLocal(path)
+        for name, data in part.tensors.items():
+            if not name.startswith("encoder.encoder") and not name.startswith("encoder.encoder_transformer"):
+                if not name.startswith("encoder.downsample") and not name.startswith("encoder.quantizer"):
+                    continue
+            if self.lazy:
+                gen = lambda data=data: LazyTorchTensor.from_local_tensor(data)  # noqa: E731
+            else:
+                dtype = LazyTorchTensor._dtype_str_map[data.dtype]
+                gen = lambda data=data, dtype=dtype: torch.from_numpy(data.mmap_bytes()).view(dtype).reshape(data.shape)  # noqa: E731
+            self.model_tensors[name] = gen
 
     def get_audio_config(self) -> dict[str, Any] | None:
         return self.global_config.get("speaker_encoder_config")
@@ -268,6 +288,11 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
         return self._wav_config_cache
 
     def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # the speech tokenizer encoder is sensitive to weight rounding: residual RVQ makes
+        # small hidden-state errors change later codebook indices. Keep its payload in F32;
+        # all pre-existing mmproj tensors still follow the requested outtype (BF16).
+        if new_name.startswith("a.enc."):
+            return gguf.GGMLQuantizationType.F32
         # conv1d/conv1d_dw kernels must be F16, ggml_conv_1d(_dw) has no BF16 path
         if new_name.endswith(".weight") and (
             new_name in ("a.gen.wav.pre_conv.weight", "a.gen.wav.dac.entry.weight", "a.gen.wav.dac.post_conv.weight")
@@ -290,6 +315,9 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
 
         if not (
             name.startswith("speaker_encoder.")
+            or name.startswith("encoder.encoder")
+            or name.startswith("encoder.downsample.")
+            or name.startswith("encoder.quantizer.")
             or name.startswith("talker.code_predictor.")
             or name == "talker.model.codec_embedding.weight"
         ):
@@ -301,6 +329,11 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
         # code2wav tensors are already named by generate_extra_tensors(), pass them through
         if name.startswith("a.gen.wav."):
             yield (name, data_torch)
+            return
+
+        # 12 Hz speech tokenizer encoder: SEANet + transformer + 16 RVQ codebooks.
+        if name.startswith("encoder."):
+            yield from self._modify_encoder_tensor(data_torch, name)
             return
 
         # codebook-0 embedding, fed back to the talker backbone (codebooks 1-15 live in code_predictor)
@@ -353,6 +386,69 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
             return
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+    def _modify_encoder_tensor(self, data_torch: Tensor, name: str) -> Iterable[tuple[str, Tensor]]:
+        if name == "encoder.downsample.conv.weight":
+            yield ("a.enc.down.weight", data_torch)
+            return
+
+        if name.startswith("encoder.encoder.layers."):
+            rest = name[len("encoder.encoder.layers."):]
+            layer_s, key = rest.split(".", 1)
+            layer = int(layer_s)
+            if key.startswith("block.1.conv."):
+                yield (f"a.enc.seanet.{layer}.res1.{key.rsplit('.', 1)[1]}", data_torch)
+            elif key.startswith("block.3.conv."):
+                yield (f"a.enc.seanet.{layer}.res2.{key.rsplit('.', 1)[1]}", data_torch)
+            elif key.startswith("conv."):
+                yield (f"a.enc.seanet.{layer}.conv.{key.rsplit('.', 1)[1]}", data_torch)
+            return
+
+        if name.startswith("encoder.encoder_transformer.layers."):
+            rest = name[len("encoder.encoder_transformer.layers."):]
+            layer_s, key = rest.split(".", 1)
+            layer = int(layer_s)
+            key_map = {
+                "input_layernorm.weight": "attn_norm.weight",
+                "input_layernorm.bias": "attn_norm.bias",
+                "post_attention_layernorm.weight": "ffn_norm.weight",
+                "post_attention_layernorm.bias": "ffn_norm.bias",
+                "self_attn.q_proj.weight": "attn_q.weight",
+                "self_attn.k_proj.weight": "attn_k.weight",
+                "self_attn.v_proj.weight": "attn_v.weight",
+                "self_attn.o_proj.weight": "attn_o.weight",
+                "self_attn_layer_scale.scale": "attn_scale",
+                "mlp.fc1.weight": "ffn_up.weight",
+                "mlp.fc2.weight": "ffn_down.weight",
+                "mlp_layer_scale.scale": "ffn_scale",
+            }
+            new_key = key_map.get(key)
+            if new_key is not None:
+                yield (f"a.enc.tfm.blk.{layer}.{new_key}", data_torch)
+            return
+
+        if name == "encoder.quantizer.semantic_residual_vector_quantizer.input_proj.weight":
+            yield ("a.enc.quant.sem.in_proj.weight", data_torch)
+            return
+
+        if name == "encoder.quantizer.semantic_residual_vector_quantizer.layers.0.codebook.embed_sum":
+            usage = self.model_tensors["encoder.quantizer.semantic_residual_vector_quantizer.layers.0.codebook.cluster_usage"]()
+            yield ("a.enc.quant.sem.codebook.weight", data_torch / usage.clamp(min=1e-5)[:, None])
+            return
+
+        if name == "encoder.quantizer.acoustic_residual_vector_quantizer.input_proj.weight":
+            yield ("a.enc.quant.aco.in_proj.weight", data_torch)
+            return
+
+        if name.startswith("encoder.quantizer.acoustic_residual_vector_quantizer.layers."):
+            rest = name[len("encoder.quantizer.acoustic_residual_vector_quantizer.layers."):]
+            layer_s, key = rest.split(".", 1)
+            layer = int(layer_s)
+            if key == "codebook.embed_sum" and layer < 15:
+                usage = self.model_tensors[
+                    f"encoder.quantizer.acoustic_residual_vector_quantizer.layers.{layer}.codebook.cluster_usage"]()
+                yield (f"a.enc.quant.aco.codebook.{layer:02d}.weight", data_torch / usage.clamp(min=1e-5)[:, None])
+            return
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         yield from self._generate_code2wav_tensors()

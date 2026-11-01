@@ -576,6 +576,43 @@ struct clip_code2wav {
     ggml_tensor * dac_post_conv_b      = nullptr;
 };
 
+// qwen3tts 12 Hz speech tokenizer encoder (Mimi SEANet -> transformer -> 16 codebooks)
+struct clip_qwen3tts_enc {
+    bool available = false;
+    struct conv {
+        ggml_tensor * w = nullptr;
+        ggml_tensor * b = nullptr;
+    };
+    struct resnet {
+        conv res1;
+        conv res2;
+    };
+    struct layer {
+        ggml_tensor * attn_norm_w = nullptr;
+        ggml_tensor * attn_norm_b = nullptr;
+        ggml_tensor * attn_q_w     = nullptr;
+        ggml_tensor * attn_k_w     = nullptr;
+        ggml_tensor * attn_v_w     = nullptr;
+        ggml_tensor * attn_o_w     = nullptr;
+        ggml_tensor * attn_scale   = nullptr;
+        ggml_tensor * ffn_norm_w   = nullptr;
+        ggml_tensor * ffn_norm_b   = nullptr;
+        ggml_tensor * ffn_up_w     = nullptr;
+        ggml_tensor * ffn_down_w   = nullptr;
+        ggml_tensor * ffn_scale    = nullptr;
+    };
+
+    std::vector<conv>   seanet_conv; // stem, /4, /5, /6, /8, final
+    std::vector<resnet> seanet_res;  // one per downsample stage
+    std::vector<layer>  layers;
+    ggml_tensor * downsample_w = nullptr;
+
+    ggml_tensor * sem_in_w = nullptr;
+    ggml_tensor * sem_cb_w = nullptr;
+    ggml_tensor * aco_in_w = nullptr;
+    std::vector<ggml_tensor *> aco_cb_w;
+};
+
 struct clip_model {
     clip_modality modality = CLIP_MODALITY_VISION;
     projector_type proj_type = PROJECTOR_TYPE_MLP;
@@ -823,6 +860,9 @@ struct clip_model {
 
     // qwen3tts code2wav: RVQ codes -> raw PCM
     clip_code2wav c2w;
+
+    // qwen3tts 12 Hz speech tokenizer encoder, used by ICL voice cloning
+    clip_qwen3tts_enc qwen3tts_enc;
 
     // pocket-tts: SEANet stack, shared by the encoder (speaker path) and the decoder (gen path)
     clip_seanet seanet;

@@ -95,6 +95,7 @@ enum clip_gen_process_type {
     CLIP_GEN_PROCESS_GEN_UNKNOWN,
     CLIP_GEN_PROCESS_GEN_CODE, // h_state to codes
     CLIP_GEN_PROCESS_GEN_WAV,  // codes to raw PCM audio
+    CLIP_GEN_PROCESS_ENCODE_CODES, // raw 24 kHz PCM to the speech tokenizer's 16 RVQ codes
 };
 struct clip_encode_params {
     int n_threads = 1;
@@ -125,6 +126,14 @@ struct clip_encode_params {
     struct clip_enc_state * enc_state = nullptr;
 };
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params);
+
+// qwen3tts 12 Hz speech tokenizer: raw 24 kHz mono PCM -> n_frames * 16 codes, frame-major
+bool clip_qwen3tts_audio_encode_codes(struct clip_ctx * ctx, int n_threads,
+        const float * samples, size_t n_samples, std::vector<int32_t> & out_codes);
+
+// qwen3tts: sum of the 15 acoustic codebook embeddings for one frame
+bool clip_qwen3tts_codec_embd(struct clip_ctx * ctx, const int32_t * codes, size_t n_codes,
+        std::vector<float> & out_embd);
 
 // persistent state of a causal audio encoder, for streaming input (one per stream)
 // it holds the sliding window of past keys/values, so each clip_encode() call only takes the new frames

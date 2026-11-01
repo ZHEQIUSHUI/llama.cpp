@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <list>
@@ -127,6 +128,11 @@ public:
         prompt_pos = 0;
         frames_out = 0;
         frames_gen = 0;
+        ref_trim_samples = 0;
+        ref_codes.clear();
+        trailing.clear();
+        trailing_idx = 0;
+        icl_mode = false;
         t_start    = std::chrono::steady_clock::now();
         t_prompt   = t_start;
     }
@@ -181,6 +187,8 @@ public:
         }
         ids.resize((size_t) n_ids);
 
+        const bool icl = inp->speaker_ref && inp->ref_text && inp->ref_text_len > 0;
+
         std::vector<std::vector<float>> prompt;
         for (int i = 0; i < 3; i++) prompt.push_back(row(ids[(size_t) i]));
         prompt.push_back(sum_row(tts_pad, c_think));
@@ -189,9 +197,89 @@ public:
         prompt.push_back(sum_row(tts_pad, c_think_e));
         if (!speaker_embd.empty()) prompt.push_back(sum_vec(tts_pad, speaker_embd));
         prompt.push_back(sum_row(tts_bos, codec_pad));
-        for (int i = 3; i < n_ids - 5; i++) prompt.push_back(sum_row(ids[(size_t) i], codec_pad));
-        prompt.push_back(sum_row(tts_eos, codec_pad));
-        prompt.push_back(sum_row(tts_pad, codec_bos));
+
+        if (icl) {
+            // ICL prompt, see generate_icl_prompt() in qwen3_tts's modeling_qwen3_tts.py:
+            // text = ref_text + target_text + tts_eos, codec = codec_bos + ref codec frames.
+            const std::string ref_wrapped = "<|im_start|>assistant\n" +
+                    std::string(inp->ref_text, inp->ref_text_len) + "<|im_end|>\n";
+            std::vector<llama_token> ref_ids(ref_wrapped.size() + 16);
+            const int n_ref_ids = llama_tokenize(vocab, ref_wrapped.c_str(), (int32_t) ref_wrapped.size(),
+                    ref_ids.data(), (int32_t) ref_ids.size(), false, true);
+            if (n_ref_ids < 6) {
+                LOG_ERR("mtmd_helper_gen_audio: reference tokenization failed\n");
+                return 1;
+            }
+            ref_ids.resize((size_t) n_ref_ids);
+
+            const unsigned char * ref_data = mtmd_bitmap_get_data(inp->speaker_ref);
+            const size_t ref_bytes = mtmd_bitmap_get_n_bytes(inp->speaker_ref);
+            const float * ref_pcm = (const float *) ref_data;
+            const size_t n_ref_samples = ref_bytes / sizeof(float);
+            const int32_t * ref_codes_ptr = nullptr;
+            size_t n_ref_codes = 0;
+            if (mtmd_gen_audio_encode_codes(mctx, ref_pcm, n_ref_samples, &ref_codes_ptr, &n_ref_codes) != 0) {
+                return 1;
+            }
+            if (n_ref_codes == 0 || n_ref_codes % 16 != 0) {
+                LOG_ERR("mtmd_helper_gen_audio: invalid reference codec output (%zu codes)\n", n_ref_codes);
+                return 1;
+            }
+            ref_codes.assign(ref_codes_ptr, ref_codes_ptr + n_ref_codes);
+            std::vector<std::vector<float>> text_embed;
+            for (int i = 3; i < n_ref_ids - 2; i++) text_embed.push_back(row(ref_ids[(size_t) i]));
+            for (int i = 3; i < n_ids - 5; i++)      text_embed.push_back(row(ids[(size_t) i]));
+            text_embed.push_back(row(tts_eos));
+
+            std::vector<std::vector<float>> codec_embed;
+            codec_embed.push_back(row(codec_bos));
+            std::vector<float> aco(n_e);
+            for (size_t f = 0; f < n_ref_codes / 16; f++) {
+                std::vector<float> frame = row(codec_0 + ref_codes[f * 16]);
+                if (mtmd_gen_audio_codec_embd(mctx, &ref_codes[f * 16 + 1], 15, aco.data(), aco.size()) != 0) {
+                    return 1;
+                }
+                for (int e = 0; e < n_e; e++) frame[(size_t) e] += aco[(size_t) e];
+                codec_embed.push_back(std::move(frame));
+            }
+
+            const size_t n_pair = std::min(text_embed.size(), codec_embed.size());
+            for (size_t i = 0; i < n_pair; i++) {
+                std::vector<float> v = text_embed[i];
+                for (int e = 0; e < n_e; e++) v[(size_t) e] += codec_embed[i][(size_t) e];
+                prompt.push_back(std::move(v));
+            }
+            if (text_embed.size() > codec_embed.size()) {
+                trailing.assign(text_embed.begin() + n_pair, text_embed.end());
+            } else {
+                std::vector<float> pad = row(tts_pad);
+                for (size_t i = n_pair; i < codec_embed.size(); i++) {
+                    std::vector<float> v = pad;
+                    for (int e = 0; e < n_e; e++) v[(size_t) e] += codec_embed[i][(size_t) e];
+                    prompt.push_back(std::move(v));
+                }
+                trailing.push_back(pad);
+            }
+
+            // the codec decoder is fed the reference codes as context, then the generated ones.
+            // decode them in the same streaming windows used for generated frames.
+            n_codes_frame = 16;
+            const size_t n_ref_frames = n_ref_codes / 16;
+            for (size_t off = 0; off < n_ref_frames; ) {
+                const size_t n_take = std::min(next_window(), n_ref_frames - off);
+                codes_buf.assign(ref_codes.begin() + (ptrdiff_t) off * 16,
+                                 ref_codes.begin() + (ptrdiff_t) (off + n_take) * 16);
+                if (!flush_gen_wav()) {
+                    return 1;
+                }
+                off += n_take;
+            }
+            ref_trim_samples = audio_pcm.size();
+        } else {
+            for (int i = 3; i < n_ids - 5; i++) prompt.push_back(sum_row(ids[(size_t) i], codec_pad));
+            prompt.push_back(sum_row(tts_eos, codec_pad));
+            prompt.push_back(sum_row(tts_pad, codec_bos));
+        }
 
         n_prompt = (int) prompt.size();
 
@@ -204,7 +292,6 @@ public:
         for (int i = 0; i < n_prompt; i++) {
             memcpy(prompt_embd_buf.data() + (size_t) i * n_e, prompt[(size_t) i].data(), (size_t) n_e * sizeof(float));
         }
-
         prompt_batch.reset(new decode_embd_batch(prompt_embd_buf.data(), n_prompt, n_pos_per_embd, n_e));
         if (mrope) prompt_batch->set_position_mrope_1d(0, seq_id);
         else       prompt_batch->set_position_normal  (0, seq_id);
@@ -217,9 +304,10 @@ public:
         seed  = inp->seed;
         out_type = inp->out_type;
 
-        // the prompt above holds the whole text stream up to tts_eos, so every generated
-        // frame adds tts_pad on top of the codes embedding
+        // x-vector mode has no trailing text stream after the prompt; ICL mode advances through
+        // the text rows that did not fit alongside the reference codec frames.
         overlay = row(tts_pad);
+        icl_mode = icl;
 
         return 0;
     }
@@ -290,7 +378,13 @@ public:
         }
 
         std::vector<float> fb(out.embd, out.embd + n_embd);
-        for (int i = 0; i < n_embd; i++) fb[(size_t) i] += overlay[(size_t) i];
+        const std::vector<float> & tr = (icl_mode && trailing_idx < trailing.size())
+                ? trailing[trailing_idx]
+                : overlay;
+        for (int i = 0; i < n_embd; i++) fb[(size_t) i] += tr[(size_t) i];
+        if (icl_mode) {
+            trailing_idx++;
+        }
 
         const int n_pos_per_embd = mrope ? 4 : 1;
         decode_embd_batch batch_embd(fb.data(), 1, n_pos_per_embd, n_embd);
@@ -314,6 +408,15 @@ public:
     int32_t get_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) override {
         if (!flush_gen_wav()) {
             return 1;
+        }
+
+        if (ref_trim_samples > 0) {
+            if (audio_pcm.size() < ref_trim_samples) {
+                LOG_ERR("mtmd_helper_gen_audio: reference audio shorter than expected\n");
+                return 1;
+            }
+            audio_pcm.erase(audio_pcm.begin(), audio_pcm.begin() + (ptrdiff_t) ref_trim_samples);
+            ref_trim_samples = 0;
         }
 
         *out_sample_rate = info.sample_rate;
@@ -526,6 +629,11 @@ private:
     int32_t  top_k = 50;
     float    top_p = 1.0f;
     uint32_t seed  = UINT32_MAX;
+    bool icl_mode = false;
+    size_t trailing_idx = 0;
+    size_t ref_trim_samples = 0;
+    std::vector<std::vector<float>> trailing;
+    std::vector<int32_t> ref_codes;
     std::vector<int32_t> codes_buf;
     std::vector<uint8_t> c2w_state;
     std::vector<float>   audio_pcm;

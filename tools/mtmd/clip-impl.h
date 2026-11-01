@@ -265,6 +265,26 @@
 #define TN_A_GEN_WAV_DAC_POST_SNAKE  "a.gen.wav.dac.post_snake.%s"
 #define TN_A_GEN_WAV_DAC_POST_CONV   "a.gen.wav.dac.post_conv.%s"
 
+// qwen3tts 12 Hz speech tokenizer encoder (ICL voice cloning)
+#define TN_A_ENC_SEANET_CONV    "a.enc.seanet.%d.conv.%s"
+#define TN_A_ENC_SEANET_RES1    "a.enc.seanet.%d.res1.%s"
+#define TN_A_ENC_SEANET_RES2    "a.enc.seanet.%d.res2.%s"
+#define TN_A_ENC_TFM_ATTN_NORM  "a.enc.tfm.blk.%d.attn_norm.%s"
+#define TN_A_ENC_TFM_ATTN_Q     "a.enc.tfm.blk.%d.attn_q.%s"
+#define TN_A_ENC_TFM_ATTN_K     "a.enc.tfm.blk.%d.attn_k.%s"
+#define TN_A_ENC_TFM_ATTN_V     "a.enc.tfm.blk.%d.attn_v.%s"
+#define TN_A_ENC_TFM_ATTN_O     "a.enc.tfm.blk.%d.attn_o.%s"
+#define TN_A_ENC_TFM_ATTN_SCALE "a.enc.tfm.blk.%d.attn_scale"
+#define TN_A_ENC_TFM_FFN_NORM   "a.enc.tfm.blk.%d.ffn_norm.%s"
+#define TN_A_ENC_TFM_FFN_UP     "a.enc.tfm.blk.%d.ffn_up.%s"
+#define TN_A_ENC_TFM_FFN_DOWN   "a.enc.tfm.blk.%d.ffn_down.%s"
+#define TN_A_ENC_TFM_FFN_SCALE  "a.enc.tfm.blk.%d.ffn_scale"
+#define TN_A_ENC_DOWNSAMPLE     "a.enc.down.%s"
+#define TN_A_ENC_QUANT_SEM_IN   "a.enc.quant.sem.in_proj.%s"
+#define TN_A_ENC_QUANT_SEM_CB   "a.enc.quant.sem.codebook.%s"
+#define TN_A_ENC_QUANT_ACO_IN   "a.enc.quant.aco.in_proj.%s"
+#define TN_A_ENC_QUANT_ACO_CB   "a.enc.quant.aco.codebook.%02d.%s"
+
 // pocket-tts
 #define TN_A_SEANET_CONV_IN      "a.seanet.conv_in.%s"
 #define TN_A_SEANET_CONV_OUT     "a.seanet.conv_out.%s"

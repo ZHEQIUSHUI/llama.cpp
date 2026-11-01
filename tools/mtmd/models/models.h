@@ -355,6 +355,18 @@ struct clip_graph_qwen3tts_gen : clip_graph {
     };
 };
 
+// qwen3tts 12 Hz speech tokenizer encoder: raw 24 kHz PCM -> 16 RVQ codes per frame
+struct clip_graph_qwen3tts_enc : clip_graph {
+    clip_graph_qwen3tts_enc(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+
+    ggml_tensor * conv1d_causal(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b,
+            int stride, int dilation, bool replicate) const;
+    ggml_tensor * resnet_block(ggml_tensor * x, const clip_qwen3tts_enc::resnet & block) const;
+    ggml_tensor * quantize_rvq(ggml_tensor * x, ggml_tensor * in_proj,
+            const std::vector<ggml_tensor *> & codebooks);
+};
+
 //
 // pocket-tts: SEANet convolution stack, shared by the voice encoder and the mimi decoder.
 // stateless unless state_in is populated: convs then pad instead of carrying left-context.

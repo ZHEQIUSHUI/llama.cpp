@@ -22,6 +22,7 @@ Common params:
 Available params:
 - `--tts-lang` can be `zh`, `en`, `de`, `it`, `pt`, `es`, `ja`, `ko`, `fr`, `ru` (default: `en`)
 - `--tts-speaker-file` should point to a speaker reference audio file (wav, mp3)
+- `--tts-ref-text` is the transcript of `--tts-speaker-file`; when given, enables full ICL voice cloning (reference text and codec codes are placed in the talker prompt)
 
 Example usage:
 
@@ -30,6 +31,17 @@ llama-tts -hf ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF \
     -p "Hello world" \
     --tts-lang english \
     --tts-speaker-file speaker.mp3 \
+    --output out.wav
+```
+
+For ICL cloning, pass the reference transcript as well:
+
+```sh
+llama-tts -m qwen3-tts.gguf -mm mmproj-qwen3-tts.gguf \
+    -p "Hello world" \
+    --tts-lang english \
+    --tts-speaker-file speaker.wav \
+    --tts-ref-text "This is the reference transcript." \
     --output out.wav
 ```
 
