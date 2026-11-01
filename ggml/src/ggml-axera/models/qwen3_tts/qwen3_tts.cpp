@@ -2,7 +2,7 @@
 // encoder's): the code predictor's frame, the codec decoder (code2wav), the speaker encoder
 //
 // The code predictor: one frame (its 16 codes, sampled with the graph's top-k) in one call of the frame kernel (role
-// cp.frame.k<top_k>, q3tts_cp_frame.py: the predictor's layers and heads, the sampling on chip), its packs filled from
+// cp.frame, its top-k an input; or cp.frame.k<top_k>, q3tts_cp_frame.py: the predictor's layers and heads, the sampling on chip), its packs filled from
 // the predictor's weights (params kinds cp, cp_out). A graph that samples otherwise (top-p) is not run.
 // The codec decoder (code2wav) in one call of its kernel per window when the manifest has role gen.codec (codec.cpp).
 // The other graphs node by node: a convolution (IM2COL + MUL_MAT) on its conv1d kernel (role gen.conv1d_*, the _b /
@@ -563,7 +563,7 @@ class qwen3_tts final : public model {
         int                                top_k = 0;
         std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
         std::vector<axera_cmm>             own;
-        axera_cmm                          E0, E1, RND, CS, PN, MASK;
+        axera_cmm                          E0, E1, RND, CS, PN, MASK, TOPK;
         ggml_backend_axera_buffer_context * codes = nullptr;  // (one of own)
     } fk;
     std::vector<uintptr_t>                                     key;  // the last graph's nodes, and its analysis
@@ -892,17 +892,21 @@ template <typename F> bool qwen3_tts::mm(ggml_tensor * n, F before) {
     return true;
 }
 
-// binds the frame kernel of the graph's top-k to the predictor's weights: its packs (params), the codebook heads and
-// embedding tables as bf16, the positions' RoPE rows, pos | nblk and mask rows
+// binds the frame kernel to the predictor's weights: its packs (params), the codebook heads (one input, or two:
+// heads_lo | heads_hi, the first tables and the rest) and embedding tables as bf16, the positions' RoPE rows, pos |
+// nblk and mask rows. The kernel of runtime top-k (role cp.frame, top_k <= 50) once, else the graph's top-k's
 void qwen3_tts::frame_bind(ggml_cgraph * cgraph, const frame_io & fr) {
     const ggml_tensor * w0 = names.at("a.gen.code.blk.0.ln1.weight");
-    if (fk.k && fk.bound == w0 && fk.top_k == fr.top_k) {
+    const bool          rt = man.has("cp.frame");
+    if (fk.k && fk.bound == w0 && (rt || fk.top_k == fr.top_k)) {
         return;
     }
-    const kernel & k  = man.get("cp.frame.k" + std::to_string(fr.top_k));
+    const kernel & k  = man.get(rt ? std::string("cp.frame") : "cp.frame.k" + std::to_string(fr.top_k));
     const int64_t  HT = fr.h->ne[0], NP = fr.n_codes, V = fr.head_w->ne[1];
+    const size_t   hb = (size_t) ggml_nelements(fr.head_w) * sizeof(ggml_bf16_t);
+    const bool     split = k.find_input("heads_lo") >= 0;
     GGML_ASSERT(k.in_bytes("e0") == HT * sizeof(ggml_bf16_t) && k.in_bytes("e1") == HT * sizeof(ggml_bf16_t) &&
-                k.in_bytes("heads") == (size_t) ggml_nelements(fr.head_w) * sizeof(ggml_bf16_t) &&
+                (split ? k.in_bytes("heads_lo") + k.in_bytes("heads_hi") : k.in_bytes("heads")) == hb &&
                 k.in_bytes("embd") == (size_t) ggml_nelements(fr.embd_w) * sizeof(ggml_bf16_t) &&
                 k.in_bytes("rnd") == (size_t) (NP - 1) * sizeof(float) && k.in_bytes("pn16") == (size_t) NP * 2 * sizeof(int32_t) &&
                 k.out_bytes("lgs") == (size_t) (NP - 1) * V * sizeof(float) && k.out_bytes("codes") % (NP * sizeof(int32_t)) == 0);
@@ -925,6 +929,7 @@ void qwen3_tts::frame_bind(ggml_cgraph * cgraph, const frame_io & fr) {
     fk.CS   = axera_cmm_alloc(cs_bytes);
     fk.PN   = axera_cmm_alloc(NP * 2 * sizeof(int32_t));
     fk.MASK = axera_cmm_alloc(mask_bytes);
+    fk.TOPK = rt ? axera_cmm_alloc(sizeof(int32_t)) : nullptr;
     auto *        cs    = (ggml_bf16_t *) fk.CS->vir;
     auto *        pn    = (int32_t *) fk.PN->vir;
     auto *        mask  = (ggml_bf16_t *) fk.MASK->vir;
@@ -950,14 +955,17 @@ void qwen3_tts::frame_bind(ggml_cgraph * cgraph, const frame_io & fr) {
     fk.out.assign(k.info->nOutputSize, {});
     for (const auto & d : k.desc->in) {
         const int i = k.input(d.name);
-        if (d.name == "heads" || d.name == "embd") {
-            const auto & b = d.name == "heads" ? heads : embd;
+        if (d.name == "heads" || d.name == "heads_lo" || d.name == "embd") {
+            const auto & b = d.name == "embd" ? embd : heads;
             fk.in[i]       = axera_io(b.first, b.second, d.bytes);
+        } else if (d.name == "heads_hi") {  // the tables after heads_lo's
+            fk.in[i] = axera_io(heads.first, (char *) heads.second + k.in_bytes("heads_lo"), d.bytes);
         } else if (k.desc->packs.count(d.name)) {
             fk.in[i] = axera_io(prm.pack(names.t, *k.desc, d.name, 0), d.bytes);
         } else {
             const axera_cmm * b = d.name == "e0" ? &fk.E0 : d.name == "e1" ? &fk.E1 : d.name == "rnd" ? &fk.RND :
-                                  d.name == "cs16" ? &fk.CS : d.name == "pn16" ? &fk.PN : d.name == "mask16" ? &fk.MASK : nullptr;
+                                  d.name == "cs16" ? &fk.CS : d.name == "pn16" ? &fk.PN : d.name == "mask16" ? &fk.MASK :
+                                  d.name == "top_k" && rt ? &fk.TOPK : nullptr;
             if (!b) {
                 GGML_ABORT("axera qwen3_tts: %s: unexpected input %s\n", k.desc->role.c_str(), d.name.c_str());
             }
@@ -1001,6 +1009,13 @@ void qwen3_tts::frame_run(const frame_io & fr) {
     fk.E0->flush();
     fk.E1->flush();
     fk.RND->flush();
+    if (fk.TOPK) {
+        if (fr.top_k > 50) {
+            GGML_ABORT("axera qwen3_tts: the code predictor's top-k %d; the frame kernel samples top-k <= 50\n", fr.top_k);
+        }
+        *(int32_t *) fk.TOPK->vir = fr.top_k;
+        fk.TOPK->flush();
+    }
     {
         axera_timer tm("gen code predictor frame (npu)");
         fk.k->run(fk.in, fk.out, "code predictor frame");

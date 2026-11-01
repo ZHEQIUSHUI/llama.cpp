@@ -74,15 +74,20 @@ void output_norm(const graph_names & names, const std::vector<float> & h, int T)
 
 // the output head: the final norm of the output rows of h ([T][H] f32, the last layer's) and the output projection
 // (role lm_head: x [K] bf16, w [N, K] MXFP8 or [N, K / 2] MXFP4, s [N, K / 32] -> out [N] f32) into the graph's
-// logits (and its padded copy); then the graph's nodes after the logits (llama.cpp's backend sampler chain) on the CPU
+// logits (and its padded copy); then the graph's nodes after the logits (llama.cpp's backend sampler chain) on the CPU.
+// With a whole-model kernel's head (bind_cpu): the rows it computed (normed: their final norm, last: the logits of
+// the last row) as they are, the projection of any other row on the CPU (a small head: the TTS codec head's)
 struct output_head {
     const kernel * k = nullptr;
     const ggml_tensor * w = nullptr;  // output.weight
     axera_cmm  q, s, x;               // the projection in the kernel's format, the bf16 input row
     bool       mx4 = false;
+    std::vector<float> wf;            // the projection in f32 (the CPU's)
 
     void bind(const kernel & lm, const ggml_tensor * output_weight);
-    void run(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T);
+    void bind_cpu(const ggml_tensor * output_weight);
+    void run(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
+             const std::vector<char> * normed = nullptr, const float * last = nullptr);
     // the logits the caller wrote (a whole-model kernel's) into the graph's: the sampler nodes after them
     static void after(ggml_cgraph * g, const graph_names & names);
 };

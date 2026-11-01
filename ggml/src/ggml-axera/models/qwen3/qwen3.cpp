@@ -6,9 +6,10 @@
 //            [L / 4, ...] per phase), the last page of a batch padded (valid_tokens). Its history is whole pages: a batch
 //            that starts inside a page restarts at the page's first cell with the page's earlier inputs (kept)
 //   decode   role decode: one token through all layers (a decode group: the layers' weights in packs) on the same KV
-//            cache; with the output head inside (ASR) it also gives a prompt's last token's logits
-//   output   the logits (lm_head, the TTS codec head's padded to the text vocabulary), or for pooled embeddings the
-//            final norm of every row (the pooling on the CPU)
+//            cache; with the output head inside (ASR, the TTS talker's codec head) it also gives a prompt's last
+//            token's logits
+//   output   the logits (the group's, the other output rows' on the CPU without lm_head; the TTS codec head's padded
+//            to the text vocabulary), or for pooled embeddings the final norm of every row (the pooling on the CPU)
 // The prefill kernel ends with an RMS norm of unit weight, the decode group with the model's final norm when its head
 // is inside, else of unit weight: the host's output head applies the model's final norm (the RMS norm of normed rows
 // changes nothing).
@@ -425,8 +426,9 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
     std::vector<float> h((size_t) T * H);
     axera_timer        tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
     const rope         rp(rope_node, inp_pos, T);
-    // the logits of the batch's last token only, and a decode group with the head: that token through the group
-    const bool group_head = logits && LOGITS && logits->ne[1] == 1;
+    // a decode group with the head: the batch's last token through the group, its logits the group's (the other
+    // output rows' on the CPU without lm_head: the TTS codec head's, the prompt's rows with embeddings)
+    const bool group_head = logits && LOGITS && logits->ne[1] > 0 && (logits->ne[1] == 1 || !man.kernels.count("lm_head"));
     if (logits && logits->ne[1] > 0 && !group_head && !man.kernels.count("lm_head")) {
         GGML_LOG_ERROR("axera qwen3: logits of %lld rows; the kernel directory has no lm_head\n", (long long) logits->ne[1]);
         return GGML_STATUS_FAILED;
@@ -439,6 +441,7 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
         const float  v   = kqm->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(((const ggml_fp16_t *) row)[c]) : ((const float *) row)[c];
         return v > -1e30f;
     };
+    std::vector<char> normed(T, 0);  // rows of h through the group with the head: the final norm's already
     for (int it = 0; it < T;) {
         // one sequence's consecutive cells from token it
         int64_t first = kv.cell_of(it);
@@ -457,6 +460,7 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
         }
         if (run == 1 && c0 > 0 && dec.k) {  // one token: the decode kernel
             decode(c0, it, xb.data() + (size_t) it * H, pb.data() + (size_t) it * 4, rp, h.data() + (size_t) it * H);
+            normed[it] = LOGITS ? 1 : 0;
             ++it;
             continue;
         }
@@ -485,13 +489,14 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
         output_norm(names, h, T);
     } else if (logits->ne[1] == 0) {  // a batch whose logits nobody reads (mtmd's prompt chunks before the last)
     } else if (group_head) {  // the group's logits of the last token
-        GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_nbytes(logits) == LOGITS->size);
-        LOGITS->invalidate();
-        memcpy(logits->data, LOGITS->vir, LOGITS->size);
-        if (ggml_backend_buffer_is_axera(logits->buffer)) {
-            ((ggml_backend_axera_buffer_context *) logits->buffer->context)->flush(logits->data, ggml_nbytes(logits));
+        GGML_ASSERT(logits->type == GGML_TYPE_F32 && (size_t) logits->ne[0] * sizeof(float) == LOGITS->size);
+        if (man.kernels.count("lm_head")) {
+            head.bind(man.get("lm_head"), logits->src[0]);
+        } else {
+            head.bind_cpu(logits->src[0]);
         }
-        output_head::after(g, names);
+        LOGITS->invalidate();
+        head.run(g, names, h, T, &normed, normed[T - 1] ? (const float *) LOGITS->vir : nullptr);
     } else {
         head.bind(man.get("lm_head"), logits->src[0]);  // output.weight, or the tied token_embd.weight
         head.run(g, names, h, T);

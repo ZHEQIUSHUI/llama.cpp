@@ -287,7 +287,37 @@ void output_head::bind(const kernel & lm, const ggml_tensor * output_weight) {
     x = axera_cmm_alloc(K * sizeof(ggml_bf16_t));
 }
 
-void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T) {
+void output_head::bind_cpu(const ggml_tensor * output_weight) {
+    k = nullptr;
+    if (w != output_weight) {
+        w = output_weight;
+        wf.clear();  // (converted at the first row the CPU projects)
+    }
+}
+
+// the projection in f32, once
+static void head_f32(const ggml_tensor * w, std::vector<float> & wf) {
+    const int64_t N = w->ne[1], K = w->ne[0];
+    if (!wf.empty()) {
+        return;
+    }
+    if (N * K > (int64_t) 16 << 20) {  // (a text vocabulary's: the lm_head kernel's)
+        GGML_ABORT("axera: an output head of %lld x %lld on the CPU\n", (long long) N, (long long) K);
+    }
+    wf.resize((size_t) N * K);
+    const auto * tr = ggml_get_type_traits(w->type);
+    axera_host_pool().run(N, [&](int64_t r) {
+        const char * src = (const char *) w->data + r * w->nb[1];
+        if (w->type == GGML_TYPE_F32) {
+            memcpy(wf.data() + r * K, src, K * sizeof(float));
+        } else {
+            tr->to_float(src, wf.data() + r * K, K);
+        }
+    });
+}
+
+void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
+                      const std::vector<char> * normed, const float * last) {
     ggml_tensor * logits = graph_head(names);
     GGML_ASSERT(logits && logits->op == GGML_OP_MUL_MAT && logits->src[0] == w && logits->type == GGML_TYPE_F32 &&
                 ggml_backend_buffer_is_axera(logits->buffer));
@@ -316,11 +346,20 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
                                                  // TTS talker's hidden state for the code predictor)
     rn                    = rn && rn->type == GGML_TYPE_F32 && rn->ne[0] == K && rn->ne[1] == n_out ? rn : nullptr;
     std::vector<float> y((size_t) n_out * K);
+    std::vector<int>   rows(n_out);
     for (int r = 0; r < n_out; ++r) {
         const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : r;
         GGML_ASSERT(row >= 0 && row < T);
+        rows[r]          = row;
         const float * xr = h.data() + (size_t) row * K;
         float *       yr = y.data() + (size_t) r * K;
+        if (normed && (*normed)[row]) {  // the kernel's final norm
+            memcpy(yr, xr, K * sizeof(float));
+            if (rn) {
+                memcpy((char *) rn->data + r * rn->nb[1], yr, K * sizeof(float));
+            }
+            continue;
+        }
         double        ss = 0;
         for (int i = 0; i < K; ++i) {
             ss += (double) xr[i] * xr[i];
@@ -336,14 +375,34 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
     if (rn && ggml_backend_buffer_is_axera(rn->buffer)) {
         ((ggml_backend_axera_buffer_context *) rn->buffer->context)->flush(rn->data, ggml_nbytes(rn));
     }
-    axera_timer tl("lm_head");
+    axera_timer tl(k ? "lm_head" : "lm_head (cpu)");
     auto *      dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
-    std::vector<AX_ENGINE_IO_BUFFER_T> in(k->info->nInputSize), out(k->info->nOutputSize);
-    in[k->input("x")] = axera_io(x);
-    in[k->input("w")] = axera_io(q, mx4 ? N * K / 2 : N * K);
-    in[k->input("s")] = axera_io(s, N * K / AXERA_MX_GROUP);
+    std::vector<AX_ENGINE_IO_BUFFER_T> in(k ? k->info->nInputSize : 0), out(k ? k->info->nOutputSize : 0);
+    if (k) {
+        in[k->input("x")] = axera_io(x);
+        in[k->input("w")] = axera_io(q, mx4 ? N * K / 2 : N * K);
+        in[k->input("s")] = axera_io(s, N * K / AXERA_MX_GROUP);
+    }
     for (int r = 0; r < n_out; ++r) {
         float * o = (float *) ((char *) logits->data + r * logits->nb[1]);
+        if ((last && rows[r] == T - 1) || !k) {
+            if (last && rows[r] == T - 1) {
+                memcpy(o, last, N * sizeof(float));
+            } else {
+                head_f32(w, wf);
+                const float * yr = y.data() + (size_t) r * K;
+                axera_host_pool().run(N, [&](int64_t n) {
+                    const float * wr = wf.data() + n * K;
+                    float         a  = 0.0f;
+                    for (int64_t i = 0; i < K; ++i) {
+                        a += wr[i] * yr[i];
+                    }
+                    o[n] = a;
+                });
+            }
+            dctx->flush(o, N * sizeof(float));
+            continue;
+        }
         ggml_fp32_to_bf16_row(y.data() + (size_t) r * K, (ggml_bf16_t *) x->vir, K);
         x->flush(x->vir, K * sizeof(ggml_bf16_t));
         dctx->flush(o, N * sizeof(float));
