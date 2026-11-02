@@ -168,11 +168,13 @@ axera_cmm qwen38_27b::bank(const std::map<std::string, ggml_tensor *> & t, const
     GGML_ASSERT(d.shape.size() >= 2 && d.shape[0] == nb && d.bytes % nb == 0);
     axera_cmm     c  = axera_cmm_alloc(d.bytes);
     const size_t  bb = d.bytes / nb;  // bytes per block
+    std::vector<const ggml_tensor *> read;  // the GGUF tensors read: their mapped pages dropped when the bank is done
     auto          T  = [&](int il, const char * g) -> ggml_tensor * {
         const std::string nm = "blk." + std::to_string(il) + "." + g;
         if (!t.count(nm)) {
             GGML_ABORT("axera qwen38_27b: %s not in the graph\n", nm.c_str());
         }
+        read.push_back(t.at(nm));
         return t.at(nm);
     };
     for (int b = 0; b < nb; ++b) {
@@ -347,6 +349,9 @@ axera_cmm qwen38_27b::bank(const std::map<std::string, ggml_tensor *> & t, const
         }
     }
     c->flush();
+    for (const ggml_tensor * w : read) {
+        axera_drop_mapped(w);
+    }
     return c;
 }
 
@@ -442,6 +447,13 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
         for (const auto & d : dk.desc->out) {
             c.out.push_back(d.name == "out" ? axera_io(A, d.bytes) : pool_io(d.name, gi * G + atoi(d.name.c_str() + 2)));
         }
+        // this group's converted parameters, read only through its packs now: freed before the next group's
+        // (the load's peak: the packs so far and one group's conversions, not every layer's)
+        std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> live;
+        for (int gj = 0; gj <= gi; ++gj) {
+            live.push_back(&dec[gj].in);
+        }
+        prm.release(live);
     }
     for (int k = 0; k < 4; ++k) {  // the current state: the pools
         where[k].assign(ng, {});
