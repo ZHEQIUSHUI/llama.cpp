@@ -1884,7 +1884,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // the whole file read ahead into the page cache unless LLAMA_MMAP_PREFETCH=0, or by default with the Axera NPU
+    // backend (GGML_AXERA_KERNEL_DIR set): it converts the weights once, tensor by tensor, and drops their pages, so
+    // without the read-ahead the resident file pages stay small
+    const char * mmap_prefetch = getenv("LLAMA_MMAP_PREFETCH");
+    const bool   prefetch      = mmap_prefetch ? atoi(mmap_prefetch) != 0 : getenv("GGML_AXERA_KERNEL_DIR") == nullptr;
+    ml.init_mappings(prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
