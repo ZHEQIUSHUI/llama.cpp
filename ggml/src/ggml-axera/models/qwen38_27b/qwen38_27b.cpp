@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstring>
 #include <regex>
+#include <set>
 
 namespace axera {
 namespace {
@@ -429,11 +430,39 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
         const size_t      b = n[0] == 's' ? st_b : n[1] == 'v' ? cv_b : cq_b;
         return axera_io(p.get(), (char *) p->vir + ord[il] * b, (uint32_t) b);
     };
+    // the prefill kernel's weight banks [blocks, ..] from the GGUF (first: decode and verification calls may read
+    // their row-split weights from them, inputs k_<bank>: the 4 blocks of the call's 16 layers)
+    const rope rp(rope_node, names.find("inp_pos"), 1);
+    banks.clear();
+    {
+        axera_timer tb("init: prefill banks");
+        static const std::set<std::string> pools = { "x", "position_ids", "indptr", "indices", "last_page_len", "cache_location",
+                                                     "valid_tokens", "b3_kv", "b0_attn_state_in", "b0_attn_q_conv_state_in",
+                                                     "b0_attn_k_conv_state_in", "b0_attn_v_conv_state_in" };
+        for (const auto & d : pk.desc->in) {
+            if (!pools.count(d.name)) {
+                banks[d.name] = bank(t, d, rp);
+            }
+        }
+    }
+    auto bank_io = [&](const kernel & k, const io_desc & d, int gi) -> AX_ENGINE_IO_BUFFER_T {
+        auto it = banks.find(d.name.substr(2));
+        if (d.name.rfind("k_", 0) != 0 || it == banks.end()) {
+            GGML_ABORT("axera qwen38_27b: %s: unexpected input %s\n", k.desc->role.c_str(), d.name.c_str());
+        }
+        const size_t bb = it->second->size / (L / 4);  // a block's bytes
+        GGML_ASSERT(d.bytes == (size_t) (G / 4) * bb);
+        return axera_io(it->second.get(), (char *) it->second->vir + (size_t) gi * d.bytes, d.bytes);
+    };
     dec.assign(L / G, {});
     for (int gi = 0; gi < L / G; ++gi) {
         call & c = dec[gi];
         c.k      = &dk;
         for (const auto & d : dk.desc->in) {
+            if (d.name.rfind("k_", 0) == 0) {
+                c.in.push_back(bank_io(dk, d, gi));
+                continue;
+            }
             if (dk.desc->packs.count(d.name)) {
                 c.in.push_back(axera_io(prm.pack(t, *dk.desc, d.name, gi * G), d.bytes));
                 continue;
@@ -514,6 +543,10 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
                     c.in.push_back(dec[gi].in[j]);
                     continue;
                 }
+                if (d.name.rfind("k_", 0) == 0) {
+                    c.in.push_back(bank_io(vk, d, gi));
+                    continue;
+                }
                 const axera_cmm * b = d.name == "x" ? &VX : d.name == "cs" ? &VCS : d.name == "pn" ? &VPN :
                                       d.name == "mask" ? &VMASK : d.name == "ntok" ? &VNT : nullptr;
                 if (!b) {
@@ -533,8 +566,7 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
         }
     }
 
-    // prefill: the weight banks from the GGUF, the pools, one page's inputs
-    const rope rp(rope_node, names.find("inp_pos"), 1);
+    // prefill: the weight banks (above), the pools, one page's inputs
     pre   = {};
     pre.k = &pk;
     PX      = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
@@ -551,8 +583,6 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
         ((int32_t *) INDICES->vir)[i] = i;
     }
     INDICES->flush();
-    banks.clear();
-    axera_timer tb("init: prefill banks");
     for (const auto & d : pk.desc->in) {
         const std::string & n = d.name;
         const axera_cmm *   b = n == "x" ? &PX : n == "position_ids" ? &POS : n == "indptr" ? &INDPTR : n == "indices" ? &INDICES :
@@ -560,7 +590,7 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
                                 n == "b3_kv" ? &KV : n == "b0_attn_state_in" ? &ST : n == "b0_attn_q_conv_state_in" ? &CQ :
                                 n == "b0_attn_k_conv_state_in" ? &CK : n == "b0_attn_v_conv_state_in" ? &CV : nullptr;
         if (!b) {
-            b = &(banks[n] = bank(t, d, rp));
+            b = &banks.at(n);
         }
         GGML_ASSERT((*b)->size >= d.bytes);
         pre.in.push_back(axera_io(*b, d.bytes));
