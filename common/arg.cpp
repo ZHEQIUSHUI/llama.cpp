@@ -4478,6 +4478,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_TTS}));
     add_opt(common_arg(
+        {"--tts-speaker"}, "NAME",
+        "built-in speaker for CustomVoice models (for example vivian or dylan)",
+        [](common_params & params, const std::string & value) {
+            params.tts_speaker = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TTS}));
+    add_opt(common_arg(
+        {"--tts-instruct"}, "TEXT",
+        "style instruction for CustomVoice, or voice description for VoiceDesign",
+        [](common_params & params, const std::string & value) {
+            params.tts_instruct = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TTS}));
+    add_opt(common_arg(
         {"--tts-speaker-file"}, "FNAME",
         "speaker file path for audio generation",
         [](common_params & params, const std::string & value) {
