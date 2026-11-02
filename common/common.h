@@ -764,9 +764,11 @@ struct common_params {
     bool no_alloc = false; // Don't allocate model buffers
 
     // TTS params
-    std::string tts_lang = "";
+    std::string tts_lang         = "";
+    std::string tts_speaker      = "";
+    std::string tts_instruct     = "";
     std::string tts_speaker_file = "";
-    std::string tts_ref_text = "";
+    std::string tts_ref_text     = "";
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };

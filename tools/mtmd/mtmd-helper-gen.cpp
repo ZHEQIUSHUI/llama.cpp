@@ -41,8 +41,31 @@ static const std::unordered_map<std::string, std::string> tts_lang_codes = {
 };
 
 static std::string tts_resolve_lang(const std::string & lang) {
-    auto it = tts_lang_codes.find(lang);
-    return it != tts_lang_codes.end() ? it->second : lang;
+    std::string lowered = lang;
+    for (char & c : lowered) c = (char) std::tolower((unsigned char) c);
+    auto it = tts_lang_codes.find(lowered);
+    return it != tts_lang_codes.end() ? it->second : lowered;
+}
+
+static std::string tts_meta_str(const llama_model * model, const std::string & key) {
+    char buf[4096];
+    const int32_t n = llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf));
+    return n >= 0 ? std::string(buf, std::min((size_t) n, sizeof(buf) - 1)) : std::string();
+}
+
+static int64_t tts_meta_int(const llama_model * model, const std::string & key) {
+    const std::string value = tts_meta_str(model, key);
+    if (value.empty()) {
+        return -1;
+    }
+    char * end = nullptr;
+    const long long result = std::strtoll(value.c_str(), &end, 10);
+    return end && *end == '\0' ? (int64_t) result : -1;
+}
+
+static std::string tts_model_type(const llama_model * model) {
+    const std::string type = tts_meta_str(model, "qwen3tts.tts_model_type");
+    return type.empty() ? "base" : type;
 }
 
 static llama_token find_special_token(const llama_vocab * vocab, const std::string & piece) {
@@ -145,20 +168,6 @@ public:
             return 1;
         }
 
-        const std::string lang   = tts_resolve_lang((inp->lang && inp->lang[0]) ? inp->lang : "english");
-        const llama_token c_lang = find_special_token(vocab, ("<|codec_language_" + lang + "|>").c_str());
-        if (c_lang == LLAMA_TOKEN_NULL) {
-            LOG_ERR("mtmd_helper_gen_audio: unknown language '%s'\n", lang.c_str());
-            return 1;
-        }
-
-        std::vector<float> speaker_embd;
-        if (inp->speaker_ref) {
-            if (!encode_speaker(inp->speaker_ref, speaker_embd)) {
-                return 1;
-            }
-        }
-
         const int n_e = n_embd;
         auto row = [&](llama_token t) {
             return std::vector<float>(tok_embd.begin() + (size_t) t * n_e,
@@ -175,6 +184,105 @@ public:
             return va;
         };
 
+        const std::string model_type = tts_model_type(model);
+        if (model_type != "base" && model_type != "custom_voice" && model_type != "voice_design") {
+            LOG_ERR("mtmd_helper_gen_audio: unsupported Qwen3-TTS model type '%s'\n", model_type.c_str());
+            return 1;
+        }
+
+        const bool has_speaker_arg  = inp->speaker && inp->speaker[0];
+        const bool has_instruct_arg = inp->instruct && inp->instruct[0];
+        const bool has_ref_text     = inp->ref_text && inp->ref_text_len > 0;
+
+        if (model_type == "base") {
+            if (has_speaker_arg) {
+                LOG_ERR("mtmd_helper_gen_audio: --tts-speaker is only supported by CustomVoice models\n");
+                return 1;
+            }
+            if (has_instruct_arg) {
+                LOG_ERR("mtmd_helper_gen_audio: --tts-instruct is not supported by Base models\n");
+                return 1;
+            }
+        } else {
+            if (inp->speaker_ref) {
+                LOG_ERR("mtmd_helper_gen_audio: --tts-speaker-file is only supported by Base models\n");
+                return 1;
+            }
+            if (has_ref_text) {
+                LOG_ERR("mtmd_helper_gen_audio: --tts-ref-text is only supported by Base models\n");
+                return 1;
+            }
+        }
+
+        std::string speaker_name;
+        std::vector<float> speaker_embd;
+        if (model_type == "base") {
+            if (inp->speaker_ref && !encode_speaker(inp->speaker_ref, speaker_embd)) {
+                return 1;
+            }
+        } else if (model_type == "custom_voice") {
+            if (!has_speaker_arg) {
+                LOG_ERR("mtmd_helper_gen_audio: CustomVoice models require --tts-speaker <name>\n");
+                return 1;
+            }
+            speaker_name = inp->speaker;
+            for (char & c : speaker_name) c = (char) std::tolower((unsigned char) c);
+            const int64_t spk_id = tts_meta_int(model, "qwen3tts.spk_id." + speaker_name);
+            if (spk_id < 0) {
+                LOG_ERR("mtmd_helper_gen_audio: speaker '%s' is not supported by this CustomVoice model\n", inp->speaker);
+                return 1;
+            }
+            speaker_embd = row(codec_0 + (llama_token) spk_id);
+        } else if (model_type == "voice_design") {
+            if (has_speaker_arg) {
+                LOG_ERR("mtmd_helper_gen_audio: --tts-speaker is only supported by CustomVoice models\n");
+                return 1;
+            }
+            if (!has_instruct_arg) {
+                LOG_ERR("mtmd_helper_gen_audio: VoiceDesign models require --tts-instruct \"<voice description>\"\n");
+                return 1;
+            }
+        }
+
+        // 0.6B CustomVoice follows the official package and ignores instructions.
+        bool use_instruct = has_instruct_arg;
+        if (model_type == "custom_voice" && tts_meta_str(model, "qwen3tts.tts_model_size") == "0b6" && use_instruct) {
+            LOG_WRN("mtmd_helper_gen_audio: the 0.6B CustomVoice model does not use --tts-instruct; ignoring it\n");
+            use_instruct = false;
+        }
+
+        std::string lang;
+        if (inp->lang && inp->lang[0]) {
+            lang = tts_resolve_lang(inp->lang);
+        } else {
+            // Keep the historical llama-tts default for Base; the official
+            // CustomVoice / VoiceDesign default is language="Auto".
+            lang = model_type == "base" ? "english" : "auto";
+        }
+        if (lang.find("dialect") != std::string::npos) {
+            LOG_ERR("mtmd_helper_gen_audio: dialect language '%s' is selected by the speaker; "
+                    "use --tts-lang auto or chinese\n", lang.c_str());
+            return 1;
+        }
+
+        // The official generate() overrides Chinese/auto with the speaker's
+        // dialect id whenever SPK_IS_DIALECT[speaker] is set.
+        if (model_type == "custom_voice" && (lang == "chinese" || lang == "auto")) {
+            const std::string dialect = tts_meta_str(model, "qwen3tts.spk_dialect." + speaker_name);
+            if (!dialect.empty()) {
+                lang = dialect;
+            }
+        }
+
+        llama_token c_lang = LLAMA_TOKEN_NULL;
+        if (lang != "auto") {
+            c_lang = find_special_token(vocab, "<|codec_language_" + lang + "|>");
+            if (c_lang == LLAMA_TOKEN_NULL) {
+                LOG_ERR("mtmd_helper_gen_audio: unknown language '%s'\n", lang.c_str());
+                return 1;
+            }
+        }
+
         // upstream chat wrap, then slices: [0:3] role, [3:-5] utterance body
         const std::string full = "<|im_start|>assistant\n" + std::string(inp->prompt, inp->prompt_len) +
                                   "<|im_end|>\n<|im_start|>assistant\n";
@@ -187,14 +295,34 @@ public:
         }
         ids.resize((size_t) n_ids);
 
-        const bool icl = inp->speaker_ref && inp->ref_text && inp->ref_text_len > 0;
+        const bool icl = model_type == "base" && inp->speaker_ref && has_ref_text;
 
         std::vector<std::vector<float>> prompt;
+
+        if (use_instruct) {
+            // _build_instruct_text() in qwen3_tts/inference/qwen3_tts_model.py
+            const std::string wrapped = "<|im_start|>user\n" + std::string(inp->instruct) + "<|im_end|>\n";
+            std::vector<llama_token> instruct_ids(wrapped.size() + 16);
+            const int n_instruct = llama_tokenize(vocab, wrapped.c_str(), (int32_t) wrapped.size(),
+                    instruct_ids.data(), (int32_t) instruct_ids.size(), false, true);
+            if (n_instruct <= 0) {
+                LOG_ERR("mtmd_helper_gen_audio: instruction tokenization failed\n");
+                return 1;
+            }
+            for (int i = 0; i < n_instruct; i++) prompt.push_back(row(instruct_ids[(size_t) i]));
+        }
+
         for (int i = 0; i < 3; i++) prompt.push_back(row(ids[(size_t) i]));
-        prompt.push_back(sum_row(tts_pad, c_think));
-        prompt.push_back(sum_row(tts_pad, c_think_b));
-        prompt.push_back(sum_row(tts_pad, c_lang));
-        prompt.push_back(sum_row(tts_pad, c_think_e));
+        if (lang == "auto") {
+            prompt.push_back(sum_row(tts_pad, c_nothink));
+            prompt.push_back(sum_row(tts_pad, c_think_b));
+            prompt.push_back(sum_row(tts_pad, c_think_e));
+        } else {
+            prompt.push_back(sum_row(tts_pad, c_think));
+            prompt.push_back(sum_row(tts_pad, c_think_b));
+            prompt.push_back(sum_row(tts_pad, c_lang));
+            prompt.push_back(sum_row(tts_pad, c_think_e));
+        }
         if (!speaker_embd.empty()) prompt.push_back(sum_vec(tts_pad, speaker_embd));
         prompt.push_back(sum_row(tts_bos, codec_pad));
 
@@ -450,13 +578,14 @@ private:
         codec_eos = find_special_token(vocab, "<|codec_eos_token|>");
         codec_pad = find_special_token(vocab, "<|codec_pad|>");
         c_think   = find_special_token(vocab, "<|codec_think|>");
+        c_nothink = find_special_token(vocab, "<|codec_nothink|>");
         c_think_b = find_special_token(vocab, "<|codec_think_bos|>");
         c_think_e = find_special_token(vocab, "<|codec_think_eos|>");
         tts_pad   = find_special_token(vocab, "<tts_pad>");
         tts_bos   = find_special_token(vocab, "<tts_text_bos>");
         tts_eos   = find_special_token(vocab, "<tts_text_eod>");
         for (llama_token t : { codec_0, codec_bos, codec_eos, codec_pad,
-                               c_think, c_think_b, c_think_e,
+                               c_think, c_nothink, c_think_b, c_think_e,
                                tts_pad, tts_bos, tts_eos }) {
             if (t == LLAMA_TOKEN_NULL) {
                 LOG_ERR("mtmd_helper_gen_audio: missing a required special token in vocab\n");
@@ -593,6 +722,7 @@ private:
     llama_token codec_eos  = LLAMA_TOKEN_NULL;
     llama_token codec_pad  = LLAMA_TOKEN_NULL;
     llama_token c_think    = LLAMA_TOKEN_NULL;
+    llama_token c_nothink  = LLAMA_TOKEN_NULL;
     llama_token c_think_b  = LLAMA_TOKEN_NULL;
     llama_token c_think_e  = LLAMA_TOKEN_NULL;
     llama_token tts_pad    = LLAMA_TOKEN_NULL;

@@ -36,7 +36,7 @@ static void print_usage(int, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n    %s -m backbone.gguf -mm mmproj.gguf -p \"text to speak\" -o output.wav", argv[0]);
     LOG("\n    %s -hf user/model -p \"text to speak\" -o output.wav\n", argv[0]);
-    LOG("\nnote: --tts-lang, --tts-speaker-file and --tts-ref-text may not be supported in all models");
+    LOG("\nnote: TTS prompt options depend on the model type, see tts/README.md");
     LOG("\n      use -n to limit the output length");
     LOG("\n      see tts/README.md for per-model usage notes");
     LOG("\n\n");
@@ -84,6 +84,49 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    char model_type_buf[64] = {};
+    if (llama_model_meta_val_str(model, "qwen3tts.tts_model_type", model_type_buf, sizeof(model_type_buf)) < 0) {
+        snprintf(model_type_buf, sizeof(model_type_buf), "base");
+    }
+    const std::string model_type = model_type_buf;
+    if (model_type == "base") {
+        if (!params.tts_speaker.empty()) {
+            LOG_ERR("--tts-speaker is only supported by CustomVoice models\n");
+            return 1;
+        }
+        if (!params.tts_instruct.empty()) {
+            LOG_ERR("--tts-instruct is not supported by Base models\n");
+            return 1;
+        }
+    } else if (model_type == "custom_voice" || model_type == "voice_design") {
+        if (!params.tts_speaker_file.empty()) {
+            LOG_ERR("--tts-speaker-file is only supported by Base models\n");
+            return 1;
+        }
+        if (!params.tts_ref_text.empty()) {
+            LOG_ERR("--tts-ref-text is only supported by Base models\n");
+            return 1;
+        }
+        if (model_type == "custom_voice") {
+            if (params.tts_speaker.empty()) {
+                LOG_ERR("CustomVoice models require --tts-speaker <name>\n");
+                return 1;
+            }
+        } else {
+            if (!params.tts_speaker.empty()) {
+                LOG_ERR("--tts-speaker is only supported by CustomVoice models\n");
+                return 1;
+            }
+            if (params.tts_instruct.empty()) {
+                LOG_ERR("VoiceDesign models require --tts-instruct \"<voice description>\"\n");
+                return 1;
+            }
+        }
+    } else {
+        LOG_ERR("unsupported Qwen3-TTS model type '%s'\n", model_type.c_str());
+        return 1;
+    }
+
     mtmd_context_params mtmd_params = mtmd_context_params_default();
     mtmd_params.use_gpu = params.mmproj_use_gpu;
     mtmd_params.device  = params.mmproj_device;
@@ -119,11 +162,13 @@ int main(int argc, char ** argv) {
     inp.speaker_ref = speaker_bitmap.get();
     inp.ref_text     = params.tts_ref_text.c_str();
     inp.ref_text_len = params.tts_ref_text.size();
-    inp.lang        = params.tts_lang.c_str();
-    inp.top_k       = params.sampling.top_k;
-    inp.top_p       = params.sampling.top_p;
-    inp.seed        = params.sampling.seed;
-    inp.out_type    = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+    inp.speaker      = params.tts_speaker.c_str();
+    inp.instruct     = params.tts_instruct.c_str();
+    inp.lang         = params.tts_lang.c_str();
+    inp.top_k        = params.sampling.top_k;
+    inp.top_p        = params.sampling.top_p;
+    inp.seed         = params.sampling.seed;
+    inp.out_type     = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
 
     //
     // stage 1: process prompt via backbone model, generate semantic representation
