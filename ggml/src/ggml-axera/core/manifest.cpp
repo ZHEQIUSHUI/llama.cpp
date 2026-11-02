@@ -50,6 +50,21 @@ void kernel::run(std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_
     io.nInputSize  = (uint32_t) in.size();
     io.pOutputs    = out.data();
     io.nOutputSize = (uint32_t) out.size();
+    // debug: GGML_AXERA_DUMP_ROLE=<role> GGML_AXERA_DUMP_DIR=<dir>: the role's first call's inputs as <dir>/<input>.bin,
+    // then exit before running it (to replay it alone)
+    static const char * dump_role = getenv("GGML_AXERA_DUMP_ROLE");
+    if (dump_role && desc->role == dump_role) {
+        const char * dir = getenv("GGML_AXERA_DUMP_DIR");
+        for (size_t i = 0; i < in.size(); ++i) {
+            const std::string p = std::string(dir ? dir : ".") + "/" + info->pInputs[i].pName + ".bin";
+            FILE *            f = fopen(p.c_str(), "wb");
+            GGML_ASSERT(f && in[i].pVirAddr);
+            fwrite(in[i].pVirAddr, 1, info->pInputs[i].nSize, f);
+            fclose(f);
+        }
+        fprintf(stderr, "axera: %s: %zu inputs of %s dumped to %s\n", what, in.size(), desc->role.c_str(), dir ? dir : ".");
+        exit(0);
+    }
     const int ret  = AX_ENGINE_RunSync(handle, &io);
     if (ret != 0) {  // the IO the kernel got (stderr: the log is asynchronous)
         for (int o = 0; o < 2; ++o) {

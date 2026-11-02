@@ -92,8 +92,9 @@ class qwen38_27b final : public model {
     int64_t ver_c0  = -1;              // the last verification's first cell, rows, snapshot set
     int     ver_T = 0, ver_set = -1;
     // the MTP block (draft context graphs): its kernels' IO, its KV cache
-    call      mtp1, mtpp;
+    call      mtp1, mtpp, mtp8;  // mtp8: role mtp.m8 (optional), up to 8 consecutive rows per call
     axera_cmm ME, MH, MCS, MPN, MMASK, MOUT, MRAW, PE, PH, PCS, PPN, PMASK, PNBLK, POUT2, PRAW, MKV;
+    axera_cmm M8E, M8H, M8CS, M8PN, M8MASK, M8NT, M8OUT, M8RAW;
     const void * mtp_bound = nullptr;
     call                           pre;
     std::map<std::string, axera_cmm> banks;
@@ -1018,6 +1019,14 @@ void qwen38_27b::init_mtp(const std::map<std::string, ggml_tensor *> & t, int il
     GGML_ASSERT(MCS->size == (size_t) ROT * sizeof(ggml_bf16_t) && MMASK->size == (size_t) man.context * sizeof(ggml_bf16_t) &&
                 PE->size % ((size_t) H * sizeof(ggml_bf16_t)) == 0);
     std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> live = { &mtp1.in, &mtpp.in };
+    if (man.has("mtp.m8")) {
+        const kernel & k8 = man.get("mtp.m8");
+        GGML_ASSERT(k8.desc->packs == k1.desc->packs && k8.out_bytes("kv") == k1.out_bytes("kv"));
+        bind(mtp8, k8, { { "e", &M8E }, { "h", &M8H }, { "cs", &M8CS }, { "pn", &M8PN }, { "mask", &M8MASK }, { "ntok", &M8NT },
+                         { "hnext", &M8OUT }, { "hraw", &M8RAW } });
+        GGML_ASSERT(M8MASK->size == M8E->size / ((size_t) H * sizeof(ggml_bf16_t)) * MMASK->size);
+        live.push_back(&mtp8.in);
+    }
     for (auto & c : dec) {
         live.push_back(&c.in);
     }
@@ -1076,7 +1085,37 @@ ggml_status qwen38_27b::compute_mtp(ggml_cgraph * g) {
     std::vector<float> h((size_t) T * H);
     const size_t       half = (ROT / 2) * sizeof(ggml_bf16_t);
     axera_timer        tm(T == 1 ? "mtp (draft)" : T <= 8 ? "mtp (catch-up rows)" : "mtp (prompt)");
-    if (T <= 8) {  // a draft step, or a verification's accepted rows: row by row
+    const int R8 = mtp8.k ? (int) (M8E->size / (H * sizeof(ggml_bf16_t))) : 0;
+    if (T >= 2 && T <= R8) {  // a verification's accepted rows in one call (each row sees the rows before it)
+        const size_t mrow = MMASK->size;
+        auto *       pn   = (int32_t *) M8PN->vir;
+        for (int r = 0; r < R8; ++r) {
+            const int rr = std::min(r, T - 1);  // rows from T on: the last row's (the kernel leaves their KV alone)
+            if (r < T) {
+                row_bf16(embd, r, (ggml_bf16_t *) M8E->vir + (size_t) r * H);
+                row_bf16(hin, r, (ggml_bf16_t *) M8H->vir + (size_t) r * H);
+            }
+            rp.rows(rr, 1, COS.get(), SIN.get());
+            memcpy((char *) M8CS->vir + r * 2 * half, COS->vir, half);
+            memcpy((char *) M8CS->vir + r * 2 * half + half, SIN->vir, half);
+            auto * mk = (ggml_bf16_t *) ((char *) M8MASK->vir + r * mrow);
+            std::fill(mk, mk + man.context, ggml_fp32_to_bf16(-3e38f));
+            const int64_t c    = kv.cell_of(rr);
+            const int     nblk = kv.mask_row(rr, mk);
+            pn[3 * r]          = (int32_t) c;
+            pn[3 * r + 1]      = std::max(nblk, (int) (c / PG + 1));
+            pn[3 * r + 2]      = (int32_t) ((c / PG) * 2 * PG + c % PG);
+        }
+        *(int32_t *) M8NT->vir = T;
+        for (const axera_cmm * b : { &M8E, &M8H, &M8CS, &M8PN, &M8MASK, &M8NT }) {
+            (*b)->flush();
+        }
+        mtp8.k->run(mtp8.in, mtp8.out, "mtp m8");
+        M8OUT->invalidate();
+        for (int r = 0; r < T; ++r) {
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) M8OUT->vir + (size_t) r * H, h.data() + (size_t) r * H, H);
+        }
+    } else if (T <= 8) {  // a draft step, or a verification's accepted rows: row by row
         for (int r = 0; r < T; ++r) {
             row_bf16(embd, r, (ggml_bf16_t *) ME->vir);
             row_bf16(hin, r, (ggml_bf16_t *) MH->vir);
