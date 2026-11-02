@@ -305,6 +305,32 @@ void output_head::bind(const kernel & lm, const ggml_tensor * output_weight) {
     x = axera_cmm_alloc(R * K * sizeof(ggml_bf16_t));
 }
 
+void output_head::bind_draft(const kernel & dlm, const std::vector<int32_t> & ids) {
+    GGML_ASSERT(k && mx4);
+    const int64_t N = w->ne[1], K = w->ne[0], NS = (int64_t) ids.size();
+    GGML_ASSERT(dlm.in_bytes("w") == NS * K / 2 && dlm.in_bytes("s") == NS * K / AXERA_MX_GROUP &&
+                dlm.in_bytes("x") == K * sizeof(ggml_bf16_t) && dlm.out_bytes("out") == NS * sizeof(float));
+    dk = &dlm;
+    if (dids == ids) {
+        return;
+    }
+    dids = ids;
+    dq   = axera_cmm_alloc(NS * K / 2);
+    ds   = axera_cmm_alloc(NS * K / AXERA_MX_GROUP);
+    dy   = axera_cmm_alloc(NS * sizeof(float));
+    axera_host_pool().run(NS, [&](int64_t i) {
+        const int64_t r = ids[i];
+        GGML_ASSERT(r >= 0 && r < N && (i == 0 || ids[i - 1] < r));
+        memcpy((uint8_t *) dq->vir + i * (K / 2), (const uint8_t *) q->vir + r * (K / 2), K / 2);
+        memcpy((uint8_t *) ds->vir + i * (K / AXERA_MX_GROUP), (const uint8_t *) s->vir + r * (K / AXERA_MX_GROUP), K / AXERA_MX_GROUP);
+    });
+    dq->flush();
+    ds->flush();
+}
+
+// a TOP_K of the draft head's single row: over its vocabulary's logits only (the others are -inf)
+static const output_head * top_k_draft = nullptr;
+
 void output_head::bind_cpu(const ggml_tensor * output_weight) {
     k = nullptr;
     if (w != output_weight) {
@@ -393,8 +419,39 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
     if (rn && ggml_backend_buffer_is_axera(rn->buffer)) {
         ((ggml_backend_axera_buffer_context *) rn->buffer->context)->flush(rn->data, ggml_nbytes(rn));
     }
+    auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+    if (draft && dk && n_out == 1 && !(last && rows[0] == T - 1)) {  // the draft head
+        draft = false;
+        axera_timer tl("lm_head (draft)");
+        ggml_fp32_to_bf16_row(y.data(), (ggml_bf16_t *) x->vir, K);
+        x->flush(x->vir, K * sizeof(ggml_bf16_t));
+        std::vector<AX_ENGINE_IO_BUFFER_T> din(dk->info->nInputSize), dout(dk->info->nOutputSize);
+        din[dk->input("x")]   = axera_io(x, K * sizeof(ggml_bf16_t));
+        din[dk->input("w")]   = axera_io(dq);
+        din[dk->input("s")]   = axera_io(ds);
+        dout[dk->output("out")] = axera_io(dy);
+        dk->run(din, dout, "draft head");
+        dy->invalidate();
+        tl.stop();
+        axera_timer   tf("lm_head (draft): logits");
+        float *       o  = (float *) logits->data;
+        const float * yv = (const float *) dy->vir;
+        std::fill(o, o + N, -INFINITY);
+        for (size_t i = 0; i < dids.size(); ++i) {
+            o[dids[i]] = yv[i];
+        }
+        // (only the host reads them: no write-back, and none when they are read back this graph)
+        dctx->clean_p     = o;
+        dctx->clean_n     = N * sizeof(float);
+        dctx->clean_epoch = axera_graph_epoch;
+        tf.stop();
+        top_k_draft = this;
+        after(g, names);
+        top_k_draft = nullptr;
+        return;
+    }
+    draft = false;
     axera_timer tl(k ? "lm_head" : "lm_head (cpu)");
-    auto *      dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
     std::vector<AX_ENGINE_IO_BUFFER_T> in(k ? k->info->nInputSize : 0), out(k ? k->info->nOutputSize : 0);
     if (k) {
         in[k->input("x")] = axera_io(x);
@@ -528,7 +585,7 @@ bool pad_rows(ggml_tensor * n) {
             std::fill(d, d + n->ne[0], 0.0f);
         }
     }
-    if (ggml_backend_buffer_is_axera(n->buffer)) {
+    if (ggml_backend_buffer_is_axera(n->buffer) && !top_k_draft) {  // (a draft head's: only the host reads it)
         ((ggml_backend_axera_buffer_context *) n->buffer->context)->flush(n->data, ggml_nbytes(n));
     }
     return true;
@@ -542,6 +599,50 @@ void top_k_rows(ggml_tensor * n) {
     auto greater = [](const float * d) {
         return [d](int32_t a, int32_t b) { return d[a] > d[b] || (d[a] == d[b] && a < b); };
     };
+    if (top_k_draft && ggml_nrows(src) == 1 && N >= (int64_t) top_k_draft->w->ne[1] && K <= (int64_t) top_k_draft->dids.size()) {
+        // the draft head's row: its vocabulary's logits (in dy, ids ascending); the rest are -inf (and padding)
+        // one pass per worker keeping its K best (sorted, ties: the lower index first), then the workers' merged
+        const auto &  ids = top_k_draft->dids;
+        const float * y   = (const float *) top_k_draft->dy->vir;
+        const int64_t NS  = (int64_t) ids.size();
+        const int     P   = (int) std::min<int64_t>(8, std::max<int64_t>(1, NS / 8192));
+        auto better = [y](int32_t a, int32_t b) { return y[a] > y[b] || (y[a] == y[b] && a < b); };
+        std::vector<int32_t> cand((size_t) P * K);
+        std::vector<int>     cn(P, 0);
+        axera_host_pool().run(P, [&](int64_t p) {
+            int32_t *     best = cand.data() + p * K;
+            int           nb   = 0;
+            const int64_t a = NS * p / P, b = NS * (p + 1) / P;
+            for (int64_t i = a; i < b; ++i) {
+                if (nb == K && !better((int32_t) i, best[K - 1])) {
+                    continue;
+                }
+                int j = nb < K ? nb++ : (int) K - 1;
+                while (j > 0 && better((int32_t) i, best[j - 1])) {
+                    best[j] = best[j - 1];
+                    --j;
+                }
+                best[j] = (int32_t) i;
+            }
+            cn[p] = nb;
+        });
+        std::vector<int32_t> all;
+        for (int p = 0; p < P; ++p) {
+            all.insert(all.end(), cand.begin() + p * K, cand.begin() + p * K + cn[p]);
+        }
+        std::partial_sort(all.begin(), all.begin() + K, all.end(), better);
+        int32_t * o = (int32_t *) n->data;
+        for (int64_t j = 0; j < K; ++j) {
+            o[j] = ids[all[j]];
+        }
+        if (K > 1) {
+            std::swap(o[0], o[1]);
+        }
+        if (ggml_backend_buffer_is_axera(n->buffer)) {
+            ((ggml_backend_axera_buffer_context *) n->buffer->context)->flush(n->data, ggml_nbytes(n));
+        }
+        return;
+    }
     for (int64_t r = 0; r < ggml_nrows(src); ++r) {
         const float *        d = (const float *) ((const char *) src->data + r * src->nb[1]);
         std::vector<int32_t> cand((size_t) P * K);

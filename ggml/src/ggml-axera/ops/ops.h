@@ -87,8 +87,15 @@ struct output_head {
     int        R   = 1;
     bool       mx4 = false;
     std::vector<float> wf;            // the projection in f32 (the CPU's)
+    // a draft head (speculative drafts): the rows of a draft vocabulary (ids ascending) gathered from q / s, one row
+    // per call; the other logits -inf
+    const kernel *       dk = nullptr;
+    std::vector<int32_t> dids;
+    axera_cmm            dq, ds, dy;
+    bool                 draft = false;  // the next run's single output row through the draft head
 
     void bind(const kernel & lm, const ggml_tensor * output_weight);
+    void bind_draft(const kernel & dlm, const std::vector<int32_t> & ids);  // after bind (MXFP4)
     void bind_cpu(const ggml_tensor * output_weight);
     void run(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
              const std::vector<char> * normed = nullptr, const float * last = nullptr);

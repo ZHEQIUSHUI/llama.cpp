@@ -1106,6 +1106,9 @@ ggml_status qwen38_27b::compute_mtp(ggml_cgraph * g) {
             pn[3 * r + 1]      = std::max(nblk, (int) (c / PG + 1));
             pn[3 * r + 2]      = (int32_t) ((c / PG) * 2 * PG + c % PG);
         }
+        for (int r = 0; r < 3 * R8; ++r) {  // (an index out of the kernel's range hangs the NPU: stop here instead)
+            GGML_ASSERT(pn[r] >= 0 && pn[r] < 2 * man.context);
+        }
         *(int32_t *) M8NT->vir = T;
         for (const axera_cmm * b : { &M8E, &M8H, &M8CS, &M8PN, &M8MASK, &M8NT }) {
             (*b)->flush();
@@ -1191,6 +1194,18 @@ ggml_status qwen38_27b::compute_mtp(ggml_cgraph * g) {
     if (logits && logits->ne[1] > 0 && (logits->flags & GGML_TENSOR_FLAG_COMPUTE)) {
         const std::vector<char> normed(T, 1);  // (the kernels' shared head norm)
         head.bind(man.get("lm_head"), logits->src[0]);
+        if (T == 1 && man.has("lm_head.draft")) {  // a draft step: the draft vocabulary's head (draft_vocab.i32)
+            if (!head.dk) {
+                const std::string    f = man.dir + "/draft_vocab.i32";
+                FILE *               fp = fopen(f.c_str(), "rb");
+                std::vector<int32_t> ids(man.get("lm_head.draft").out_bytes("out") / sizeof(float));
+                GGML_ASSERT(fp && fread(ids.data(), sizeof(int32_t), ids.size(), fp) == ids.size());
+                fclose(fp);
+                axera_timer tb("init: draft head");
+                head.bind_draft(man.get("lm_head.draft"), ids);
+            }
+            head.draft = true;
+        }
         head.run(g, names, h, T, &normed);
     }
     return GGML_STATUS_SUCCESS;
