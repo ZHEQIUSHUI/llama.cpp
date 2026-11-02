@@ -444,7 +444,20 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         x->flush();
         *(int32_t *) mk->vir = nr;
         mk->flush();
-        in[k->input("m")]     = axera_io(mk);
+        in[k->input("m")] = axera_io(mk);
+        // R consecutive logits rows: the kernel writes them in place (a verification batch), else through y
+        const bool direct = nr == R && kr[i0 + R - 1] == kr[i0] + R - 1 && logits->nb[1] == N * sizeof(float);
+        if (direct) {
+            float * o = (float *) ((char *) logits->data + kr[i0] * logits->nb[1]);
+            dctx->flush(o, (size_t) R * N * sizeof(float));
+            out[k->output("out")] = axera_io(dctx, o, (uint32_t) (R * N * sizeof(float)));
+            k->run(in, out, "output head");
+            dctx->invalidate(o, (size_t) R * N * sizeof(float));
+            dctx->clean_p     = o;
+            dctx->clean_n     = (size_t) R * N * sizeof(float);
+            dctx->clean_epoch = axera_graph_epoch;
+            continue;
+        }
         out[k->output("out")] = axera_io(yk);
         k->run(in, out, "output head");
         yk->invalidate(yk->vir, (size_t) nr * N * sizeof(float));

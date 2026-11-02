@@ -166,24 +166,34 @@ class axera_pool {
             return;
         }
         {
-            std::lock_guard<std::mutex> l(mu);
-            job     = &fn;
-            total   = n;
-            next    = 0;
-            pending = workers.size();
+            std::unique_lock<std::mutex> l(mu);
+            idle.wait(l, [&] { return active == 0; });  // (a worker woken late for the last job, still in it)
+            job      = &fn;
+            total    = n;
+            next     = 0;
+            finished = 0;
             ++gen;
         }
         cv.notify_all();
         work();
+        // the items done, not every worker awake: one waking late (the CPU idle between graphs) would add milliseconds
         std::unique_lock<std::mutex> l(mu);
-        done.wait(l, [&] { return pending == 0; });
-        job = nullptr;
+        done.wait(l, [&] { return finished == total; });
     }
 
   private:
     void work() {
+        int64_t k = 0;
         for (int64_t i; (i = next.fetch_add(1)) < total;) {
             (*job)(i);
+            ++k;
+        }
+        if (k > 0) {
+            std::lock_guard<std::mutex> l(mu);
+            finished += k;
+            if (finished == total) {
+                done.notify_one();
+            }
         }
     }
 
@@ -197,22 +207,24 @@ class axera_pool {
                     return;
                 }
                 seen = gen;
+                ++active;
             }
             work();
             std::lock_guard<std::mutex> l(mu);
-            if (--pending == 0) {
-                done.notify_one();
+            if (--active == 0) {
+                idle.notify_all();
             }
         }
     }
 
     std::vector<std::thread>             workers;
     std::mutex                           mu;
-    std::condition_variable              cv, done;
+    std::condition_variable              cv, done, idle;
     const std::function<void(int64_t)> * job = nullptr;
     std::atomic<int64_t>                 next{ 0 };
     int64_t                              total   = 0;
-    size_t                               pending = 0;
+    int64_t                              finished = 0;  // items done of this job
+    int                                  active   = 0;  // workers in a job
     uint64_t                             gen     = 0;
     bool                                 stop    = false;
 };
