@@ -330,6 +330,9 @@ void output_head::bind_draft(const kernel & dlm, const std::vector<int32_t> & id
 
 // a TOP_K of the draft head's single row: over its vocabulary's logits only (the others are -inf)
 static const output_head * top_k_draft = nullptr;
+// with a TOP_K in its sampler, a draft head writes no logits: the TOP_K writes those of its rows (here and in the
+// padded copy, which is not made) and nothing reads the others
+static float * draft_logits = nullptr;
 
 void output_head::bind_cpu(const ggml_tensor * output_weight) {
     k = nullptr;
@@ -436,18 +439,26 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         axera_timer   tf("lm_head (draft): logits");
         float *       o  = (float *) logits->data;
         const float * yv = (const float *) dy->vir;
-        std::fill(o, o + N, -INFINITY);
-        for (size_t i = 0; i < dids.size(); ++i) {
-            o[dids[i]] = yv[i];
+        bool          tk = false;
+        for (int i = 0; i < g->n_nodes && !tk; i++) {
+            tk = g->nodes[i]->op == GGML_OP_TOP_K && g->nodes[i]->ne[0] <= 64;
+        }
+        if (!tk) {
+            std::fill(o, o + N, -INFINITY);
+            for (size_t i = 0; i < dids.size(); ++i) {
+                o[dids[i]] = yv[i];
+            }
         }
         // (only the host reads them: no write-back, and none when they are read back this graph)
         dctx->clean_p     = o;
         dctx->clean_n     = N * sizeof(float);
         dctx->clean_epoch = axera_graph_epoch;
         tf.stop();
-        top_k_draft = this;
+        top_k_draft  = this;
+        draft_logits = tk ? o : nullptr;
         after(g, names);
-        top_k_draft = nullptr;
+        top_k_draft  = nullptr;
+        draft_logits = nullptr;
         return;
     }
     draft = false;
@@ -560,6 +571,8 @@ void output_head::after(ggml_cgraph * g, const graph_names & names) {
             axera_timer tk("sampler: top_k (host)");
             top_k_rows(n);
             i0 = i + 1;
+        } else if (n->op == GGML_OP_PAD && i == i0 && draft_logits) {  // (the TOP_K writes the rows it picks)
+            i0 = i + 1;
         } else if (n->op == GGML_OP_PAD && i == i0 && pad_rows(n)) {  // (the sampler's padded logits: a copy)
             i0 = i + 1;
         }
@@ -634,6 +647,10 @@ void top_k_rows(ggml_tensor * n) {
         int32_t * o = (int32_t *) n->data;
         for (int64_t j = 0; j < K; ++j) {
             o[j] = ids[all[j]];
+            if (draft_logits) {  // the picked rows' logits, in the logits and their padded copy
+                draft_logits[ids[all[j]]]          = y[all[j]];
+                ((float *) src->data)[ids[all[j]]] = y[all[j]];
+            }
         }
         if (K > 1) {
             std::swap(o[0], o[1]);
