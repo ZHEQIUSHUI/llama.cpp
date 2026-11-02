@@ -7,7 +7,11 @@
 //   prefill  per page of 256 cells, layer by layer: role prefill.gdn or prefill.attn (one layer, 256 rows), then
 //            role prefill.moe (the layer's experts, 256 rows); their weights are the decode banks' slices of the
 //            layer. A batch that starts inside a page restarts at the page's first cell from the recurrent state
-//            saved there, with the page's earlier inputs (kept) before its own
+//            saved there, with the page's earlier inputs (kept) before its own.
+//            With roles prefill.gdn_moe / prefill.attn_moe, moe.slots and moe.combine instead: up to 8 pages at a time,
+//            layer by layer: each page through the layer's attention, router, top-8 and shared expert, then the pages'
+//            routed experts at once (picks grouped by expert into slots: moe.slots, then moe.combine adds them to each
+//            row's base), so a layer's experts are read once per 8 pages instead of once per page
 // The state is this adapter's (the decode kernel's banks): KV cache paged [10][64 pages][K, V][256][2 x 256] bf16,
 // delta-net states [30][32][128][128] f32, conv states q / k [30][3][2048], v [30][3][4096] bf16 (value heads in HF
 // order). The prefill kernels write the recurrent states to a second set, the two swapped after each page. One
@@ -17,6 +21,7 @@
 #include "../../core/quant.h"
 #include "../../ops/ops.h"
 
+#include <array>
 #include <cmath>
 #include <regex>
 
@@ -106,9 +111,36 @@ class qwen35_35b_a3b final : public model {
     std::vector<int32_t>     page_p;  // [cells][4]
     output_head              head;
 
+    // the fused prefill (roles prefill.gdn_moe / prefill.attn_moe, moe.slots, moe.combine): per layer and state parity
+    // (0: the current recurrent states in, the second set out; 1 the reverse) its call, the IO entries rebound per page
+    struct fcall : call {
+        struct at {
+            bool out = false;
+            int  i   = -1;
+        };
+        at x, h2, base, ti, tw;  // the per-page IO entries
+        AX_ENGINE_IO_BUFFER_T & operator[](const at & a) { return a.out ? out[a.i] : in[a.i]; }
+    };
+    bool                     fused = false;
+    std::vector<fcall>       pre_f[2];
+    std::vector<std::array<AX_ENGINE_IO_BUFFER_T, 4>> exp_w;  // per layer: e_gw, e_gs, e_dw, e_ds (bank slices)
+    const kernel *           slots_k = nullptr, *comb_k = nullptr;
+    axera_cmm                FPOS, XS, H2S, BASES, AOUT, TKI, TKW, SOUT, SLOTE, SLOTT, SLOTW, SNS, SGR, LOC, NTOK;
+
     void         init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
+    void         init_fused();
+    void         prefill_fused(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0);
+    void         experts(int il, int nt);
+    void         snap_layer(int il, int set);
     void         fill(const std::map<std::string, ggml_tensor *> & t, const kernel & dk, const rope & rp);
     axera_cmm &  B(const std::string & n) { return banks.at(n); }
+    // entry idx of a bank (a layer's slice: [10 blocks] of a phase's, [30] of the delta-net states)
+    AX_ENGINE_IO_BUFFER_T slice(const std::string & bank, int idx, uint32_t bytes) {
+        const axera_cmm & c = B(bank);
+        const size_t      n = bank.find("state_in") != std::string::npos ? 3 * NB : NB;
+        GGML_ASSERT(c->size % n == 0 && c->size / n == bytes);
+        return axera_io(c.get(), (char *) c->vir + (size_t) idx * bytes, bytes);
+    }
     void         states_swap();
     void         zero_state();
     void         save_state(int64_t cell);
@@ -423,12 +455,6 @@ void qwen35_35b_a3b::init(const std::map<std::string, ggml_tensor *> & t, const 
     dec.out.push_back(axera_io(DOUT, dk.out_bytes("output")));
 
     // prefill: per layer, the slices of the decode banks of its phase and block
-    auto slice = [&](const std::string & bank, int idx, uint32_t bytes) {
-        const axera_cmm & c = B(bank);
-        const size_t      n = bank.find("state_in") != std::string::npos ? 3 * NB : NB;
-        GGML_ASSERT(c->size % n == 0 && c->size / n == bytes);
-        return axera_io(c.get(), (char *) c->vir + (size_t) idx * bytes, bytes);
-    };
     pre_attn.assign(L, {});
     pre_moe.assign(L, {});
     for (int il = 0; il < L; ++il) {
@@ -487,6 +513,10 @@ void qwen35_35b_a3b::init(const std::map<std::string, ggml_tensor *> & t, const 
         }
         m.out.push_back(axera_io(PX, mk.desc->out[0].bytes));
     }
+    fused = man.has("prefill.gdn_moe") && man.has("prefill.attn_moe") && man.has("moe.slots") && man.has("moe.combine");
+    if (fused) {
+        init_fused();
+    }
     size_t bb = 0;
     for (const auto & [n, b] : banks) {
         bb += b->size;
@@ -518,6 +548,12 @@ void qwen35_35b_a3b::states_swap() {
         for (auto & c : pre_attn) {
             rebind(c.in);
             rebind(c.out);
+        }
+        for (auto & v : pre_f) {
+            for (auto & c : v) {
+                rebind(c.in);
+                rebind(c.out);
+            }
         }
     }
 }
@@ -557,6 +593,346 @@ void qwen35_35b_a3b::load_state() {
     }
 }
 
+// the fused prefill's calls: per layer and state parity the layer kernel's IO (the decode banks' slices of the layer, its
+// recurrent states in the set of the parity and out to the other), the routed experts' bank slices, the group buffers
+void qwen35_35b_a3b::init_fused() {
+    const kernel & gk = man.get("prefill.gdn_moe");
+    const kernel & ak = man.get("prefill.attn_moe");
+    slots_k           = &man.get("moe.slots");
+    comb_k            = &man.get("moe.combine");
+    const size_t xr   = (size_t) H * sizeof(ggml_bf16_t);  // bytes per row
+    const size_t NR   = comb_k->in_bytes("base") / xr;     // rows of a group
+    const size_t K    = gk.out_bytes("topk_i") / (PG * sizeof(int32_t));
+    GGML_ASSERT(NR % PG == 0 && slots_k->in_bytes("h2") == NR * xr && comb_k->out_bytes("out") == NR * xr &&
+                comb_k->in_bytes("loc") == K * NR * sizeof(int32_t) && gk.out_bytes("topk_w") == PG * K * sizeof(float));
+    XS    = axera_cmm_alloc(NR * xr);
+    H2S   = axera_cmm_alloc(NR * xr);
+    BASES = axera_cmm_alloc(NR * xr);
+    AOUT  = axera_cmm_alloc(PG * xr);
+    TKI   = axera_cmm_alloc(NR * K * sizeof(int32_t));
+    TKW   = axera_cmm_alloc(NR * K * sizeof(float));
+    // slot rows: the combine kernel's, and one slots call's past them (a call's output is a whole window)
+    SOUT          = axera_cmm_alloc(comb_k->in_bytes("sout") + slots_k->out_bytes("out"));
+    const int NCL = (int) (2 * comb_k->in_bytes("sout") / slots_k->out_bytes("out") + 4);  // slots calls per layer, at most
+    SLOTE         = axera_cmm_alloc((size_t) NCL * slots_k->in_bytes("slot_exp"));
+    SLOTT         = axera_cmm_alloc((size_t) NCL * slots_k->in_bytes("slot_tok"));
+    SLOTW         = axera_cmm_alloc((size_t) NCL * slots_k->in_bytes("rw"));
+    SNS           = axera_cmm_alloc((size_t) NCL * sizeof(int32_t));
+    SGR           = axera_cmm_alloc((size_t) NCL * sizeof(int32_t));
+    LOC           = axera_cmm_alloc(comb_k->in_bytes("loc"));
+    NTOK          = axera_cmm_alloc(sizeof(int32_t));
+
+    auto state = [&](const std::string & in, int il, int set, uint32_t bytes) {  // a delta-net state slice of set 0 / 1
+        if (set == 0) {
+            return slice("b0_attn_" + in, ord[il], bytes);
+        }
+        const axera_cmm & s2 = in == "state_in" ? ST2 : in == "q_conv_state_in" ? CQ2 : in == "k_conv_state_in" ? CK2 : CV2;
+        return axera_io(s2.get(), (char *) s2->vir + (size_t) ord[il] * bytes, bytes);
+    };
+    for (int par = 0; par < 2; ++par) {
+        pre_f[par].assign(L, {});
+        for (int il = 0; il < L; ++il) {
+            const int         phase = il % 4, blk = il / 4;
+            const std::string pa = "b" + std::to_string(phase) + "_attn_", pm = "b" + std::to_string(phase) + "_moe_";
+            fcall &           c = pre_f[par][il];
+            c.k                 = phase == 3 ? &ak : &gk;
+            auto bind = [&](const io_desc & d, bool out) {
+                const std::string &                 n = d.name;
+                std::vector<AX_ENGINE_IO_BUFFER_T> & v = out ? c.out : c.in;
+                const fcall::at                     here{ out, (int) v.size() };
+                const bool st_in  = n == "state_in" || (n.size() > 9 && n.compare(n.size() - 9, 9, "_state_in") == 0);
+                const bool st_out = n == "state_out" || (n.size() > 10 && n.compare(n.size() - 10, 10, "_state_out") == 0);
+                if (n == "x") {
+                    c.x = here;
+                    v.push_back(axera_io(XS, PG * xr));
+                } else if (n == "h2" || n == "base") {
+                    (n == "h2" ? c.h2 : c.base) = here;
+                    v.push_back(axera_io(n == "h2" ? H2S : BASES, PG * xr));
+                } else if (n == "topk_i" || n == "topk_w") {
+                    (n == "topk_i" ? c.ti : c.tw) = here;
+                    v.push_back(axera_io(n == "topk_i" ? TKI : TKW, d.bytes));
+                } else if (n == "output" || n == "residual_out") {  // the attention's own output: unused
+                    v.push_back(axera_io(AOUT, d.bytes));
+                } else if (st_in) {
+                    v.push_back(state(n, il, par, d.bytes));
+                } else if (st_out) {  // (an output the kernel writes in place, declared as either)
+                    v.push_back(state(n.substr(0, n.size() - 4) + "_in", il, 1 - par, d.bytes));
+                } else if (out) {
+                    GGML_ABORT("axera qwen35_35b_a3b: %s: unexpected output %s\n", c.k->desc->role.c_str(), n.c_str());
+                } else if (n == "position_ids") {  // (its own: the fused attention takes 3 M-RoPE axes)
+                    if (!FPOS) {
+                        FPOS = axera_cmm_alloc(d.bytes);
+                    }
+                    GGML_ASSERT(FPOS->size == d.bytes);
+                    v.push_back(axera_io(FPOS, d.bytes));
+                } else if (n == "valid_tokens") {
+                    v.push_back(axera_io(VALID, d.bytes));
+                } else if (n == "indptr" || n == "indices" || n == "cache_location") {
+                    v.push_back(axera_io(n == "indptr" ? INDPTR : n == "indices" ? INDICES : CLOC, d.bytes));
+                } else if (n.find("scale2") != std::string::npos) {
+                    v.push_back(axera_io(ONES, d.bytes));
+                } else if (n.rfind("w_zeropoint_", 0) == 0) {
+                    v.push_back(axera_io(ZERO, d.bytes));
+                } else if (n == "paged_kv_cache") {
+                    v.push_back(slice("b3_kv", ord[il], d.bytes));
+                } else if (n == "cos_sin_cache") {
+                    v.push_back(axera_io(B("b3_attn_cos_sin_cache"), d.bytes));
+                } else if (n == "moe_input_norm_w" || (phase == 3 && n == "input_norm_w")) {  // the post-attention norm
+                    v.push_back(slice(pm + "input_norm_w", blk, d.bytes));
+                } else if (n.find("shared_expert") != std::string::npos || n.find("route") != std::string::npos) {
+                    v.push_back(slice(pm + n, blk, d.bytes));
+                } else {
+                    static const std::map<std::string, std::string> A = { { "x_norm_w", "w_norm_attn" }, { "q_norm_w", "w_norm_q" },
+                                                                           { "k_norm_w", "w_norm_k" } };
+                    v.push_back(slice(pa + (A.count(n) ? A.at(n) : n), blk, d.bytes));
+                }
+            };
+            for (const auto & d : c.k->desc->in) {
+                bind(d, false);
+            }
+            for (const auto & d : c.k->desc->out) {
+                bind(d, true);
+            }
+            GGML_ASSERT(c.x.i >= 0 && c.h2.i >= 0 && c.base.i >= 0 && c.ti.i >= 0 && c.tw.i >= 0);
+        }
+    }
+    exp_w.assign(L, {});
+    for (int il = 0; il < L; ++il) {
+        const std::string pm = "b" + std::to_string(il % 4) + "_moe_";
+        exp_w[il] = { slice(pm + "w_gate", il / 4, slots_k->in_bytes("e_gw")), slice(pm + "w_scale_gate", il / 4, slots_k->in_bytes("e_gs")),
+                      slice(pm + "w_down", il / 4, slots_k->in_bytes("e_dw")), slice(pm + "w_scale_down", il / 4, slots_k->in_bytes("e_ds")) };
+    }
+}
+
+// layer il's recurrent state, in set 0 (the current one) or 1, into the restart point (as save_state would)
+void qwen35_35b_a3b::snap_layer(int il, int set) {
+    size_t o = 0;
+    for (auto [n, s2] : std::initializer_list<std::pair<const char *, axera_cmm *>>{
+             { "b0_attn_state_in", &ST2 }, { "b0_attn_q_conv_state_in", &CQ2 }, { "b0_attn_k_conv_state_in", &CK2 },
+             { "b0_attn_v_conv_state_in", &CV2 } }) {
+        const axera_cmm & c  = set == 0 ? B(n) : *s2;
+        const size_t      lb = c->size / (3 * NB), lo = (size_t) ord[il] * lb;
+        c->invalidate((char *) c->vir + lo, lb);
+        memcpy(snap.data() + o + lo, (const char *) c->vir + lo, lb);
+        o += c->size;
+    }
+}
+
+// prefill with the fused kernels: groups of up to NR rows (pages) from cell c0 (a page's first), each layer by layer:
+// its pages through the layer kernel (the states alternating between the two sets page by page), then its experts
+void qwen35_35b_a3b::prefill_fused(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0) {
+    GGML_ASSERT(c0 % PG == 0 && c0 + n <= man.context);
+    const size_t xr = (size_t) H * sizeof(ggml_bf16_t);
+    const int    NR = (int) (XS->size / xr);
+    for (int g0 = 0; g0 < n; g0 += NR) {
+        const int  rows = std::min(NR, n - g0), np = (rows + PG - 1) / PG, vl = rows - (np - 1) * PG;
+        const bool part = vl < PG;  // (the last group's last page only)
+        memcpy(XS->vir, x + (size_t) g0 * H, rows * xr);
+        memset((char *) XS->vir + rows * xr, 0, ((size_t) np * PG - rows) * xr);
+        XS->flush(XS->vir, (size_t) np * PG * xr);
+        axera_timer tg("prefill (group)");
+        for (int il = 0; il < L; ++il) {
+            for (int p = 0; p < np; ++p) {
+                const int     r0 = g0 + p * PG, v = p == np - 1 ? vl : PG;
+                const int64_t cell = c0 + r0;
+                if (part && p == np - 1 && il % 4 != 3) {  // the state before a partial page: a later batch restarts there
+                    snap_layer(il, p % 2);
+                }
+                if (il % 4 == 3) {  // the attention's positions, all its axes (padding 0)
+                    auto *    pp = (int32_t *) FPOS->vir;
+                    const int ax = (int) (FPOS->size / (PG * sizeof(int32_t)));
+                    GGML_ASSERT(ax <= 4);
+                    for (int s = 0; s < ax; ++s) {
+                        for (int r = 0; r < PG; ++r) {
+                            pp[s * PG + r] = r < v ? p4[(size_t) (r0 + r) * 4 + s] : 0;
+                            // (an index out of the kernel's tables hangs the NPU: stop here instead)
+                            GGML_ASSERT(pp[s * PG + r] >= 0 && pp[s * PG + r] < man.context);
+                        }
+                    }
+                    FPOS->flush();
+                }
+                paging(cell, cell);
+                *(int32_t *) VALID->vir = v;
+                VALID->flush();
+                fcall &      c  = pre_f[p % 2][il];
+                const size_t xo = (size_t) p * PG * xr, to = (size_t) p * PG * (TKI->size / NR);
+                c[c.x]          = axera_io(XS.get(), (char *) XS->vir + xo, (uint32_t) (PG * xr));
+                c[c.h2]         = axera_io(H2S.get(), (char *) H2S->vir + xo, (uint32_t) (PG * xr));
+                c[c.base]       = axera_io(BASES.get(), (char *) BASES->vir + xo, (uint32_t) (PG * xr));
+                c[c.ti]         = axera_io(TKI.get(), (char *) TKI->vir + to, (uint32_t) (PG * (TKI->size / NR)));
+                c[c.tw]         = axera_io(TKW.get(), (char *) TKW->vir + to, (uint32_t) (PG * (TKW->size / NR)));
+                axera_timer ta(il % 4 == 3 ? "prefill: attn_moe (page, layer)" : "prefill: gdn_moe (page, layer)");
+                c.k->run(c.in, c.out, il % 4 == 3 ? "prefill attn_moe" : "prefill gdn_moe");
+            }
+            experts(il, rows);
+            static const bool chk = getenv("GGML_AXERA_FUSED_CHECK") != nullptr;  // debug: each layer's output rows
+            if (chk) {
+                auto stat = [&](const axera_cmm & b, const char * nm) {
+                    b->invalidate(b->vir, rows * xr);
+                    const ggml_bf16_t * s = (const ggml_bf16_t *) b->vir;
+                    float mx = 0; int64_t bad = 0;
+                    for (int64_t i = 0; i < (int64_t) rows * H; ++i) {
+                        const float f = ggml_bf16_to_fp32(s[i]);
+                        if (!std::isfinite(f)) { bad++; } else { mx = std::max(mx, std::fabs(f)); }
+                    }
+                    fprintf(stderr, "axera fused: layer %d %s: max |x| %g, %lld non-finite\n", il, nm, mx, (long long) bad);
+                    return bad;
+                };
+                stat(H2S, "h2"); stat(BASES, "base");
+                if (stat(XS, "out")) {
+                    GGML_ABORT("axera fused: layer %d: non-finite output\n", il);
+                }
+            }
+        }
+        if (np % 2) {  // the last page's states in the second set
+            states_swap();
+        }
+        tg.stop();
+        XS->invalidate(XS->vir, rows * xr);
+        const int a = std::max(0, out0 - g0);
+        if (a < rows) {
+            axera_host_pool().run(rows - a, [&](int64_t i) {
+                const int r = a + (int) i;
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) XS->vir + (size_t) r * H, h.data() + (size_t) (g0 + r - out0) * H, H);
+            });
+        }
+        if (part) {  // the page's inputs so far: a later batch restarts the page with them
+            snap_cell = c0 + g0 + (np - 1) * PG;
+            page_x.assign(x + (size_t) (g0 + (np - 1) * PG) * H, x + (size_t) (g0 + rows) * H);
+            page_p.assign(p4 + (size_t) (g0 + (np - 1) * PG) * 4, p4 + (size_t) (g0 + rows) * 4);
+        } else if (g0 + rows == n) {  // a full last page: the next page starts clean
+            save_state(c0 + n);
+        }
+    }
+}
+
+// layer il's routed experts for the group's first nt rows: their top-K (ids, normalized weights) grouped by expert into
+// slots of G rows (experts with more than 64 picks in slots of 128 rows), the slots calls (a call: up to its window
+// of rows), then the combine kernel adds every row's K slot rows to its base: the next layer's input, in XS
+void qwen35_35b_a3b::experts(int il, int nt) {
+    axera_timer   tr("prefill: moe route (host)");
+    const size_t  NR = XS->size / ((size_t) H * sizeof(ggml_bf16_t));
+    const int     K = (int) (TKI->size / (NR * sizeof(int32_t))), NE = 256, G1 = 64, G2 = 128;
+    const int     SW = (int) (slots_k->out_bytes("out") / ((size_t) H * sizeof(ggml_bf16_t)));  // rows per slots call
+    const int     SM = (int) (slots_k->in_bytes("slot_exp") / sizeof(int32_t));                 // slots per call, at most
+    const int     GM = (int) (slots_k->in_bytes("slot_tok") / (SM * sizeof(int32_t)));          // rows per slot, at most
+    const int64_t SR = comb_k->in_bytes("sout") / ((int64_t) H * sizeof(ggml_bf16_t));          // slot rows
+    GGML_ASSERT(GM >= G2 && SW % G2 == 0);
+    TKI->invalidate(TKI->vir, (size_t) nt * K * sizeof(int32_t));
+    TKW->invalidate(TKW->vir, (size_t) nt * K * sizeof(float));
+    const int32_t * ids = (const int32_t *) TKI->vir;
+    const float *   wts = (const float *) TKW->vir;
+    // picks grouped by expert (counting sort, row order within an expert)
+    std::vector<int> cnt(NE, 0), first(NE + 1, 0), order((size_t) nt * K);
+    for (int pk = 0; pk < nt * K; ++pk) {
+        GGML_ASSERT(ids[pk] >= 0 && ids[pk] < NE);
+        cnt[ids[pk]]++;
+    }
+    for (int e = 0; e < NE; ++e) {
+        first[e + 1] = first[e] + cnt[e];
+    }
+    {
+        std::vector<int> f(first.begin(), first.end() - 1);
+        for (int pk = 0; pk < nt * K; ++pk) {
+            order[f[ids[pk]]++] = pk;
+        }
+    }
+    // two regions of slots (G2 first), each region's slots in calls of up to min(SM, SW / G) slots
+    struct region {
+        int G = 0, ns = 0, per = 0, call0 = 0, ncall = 0;
+        int64_t row0 = 0;
+    } rg[2];
+    std::vector<char> big(NE, 0);
+    std::vector<int>  slot0(NE, 0);
+    for (int pass = 0; pass < 2; ++pass) {  // pass 1: no G2 slots (pass 0's rows over the combine kernel's)
+        rg[0] = { G2 };
+        rg[1] = { G1 };
+        for (int e = 0; e < NE; ++e) {
+            big[e]   = pass == 0 && cnt[e] > G1;
+            region & r = rg[big[e] ? 0 : 1];
+            slot0[e] = r.ns;
+            r.ns += (cnt[e] + r.G - 1) / r.G;
+        }
+        rg[1].row0 = (int64_t) rg[0].ns * G2;
+        if (rg[1].row0 + (int64_t) rg[1].ns * G1 <= SR) {
+            break;
+        }
+        GGML_ASSERT(pass == 0 && "axera qwen35_35b_a3b: a layer's expert slots exceed the combine kernel's rows");
+    }
+    int ncall = 0;
+    for (region & r : rg) {
+        r.per   = std::min(SM, SW / r.G);
+        r.call0 = ncall;
+        r.ncall = (r.ns + r.per - 1) / r.per;
+        ncall += r.ncall;
+    }
+    GGML_ASSERT((size_t) ncall * sizeof(int32_t) <= SNS->size);
+    const size_t te = slots_k->in_bytes("slot_exp"), tt = slots_k->in_bytes("slot_tok"), tw = slots_k->in_bytes("rw");
+    memset(SLOTE->vir, 0, ncall * te);  // padding: expert 0, row 0, weight 0
+    memset(SLOTT->vir, 0, ncall * tt);
+    memset(SLOTW->vir, 0, ncall * tw);
+    auto * se  = (int32_t *) SLOTE->vir;
+    auto * st  = (int32_t *) SLOTT->vir;
+    auto * sw  = (float *) SLOTW->vir;
+    auto * loc = (int32_t *) LOC->vir;  // [K][NR]
+    for (const region & r : rg) {
+        for (int c = 0; c < r.ncall; ++c) {
+            ((int32_t *) SNS->vir)[r.call0 + c] = std::min(r.per, r.ns - c * r.per);
+            ((int32_t *) SGR->vir)[r.call0 + c] = r.G;
+        }
+    }
+    axera_host_pool().run(NE, [&](int64_t e) {
+        const region & r = rg[big[e] ? 0 : 1];
+        for (int j = 0; j < cnt[e]; ++j) {
+            const int sl = slot0[e] + j / r.G, gg = j % r.G, pk = order[first[e] + j];
+            const int ci = r.call0 + sl / r.per, js = sl % r.per;
+            se[(size_t) ci * SM + js]                   = (int32_t) e;
+            st[((size_t) ci * SM + js) * GM + gg]       = pk / K;
+            sw[((size_t) ci * SM + js) * GM + gg]       = wts[pk];
+            loc[(size_t) (pk % K) * NR + pk / K]        = (int32_t) (r.row0 + (int64_t) sl * r.G + gg);
+        }
+    });
+    SLOTE->flush(SLOTE->vir, ncall * te);
+    SLOTT->flush(SLOTT->vir, ncall * tt);
+    SLOTW->flush(SLOTW->vir, ncall * tw);
+    SNS->flush(SNS->vir, ncall * sizeof(int32_t));
+    SGR->flush(SGR->vir, ncall * sizeof(int32_t));
+    LOC->flush();
+    *(int32_t *) NTOK->vir = nt;
+    NTOK->flush();
+    tr.stop();
+    const kernel &                     sk = *slots_k;
+    std::vector<AX_ENGINE_IO_BUFFER_T> in(sk.info->nInputSize), out(sk.info->nOutputSize);
+    in[sk.input("h2")]   = axera_io(H2S);
+    in[sk.input("e_gw")] = exp_w[il][0];
+    in[sk.input("e_gs")] = exp_w[il][1];
+    in[sk.input("e_dw")] = exp_w[il][2];
+    in[sk.input("e_ds")] = exp_w[il][3];
+    for (const region & r : rg) {
+        for (int c = 0; c < r.ncall; ++c) {
+            const int     ci = r.call0 + c;
+            const int64_t o  = r.row0 + (int64_t) c * r.per * r.G;  // the call's first slot row
+            in[sk.input("slot_exp")]   = axera_io(SLOTE.get(), (char *) SLOTE->vir + ci * te, (uint32_t) te);
+            in[sk.input("slot_tok")]   = axera_io(SLOTT.get(), (char *) SLOTT->vir + ci * tt, (uint32_t) tt);
+            in[sk.input("rw")]         = axera_io(SLOTW.get(), (char *) SLOTW->vir + ci * tw, (uint32_t) tw);
+            in[sk.input("nslots")]     = axera_io(SNS.get(), (int32_t *) SNS->vir + ci, sizeof(int32_t));
+            in[sk.input("group_rows")] = axera_io(SGR.get(), (int32_t *) SGR->vir + ci, sizeof(int32_t));
+            out[sk.output("out")]      = axera_io(SOUT.get(), (char *) SOUT->vir + o * H * sizeof(ggml_bf16_t), sk.out_bytes("out"));
+            axera_timer ts("prefill: moe slots");
+            sk.run(in, out, "prefill moe slots");
+        }
+    }
+    const kernel &                     ck = *comb_k;
+    std::vector<AX_ENGINE_IO_BUFFER_T> ci(ck.info->nInputSize), co(ck.info->nOutputSize);
+    ci[ck.input("base")]    = axera_io(BASES);
+    ci[ck.input("loc")]     = axera_io(LOC);
+    ci[ck.input("sout")]    = axera_io(SOUT, ck.in_bytes("sout"));
+    ci[ck.input("ntokens")] = axera_io(NTOK);
+    co[ck.output("out")]    = axera_io(XS);
+    axera_timer tc("prefill: moe combine");
+    ck.run(ci, co, "prefill moe combine");
+}
+
 // the history before the token(s) written from cell write_cell: hist cells in whole pages and a last one
 void qwen35_35b_a3b::paging(int64_t hist, int64_t write_cell) {
     const int64_t pages          = (hist + PG - 1) / PG;
@@ -573,6 +949,10 @@ void qwen35_35b_a3b::paging(int64_t hist, int64_t write_cell) {
 // prefill pages from cell c0 (a page's first): n rows x [n][H] bf16, their positions p4 [n][4]; the hidden states of
 // the rows from out0 on into h
 void qwen35_35b_a3b::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0) {
+    if (fused) {
+        prefill_fused(c0, n, x, p4, h, out0);
+        return;
+    }
     GGML_ASSERT(c0 % PG == 0 && c0 + n <= man.context);
     for (int r0 = 0; r0 < n; r0 += PG) {
         const int     v    = std::min(PG, n - r0);
