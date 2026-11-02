@@ -19,10 +19,26 @@ Common params:
 
 ## Qwen3-TTS
 
-Available params:
-- `--tts-lang` can be `zh`, `en`, `de`, `it`, `pt`, `es`, `ja`, `ko`, `fr`, `ru` (default: `en`)
-- `--tts-speaker-file` should point to a speaker reference audio file (wav, mp3)
-- `--tts-ref-text` is the transcript of `--tts-speaker-file`; when given, enables full ICL voice cloning (reference text and codec codes are placed in the talker prompt)
+The model type is read from the talker GGUF metadata. Available prompt options
+depend on the variant:
+
+- Base: `--tts-speaker-file` points to a speaker reference audio file (wav,
+  mp3). `--tts-ref-text` is its transcript; when given, it enables full ICL
+  voice cloning (reference text and codec codes are placed in the talker
+  prompt).
+- CustomVoice: `--tts-speaker <name>` selects one of the built-in speakers
+  (`aiden`, `dylan`, `eric`, `ono_anna`, `ryan`, `serena`, `sohee`, `uncle_fu`,
+  `vivian`). `--tts-instruct "<style>"` is optional, except that the 0.6B
+  CustomVoice model ignores it, as in the official API.
+- VoiceDesign: `--tts-instruct "<voice description>"` is required.
+
+Common params:
+- `--tts-lang` can be `auto`, `zh`, `en`, `de`, `it`, `pt`, `es`, `ja`, `ko`,
+  `fr`, `ru` (default: `auto` for CustomVoice/VoiceDesign, `en` for Base).
+  `auto` uses the official `nothink` prompt; `dylan` and `eric` select the
+  Beijing and Sichuan dialect language ids for Chinese/auto.
+- `--temp 0 --top-k 1` requests greedy decoding for both the talker and the
+  code predictor.
 
 Example usage:
 
@@ -42,6 +58,25 @@ llama-tts -m qwen3-tts.gguf -mm mmproj-qwen3-tts.gguf \
     --tts-lang english \
     --tts-speaker-file speaker.wav \
     --tts-ref-text "This is the reference transcript." \
+    --output out.wav
+```
+
+CustomVoice example:
+
+```sh
+llama-tts -m qwen3-tts-customvoice.gguf -mm mmproj-qwen3-tts-customvoice.gguf \
+    -p "Hello world" \
+    --tts-speaker vivian \
+    --tts-instruct "Speak in a warm, cheerful tone." \
+    --output out.wav
+```
+
+VoiceDesign example:
+
+```sh
+llama-tts -m qwen3-tts-voicedesign.gguf -mm mmproj-qwen3-tts-voicedesign.gguf \
+    -p "Hello world" \
+    --tts-instruct "A deep, warm male narrator voice, calm and measured." \
     --output out.wav
 ```
 
