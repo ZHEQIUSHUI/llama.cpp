@@ -89,11 +89,13 @@ axera_cmm qwen3::bank(const std::map<std::string, ggml_tensor *> & t, const io_d
     GGML_ASSERT(d.bytes % nb == 0);
     axera_cmm    c  = axera_cmm_alloc(d.bytes);
     const size_t bb = d.bytes / nb;  // bytes per block
+    std::vector<const ggml_tensor *> read;  // the GGUF tensors read: their mapped pages dropped when the bank is done
     auto         T  = [&](int il, const char * g) -> ggml_tensor * {
         const std::string nm = "blk." + std::to_string(il) + "." + g;
         if (!t.count(nm)) {
             GGML_ABORT("axera qwen3: %s not in the graph\n", nm.c_str());
         }
+        read.push_back(t.at(nm));
         return t.at(nm);
     };
     for (int b = 0; b < nb; ++b) {
@@ -171,6 +173,9 @@ axera_cmm qwen3::bank(const std::map<std::string, ggml_tensor *> & t, const io_d
         }
     }
     c->flush();
+    for (const ggml_tensor * w : read) {
+        axera_drop_mapped(w);
+    }
     return c;
 }
 
@@ -257,10 +262,21 @@ void qwen3::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tens
         const std::vector<float> fn = head_in ? f32_of(t.at("output_norm.weight")) : std::vector<float>(H, 1.0f);
         ggml_fp32_to_bf16_row(fn.data(), (ggml_bf16_t *) FNORM->vir, H);
         FNORM->flush();
+        std::vector<std::string> packs;
+        for (const auto & d : dk->desc->in) {
+            if (dk->desc->packs.count(d.name)) {
+                packs.push_back(d.name);
+            }
+        }
+        const std::vector<const axera_cmm *> built = prm.pack_all(t, *dk->desc, packs, 0);
+        std::map<std::string, const axera_cmm *> by_name;
+        for (size_t i = 0; i < packs.size(); ++i) {
+            by_name[packs[i]] = built[i];
+        }
         for (const auto & d : dk->desc->in) {
             const std::string & n = d.name;
             if (dk->desc->packs.count(n)) {
-                dec.in.push_back(axera_io(prm.pack(t, *dk->desc, n, 0), d.bytes));
+                dec.in.push_back(axera_io(*by_name.at(n), d.bytes));
                 continue;
             }
             const axera_cmm * b = n == "x" ? &DX : n == "cs" ? &CS : n == "pn" ? &PN : n == "mask" ? &MASK : n == "kv" ? &KV :

@@ -346,7 +346,73 @@ const axera_cmm & params::pack(const std::map<std::string, ggml_tensor *> & t, c
     return packs[sig] = std::move(b);
 }
 
-void params::release(const std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> & live) {
+std::vector<const axera_cmm *> params::pack_all(const std::map<std::string, ggml_tensor *> & t, const kernel_desc & kd,
+                                                const std::vector<std::string> & names, int il0) {
+    std::vector<const axera_cmm *> out;
+    std::set<int>                  layers;
+    for (const std::string & name : names) {
+        std::string sig = std::to_string(il0) + " " + name + ":";
+        for (const auto & mb : kd.members) {
+            if (mb.pack == name) {
+                sig += mb.kind + "/" + mb.param + "@" + std::to_string(mb.layer) + " " + std::to_string(mb.offset) + " " +
+                       std::to_string(mb.bytes) + " " + std::to_string(mb.strip_w) + " " + std::to_string(mb.ranges.size()) + ";";
+                layers.insert(il0 + std::max(mb.layer, 0));
+            }
+        }
+        const size_t bytes = kd.packs.at(name);
+        auto         it    = packs.find(sig);
+        if (it != packs.end() && it->second->size >= bytes) {
+            out.push_back(&it->second);
+        } else {
+            auto & b = packs[sig];
+            b        = axera_cmm_alloc(bytes);  // zeroed
+            out.push_back(&b);
+        }
+    }
+    for (int il : layers) {
+        for (size_t i = 0; i < names.size(); ++i) {
+            auto b = out[i]->get();
+            for (const auto & mb : kd.members) {
+                if (mb.pack != names[i] || il0 + std::max(mb.layer, 0) != il) {
+                    continue;
+                }
+                const AX_ENGINE_IO_BUFFER_T src = get(t, il, mb.kind, mb.param);
+                if (!src.pVirAddr && mb.kind == "out") {  // (a whole-model group's logits are then not read)
+                    static std::once_flag once;
+                    std::call_once(once, [] { GGML_LOG_INFO("axera: no output head in the graph: the group's head members left zero\n"); });
+                    continue;
+                }
+                GGML_ASSERT(src.pVirAddr && src.nSize == mb.bytes && mb.offset + mb.bytes <= b->size);
+                char *       dst = (char *) b->vir + mb.offset;
+                const char * sp  = (const char *) src.pVirAddr;
+                if (mb.strip_w > 0) {
+                    const size_t es = mb.bytes / (size_t) (mb.strip_rows * mb.strip_cols);
+                    for (int64_t j = 0; j < mb.strip_cols / mb.strip_w; ++j) {
+                        for (int64_t r = 0; r < mb.strip_rows; ++r) {
+                            memcpy(dst + ((j * mb.strip_rows + r) * mb.strip_w) * es,
+                                   sp + (r * mb.strip_cols + j * mb.strip_w) * es, mb.strip_w * es);
+                        }
+                    }
+                } else if (!mb.ranges.empty()) {
+                    for (const auto & [x, y] : mb.ranges) {
+                        for (size_t r = 0; r < mb.blk_rows; ++r, dst += y - x) {
+                            memcpy(dst, sp + r * mb.blk_row_bytes + x, y - x);
+                        }
+                    }
+                } else {
+                    memcpy(dst, sp, mb.bytes);
+                }
+            }
+        }
+        release({}, false);
+    }
+    for (const axera_cmm * b : out) {
+        (*b)->flush();
+    }
+    return out;
+}
+
+void params::release(const std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> & live, bool log) {
     std::vector<const void *> used;
     for (const auto * io : live) {
         for (const auto & b : *io) {
@@ -397,11 +463,13 @@ void params::release(const std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> 
     for (const auto & b : exp_own) {
         ex += b->size;
     }
-    size_t cmm_free, cmm_total;
-    axera_cmm_memory(&cmm_free, &cmm_total);
-    GGML_LOG_INFO("axera: parameters: %.1f MiB freed (read only through packs); kept: packs %.1f MiB, direct %.1f MiB, "
-                  "expert copies %.1f MiB; CMM in use %.1f of %.1f MiB\n", freed / 1048576.0, pk / 1048576.0,
-                  kept / 1048576.0, ex / 1048576.0, (cmm_total - cmm_free) / 1048576.0, cmm_total / 1048576.0);
+    if (log) {
+        size_t cmm_free, cmm_total;
+        axera_cmm_memory(&cmm_free, &cmm_total);
+        GGML_LOG_INFO("axera: parameters: %.1f MiB freed (read only through packs); kept: packs %.1f MiB, direct %.1f MiB, "
+                      "expert copies %.1f MiB; CMM in use %.1f of %.1f MiB\n", freed / 1048576.0, pk / 1048576.0,
+                      kept / 1048576.0, ex / 1048576.0, (cmm_total - cmm_free) / 1048576.0, cmm_total / 1048576.0);
+    }
 }
 
 }  // namespace axera

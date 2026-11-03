@@ -602,6 +602,7 @@ std::pair<const ggml_backend_axera_buffer_context *, void *> qwen3_tts::bf16(con
                 to_bf16(a, rows, (ggml_bf16_t *) c->vir);
             }
             c->flush(c->vir, bytes);
+            axera_drop_mapped(root);
         }
         return { c.get(), c->vir };
     }
@@ -611,6 +612,7 @@ std::pair<const ggml_backend_axera_buffer_context *, void *> qwen3_tts::bf16(con
             c = axera_cmm_alloc(bytes);
             to_bf16(a, rows, (ggml_bf16_t *) c->vir);
             c->flush(c->vir, bytes);
+            axera_drop_mapped(a);
         }
         return { c.get(), c->vir };
     }
@@ -688,6 +690,7 @@ void qwen3_tts::conv(ggml_tensor * n, const ggml_tensor * ic, std::string name, 
             }
         });
         wk->flush(wk->vir, wk->size);
+        axera_drop_mapped(wt);
     }
     const size_t xb = (size_t) IC * L * sizeof(ggml_bf16_t);
     if (!tmp[1] || tmp[1]->size < xb) {
@@ -961,7 +964,8 @@ void qwen3_tts::frame_bind(ggml_cgraph * cgraph, const frame_io & fr) {
         } else if (d.name == "heads_hi") {  // the tables after heads_lo's
             fk.in[i] = axera_io(heads.first, (char *) heads.second + k.in_bytes("heads_lo"), d.bytes);
         } else if (k.desc->packs.count(d.name)) {
-            fk.in[i] = axera_io(prm.pack(names.t, *k.desc, d.name, 0), d.bytes);
+            // (the packs are built together below)
+            fk.in[i] = {};
         } else {
             const axera_cmm * b = d.name == "e0" ? &fk.E0 : d.name == "e1" ? &fk.E1 : d.name == "rnd" ? &fk.RND :
                                   d.name == "cs16" ? &fk.CS : d.name == "pn16" ? &fk.PN : d.name == "mask16" ? &fk.MASK :
@@ -970,6 +974,22 @@ void qwen3_tts::frame_bind(ggml_cgraph * cgraph, const frame_io & fr) {
                 GGML_ABORT("axera qwen3_tts: %s: unexpected input %s\n", k.desc->role.c_str(), d.name.c_str());
             }
             fk.in[i] = axera_io(*b, d.bytes);
+        }
+    }
+    std::vector<std::string> packs;
+    for (const auto & d : k.desc->in) {
+        if (k.desc->packs.count(d.name)) {
+            packs.push_back(d.name);
+        }
+    }
+    const std::vector<const axera_cmm *> built = prm.pack_all(names.t, *k.desc, packs, 0);
+    std::map<std::string, const axera_cmm *> by_name;
+    for (size_t i = 0; i < packs.size(); ++i) {
+        by_name[packs[i]] = built[i];
+    }
+    for (const auto & d : k.desc->in) {
+        if (k.desc->packs.count(d.name)) {
+            fk.in[k.input(d.name)] = axera_io(*by_name.at(d.name), d.bytes);
         }
     }
     fk.own.clear();

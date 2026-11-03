@@ -30,6 +30,7 @@ void to_bf16(const ggml_tensor * p, ggml_bf16_t * dst) {
         }
         ggml_fp32_to_bf16_row(f.data(), dst + r * K, K);
     });
+    axera_drop_mapped(p);
 }
 
 std::string base_name(const char * n) {  // the scheduler's copies "<backend>#<name>#<copy>" by <name>
@@ -121,6 +122,7 @@ void qwen3_asr::weights(const std::map<std::string, ggml_tensor *> & t, const ke
             }
             ggml_fp32_to_bf16_row(g.data(), d + o * K, K);
         });
+        axera_drop_mapped(wt);
     };
     auto copy = [&](ggml_bf16_t * d, const ggml_tensor * p) {
         to_bf16(p, d);

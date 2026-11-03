@@ -26,9 +26,15 @@ class params {
     const axera_cmm & pack(const std::map<std::string, ggml_tensor *> & t, const kernel_desc & kd, const std::string & pack,
                            int il0);
 
+    // several packs of one kernel, built layer by layer: each layer's converted parameters are freed once every
+    // pack has its members of that layer, so the load holds one layer's conversions, not all layers'
+    // (it frees every conversion no pack holds: call it before any kernel input points straight into a conversion)
+    std::vector<const axera_cmm *> pack_all(const std::map<std::string, ggml_tensor *> & t, const kernel_desc & kd,
+                                            const std::vector<std::string> & packs, int il0);
+
     // the converted parameters no IO in `live` points into, freed (the packs and the experts stay): once every
     // kernel is bound, those read only through packs
-    void release(const std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> & live);
+    void release(const std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> & live, bool log = true);
 
   private:
     const manifest & m;
