@@ -3,6 +3,7 @@
 #include "ggml-axera-impl.h"
 #include "core/manifest.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 
@@ -42,7 +43,16 @@ static void ggml_backend_axera_buffer_get_tensor(ggml_backend_buffer_t buffer, c
         ctx->flush(p, size);
         ctx->invalidate(p, size);
     }
-    memcpy(data, p, size);
+    if (size < (512u << 10)) {
+        memcpy(data, p, size);
+        return;
+    }
+    // (a verification's logits, 4 x 1 MB: one core copies at ~2 GB/s) in parts on the host workers
+    const size_t part = (size / 8 + 63) & ~(size_t) 63;
+    axera_host_pool().run(8, [&](int64_t i) {
+        const size_t b = std::min(size, (size_t) i * part), e = std::min(size, b + part);
+        memcpy((char *) data + b, p + b, e - b);
+    });
 }
 
 static bool ggml_backend_axera_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src,
