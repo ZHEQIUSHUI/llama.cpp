@@ -16,6 +16,14 @@
 #include <unordered_map>
 #include <map>
 #include <vector>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
@@ -664,6 +672,104 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// the largest value of x[0 .. n) (NaN ignored)
+static float max_of(const float * x, int n) {
+    float m = -INFINITY;
+    int   i = 0;
+#if defined(__ARM_NEON)
+    float32x4_t a0 = vdupq_n_f32(-INFINITY), a1 = a0, a2 = a0, a3 = a0;
+    for (; i + 16 <= n; i += 16) {
+        a0 = vmaxnmq_f32(a0, vld1q_f32(x + i));
+        a1 = vmaxnmq_f32(a1, vld1q_f32(x + i + 4));
+        a2 = vmaxnmq_f32(a2, vld1q_f32(x + i + 8));
+        a3 = vmaxnmq_f32(a3, vld1q_f32(x + i + 12));
+    }
+    m = vmaxnmvq_f32(vmaxnmq_f32(vmaxnmq_f32(a0, a1), vmaxnmq_f32(a2, a3)));
+#endif
+    for (; i < n; ++i) {
+        m = x[i] > m ? x[i] : m;
+    }
+    return m;
+}
+
+// the greedy fast path's argmax over a vocabulary row (1 MB for 248k tokens: one core reads it at ~2 GB/s): the
+// maximum in parts on a few persistent workers, then the first index holding it (as a strict > scan)
+struct argmax_pool {
+    static constexpr int     NW = 3;  // workers; the caller takes part 0
+    std::mutex               mu;
+    std::condition_variable  cv;
+    std::vector<std::thread> th;
+    const float *            x     = nullptr;
+    int                      n     = 0;
+    int64_t                  gen   = 0;
+    std::atomic<int>         left{ 0 };
+    float                    part[NW + 1];
+
+    argmax_pool() {
+        for (int w = 1; w <= NW; ++w) {
+            th.emplace_back([this, w] {
+                int64_t seen = 0;
+                for (;;) {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&] { return gen != seen; });
+                    seen = gen;
+                    lk.unlock();
+                    part[w] = run(w);
+                    left.fetch_sub(1, std::memory_order_release);
+                }
+            });
+            th.back().detach();
+        }
+    }
+    float run(int w) const {
+        const int per = (n + NW) / (NW + 1);
+        const int b = std::min(n, w * per), e = std::min(n, b + per);
+        return max_of(x + b, e - b);
+    }
+    llama_token argmax(const float * v, int nv, float * best_v) {
+        if (nv < 65536) {
+            const float m = max_of(v, nv);
+            *best_v = m;
+            for (int j = 0; j < nv && m > -INFINITY; ++j) {
+                if (v[j] == m) {
+                    return j;
+                }
+            }
+            return -1;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            x = v;
+            n = nv;
+            left.store(NW, std::memory_order_relaxed);
+            ++gen;
+        }
+        cv.notify_all();
+        part[0] = run(0);
+        while (left.load(std::memory_order_acquire) > 0) {
+        }
+        const int per = (nv + NW) / (NW + 1);
+        float     m   = -INFINITY;
+        int       w0  = -1;
+        for (int w = 0; w <= NW; ++w) {  // the first part holding the maximum
+            if (part[w] > m) {
+                m  = part[w];
+                w0 = w;
+            }
+        }
+        *best_v = m;
+        if (w0 < 0) {
+            return -1;
+        }
+        for (int j = w0 * per; j < nv; ++j) {
+            if (v[j] == m) {
+                return j;
+            }
+        }
+        return -1;
+    }
+};
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -687,6 +793,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_token best = -1;
         float       bv   = -INFINITY;
         llama_token i    = 0;
+        if (gsmpl->fast_bias.empty()) {
+            static argmax_pool pool;
+            i    = n_vocab;
+            best = pool.argmax(logits, n_vocab, &bv);
+        }
         auto        run  = [&](llama_token end) {
             for (; i < end; ++i) {
                 if (logits[i] > bv) {
