@@ -34,6 +34,7 @@ std::vector<float> f32_of(const ggml_tensor * w) {
             tr->to_float(src, &v[(size_t) r * K], K);
         }
     });
+    axera_drop_mapped(w);
     return v;
 }
 
@@ -43,12 +44,15 @@ std::vector<float> f32_of(const ggml_tensor * w) {
 // each tensor's in parallel over its leading index
 struct codec_packer {
     const graph_names &      names;
-    std::vector<ggml_bf16_t> out;
+    axera_cmm &              bank;
+    size_t                   used = 0;
 
     const ggml_tensor * T(const std::string & n) const { return names.at("a.gen.wav." + n); }
     ggml_bf16_t *       grow(size_t n) {
-        out.resize(out.size() + n);
-        return out.data() + out.size() - n;
+        GGML_ASSERT(used + n <= bank->size / sizeof(ggml_bf16_t));
+        ggml_bf16_t * p = (ggml_bf16_t *) bank->vir + used;
+        used += n;
+        return p;
     }
     void copy(const std::string & n) {
         const std::vector<float> g = f32_of(T(n));
@@ -111,7 +115,8 @@ tts_codec::tts_codec(const manifest & m) : k(m.get("gen.codec")) {}
 void tts_codec::pack(const graph_names & names) {
     axera_timer tm("codec weights (load)");
     {
-        codec_packer p{ names, {} };
+        QW = axera_cmm_alloc(k.in_bytes("quant_w"));
+        codec_packer p{ names, QW };
         p.copy("quant.first.codebook.weight");
         p.ones(T("quant.first.codebook.weight", names)->ne[1]);
         p.copy("quant.first.out_proj.weight");
@@ -135,10 +140,11 @@ void tts_codec::pack(const graph_names & names) {
                 p.copy("tfm.blk." + std::to_string(l) + "." + s);
             }
         }
-        bank(QW, "quant_w", p.out);
+        bank(QW, "quant_w", p.used);
     }
     {
-        codec_packer p{ names, {} };
+        UW = axera_cmm_alloc(k.in_bytes("up_w"));
+        codec_packer p{ names, UW };
         for (int u = 0; u < 2; ++u) {
             const std::string b = "up.blk." + std::to_string(u) + ".";
             p.trans(b + "conv.weight", 2);
@@ -149,10 +155,11 @@ void tts_codec::pack(const graph_names & names) {
                 p.copy(b + s);
             }
         }
-        bank(UW, "up_w", p.out);
+        bank(UW, "up_w", p.used);
     }
     {
-        codec_packer p{ names, {} };
+        DW = axera_cmm_alloc(k.in_bytes("dac_w"));
+        codec_packer p{ names, DW };
         p.conv("dac.entry.weight");
         p.copy("dac.entry.bias");
         for (int b = 0; b < 4; ++b) {
@@ -178,7 +185,7 @@ void tts_codec::pack(const graph_names & names) {
         p.copy("dac.post_snake.beta");
         p.conv("dac.post_conv.weight");
         p.copy("dac.post_conv.bias");
-        bank(DW, "dac_w", p.out);
+        bank(DW, "dac_w", p.used);
     }
     if (const char * d = getenv("GGML_AXERA_CODEC_DUMP")) {  // the banks as files, to compare with the packer's
         for (auto [c, n] : std::initializer_list<std::pair<axera_cmm *, const char *>>{ { &QW, "quant_w" }, { &UW, "up_w" }, { &DW, "dac_w" } }) {
@@ -195,12 +202,10 @@ const ggml_tensor * tts_codec::T(const std::string & n, const graph_names & name
     return names.at("a.gen.wav." + n);
 }
 
-void tts_codec::bank(axera_cmm & c, const char * name, const std::vector<ggml_bf16_t> & v) {
-    if (v.size() * sizeof(ggml_bf16_t) != k.in_bytes(name)) {
-        GGML_ABORT("axera qwen3_tts codec: %s: %zu bf16 packed, the kernel takes %u bytes\n", name, v.size(), k.in_bytes(name));
+void tts_codec::bank(axera_cmm & c, const char * name, size_t n) {
+    if (n * sizeof(ggml_bf16_t) != k.in_bytes(name)) {
+        GGML_ABORT("axera qwen3_tts codec: %s: %zu bf16 packed, the kernel takes %u bytes\n", name, n, k.in_bytes(name));
     }
-    c = axera_cmm_alloc(v.size() * sizeof(ggml_bf16_t));
-    memcpy(c->vir, v.data(), v.size() * sizeof(ggml_bf16_t));
     c->flush();
 }
 

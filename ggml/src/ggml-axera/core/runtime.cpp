@@ -37,7 +37,9 @@ bool axera_runtime_init() {
 void axera_drop_mapped(const ggml_tensor * t) {
     const ggml_tensor * s = t->view_src ? t->view_src : t;
     if (!s->buffer || strcmp(ggml_backend_buffer_name(s->buffer), GGML_AXERA_NAME "_Mapped") != 0 ||
-        strncmp(s->name, "token_embd", 10) == 0) {  // (the token embedding: a row read on the CPU per token)
+        strncmp(s->name, "token_embd", 10) == 0 ||  // (the token embedding: a row read on the CPU per token)
+        strcmp(s->name, "a.gen.code.embd.weight") == 0 ||
+        strcmp(s->name, "a.gen.code.out_embd.weight") == 0) {  // (the code predictor's tables: rows read per frame)
         return;
     }
     static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);

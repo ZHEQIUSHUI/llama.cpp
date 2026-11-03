@@ -26,7 +26,7 @@ class tts_codec {
     std::map<std::string, std::string> pair;      // a state input -> its next
 
     void                       pack(const graph_names & names);
-    void                       bank(axera_cmm & c, const char * name, const std::vector<ggml_bf16_t> & v);
+    void                       bank(axera_cmm & c, const char * name, size_t n);
     void                       reset();
     static const ggml_tensor * T(const std::string & n, const graph_names & names);
 };
