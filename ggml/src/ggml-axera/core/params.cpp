@@ -280,6 +280,7 @@ AX_ENGINE_IO_BUFFER_T params::convert(const std::map<std::string, ggml_tensor *>
             for (int64_t j = 0; j < ggml_nelements(w); ++j) {
                 ((float *) d)[j] = logf(-((const float *) w->data)[j]);
             }
+            axera_drop_mapped(w);
         });
     }
     if (p.convert == "bf16_taps_reversed") {  // f32 [channels][taps] -> bf16, kernel tap 0 = the current token
@@ -291,6 +292,7 @@ AX_ENGINE_IO_BUFFER_T params::convert(const std::map<std::string, ggml_tensor *>
                     ((ggml_bf16_t *) d)[r * taps + j] = ggml_fp32_to_bf16(((const float *) w->data)[r * taps + taps - 1 - j]);
                 }
             }
+            axera_drop_mapped(w);
         });
     }
     GGML_ABORT("axera: parameter %s: unknown conversion %s\n", name.c_str(), p.convert.c_str());

@@ -179,7 +179,8 @@ axera_cmm qwen38_27b::bank(const std::map<std::string, ggml_tensor *> & t, const
     GGML_ASSERT(d.shape.size() >= 2 && d.shape[0] == nb && d.bytes % nb == 0);
     axera_cmm     c  = axera_cmm_alloc(d.bytes);
     const size_t  bb = d.bytes / nb;  // bytes per block
-    std::vector<const ggml_tensor *> read;  // the GGUF tensors read: their mapped pages dropped when the bank is done
+    const bool keep_pages = axera_keep_pages();
+    std::vector<const ggml_tensor *> read;  // the GGUF tensors of one block: their mapped pages dropped right after it
     auto          T  = [&](int il, const char * g) -> ggml_tensor * {
         const std::string nm = "blk." + std::to_string(il) + "." + g;
         if (!t.count(nm)) {
@@ -189,6 +190,7 @@ axera_cmm qwen38_27b::bank(const std::map<std::string, ggml_tensor *> & t, const
         return t.at(nm);
     };
     for (int b = 0; b < nb; ++b) {
+        axera_mapped_drop_guard drop(read, !keep_pages);
         const int il  = 4 * b + phase;
         uint8_t * dst = (uint8_t *) c->vir + (size_t) b * bb;
         auto put_f32 = [&](const std::vector<float> & v, float scale = 1.0f) {
@@ -360,8 +362,10 @@ axera_cmm qwen38_27b::bank(const std::map<std::string, ggml_tensor *> & t, const
         }
     }
     c->flush();
-    for (const ggml_tensor * w : read) {
-        axera_drop_mapped(w);
+    if (keep_pages) {
+        for (const ggml_tensor * w : read) {
+            axera_drop_mapped(w);
+        }
     }
     return c;
 }
