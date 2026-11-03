@@ -204,7 +204,8 @@ static bool ggml_backend_axera_device_supports_buft(ggml_backend_dev_t dev, ggml
     // NPU kernels need physical addresses: CMM buffers, and the GGUF mapping whose weights the templates convert into
     // CMM. Activations from other host buffers are copied in by the
     // scheduler; the CPU backend in turn uses CMM buffers directly (they are host buffers).
-    return buft == ggml_backend_axera_buffer_type() || buft == ggml_backend_axera_mapped_buffer_type();
+    return buft == ggml_backend_axera_buffer_type() || buft == ggml_backend_axera_mapped_buffer_type() ||
+           buft == ggml_backend_axera_lazy_buffer_type();
     GGML_UNUSED(dev);
 }
 
@@ -282,6 +283,9 @@ static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_set_n_seq_max") == 0) {
         return (void *) ggml_backend_axera_set_n_seq_max;
+    }
+    if (strcmp(name, "ggml_backend_axera_kv_buffer_type") == 0) {
+        return (void *) ggml_backend_axera_kv_buffer_type;
     }
     return NULL;
     GGML_UNUSED(reg);

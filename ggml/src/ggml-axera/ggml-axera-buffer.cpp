@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <sys/mman.h>
 
 static void ggml_backend_axera_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     delete (ggml_backend_axera_buffer_context *) buffer->context;
@@ -86,6 +87,87 @@ static const struct ggml_backend_buffer_i ggml_backend_axera_buffer_i = {
     /* .reset           = */ NULL,
 };
 
+// the llama.cpp KV / recurrent-state caches of an adapter that keeps the model's state in its own CMM pools (the
+// manifest's model qwen38_27b): nothing reads or writes them, so they live in lazily-backed host memory (anonymous
+// mmap: untouched pages cost nothing; clear() is a no-op, the pages are zero), not in CMM (16 GB at a 256k context)
+struct ggml_backend_axera_lazy_context {
+    void * base = nullptr;
+    size_t size = 0;
+};
+
+static void ggml_backend_axera_lazy_free_buffer(ggml_backend_buffer_t buffer) {
+    auto * ctx = (ggml_backend_axera_lazy_context *) buffer->context;
+    if (ctx->base) {
+        munmap(ctx->base, ctx->size);
+    }
+    delete ctx;
+}
+
+static void * ggml_backend_axera_lazy_get_base(ggml_backend_buffer_t buffer) {
+    return ((ggml_backend_axera_lazy_context *) buffer->context)->base;
+}
+
+static void ggml_backend_axera_lazy_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value,
+                                                  size_t offset, size_t size) {
+    memset((char *) tensor->data + offset, value, size);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_axera_lazy_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
+                                               size_t offset, size_t size) {
+    memcpy((char *) tensor->data + offset, data, size);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_axera_lazy_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
+                                               size_t offset, size_t size) {
+    memcpy(data, (const char *) tensor->data + offset, size);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_axera_lazy_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    if (value != 0) {  // (a fresh anonymous mapping is zero already)
+        auto * ctx = (ggml_backend_axera_lazy_context *) buffer->context;
+        memset(ctx->base, value, ctx->size);
+    }
+}
+
+static const struct ggml_backend_buffer_i ggml_backend_axera_lazy_buffer_i = {
+    /* .free_buffer     = */ ggml_backend_axera_lazy_free_buffer,
+    /* .get_base        = */ ggml_backend_axera_lazy_get_base,
+    /* .init_tensor     = */ NULL,
+    /* .memset_tensor   = */ ggml_backend_axera_lazy_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_axera_lazy_set_tensor,
+    /* .get_tensor      = */ ggml_backend_axera_lazy_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ NULL,
+    /* .clear           = */ ggml_backend_axera_lazy_clear,
+    /* .reset           = */ NULL,
+};
+
+static const char * ggml_backend_axera_lazy_type_get_name(ggml_backend_buffer_type_t buft) {
+    return GGML_AXERA_NAME "_KV";
+    GGML_UNUSED(buft);
+}
+
+static ggml_backend_buffer_t ggml_backend_axera_lazy_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    auto * ctx = new ggml_backend_axera_lazy_context;
+    ctx->size  = std::max<size_t>(size, 4096);
+    ctx->base  = mmap(nullptr, ctx->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (ctx->base == MAP_FAILED) {
+        GGML_LOG_ERROR("%s: failed to map %zu bytes\n", __func__, size);
+        delete ctx;
+        return nullptr;
+    }
+    return ggml_backend_buffer_init(buft, ggml_backend_axera_lazy_buffer_i, ctx, size);
+}
+
+static size_t ggml_backend_axera_lazy_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    return SIZE_MAX;
+    GGML_UNUSED(buft);
+}
+
 // buffer type
 
 static const char * ggml_backend_axera_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -133,6 +215,30 @@ static size_t ggml_backend_axera_buffer_type_get_alloc_size(ggml_backend_buffer_
     return kv && m ? std::max(n, (size_t) (t->ne[2] - 1) * t->nb[2] + (size_t) m->context * t->nb[1]) : n;
     GGML_UNUSED(buft);
 }
+ggml_backend_buffer_type_t ggml_backend_axera_lazy_buffer_type(void) {
+    static struct ggml_backend_buffer_type buft = {
+        /* .iface   = */ {
+            /* .get_name         = */ ggml_backend_axera_lazy_type_get_name,
+            /* .alloc_buffer     = */ ggml_backend_axera_lazy_type_alloc_buffer,
+            /* .alloc_buffer_n   = */ NULL,
+            /* .get_alignment    = */ ggml_backend_axera_buffer_type_get_alignment,
+            /* .get_max_size     = */ ggml_backend_axera_lazy_type_get_max_size,
+            /* .get_alloc_size   = */ ggml_backend_axera_buffer_type_get_alloc_size,
+            /* .get_alloc_size_n = */ NULL,
+            /* .is_host          = */ ggml_backend_axera_buffer_type_is_host,
+        },
+        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_axera_reg(), 0),
+        /* .context = */ NULL,
+    };
+    return &buft;
+}
+
+// the buffer type of the llama.cpp caches: lazy host memory for an adapter that does not use them, else CMM
+ggml_backend_buffer_type_t ggml_backend_axera_kv_buffer_type(void) {
+    const axera::manifest * m = axera::kernels();
+    return m && m->model == "qwen38_27b" ? ggml_backend_axera_lazy_buffer_type() : ggml_backend_axera_buffer_type();
+}
+
 ggml_backend_buffer_type_t ggml_backend_axera_buffer_type(void) {
     static struct ggml_backend_buffer_type buft = {
         /* .iface   = */ {

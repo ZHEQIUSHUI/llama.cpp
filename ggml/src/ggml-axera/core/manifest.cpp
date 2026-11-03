@@ -65,6 +65,7 @@ void kernel::run(std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_
         fprintf(stderr, "axera: %s: %zu inputs of %s dumped to %s\n", what, in.size(), desc->role.c_str(), dir ? dir : ".");
         exit(0);
     }
+    axera_thermal_guard();
     const int ret  = AX_ENGINE_RunSync(handle, &io);
     if (ret != 0) {  // the IO the kernel got (stderr: the log is asynchronous)
         for (int o = 0; o < 2; ++o) {

@@ -83,6 +83,7 @@ NPU (top-k 1 and 50 kernels); top-p < 1 is not supported.
 | `GGML_AXERA_KERNEL_DIR` | the kernel directory (default `./axera_kernels`); without a `manifest.json` the backend has no device |
 | `GGML_AXERA_PROF=1` | time per kernel role and host step, printed at exit |
 | `GGML_AXERA_TRACE=1` | every graph: node count, host gap before it, run time |
+| `GGML_AXERA_TEMP_MAX=<°C>` | the thermal guard: a kernel waits while an NPU sensor reads above it, until 5 °C below (default 100; 0 off). A board without thermal trip points resets itself at about 109 °C, which a long prompt reaches in under a minute |
 
 None of them changes a result.
 

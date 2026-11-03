@@ -126,6 +126,11 @@ inline AX_ENGINE_IO_BUFFER_T axera_io(const axera_cmm & c) {
 
 extern std::atomic<uint64_t> axera_graph_epoch;  // graphs computed so far
 
+// the thermal guard (GGML_AXERA_TEMP_MAX, default 100 °C, 0 off): before a kernel runs, if an NPU sensor
+// (/sys/class/thermal, type thermal_npu*) reads above it, wait until it is 5 °C below (a board without trip points resets
+// itself at about 109 °C under a long prefill; decode never gets near it)
+void axera_thermal_guard();
+
 // GGML_AXERA_PROF=1: wall time per part, printed at exit
 struct axera_prof {
     const bool on = [] {

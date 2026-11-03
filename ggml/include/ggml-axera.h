@@ -16,6 +16,10 @@ GGML_BACKEND_API bool ggml_backend_is_axera(ggml_backend_t backend);
 
 // device memory (CMM): host-visible, usable by the CPU backend as well
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_axera_buffer_type(void);
+// the llama.cpp KV / recurrent-state caches: lazily-backed host memory for the adapters that keep the state in their
+// own pools (nothing reads them), else CMM; llama.cpp asks for it through the registry ("ggml_backend_axera_kv_buffer_type")
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_axera_kv_buffer_type(void);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_axera_lazy_buffer_type(void);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_axera_reg(void);
 

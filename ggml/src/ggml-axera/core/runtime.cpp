@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <dirent.h>
 #include <fcntl.h>
 
 #include <fstream>
@@ -15,6 +16,67 @@
 #include <unistd.h>
 
 std::atomic<uint64_t> axera_graph_epoch{ 0 };
+
+void axera_thermal_guard() {
+    static const int limit = [] {
+        const char * e = getenv("GGML_AXERA_TEMP_MAX");
+        return e ? atoi(e) : 100;
+    }();
+    if (limit <= 0) {
+        return;
+    }
+    static const std::vector<std::string> sensors = [] {
+        std::vector<std::string> v;
+        if (DIR * d = opendir("/sys/class/thermal")) {
+            while (const dirent * e = readdir(d)) {
+                const std::string p = std::string("/sys/class/thermal/") + e->d_name;
+                std::ifstream     t(p + "/type");
+                std::string       type;
+                if (t && std::getline(t, type) && type.compare(0, 11, "thermal_npu") == 0) {
+                    v.push_back(p + "/temp");
+                }
+            }
+            closedir(d);
+        }
+        return v;
+    }();
+    if (sensors.empty()) {
+        return;
+    }
+    static std::mutex                                      mu;
+    static std::chrono::steady_clock::time_point           last;
+    static bool                                            hot = false;
+    const auto                                             read = [] {
+        int m = 0;
+        for (const auto & p : sensors) {
+            std::ifstream f(p);
+            int           t = 0;
+            if (f >> t) {
+                m = std::max(m, t / 1000);
+            }
+        }
+        return m;
+    };
+    std::lock_guard<std::mutex> lk(mu);
+    const auto                  now = std::chrono::steady_clock::now();
+    if (!hot && now - last < std::chrono::milliseconds(200)) {  // (a sensor read per kernel is too often)
+        return;
+    }
+    last  = now;
+    int t = read();
+    if (t < limit) {
+        return;
+    }
+    axera_timer tw("thermal pause");
+    fprintf(stderr, "axera: NPU %d °C: pausing until %d °C (GGML_AXERA_TEMP_MAX=%d)\n", t, limit - 5, limit);
+    hot = true;
+    while (t > limit - 5) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        t = read();
+    }
+    hot  = false;
+    last = std::chrono::steady_clock::now();
+}
 
 // AX_SYS / AX_ENGINE are process-wide; initialized once, never torn down while tensors may still live in CMM
 bool axera_runtime_init() {

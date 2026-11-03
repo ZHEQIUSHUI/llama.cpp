@@ -17,6 +17,15 @@
 // llama_memory_recurrent
 //
 
+// the buffer type a backend wants its KV / state caches in (the Axera NPU backend keeps an adapter's state in its own
+// device pools and puts the llama.cpp caches, which nothing reads, in lazily-backed host memory)
+static ggml_backend_buffer_type_t llama_cache_buft(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto * fn = reg ? (ggml_backend_buffer_type_t (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_axera_kv_buffer_type") : nullptr;
+    return fn ? fn() : buft;
+}
+
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
                 ggml_type   type_r,
@@ -116,7 +125,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), llama_cache_buft(buft));
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for rs cache");
         }
