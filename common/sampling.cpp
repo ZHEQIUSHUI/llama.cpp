@@ -794,7 +794,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         float       bv   = -INFINITY;
         llama_token i    = 0;
         if (gsmpl->fast_bias.empty()) {
-            static argmax_pool pool;
+            static argmax_pool & pool = *new argmax_pool;  // (never destroyed: its workers wait on its condition variable)
             i    = n_vocab;
             best = pool.argmax(logits, n_vocab, &bv);
         }
