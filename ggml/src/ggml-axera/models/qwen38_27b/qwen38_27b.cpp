@@ -25,6 +25,7 @@
 #include <cstring>
 #include <regex>
 #include <set>
+#include <thread>
 
 namespace axera {
 namespace {
@@ -46,6 +47,7 @@ inline int tiled(int g) {
 class qwen38_27b final : public model {
   public:
     explicit qwen38_27b(const manifest & m) : man(m), prm(m) {}
+    ~qwen38_27b() override { mtp_wait(); }
     ggml_status compute(ggml_cgraph * g) override;
 
   private:
@@ -97,6 +99,14 @@ class qwen38_27b final : public model {
     axera_cmm ME, MH, MCS, MPN, MMASK, MOUT, MRAW, PE, PH, PCS, PPN, PMASK, PNBLK, POUT2, PRAW, MKV;
     axera_cmm M8E, M8H, M8CS, M8PN, M8MASK, M8NT, M8OUT, M8RAW;
     const void * mtp_bound = nullptr;
+    // a verification's MTP catch-up (nothing on the host reads its result: it only extends the MTP block's KV) runs
+    // on its own thread while the host goes on (sampling, the next draft's setup); any next graph waits for it
+    std::thread mtp_bg;
+    void        mtp_wait() {
+        if (mtp_bg.joinable()) {
+            mtp_bg.join();
+        }
+    }
     call                           pre;
     std::map<std::string, axera_cmm> banks;
     axera_cmm                      PX, POS, INDPTR, INDICES, LASTLEN, CLOC, VALID, POUT;
@@ -829,6 +839,7 @@ ggml_status qwen38_27b::verify(const kv_view & kv, const rope & rp, const ggml_b
 }
 
 ggml_status qwen38_27b::compute(ggml_cgraph * g) {
+    mtp_wait();
     const auto &  t       = names.of(g);
     if (names.find("mtp_h_input")) {  // a speculative draft context's MTP block
         return compute_mtp(g);
@@ -1154,6 +1165,18 @@ ggml_status qwen38_27b::compute_mtp(ggml_cgraph * g) {
         *(int32_t *) M8NT->vir = T;
         for (const axera_cmm * b : { &M8E, &M8H, &M8CS, &M8PN, &M8MASK, &M8NT }) {
             (*b)->flush();
+        }
+        // (GGML_AXERA_MTP_SYNC=1: in line) asynchronous when this graph has no output rows: neither its logits nor
+        // its h_nextn rows are read
+        static const bool  sync = getenv("GGML_AXERA_MTP_SYNC") && atoi(getenv("GGML_AXERA_MTP_SYNC")) != 0;
+        const ggml_tensor * lg   = names.find("result_output");
+        if (!sync && !(lg && lg->ne[1] > 0 && (lg->flags & GGML_TENSOR_FLAG_COMPUTE))) {
+            tm.stop();
+            mtp_bg = std::thread([this] {
+                axera_timer tb("mtp (catch-up rows, async)");
+                mtp8.k->run(mtp8.in, mtp8.out, "mtp m8");
+            });
+            return GGML_STATUS_SUCCESS;
         }
         mtp8.k->run(mtp8.in, mtp8.out, "mtp m8");
         M8OUT->invalidate();
