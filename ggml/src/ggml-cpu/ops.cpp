@@ -1,6 +1,7 @@
 #include "ops.h"
 
 #include "ggml-cpu.h"
+#include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
@@ -11,6 +12,15 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <set>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 // ggml_compute_forward_dup
 
@@ -5272,6 +5282,97 @@ void ggml_compute_forward_cont(
 
 // ggml_compute_forward_get_rows
 
+// GGML_AXERA_KERNEL_DIR: the Axera NPU backend leaves the token embedding tables in the GGUF file mapping. Read only the
+// rows this operation touches, then drop their pages from the process: a token's row faulting in from storage costs
+// much less than the table staying resident. The mapping cannot use fault-around, or one row would bring in a page of
+// rows. GGML_AXERA_KEEP_PAGES=1 keeps the old resident behaviour.
+static bool ggml_get_rows_drop_pages_enabled(void) {
+#if defined(__linux__)
+    static const bool enabled = [] {
+        const char * kernel_dir = std::getenv("GGML_AXERA_KERNEL_DIR");
+        const char * keep       = std::getenv("GGML_AXERA_KEEP_PAGES");
+        return kernel_dir != nullptr && (keep == nullptr || std::atoi(keep) == 0);
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+static void ggml_get_rows_drop_pages(const ggml_compute_params * params, const ggml_tensor * src0,
+                                     const ggml_tensor * src1) {
+#if defined(__linux__)
+    if (!ggml_get_rows_drop_pages_enabled() || !src0->buffer || !src1) {
+        return;
+    }
+    const char * buf_name = ggml_backend_buffer_name(src0->buffer);
+    if (std::strcmp(buf_name, "CPU_Mapped") != 0 && std::strcmp(buf_name, "AXERA_Mapped") != 0) {
+        return;
+    }
+
+    static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+    static std::mutex      random_mu;
+    static std::set<const void *> random_done;
+    {
+        std::lock_guard<std::mutex> lock(random_mu);
+        if (random_done.insert(src0->data).second) {
+            const uintptr_t a = (uintptr_t) src0->data & ~(pg - 1);
+            const uintptr_t b = ((uintptr_t) src0->data + ggml_nbytes(src0) + pg - 1) & ~(pg - 1);
+            madvise((void *) a, b - a, MADV_RANDOM);
+        }
+    }
+
+    const int64_t nr = ggml_nelements(src1);
+    const int     ith = params->ith;
+    const int     nth = params->nth;
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = std::min(ir0 + dr, nr);
+    if (ir0 >= ir1) {
+        return;
+    }
+
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1];
+    const size_t  row_size = ggml_row_size(src0->type, src0->ne[0]);
+    thread_local std::vector<uintptr_t> pages;
+    pages.clear();
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t i12 = i / (ne11 * ne10);
+        const int64_t i11 = (i - i12 * ne11 * ne10) / ne10;
+        const int64_t i10 = i - i12 * ne11 * ne10 - i11 * ne10;
+        const int64_t i01 = *(const int32_t *) ((const char *) src1->data + i10 * src1->nb[0] + i11 * src1->nb[1] +
+                                               i12 * src1->nb[2]);
+        if (i01 < 0 || i01 >= src0->ne[1]) {
+            continue;
+        }
+        const uintptr_t p = (uintptr_t) src0->data + i01 * src0->nb[1] + i11 * src0->nb[2] + i12 * src0->nb[3];
+        const uintptr_t a = p & ~(pg - 1);
+        const uintptr_t b = (p + row_size + pg - 1) & ~(pg - 1);
+        for (uintptr_t x = a; x < b; x += pg) {
+            pages.push_back(x);
+        }
+    }
+    if (pages.empty()) {
+        return;
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    uintptr_t a = pages[0], b = a + pg;
+    for (size_t i = 1; i < pages.size(); ++i) {
+        if (pages[i] > b) {
+            madvise((void *) a, b - a, MADV_DONTNEED);
+            a = pages[i];
+        }
+        b = pages[i] + pg;
+    }
+    madvise((void *) a, b - a, MADV_DONTNEED);
+#else
+    GGML_UNUSED(params);
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+#endif
+}
+
 static void ggml_compute_forward_get_rows_q(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -5493,6 +5594,8 @@ void ggml_compute_forward_get_rows(
                 GGML_ABORT("fatal error");
             }
     }
+
+    ggml_get_rows_drop_pages(params, src0, dst->src[1]);
 
     //static bool first = true;
     //printf("ne0 = %d, ne1 = %d, ne2 = %d\n", dst->ne[0], dst->ne[1], dst->ne[2]);

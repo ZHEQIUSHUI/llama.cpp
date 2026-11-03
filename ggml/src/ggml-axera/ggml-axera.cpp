@@ -30,6 +30,7 @@ static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend,
         axera_timer tm("graph_compute");
         st = ctx->model->compute(cgraph);
     }
+    axera_flush_file_pages();  // the model's init is done: release its converted tensors' file pages once
     static const bool trace = std::getenv("GGML_AXERA_TRACE") != nullptr;  // every graph: nodes, host gap, run
     if (trace) {
         const auto now = std::chrono::steady_clock::now();
@@ -256,11 +257,10 @@ static ggml_backend_dev_t ggml_backend_axera_reg_get_device(ggml_backend_reg_t r
     GGML_UNUSED(index);
 }
 
-// the weights left on the CPU (the token embeddings: one row read per token) kept resident when the model is mmap'ed:
-// the NPU weights take most of the board's memory, page reclaim evicts the embedding pages, and every token's row
-// then faults in from storage (~2 ms per token on a 16 GB board with a 20 GB model)
+// GGML_AXERA_KEEP_PAGES=1 restores pinning the weights left on the CPU (the token embeddings). By default their rows are
+// read on demand and dropped after each use, so they neither stay resident nor keep the GGUF's pages in the cache
 static bool ggml_backend_axera_pin_host_weights(void) {
-    return true;
+    return axera_keep_pages();
 }
 
 // llama.cpp tells each context's sequence count: the largest is kept (a padded prefill chunk needs one sequence)

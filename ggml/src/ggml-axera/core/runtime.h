@@ -37,9 +37,33 @@ bool ggml_backend_buffer_is_axera(struct ggml_backend_buffer * buffer);
 bool axera_runtime_init();
 // CMM total / free (/proc/ax_proc/mem_cmm_info)
 void axera_cmm_memory(size_t * free, size_t * total);
+// GGML_AXERA_KEEP_PAGES=1: the load keeps the old pinning and page-release timing, for debugging
+bool axera_keep_pages();
 // a weight in the GGUF file mapping whose data has been converted into CMM: its pages dropped from the process (they
-// are the file's, read only: a later read faults them in again). Nothing for any other buffer
-void axera_drop_mapped(const struct ggml_tensor * t);
+// are the file's, read only: a later read faults them in again) and from the kernel page cache. Nothing for any other
+// buffer. Unless `force`, the token embedding tables stay mapped: their rows are read on demand on the CPU
+void axera_drop_mapped(const struct ggml_tensor * t, bool force = false);
+// queue the same pages for release from the kernel page cache (posix_fadvise DONTNEED), not from the process mapping
+void axera_drop_file_pages(const struct ggml_tensor * t);
+// coalesce and release the queued file-page ranges: the backend calls it after the model's first graph (its init)
+void axera_flush_file_pages();
+// drop every tensor read by a bank block when the block ends, including through an early continue
+struct axera_mapped_drop_guard {
+    std::vector<const struct ggml_tensor *> & read;
+    const bool                               enabled;
+    axera_mapped_drop_guard(std::vector<const struct ggml_tensor *> & r, bool e) : read(r), enabled(e) {}
+    axera_mapped_drop_guard(const axera_mapped_drop_guard &) = delete;
+    axera_mapped_drop_guard & operator=(const axera_mapped_drop_guard &) = delete;
+    ~axera_mapped_drop_guard() {
+        if (!enabled) {
+            return;
+        }
+        for (const ggml_tensor * w : read) {
+            axera_drop_mapped(w);
+        }
+        read.clear();
+    }
+};
 // the largest sequence count of any llama.cpp context made in this process (0: none told the backend): a padded
 // prefill chunk writes K / V into the cells after its batch's, which only one sequence leaves free
 uint32_t axera_n_seq_max();

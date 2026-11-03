@@ -301,7 +301,7 @@ void output_head::bind(const kernel & lm, const ggml_tensor * output_weight) {
     } else {
         axera_quantize_mxfp8(w, q, s);
     }
-    axera_drop_mapped(w);
+    axera_drop_mapped(w, true);  // (a tied output head shares token_embd.weight: the mapped rows are not needed now)
     x = axera_cmm_alloc(R * K * sizeof(ggml_bf16_t));
 }
 

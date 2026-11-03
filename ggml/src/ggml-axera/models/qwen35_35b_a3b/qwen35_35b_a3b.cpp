@@ -156,6 +156,7 @@ class qwen35_35b_a3b final : public model {
 void qwen35_35b_a3b::fill(const std::map<std::string, ggml_tensor *> & t, const kernel & dk, const rope & rp) {
     static const std::regex re("b([0-3])_(attn|moe)_(.+)");
     std::vector<const ggml_tensor *> read;  // the GGUF tensors of the layer being filled
+    const bool                       keep_pages = axera_keep_pages();
     auto T = [&](int il, const std::string & g) -> const ggml_tensor * {
         const std::string nm = "blk." + std::to_string(il) + "." + g;
         if (!t.count(nm)) {
@@ -225,8 +226,8 @@ void qwen35_35b_a3b::fill(const std::map<std::string, ggml_tensor *> & t, const 
         }
         GGML_ASSERT(d.shape[0] == NB && d.bytes % NB == 0);
     }
-    // then one layer at a time: its slice of every bank, then the layer's mapped GGUF pages dropped, so the load
-    // holds one layer's file pages rather than the whole model's
+    // then one layer at a time: its slice of every bank, then the block's mapped GGUF pages dropped, so the load
+    // holds one block's file pages rather than the whole model's
     for (int b = 0; b < NB; ++b) {
         for (int phase = 0; phase < 4; ++phase) {
             const int il = 4 * b + phase;
@@ -241,6 +242,10 @@ void qwen35_35b_a3b::fill(const std::map<std::string, ggml_tensor *> & t, const 
                     n == "kv" || n == "cos_sin_cache") {
                     continue;
                 }
+                if (!keep_pages) {
+                    read.clear();
+                }
+                axera_mapped_drop_guard drop(read, !keep_pages);
                 const bool        moe = mt[2] == "moe";
                 const bool        f8  = is_fp8(d.name);
                 const auto        cb  = banks.find(d.name);
@@ -402,9 +407,11 @@ void qwen35_35b_a3b::fill(const std::map<std::string, ggml_tensor *> & t, const 
                 } else {
                     GGML_ABORT("axera qwen35_35b_a3b: unexpected delta-net input %s\n", d.name.c_str());
                 }
+            }
+            if (keep_pages) {
+                for (const ggml_tensor * w : read) {
+                    axera_drop_mapped(w);
                 }
-            for (const ggml_tensor * w : read) {
-                axera_drop_mapped(w);
             }
         }
     }
