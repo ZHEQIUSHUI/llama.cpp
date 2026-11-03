@@ -10,7 +10,7 @@ ggml-axera 是 llama.cpp 的一个 ggml 后端，在爱芯 AX8860 的 NPU（4 �
 
 | 模型 | 适配器 | 功能 | HF 发布仓库 |
 |---|---|---|---|
-| Qwen3.8-27B | `qwen38_27b`（ViT：`qwen35_vit`） | 文本、图像输入；MTP 投机解码（开发中） | [AXERA-TECH/Qwen3.8-27B-AX8860-llama.cpp](https://huggingface.co/AXERA-TECH/Qwen3.8-27B-AX8860-llama.cpp) |
+| Qwen3.8-27B | `qwen38_27b`（ViT：`qwen35_vit`） | 文本、图像输入；MTP 投机解码；NPU 内存里只放一份权重 | [AXERA-TECH/Qwen3.8-27B-AX8860-llama.cpp](https://huggingface.co/AXERA-TECH/Qwen3.8-27B-AX8860-llama.cpp) |
 | Qwen3.5-35B-A3B | `qwen35_moe`（整模型版 `qwen35_35b_a3b` 开发中） | 文本 | 待发布 |
 | Qwen3.5-9B | `qwen35_dense` | 文本 | — |
 | Qwen3-Embedding-0.6B | `qwen3` | 文本向量 | [AXERA-TECH/Qwen3-Embedding-0.6B-AX8860-llama.cpp](https://huggingface.co/AXERA-TECH/Qwen3-Embedding-0.6B-AX8860-llama.cpp) |
@@ -25,7 +25,7 @@ HF 仓库里有 GGUF、静态链接的板端程序、kernel 目录和 `run.sh`�
 
 | 模型 | 结果 |
 |---|---|
-| Qwen3.8-27B | 4k prompt prefill 1231 tokens/s；decode 13.7 tokens/s（4k 上下文）；图像编码 0.28 s（768 图像 token） |
+| Qwen3.8-27B | 4k prompt prefill 1231 tokens/s；decode 13.5 tokens/s，MTP 投机解码 22–24 tokens/s（4k 上下文）；图像编码 0.28 s（768 图像 token）；加载后 NPU 内存 18.2 GB |
 | Qwen3.5-35B-A3B | 4k prompt prefill 约 2400 tokens/s；decode 约 56 tokens/s |
 | Qwen3-Embedding-0.6B | 单条 query 22 ms；229 token 36 ms |
 | Qwen3-ASR-0.6B / 1.7B | 60 s 录音 1.7 s / 2.5 s（RTF 0.028 / 0.041） |

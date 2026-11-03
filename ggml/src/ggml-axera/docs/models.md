@@ -13,12 +13,12 @@
 | 项 | 内容 |
 |---|---|
 | GGUF | `qwen3.8-27b-mxfp4.gguf`（MXFP4），`mmproj-qwen3.8-27b-bf16.gguf`（视觉，BF16） |
-| kernel | `prefill`：整模型一次处理一页 256 token，16 个 block 在 kernel 内循环<br>`decode.group`：每次 16 层，每个 token 调 4 次<br>`lm_head`：输出头<br>`vit`：整个 ViT（3072 patch） |
+| kernel | `prefill`：整模型一次处理一页 256 token，16 个 block 在 kernel 内循环，权重在 bank 里<br>`decode.group`：每次 16 层，每个 token 调 4 次；所有投影权重直接读 prefill 的 bank（输入 `k_<bank 名>`），pack 里只剩小参数，所以 NPU 内存里只有一份权重<br>`decode.verify`：同样的 16 层，一次 4 行（投机解码的验证）<br>`lm_head`：输出头，一次最多 4 行<br>`mtp.t1` / `mtp.m8` / `mtp.prompt`：MTP 头，1 行 / 最多 8 行 / 256 行一页<br>`lm_head.draft`：65536 词的草稿词表头<br>`vit`：整个 ViT（3072 patch） |
 | 上下文 | 16384 |
 | 状态 | KV cache 分页存放（256 token 一页，BF16），GDN 递归状态和 conv 状态由适配器在 CMM 里自己分配 |
 | 多轮对话 | prefill 只能从页边界开始。适配器在每页开头保存递归状态，并保留本页已处理的输入；新一轮从页中间开始时，恢复该页开头的状态，把本页旧输入和新输入拼起来重算这一页 |
-| MTP（开发中） | 用模型自带的单层 MTP 头连续出 3 个 draft，再一次验证 4 行（kernel 角色 `decode.verify`、`mtp.t1`、`mtp.prompt`，`lm_head` 一次可算多行）。验证后保留每一行的状态快照，用于回退 |
-| 加载 | 约 70 s，大部分时间是 GGUF 转 NPU 格式 |
+| MTP | 用模型自带的单层 MTP 头连续出 3 个 draft（草稿词表头出 logits），再一次验证 4 行。验证 kernel 把每一行之后的递归状态和 conv 状态写成快照，下一轮从被接受的那一行的快照继续；验证后被接受的几行用 `mtp.m8` 一次补进 MTP 头的 KV（在另一个线程上，和采样重叠）。`GGML_AXERA_MTP_SYNC=1` 改为同步 |
+| 加载 | 约 60 s，大部分时间是 GGUF 转 NPU 格式；转完的 GGUF 页随即释放，系统内存峰值约 3 GB |
 
 ## Qwen3.5-35B-A3B（`qwen35_moe`）
 

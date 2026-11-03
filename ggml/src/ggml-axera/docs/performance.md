@@ -15,16 +15,20 @@ NPU 上的累加顺序不固定，所以同一输入多次运行，输出偶尔�
 |---|---|
 | 4k prompt（3908 token）prefill | 3.18 s（1231 tokens/s） |
 | 16k prompt prefill | 1168 tokens/s |
-| decode，4k 上下文 | 72.8 ms/token（13.7 tokens/s） |
+| decode，4k 上下文 | 73 ms/token（13.5 tokens/s） |
+| decode，MTP 投机解码（`--spec-type draft-mtp --spec-draft-n-max 3`） | 短回答 22–24 tokens/s，400 token 长回答 20 tokens/s |
 | decode，16k 上下文 | 81.0 ms/token（12.3 tokens/s） |
 | 图像编码（3072 patch = 768 图像 token） | 0.28 s |
-| 加载 | 约 70 s |
+| 加载 | 约 60 s |
+| 加载峰值 / 加载后 NPU 内存（CMM） | 18.1 GB / 18.2 GB（上一版 30.9 / 28.3 GB，再上一版 42.7 GB） |
+| 加载峰值系统内存 | 3.2 GB（上一版 15.5 GB） |
 | 中文 PPL（内部测试集，`-c 512`） | 10.85 |
 
-MTP 投机解码（开发中，`--spec-draft-n-max 3`）：
+MTP 投机解码（`--spec-type draft-mtp --spec-draft-n-max 3`，贪心）：
 
-- 短 prompt 生成速度 18–19 tokens/s，长文 16.5 tokens/s。
-- draft 接受率约 42–50%。同样的设置在 CPU 上跑参考实现，接受率也是这个水平，说明这是模型本身的特性，不是 NPU 精度造成的。
+- 每轮接受 2.0–2.4 个 token（draft 接受率 35–50%，和 CPU 参考实现一致，是模型本身的特性）。
+- 一轮约 100 ms：verify kernel 76.6 ms（4 行），lm_head 4.0 ms，3 次 draft 各 3.5 ms + 草稿词表头 1.1 ms，其余是 host（验证后的 MTP 追赶在另一个线程上和采样重叠，采样的 argmax 多线程，大块 logits 并行拷贝）。
+- 输出和普通贪心解码一致。
 
 ## Qwen3.5-35B-A3B（路由专家 MXFP4）
 
