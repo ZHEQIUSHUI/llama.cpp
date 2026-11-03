@@ -5,7 +5,8 @@
 //   prefill  role prefill: one call per page of 256 cells (a runtime loop over the layers, their weights in banks
 //            [L / 4, ...] per phase), the last page of a batch padded (valid_tokens). Its history is whole pages: a batch
 //            that starts inside a page restarts at the page's first cell with the page's earlier inputs (kept)
-//   decode   role decode: one token through all layers (a decode group: the layers' weights in packs) on the same KV
+//   decode   role decode: one token through all layers (a decode group: the row-split weights from the prefill banks,
+//            the column-split and small ones in packs) on the same KV
 //            cache; with the output head inside (ASR, the TTS talker's codec head) it also gives a prompt's last
 //            token's logits
 //   output   the logits (the group's, the other output rows' on the CPU without lm_head; the TTS codec head's padded
@@ -237,8 +238,21 @@ void qwen3::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tens
     }
     GGML_ASSERT(pk.desc->out.size() == 1 && pk.desc->out[0].name == "output");
     pre.out.push_back(axera_io(POUT, pk.desc->out[0].bytes));
+    // a decode group's k_<bank> input reads the prefill bank of that name, at this group's block offset
+    auto bank_io = [&](const io_desc & d, int gi) -> AX_ENGINE_IO_BUFFER_T {
+        auto it = banks.find(d.name.substr(2));
+        if (d.name.rfind("k_", 0) != 0 || it == banks.end()) {
+            GGML_ABORT("axera qwen3: decode: unexpected input %s\n", d.name.c_str());
+        }
+        const size_t nb = (size_t) L / 4;  // blocks of one phase in the bank
+        GGML_ASSERT(nb > 0 && it->second->size % nb == 0);
+        const size_t bb = it->second->size / nb;
+        const size_t off = (size_t) gi * d.bytes;
+        GGML_ASSERT(d.bytes % bb == 0 && off + d.bytes <= it->second->size);
+        return axera_io(it->second.get(), (char *) it->second->vir + off, d.bytes);
+    };
     // decode: the group's packs from the GGUF, the same KV cache; cs = cos | sin, pn = cell | blocks | the K row of the
-    // cell, the final norm the model's when the head is inside
+    // cell, the final norm the model's when the head is inside.  The row-split weights are the prefill banks.
     dec    = {};
     LOGITS = {};
     if (dk) {
@@ -277,6 +291,10 @@ void qwen3::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tens
             const std::string & n = d.name;
             if (dk->desc->packs.count(n)) {
                 dec.in.push_back(axera_io(*by_name.at(n), d.bytes));
+                continue;
+            }
+            if (n.rfind("k_", 0) == 0) {
+                dec.in.push_back(bank_io(d, 0));
                 continue;
             }
             const axera_cmm * b = n == "x" ? &DX : n == "cs" ? &CS : n == "pn" ? &PN : n == "mask" ? &MASK : n == "kv" ? &KV :
