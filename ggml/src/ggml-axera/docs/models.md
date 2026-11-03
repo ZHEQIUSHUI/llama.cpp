@@ -40,6 +40,20 @@
 
 暂未发布。
 
+## Qwen3.5-9B / 2B 整模型（`qwen35_whole`）
+
+| 项 | 内容 |
+|---|---|
+| GGUF | 9B：`qwen3.5-9b-Q4_K_M.gguf`（MXFP4）+ `mmproj-qwen3.5-9b-bf16.gguf`；2B：`Qwen3.5-2B-Q4_K_M.gguf`（MXFP4）+ `mmproj-Qwen3.5-2B-BF16.gguf` |
+| kernel | `prefill`：整个模型一个 kernel，运行时按 block 循环读取 `b0..b3` 权重 bank<br>`decode.group`：每次 16 层（9B）/ 12 层（2B），每 token 2 次<br>`lm_head`：输出头<br>`vit`：整个 ViT（最多 3072 patch） |
+| 上下文 | 16384 |
+| 权重 | decode group 的投影权重通过 `k_<bank>` 直接读 prefill 的 bank；CMM 里只有一份主干权重 |
+| 状态 | KV cache 分页存放（256 token 一页），GDN 递归 / conv 状态由适配器管理 |
+| 限制 | 单序列（`-np 1`），整模型加载（`-ngl 99`） |
+
+适配器目录是 `models/qwen35_whole`，由 manifest 的 `"model": "qwen35_whole"` 选择。9B 和 2B 共用适配器，层数和
+decode group 大小从 manifest / kernel 的层数得到。
+
 ## Qwen3-Embedding-0.6B（`qwen3`）
 
 | 项 | 内容 |

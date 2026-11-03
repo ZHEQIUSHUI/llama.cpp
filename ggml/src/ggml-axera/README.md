@@ -12,7 +12,8 @@ ggml-axera 是 llama.cpp 的一个 ggml 后端，在爱芯 AX8860 的 NPU（4 �
 |---|---|---|---|
 | Qwen3.8-27B | `qwen38_27b`（ViT：`qwen35_vit`） | 文本、图像输入；MTP 投机解码；NPU 内存里只放一份权重 | [AXERA-TECH/Qwen3.8-27B-AX8860-llama.cpp](https://huggingface.co/AXERA-TECH/Qwen3.8-27B-AX8860-llama.cpp) |
 | Qwen3.5-35B-A3B | `qwen35_moe`（整模型版 `qwen35_35b_a3b` 开发中） | 文本 | 待发布 |
-| Qwen3.5-9B | `qwen35_dense` | 文本 | — |
+| Qwen3.5-9B | `qwen35_dense` / `qwen35_whole` | 文本、图像输入（`qwen35_whole` 整模型路径） | 待发布 |
+| Qwen3.5-2B | `qwen35_whole` | 文本、图像输入 | 待发布 |
 | Qwen3-Embedding-0.6B | `qwen3` | 文本向量 | [AXERA-TECH/Qwen3-Embedding-0.6B-AX8860-llama.cpp](https://huggingface.co/AXERA-TECH/Qwen3-Embedding-0.6B-AX8860-llama.cpp) |
 | Qwen3-ASR-0.6B / 1.7B | `qwen3` + `qwen3_asr` | 语音识别 | [0.6B](https://huggingface.co/AXERA-TECH/Qwen3-ASR-0.6B-AX8860-llama.cpp) / [1.7B](https://huggingface.co/AXERA-TECH/Qwen3-ASR-1.7B-AX8860-llama.cpp) |
 | Qwen3-TTS-12Hz-0.6B / 1.7B-Base | `qwen3` + `qwen3_tts` | 语音合成、声音克隆（x-vector / ICL） | [0.6B](https://huggingface.co/AXERA-TECH/Qwen3-TTS-0.6B-AX8860-llama.cpp) / [1.7B](https://huggingface.co/AXERA-TECH/Qwen3-TTS-1.7B-AX8860-llama.cpp) |
