@@ -11,6 +11,7 @@ parts of the TTS codec decoder) run on the CPU backend on the same memory.
 | Qwen3.5-35B-A3B (MoE, MXFP4 experts) | `qwen35_moe` + `qwen35_vit` | language model, 4-core ViT | 16k |
 | Qwen3.8-27B (MXFP4) | `qwen35_dense` + `qwen35_vit` | language model, 4-core ViT | 16k |
 | Qwen3.5-9B (MXFP4) | `qwen35_dense` | language model | 16k |
+| Qwen3.5-9B / 4B / 2B (MXFP4), 0.8B (MXFP8) | `qwen35_whole` + `qwen35_vit` | whole-model language path, one-call ViT | 16k |
 | Qwen3-Embedding-0.6B | `qwen3` | model up to the final norm (pooling on the CPU) | 16k |
 | Qwen3-ASR-0.6B / 1.7B | `qwen3` + `qwen3_asr` | text model, audio encoder | 4k |
 | Qwen3-TTS-0.6B / 1.7B | `qwen3` + `qwen3_tts` | talker, code predictor frames, codec decoder GEMMs / convolutions | 4k |
