@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include <map>
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -1519,6 +1521,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // LLAMA_GRAPH_PROF=1: per context, the time of graph builds (with allocation), reuses and input setting
+    static const bool gprof = getenv("LLAMA_GRAPH_PROF") != nullptr;
+    struct gp_acc { int64_t nb = 0, nr = 0, tb = 0, ti = 0, n = 0; };
+    static std::map<const void *, gp_acc> gp;
+    const int64_t gp_t0 = gprof ? ggml_time_us() : 0;
+    bool          gp_built = false;
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1563,7 +1572,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+        gp_built           = true;
     }
+    const int64_t gp_t1 = gprof ? ggml_time_us() : 0;
 
     // set the input data for the input tensors
     {
@@ -1573,6 +1584,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+    if (gprof) {
+        auto & g = gp[this];
+        (gp_built ? g.nb : g.nr)++;
+        if (gp_built) {
+            g.tb += gp_t1 - gp_t0;
+        }
+        g.ti += ggml_time_us() - gp_t1;
+        if (++g.n % 200 == 0) {
+            fprintf(stderr, "graph prof %p: %lld built (%.3f ms each), %lld reused, inputs %.3f ms each\n", (const void *) this,
+                           (long long) g.nb, g.nb ? g.tb / 1e3 / g.nb : 0.0, (long long) g.nr, g.ti / 1e3 / g.n);
+        }
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
