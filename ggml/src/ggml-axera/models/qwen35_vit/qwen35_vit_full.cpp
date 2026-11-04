@@ -1,7 +1,7 @@
-// Axera NPU backend: the Qwen3.5 / Qwen3.8 vision encoder (mtmd clip graph, projector qwen3vl: 27 layers of 1152, 16
-// heads of 72; 27B, 35B-A3B) in one call of the manifest's role vit (ax-dsl-kernels models/<model>/vit, vit_full: patch
-// embedding, every layer, the 2 x 2 merge and projector for N patches, an image padded to N; the projector's width
-// from the kernel's output).
+// Axera NPU backend: the Qwen3.5 / Qwen3.8 vision encoder (mtmd clip graph, projector qwen3vl) in one call of the
+// manifest's role vit (ax-dsl-kernels models/<model>/whole/vit, vit_full): patch embedding, every layer, the 2 x 2
+// merge and projector for N patches, an image padded to N. The layer count, width, head width and projector's output
+// width come from the kernel's IO; 27B / 35B-A3B use 27 x 1152 and 2B / 4B use 24 x 1024.
 //
 // The host orders the patches in 2 x 2 merge order (as clip_graph_qwen3vl), resizes the learned position table
 // (bilinear, align corners), makes the 2-D RoPE tables and the key mask: those depend on the image's size only and are
