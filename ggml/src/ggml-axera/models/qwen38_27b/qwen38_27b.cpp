@@ -435,9 +435,9 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
     NBLK = (int) pkv.shape[1];
     GGML_ASSERT(pkv.shape[3] == PG && (int64_t) NBLK * PG == man.context);
     kv_pages = NBLK;
-    if (const int64_t cells = axera_kv_cells(); cells > 0) {  // llama.cpp's -c (its own cache's cells)
-        kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(NBLK, (cells + PG - 1) / PG));
-    }
+    if (const int64_t cells = axera_kv_cells(); cells > 0 && pna == 1) {  // llama.cpp's -c (its own cache's cells); a
+        kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(NBLK, (cells + PG - 1) / PG));  // multi-layer prefill
+    }                                                                                            // call needs every page
     if (const char * e = getenv("GGML_AXERA_KV_PAGES")) {
         kv_pages = std::max(1, std::min(NBLK, atoi(e)));
     }
