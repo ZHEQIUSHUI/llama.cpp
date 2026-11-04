@@ -1,19 +1,20 @@
-// Axera NPU backend: the Qwen3.5 dense whole-model design (4B, 9B and 2B). Every model of a manifest gets this
-// adapter; the manifest names its kernels, and the kernel IO gives the model's layer counts and head sizes.
+// Axera NPU backend: the Qwen3.5 dense whole-model design (Qwen3.5-4B, 9B and 2B). Every model of a manifest gets
+// this adapter; the manifest names its kernels, and the kernel IO gives the model's layer counts and head sizes.
 //
-// One path, the manifest's kernels (ax-dsl-kernels models/qwen35_{2b,4b,9b}/whole):
-//   prefill  role prefill: the whole model in one call per page of 256 cells (a runtime loop over the manifest's
-//            blocks, the layers' weights in banks [blocks, ...] indexed by the block), the last page of a batch padded
-//            (valid_tokens).
+// One path, the manifest's kernels (ax-dsl-kernels models/qwen35_whole):
+//   prefill  role prefill: the model in one or more calls per page of 256 cells (each call covers B blocks, a runtime
+//            loop over them, the layers' weights in banks [all blocks, ...] sliced per call), the last page of a batch
+//            padded (valid_tokens). A call's x is the previous call's output; the KV cache is one CMM pool per call.
 //            Its history is whole pages: a batch that starts inside a page restarts at the page's first cell from the
 //            recurrent state saved there, with the page's earlier inputs (kept) before its own
-//   decode   role decode.group: G consecutive layers per call (weights in packs), L / G calls per token, then lm_head
+//   decode   role decode.group: one group's consecutive layers per call (weights in packs), L / G calls per token,
+//            then lm_head
 //   verify   role decode.verify, optional (speculative decoding): a batch of 2 - 4 tokens in one call
 //   mtp      roles mtp.*, optional: a draft context's MTP block
 // The state is this adapter's (CMM pools in the prefill kernel's layouts, the decode group bound to each layer's part):
-// the KV cache paged [blocks][pages][K, V][256][kv heads x head dim] bf16, the delta-net states
-// [layers][value heads][key dim][value dim] f32 and conv states q / k [layers][3][key heads x key dim], v
-// [layers][3][value heads x value dim] bf16 (value heads in HF order); after a verification the current state of a
+// the KV cache paged by prefill call [attention layers][pages][K, V][256][key heads][head dim] bf16, the delta-net
+// states [delta-net layers][value heads][key dim][value dim] f32 and their q / k / v conv states bf16 (value heads in
+// HF order); the manifest's IO sizes give every model's exact geometry. After a verification the current state of a
 // delta-net layer is a snapshot's row (where[]). One sequence. Weights only from the GGUF.
 
 #include "../model.h"
@@ -49,12 +50,14 @@ class qwen35_whole final : public model {
     int              L = 0, H = 0, G = 0, ROT = 0, NBLK = 0;
     int              KH = 16, VH = 0, REP = 1;  // delta-net key / value heads (from the prefill kernels' IO)
     std::vector<int> ord;  // layer -> its index among the delta-net layers / the attention layers
+    std::vector<int> state_group, state_local;  // a delta-net pool slot -> its verification group / local state
 
     // GGUF's tiled value head of HF (grouped) head g
     int tiled(int g) const { return (g % REP) * KH + g / REP; }
 
     // the state pools; their sizes per layer
-    axera_cmm KV, ST, CQ, CK, CV;
+    axera_cmm              ST, CQ, CK, CV;
+    std::vector<axera_cmm> KVC;  // the KV cache: one buffer per prefill call's attention layers (a CMM allocation is < 4 GB)
     size_t    kv_b = 0, st_b = 0, cq_b = 0, cv_b = 0;
     // the recurrent state at the first cell of the current page (snap_cell), and the inputs of that page's cells so far
     std::vector<uint8_t>     snap;
@@ -94,9 +97,10 @@ class qwen35_whole final : public model {
     axera_cmm ME, MH, MCS, MPN, MMASK, MOUT, MRAW, PE, PH, PCS, PPN, PMASK, PNBLK, POUT2, PRAW, MKV;
     axera_cmm M8E, M8H, M8CS, M8PN, M8MASK, M8NT, M8OUT, M8RAW;
     const void * mtp_bound = nullptr;
-    call                           pre;
+    std::vector<call>              pres;  // the prefill calls of a page (the kernel's blocks each)
+    int                            ncall = 1;
     std::map<std::string, axera_cmm> banks;
-    axera_cmm                      PX, POS, INDPTR, INDICES, LASTLEN, CLOC, VALID, POUT;
+    axera_cmm                      PX, POS, INDPTR, INDICES, LASTLEN, CLOC, VALID, POUT[2];
     output_head                    head;
 
     void init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
@@ -162,8 +166,9 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
     const int         phase = std::stoi(mt[1]);
     const bool        mlp   = mt[2] == "mlp";
     const std::string n     = mt[3];
-    const int         nb    = L / 4;
-    GGML_ASSERT(d.shape.size() >= 2 && d.shape[0] == nb && d.bytes % nb == 0);
+    const bool        cs    = n == "cos" || n == "sin";
+    const int         nb    = (int) d.shape[0];
+    GGML_ASSERT(d.shape.size() >= 2 && nb > 0 && (nb == L / 4 || cs) && d.bytes % nb == 0);
     axera_cmm     c  = axera_cmm_alloc(d.bytes);
     const size_t  bb = d.bytes / nb;  // bytes per block
     std::vector<const ggml_tensor *> read;  // the GGUF tensors read: their mapped pages dropped when the bank is done
@@ -364,9 +369,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
         if (g != (il % 4 != 3)) {
             GGML_ABORT("axera qwen35_whole: layer %d is not the 3 delta-net + 1 attention pattern\n", il);
         }
-        // The prefill build may keep one state bank per phase (b0 / b1 / b2, each [blocks]) or one common bank
-        // (b0, [layers]). Phase-major is also the pool layout the decode groups write, so use it for both forms.
-        ord[il] = g ? (il % 4) * (L / 4) + il / 4 : na++;
+        ord[il] = g ? 0 : na++;  // the delta-net rows are laid out below, once the prefill call size is known
         if (g) {
             ++ng;
         }
@@ -396,8 +399,32 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     };
     const io_desc & pkv = in_of(pk, "b3_kv"), &pst = in_of(pk, "b0_attn_state_in");
     const io_desc & pcq = in_of(pk, "b0_attn_q_conv_state_in"), &pcv = in_of(pk, "b0_attn_v_conv_state_in");
-    GGML_ASSERT(pkv.shape[0] == na && (pst.shape[0] == ng || pst.shape[0] == L / 4) &&
-                (pcq.shape[0] == ng || pcq.shape[0] == L / 4) && (pcv.shape[0] == ng || pcv.shape[0] == L / 4));
+    const int pna = (int) pkv.shape[0], png = 3 * pna;  // the prefill kernel's layers per call
+    GGML_ASSERT(pna > 0 && na % pna == 0);
+    ncall = na / pna;
+    GGML_ASSERT((pst.shape[0] == png || pst.shape[0] == ng || pst.shape[0] == L / 4 || pst.shape[0] == pna) &&
+                pcq.shape[0] == pst.shape[0] && pcv.shape[0] == pst.shape[0]);
+    // The common state bank (b0 [3 * pna]) is phase-major inside one call; calls follow one another. A call's
+    // [3 * pna] rows are then one contiguous slice of the pool, which is what the prefill calls bind below. A build
+    // with one bank per phase (b0 / b1 / b2, each [blocks]) keeps the phase-major pool instead.
+    const bool common_state = pst.shape[0] == png || pst.shape[0] == ng;
+    for (int il = 0; il < L; ++il) {
+        if (t.count("blk." + std::to_string(il) + ".ssm_a") == 0) {
+            continue;
+        }
+        const int b = il / 4, p = il % 4;
+        ord[il] = common_state ? (b / pna) * png + p * pna + b % pna : p * (L / 4) + b;
+    }
+    state_group.assign(ng, -1);
+    state_local.assign(ng, -1);
+    for (int il = 0; il < L; ++il) {
+        if (t.count("blk." + std::to_string(il) + ".ssm_a") == 0) {
+            continue;
+        }
+        const int gi = (il / 4) / (G / 4), j = il - gi * G;
+        state_group[ord[il]] = gi;
+        state_local[ord[il]] = (j / 4) * 3 + j % 4;
+    }
     // the delta-net head geometry: the state [layers, 1, VH, KD, VD], and conv1d's channels 2 * KH * KD + VH * VD
     GGML_ASSERT(pst.shape.size() == 5 && pcv.shape.size() >= 2);
     VH = (int) pst.shape[2];
@@ -407,7 +434,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     KH  = (int) ((conv_w->ne[1] - VH * VD) / (2 * KD));
     REP = VH / KH;
     GGML_ASSERT(KH > 0 && REP * KH == VH && conv_w->ne[1] == 2 * KH * KD + VH * VD);
-    kv_b = pkv.bytes / na;
+    kv_b = pkv.bytes / pna;
     st_b = pst.bytes / pst.shape[0];
     cq_b = pcq.bytes / pcq.shape[0];
     cv_b = pcv.bytes / pcv.shape[0];
@@ -415,7 +442,10 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
                 in_of(dk, "ck0").bytes == cq_b && in_of(dk, "cv0").bytes == cv_b);
     NBLK = (int) pkv.shape[1];
     GGML_ASSERT(pkv.shape[3] == PG && (int64_t) NBLK * PG == man.context);
-    KV = axera_cmm_alloc(pkv.bytes);
+    KVC.resize(ncall);
+    for (int k = 0; k < ncall; ++k) {
+        KVC[k] = axera_cmm_alloc(kv_b * pna);
+    }
     ST = axera_cmm_alloc((size_t) ng * st_b);
     CQ = axera_cmm_alloc((size_t) ng * cq_b);
     CK = axera_cmm_alloc((size_t) ng * cq_b);
@@ -436,14 +466,15 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     GGML_ASSERT(dk.in_bytes("pn") == 3 * sizeof(int32_t) && dk.in_bytes("mask") == (size_t) man.context * sizeof(ggml_bf16_t));
     auto pool_io = [&](const std::string & n, int il) {
         if (n.rfind("kv", 0) == 0) {
-            return axera_io(KV.get(), (char *) KV->vir + ord[il] * kv_b, (uint32_t) kv_b);
+            const int a = ord[il];
+            return axera_io(KVC[a / pna].get(), (char *) KVC[a / pna]->vir + (size_t) (a % pna) * kv_b, (uint32_t) kv_b);
         }
         const axera_cmm & p = n[0] == 's' ? ST : n[1] == 'q' ? CQ : n[1] == 'k' ? CK : CV;
         const size_t      b = n[0] == 's' ? st_b : n[1] == 'v' ? cv_b : cq_b;
         return axera_io(p.get(), (char *) p->vir + ord[il] * b, (uint32_t) b);
     };
     // the prefill kernel's weight banks [blocks, ..] from the GGUF (first: decode and verification calls may read
-    // their row-split weights from them, inputs k_<bank>: the blocks of the call's G layers)
+    // their row-split weights from them, inputs k_<bank>: the blocks of each prefill call)
     const rope rp(rope_node, names.find("inp_pos"), 1);
     banks.clear();
     {
@@ -462,7 +493,15 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
         };
         for (const auto & d : pk.desc->in) {
             if (!pools.count(d.name) && !state_pool(d.name)) {
-                banks[d.name] = bank(t, d, rp);
+                // the weights of all L / 4 blocks (a call binds its slice below); the cos / sin tables are the same
+                // for every block, so the kernel's blocks of them are bound whole to every call
+                const bool cs = ends(d.name, "_attn_cos") || ends(d.name, "_attn_sin");
+                io_desc    dd = d;
+                if (!cs && ncall > 1) {
+                    dd.shape[0] *= ncall;
+                    dd.bytes *= ncall;
+                }
+                banks[d.name] = bank(t, dd, rp);
             }
         }
     }
@@ -588,10 +627,9 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     }
 
     // prefill: the weight banks (above), the pools, one page's inputs
-    pre   = {};
-    pre.k = &pk;
     PX      = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
-    POUT    = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
+    POUT[0] = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
+    POUT[1] = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
     POS     = axera_cmm_alloc(pk.in_bytes("position_ids"));
     INDPTR  = axera_cmm_alloc(2 * sizeof(int32_t));
     INDICES = axera_cmm_alloc(pk.in_bytes("indices"));
@@ -604,39 +642,59 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
         ((int32_t *) INDICES->vir)[i] = i;
     }
     INDICES->flush();
-    for (const auto & d : pk.desc->in) {
-        const std::string & n = d.name;
-        const axera_cmm *   b = n == "x" ? &PX : n == "position_ids" ? &POS : n == "indptr" ? &INDPTR : n == "indices" ? &INDICES :
-                                n == "last_page_len" ? &LASTLEN : n == "cache_location" ? &CLOC : n == "valid_tokens" ? &VALID :
-                                n == "b3_kv" ? &KV : nullptr;
-        size_t off = 0;
-        auto ends = [](const std::string & s, const char * suffix) {
-            const size_t z = strlen(suffix);
-            return s.size() >= z && s.compare(s.size() - z, z, suffix) == 0;
-        };
-        if (!b && n.size() > 5 && n[0] == 'b' && n[1] >= '0' && n[1] <= '2' &&
-            (ends(n, "_attn_state_in") || ends(n, "_attn_q_conv_state_in") || ends(n, "_attn_k_conv_state_in") ||
-             ends(n, "_attn_v_conv_state_in"))) {
-            const int phase = n[1] - '0';
-            const int kind  = n.rfind("_attn_state_in") != std::string::npos ? 0 : n.rfind("_attn_q_conv_state_in") != std::string::npos ? 1 :
-                              n.rfind("_attn_k_conv_state_in") != std::string::npos ? 2 : 3;
-            b   = &pool(kind);
-            // A common bank (b0 [layers]) has the phase-major pool's own order. A phase bank (bP [blocks]) is one
-            // contiguous slice of it, and this kernel input points at that slice.
-            off = b->get() && d.shape[0] == (int64_t) (L / 4) ? (size_t) phase * (L / 4) * part(kind) : 0;
-            if (d.bytes != (size_t) d.shape[0] * part(kind) || off + d.bytes > (*b)->size) {
-                GGML_ABORT("axera qwen35_whole: prefill state %s: shape0 %lld bytes %zu part %zu bank %zu off %zu\n", n.c_str(),
-                           (long long) d.shape[0], d.bytes, (size_t) part(kind), (*b)->size, off);
+    GGML_ASSERT(pk.desc->out.size() == 1 && pk.desc->out[0].name == "output" && pk.desc->out[0].bytes == POUT[0]->size);
+    pres.assign(ncall, {});
+    auto ends = [](const std::string & s, const char * suffix) {
+        const size_t z = strlen(suffix);
+        return s.size() >= z && s.compare(s.size() - z, z, suffix) == 0;
+    };
+    for (int k = 0; k < ncall; ++k) {  // call k: blocks k * pna .. of the banks, its layers of the pools
+        call & c = pres[k];
+        c.k      = &pk;
+        for (const auto & d : pk.desc->in) {
+            const std::string & n = d.name;
+            const axera_cmm *   b = n == "x" ? (k == 0 ? &PX : &POUT[(k - 1) & 1]) : n == "position_ids" ? &POS :
+                                    n == "indptr" ? &INDPTR : n == "indices" ? &INDICES : n == "last_page_len" ? &LASTLEN :
+                                    n == "cache_location" ? &CLOC : n == "valid_tokens" ? &VALID : nullptr;
+            size_t off = 0;
+            if (!b && n == "b3_kv") {
+                b = &KVC[k];
+            } else if (!b && n.size() > 5 && n[0] == 'b' && n[1] >= '0' && n[1] <= '2' &&
+                       (ends(n, "_attn_state_in") || ends(n, "_attn_q_conv_state_in") || ends(n, "_attn_k_conv_state_in") ||
+                        ends(n, "_attn_v_conv_state_in"))) {
+                const int phase = n[1] - '0';
+                const int kind  = n.rfind("_attn_state_in") != std::string::npos ? 0 :
+                                  n.rfind("_attn_q_conv_state_in") != std::string::npos ? 1 :
+                                  n.rfind("_attn_k_conv_state_in") != std::string::npos ? 2 : 3;
+                b = &pool(kind);
+                // A common bank (b0 [layers]) has the phase-major pool's own order: a call's slice follows its
+                // predecessor's. A phase bank (bP [blocks]) is one contiguous phase of the pool, and the call's
+                // blocks follow in that phase.
+                if (d.shape[0] == png && ncall > 1) {
+                    off = (size_t) k * d.bytes;
+                } else if (d.shape[0] == ng) {
+                    off = 0;
+                } else if (d.shape[0] == L / 4) {
+                    off = (size_t) phase * (L / 4) * part(kind);
+                } else if (d.shape[0] == pna) {
+                    off = (size_t) phase * (L / 4) * part(kind) + (size_t) k * d.bytes;
+                } else {
+                    GGML_ABORT("axera qwen35_whole: prefill state %s: shape0 %lld\n", n.c_str(), (long long) d.shape[0]);
+                }
+                if (d.bytes != (size_t) d.shape[0] * part(kind) || off + d.bytes > (*b)->size) {
+                    GGML_ABORT("axera qwen35_whole: prefill state %s: shape0 %lld bytes %zu part %zu bank %zu off %zu\n", n.c_str(),
+                               (long long) d.shape[0], (size_t) d.bytes, (size_t) part(kind), (*b)->size, off);
+                }
+            } else if (!b) {
+                b   = &banks.at(n);
+                // (cos / sin are bound whole; the weight banks hold every call's blocks)
+                off = (*b)->size >= (size_t) ncall * d.bytes ? (size_t) k * d.bytes : 0;
             }
+            GGML_ASSERT((*b)->size >= off + d.bytes);
+            c.in.push_back(axera_io(b->get(), (char *) (*b)->vir + off, (uint32_t) d.bytes));
         }
-        if (!b) {
-            b = &banks.at(n);
-        }
-        GGML_ASSERT((*b)->size >= d.bytes);
-        pre.in.push_back(axera_io(b->get(), (char *) (*b)->vir + off, (uint32_t) d.bytes));
+        c.out.push_back(axera_io(POUT[k & 1], pk.desc->out[0].bytes));
     }
-    GGML_ASSERT(pk.desc->out.size() == 1 && pk.desc->out[0].name == "output");
-    pre.out.push_back(axera_io(POUT, pk.desc->out[0].bytes));
 
     std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> live;
     for (auto & c : dec) {
@@ -648,7 +706,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
         bb += b->size;
     }
     GGML_LOG_INFO("axera qwen35_whole: %d layers (%d per decode call), prefill banks %.1f GiB, state %.2f GiB, %lld cells\n",
-                  L, G, bb / 1073741824.0, (KV->size + ST->size + CQ->size + CK->size + CV->size) / 1073741824.0,
+                  L, G, bb / 1073741824.0, (kv_b * na + ST->size + CQ->size + CK->size + CV->size) / 1073741824.0,
                   (long long) man.context);
 }
 
@@ -684,8 +742,9 @@ void qwen35_whole::state_at(int set, int row) {
     const int per = G / 4 * 3;  // delta-net layers per group
     for (int k = 0; k < 4; ++k) {
         for (size_t g = 0; g < where[k].size(); ++g) {
-            const axera_cmm & sn = snaps[set][g / per][k];
-            where[k][g]          = { sn.get(), (char *) sn->vir + ((size_t) row * per + g % per) * part(k) };
+            GGML_ASSERT(k > 0 || (state_group[g] >= 0 && state_local[g] >= 0));
+            const axera_cmm & sn = snaps[set][state_group[g]][k];
+            where[k][g]          = { sn.get(), (char *) sn->vir + ((size_t) row * per + state_local[g]) * part(k) };
         }
     }
     cur_set = set;
@@ -796,13 +855,16 @@ void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32
         }
         {
             axera_timer tl("prefill (page)");
-            pre.k->run(pre.in, pre.out, "prefill");
+            for (auto & c : pres) {
+                c.k->run(c.in, c.out, "prefill");
+            }
         }
-        axera_timer to("prefill out rows");
-        POUT->invalidate(POUT->vir, (size_t) v * H * sizeof(ggml_bf16_t));
+        axera_timer       to("prefill out rows");
+        const axera_cmm & po = POUT[(ncall - 1) & 1];
+        po->invalidate(po->vir, (size_t) v * H * sizeof(ggml_bf16_t));
         axera_host_pool().run(v - std::max(0, out0 - r0), [&](int64_t i) {
             const int r = std::max(0, out0 - r0) + (int) i;
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) POUT->vir + (size_t) r * H, h.data() + (size_t) (r0 + r - out0) * H, H);
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) po->vir + (size_t) r * H, h.data() + (size_t) (r0 + r - out0) * H, H);
         });
         if (v < PG) {  // the page's inputs so far: a later batch restarts the page with them
             page_x.assign(x + (size_t) r0 * H, x + (size_t) (r0 + v) * H);
