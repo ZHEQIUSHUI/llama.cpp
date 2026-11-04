@@ -131,6 +131,11 @@ extern std::atomic<uint64_t> axera_graph_epoch;  // graphs computed so far
 // itself at about 109 °C under a long prefill; decode never gets near it)
 void axera_thermal_guard();
 
+// the cells of llama.cpp's KV cache (its -c): noted by the buffer type as the cache tensors are sized, read by the
+// adapters that keep the state in their own pools to size them (GGML_AXERA_KV_PAGES overrides)
+void    axera_note_kv_cells(int64_t cells);
+int64_t axera_kv_cells();
+
 // GGML_AXERA_PROF=1: wall time per part, printed at exit
 struct axera_prof {
     const bool on = [] {

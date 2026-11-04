@@ -17,6 +17,18 @@
 
 std::atomic<uint64_t> axera_graph_epoch{ 0 };
 
+static std::atomic<int64_t> g_axera_kv_cells{ 0 };
+
+void axera_note_kv_cells(int64_t cells) {
+    int64_t cur = g_axera_kv_cells.load();
+    while (cells > cur && !g_axera_kv_cells.compare_exchange_weak(cur, cells)) {
+    }
+}
+
+int64_t axera_kv_cells() {
+    return g_axera_kv_cells.load();
+}
+
 void axera_thermal_guard() {
     static const int limit = [] {
         const char * e = getenv("GGML_AXERA_TEMP_MAX");

@@ -213,6 +213,9 @@ static size_t ggml_backend_axera_buffer_type_get_alloc_size(ggml_backend_buffer_
     const bool   kv = t->type == GGML_TYPE_F16 && t->ne[3] == 1 &&
                     (strncmp(t->name, "cache_k_l", 9) == 0 || strncmp(t->name, "cache_v_l", 9) == 0);
     const axera::manifest * m = axera::kernels();
+    if (kv) {
+        axera_note_kv_cells(t->ne[1]);  // (the context llama.cpp runs with: the adapters size their pools to it)
+    }
     return kv && m ? std::max(n, (size_t) (t->ne[2] - 1) * t->nb[2] + (size_t) m->context * t->nb[1]) : n;
     GGML_UNUSED(buft);
 }
