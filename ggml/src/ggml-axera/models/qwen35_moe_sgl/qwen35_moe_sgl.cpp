@@ -11,7 +11,9 @@
 // The state is this adapter's (the decode kernel's banks): KV cache paged [10][64 pages][K, V][256][2 x 256] bf16,
 // delta-net states [30][32][128][128] f32, conv states q / k [30][3][2048], v [30][3][4096] bf16 (value heads in HF
 // order). The prefill kernels write the recurrent states to a second set, the two swapped after each page. One
-// sequence. Weights only from the GGUF; the routed experts once, in the decode banks.
+// sequence. Weights only from the GGUF: every projection and expert row is quantized to NVFP4 (E2M1 pairs, an E4M3
+// scale per 16 inputs, the FP32 tensor scale2) in memory at load, one tensor / expert at a time, straight into the
+// device banks. An offline bank pack is a debug fallback only (AXERA_SGL35_BANKS=1); the release ships no bank files.
 
 #include "../model.h"
 #include "../../core/quant.h"
@@ -19,6 +21,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <regex>
 
@@ -40,39 +43,6 @@ struct call {
 inline int tiled(int g) {
     return (g % REP) * KH + g / REP;
 }
-
-// rows of an [N, K] weight of the GGUF in the kernels' MXFP4 layout (codes [K / 2], scales [K / 32]): an MXFP4 tensor's
-// converted row by row as read, any other type quantized once; or in MXFP8 (codes [K], scales [K / 32]), quantized once
-struct mx4 {
-    const ggml_tensor * w;
-    axera_cmm           q, s;
-    int64_t             N = 0, K = 0;
-    bool                fp8 = false;
-    mx4(const ggml_tensor * w, bool fp8) : w(w), N(ggml_nrows(w)), K(w->ne[0]), fp8(fp8) {
-        if (fp8) {
-            axera_quantize_mxfp8(w, q, s);
-        } else if (w->type != GGML_TYPE_MXFP4) {
-            axera_quantize_mxfp4(w, q, s);
-        }
-    }
-    int64_t code_bytes() const { return fp8 ? K : K / 2; }  // per row
-    // row r: its codes and its scales (either may be null)
-    void row(int64_t r, uint8_t * codes, uint8_t * scales) const {
-        if (q) {
-            if (codes) {
-                memcpy(codes, (const uint8_t *) q->vir + r * code_bytes(), code_bytes());
-            }
-            if (scales) {
-                memcpy(scales, (const uint8_t *) s->vir + r * (K / 32), K / 32);
-            }
-            return;
-        }
-        thread_local std::vector<uint8_t> c, sc;
-        c.resize(K / 2);
-        sc.resize(K / 32);
-        axera_mxfp4_rows((const uint8_t *) w->data + r * w->nb[1], 1, K, codes ? codes : c.data(), scales ? scales : sc.data());
-    }
-};
 
 std::vector<float> f32_of(const ggml_tensor * w) {
     std::vector<float> v((size_t) ggml_nelements(w));
@@ -172,8 +142,9 @@ class qwen35_moe_sgl final : public model {
     void         decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h);
 };
 
-// Allocate the decode kernel's runtime banks and load the offline BF16->NVFP4 pack. The pack contains one file per
-// non-state input and is shared by decode and prefill; state and paged KV banks start zero.
+// Debug-only fallback: allocate the decode kernel's runtime banks and load an offline NVFP4 pack. The pack contains
+// one file per non-state input and is shared by decode and prefill; state and paged KV banks start zero. The release
+// path is fill() below; this is used only when AXERA_SGL35_BANKS=1 and a pack is present.
 void qwen35_moe_sgl::fill_pack(const kernel & dk, const rope & rp) {
     static const std::regex re("b([0-3])_(attn|moe)_(.+)");
     std::string           dir = man.dir + "/banks/";
@@ -224,12 +195,17 @@ void qwen35_moe_sgl::fill_pack(const kernel & dk, const rope & rp) {
     }
 }
 
-// the decode kernel's banks from the GGUF: b<phase>_attn_* (delta net, phases 0-2; gated attention, phase 3),
-// b<phase>_moe_*, each [10 blocks, ...] (layer = 4 * block + phase), and the state / KV pools
+// the decode kernel's banks from the published GGUF: b<phase>_attn_* (delta net, phases 0-2; gated attention, phase 3),
+// b<phase>_moe_*, each [10 blocks, ...] (layer = 4 * block + phase), and the state / KV pools. Every projection and
+// expert row is quantized here, in memory, to the kernels' NVFP4 layout (E2M1 pairs, one E4M3 scale per 16 inputs and
+// the FP32 global scale2): the GGUF's own quantization is never copied, so Q8_0 is a faithful source without a second
+// lossy requantization. One layer (and one expert) at a time; the mapped pages are dropped as soon as a tensor has
+// been consumed.
 void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const kernel & dk, const rope & rp) {
     static const std::regex re("b([0-3])_(attn|moe)_(.+)");
-    std::vector<const ggml_tensor *> read;  // the GGUF tensors of the layer being filled
-    const bool                       keep_pages = axera_keep_pages();
+    std::vector<const ggml_tensor *> read;
+    std::map<std::string, int>       dtype;  // AX_ENGINE dtype of each bank (3 = FP32, else BF16)
+    const bool                       keep = axera_keep_pages();
     auto T = [&](int il, const std::string & g) -> const ggml_tensor * {
         const std::string nm = "blk." + std::to_string(il) + "." + g;
         if (!t.count(nm)) {
@@ -238,56 +214,28 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
         read.push_back(t.at(nm));
         return t.at(nm);
     };
-    // a weight's codes [.., K] MXFP8 (else [.., K / 2] MXFP4): by its codes input's last dimension against its scales'
-    // (scales input w_<p>_scale / w_scale_<p> of codes w_<p>)
-    auto io = [&](const std::string & n) -> const io_desc * {
-        for (const auto & e : dk.desc->in) {
-            if (e.name == n) {
-                return &e;
-            }
-        }
-        return nullptr;
-    };
-    auto is_fp8 = [&](const std::string & name) {
-        std::string c = name, sc;
-        const size_t i = name.find("w_scale_");
-        if (i != std::string::npos) {
-            c  = name.substr(0, i) + "w_" + name.substr(i + 8);
-            sc = name;
-        } else if (name.size() > 6 && name.compare(name.size() - 6, 6, "_scale") == 0) {
-            c  = name.substr(0, name.size() - 6);
-            sc = name;
-        } else {
-            const size_t j = name.find("w_");
-            sc             = j == std::string::npos ? "" : name + "_scale";
-            if (!io(sc)) {
-                sc = name.substr(0, j) + "w_scale_" + name.substr(j + 2);
-            }
-        }
-        const io_desc * a = io(c), * b = io(sc);
-        return a && b && a->shape.back() == 32 * b->shape.back();
-    };
-    // the banks first: the state / KV pools stay zero, cos_sin_cache is filled
+    // allocate every bank; the state / KV pools stay zero, the RoPE table is generated
     for (const auto & d : dk.desc->in) {
         bank_n[d.name] = d.bytes;
+        dtype[d.name]  = d.dtype;
     }
     for (const auto & d : dk.desc->in) {
-        std::smatch mt;
         if (banks.count(d.name)) {
             continue;
         }
+        std::smatch mt;
         if (!std::regex_match(d.name, mt, re)) {
             if (d.name == "b3_kv") {  // the KV cache pool: zero
                 banks[d.name] = axera_cmm_alloc(d.bytes);
             }
             continue;
         }
-        const std::string n     = mt[3];
-        axera_cmm &       c     = banks[d.name] = axera_cmm_alloc(d.bytes);
+        axera_cmm & c = banks[d.name] = axera_cmm_alloc(d.bytes);
+        const std::string n = mt[3];
         if (n == "state_in" || n == "q_conv_state_in" || n == "k_conv_state_in" || n == "v_conv_state_in" || n == "kv") {
             continue;  // the state pools: zero
         }
-        if (n == "cos_sin_cache") {  // [positions][cos | sin of ROT / 2 frequencies] f32
+        if (n == "cos_sin_cache") {  // [positions][cos | sin of ROT / 2] f32
             const int64_t P = d.shape[1], R = d.shape[2] / 2;
             GGML_ASSERT((size_t) R == rp.inv_freq.size() && d.dtype == 3);
             for (int64_t q = 0; q < P; ++q) {
@@ -302,189 +250,193 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
         }
         GGML_ASSERT(d.shape[0] == NB && d.bytes % NB == 0);
     }
-    // then one layer at a time: its slice of every bank, then the block's mapped GGUF pages dropped, so the load
-    // holds one block's file pages rather than the whole model's
+    auto slot = [&](const std::string & n, int b) -> uint8_t * {
+        if (!banks.count(n) || !bank_n.count(n)) {
+            GGML_ABORT("axera qwen35_moe_sgl: bank %s is not in the decode ABI\n", n.c_str());
+        }
+        const axera_cmm & c = banks.at(n);
+        const size_t      bb = bank_n.at(n) / NB;
+        GGML_ASSERT(bb * NB == bank_n.at(n));
+        return (uint8_t *) c->vir + (size_t) b * bb;
+    };
+    // floats into a bank slot (BF16 or FP32 by the ABI)
+    auto put = [&](const std::string & n, int b, const std::vector<float> & v, float scale = 1.0f) {
+        if (!bank_n.count(n) || !dtype.count(n)) {
+            GGML_ABORT("axera qwen35_moe_sgl: bank %s is not in the decode ABI\n", n.c_str());
+        }
+        const size_t bb = bank_n.at(n) / NB;
+        uint8_t *    d  = slot(n, b);
+        if (dtype.at(n) == 3) {
+            if (v.size() * 4 != bb) {
+                GGML_ABORT("axera qwen35_moe_sgl: %s f32 %zu floats, bank slot %zu bytes\n", n.c_str(), v.size(), bb);
+            }
+            for (size_t i = 0; i < v.size(); ++i) {
+                ((float *) d)[i] = v[i] * scale;
+            }
+        } else {
+            if (v.size() * 2 != bb) {
+                GGML_ABORT("axera qwen35_moe_sgl: %s bf16 %zu floats, bank slot %zu bytes\n", n.c_str(), v.size(), bb);
+            }
+            for (size_t i = 0; i < v.size(); ++i) {
+                ((ggml_bf16_t *) d)[i] = ggml_fp32_to_bf16(v[i] * scale);
+            }
+        }
+    };
+    // rows r0 .. r0 + nr of a GGUF tensor -> this block's NVFP4 code / scale banks, its global scale at scale2 index
+    auto put_nv = [&](const std::string & pre, const std::string & base, const ggml_tensor * w, int64_t r0, int64_t nr,
+                      int b, int64_t row0, int64_t s2i, const std::vector<int64_t> * row_src = nullptr,
+                      const std::vector<int64_t> * blk_src = nullptr, const std::string & sname = "",
+                      const std::string & zname = "") -> float {
+        const std::string qn = pre + base;
+        const std::string sn = sname.empty() ? qn + "_scale" : sname;
+        const std::string zn = zname.empty() ? qn + "_scale2" : zname;
+        const int64_t     K  = w->ne[0];
+        uint8_t *         q  = slot(qn, b);
+        uint8_t *         s  = slot(sn, b);
+        GGML_ASSERT((size_t) (row0 + nr) * (K / 2) <= bank_n.at(qn) / NB);
+        GGML_ASSERT((size_t) (row0 + nr) * (K / 16) <= bank_n.at(sn) / NB);
+        GGML_ASSERT((size_t) (s2i + 1) * sizeof(float) <= bank_n.at(zn) / NB);
+        const float scale2 = row_src || blk_src
+                                 ? axera_quantize_nvfp4_slice_perm(w, r0, nr, row_src, blk_src,
+                                                                   q + (size_t) row0 * (K / 2), K / 2,
+                                                                   s + (size_t) row0 * (K / 16), K / 16)
+                                 : axera_quantize_nvfp4_slice(w, r0, nr, q + (size_t) row0 * (K / 2), K / 2,
+                                                              s + (size_t) row0 * (K / 16), K / 16);
+        ((float *) slot(zn, b))[s2i] = scale2;
+        return scale2;
+    };
+    // GGUF tiles the 32 GDN value heads; the kernels want HF grouped order. row_src undoes it for output rows,
+    // blk_src for the 16-input blocks of an input-column permutation.
+    auto head_rows = [&](int64_t rows) {
+        std::vector<int64_t> m(rows);
+        const int64_t        hr = rows / VH;
+        for (int64_t r = 0; r < rows; ++r) {
+            m[r] = tiled((int) (r / hr)) * hr + r % hr;
+        }
+        return m;
+    };
+    auto head_blocks = [&](int64_t K) {
+        std::vector<int64_t> m(K / 16);
+        const int64_t        hb = K / VH / 16;
+        for (int64_t g = 0; g < K / 16; ++g) {
+            m[g] = tiled((int) (g / hb)) * hb + g % hb;
+        }
+        return m;
+    };
+    auto head_perm = [&](const std::vector<float> & v) {  // GGUF's tiled value-head order -> HF grouped order
+        std::vector<float> u(VH);
+        for (int h = 0; h < VH; ++h) {
+            u[h] = v[tiled(h)];
+        }
+        return u;
+    };
+
     for (int b = 0; b < NB; ++b) {
         for (int phase = 0; phase < 4; ++phase) {
-            const int il = 4 * b + phase;
+            const int         il = 4 * b + phase;
+            const std::string pa = "b" + std::to_string(phase) + "_attn_";
+            const std::string pm = "b" + std::to_string(phase) + "_moe_";
             read.clear();
-            for (const auto & d : dk.desc->in) {
-                std::smatch mt;
-                if (!std::regex_match(d.name, mt, re) || std::stoi(mt[1]) != phase) {
-                    continue;
+            if (phase < 3) {  // gated delta net
+                put(pa + "input_norm_w", b, f32_of(T(il, "attn_norm.weight")));
+                const ggml_tensor * qkv = T(il, "attn_qkv.weight");
+                GGML_ASSERT(qkv->ne[0] % 16 == 0 && qkv->ne[1] == 2048 + 2048 + 4096);
+                const std::vector<int64_t> vr = head_rows(4096);
+                put_nv(pa, "w_q", qkv, 0, 2048, b, 0, 0);
+                put_nv(pa, "w_k", qkv, 2048, 2048, b, 0, 0);
+                put_nv(pa, "w_v", qkv, 4096, 4096, b, 0, 0, &vr);
+                if (!keep) {
+                    axera_drop_mapped(qkv);
                 }
-                const std::string n = mt[3];
-                if (n == "state_in" || n == "q_conv_state_in" || n == "k_conv_state_in" || n == "v_conv_state_in" ||
-                    n == "kv" || n == "cos_sin_cache") {
-                    continue;
+                {
+                    const ggml_tensor * w = T(il, "attn_gate.weight");
+                    const std::vector<int64_t> m = head_rows(ggml_nrows(w));
+                    put_nv(pa, "w_z", w, 0, ggml_nrows(w), b, 0, 0, &m);
                 }
-                if (!keep_pages) {
-                    read.clear();
+                for (const auto & [base, g] : { std::pair<const char *, const char *>{ "w_a", "ssm_alpha.weight" },
+                                                { "w_b", "ssm_beta.weight" } }) {
+                    const ggml_tensor * w = T(il, g);
+                    const std::vector<int64_t> m = head_rows(ggml_nrows(w));
+                    put_nv(pa, base, w, 0, ggml_nrows(w), b, 0, 0, &m);
                 }
-                axera_mapped_drop_guard drop(read, !keep_pages);
-                const bool        moe = mt[2] == "moe";
-                const bool        f8  = is_fp8(d.name);
-                const auto        cb  = banks.find(d.name);
-                GGML_ASSERT(cb != banks.end());
-                axera_cmm & c  = cb->second;
-                const size_t bb = d.bytes / NB;  // bytes per block
-                uint8_t *    dst = (uint8_t *) c->vir + (size_t) b * bb;
-                auto      put = [&](const std::vector<float> & v, float scale = 1.0f) {
-                    GGML_ASSERT(v.size() * (d.dtype == 3 ? 4 : 2) == bb);
-                    for (size_t i = 0; i < v.size(); ++i) {
-                        if (d.dtype == 3) {
-                            ((float *) dst)[i] = v[i] * scale;
-                        } else {
-                            ((ggml_bf16_t *) dst)[i] = ggml_fp32_to_bf16(v[i] * scale);
-                        }
-                    }
-                };
-                auto fill_v = [&](float v) { put(std::vector<float>(bb / (d.dtype == 3 ? 4 : 2), v)); };
-                // MXFP4 rows of a weight into this input (codes or scales): rows r0 .. r0 + nr, value heads (of hr rows)
-                // from row vrow on in HF order
-                auto rows = [&](const mx4 & w, int64_t r0, int64_t nr, bool scales, int64_t vrow = -1, int64_t hr = 0) {
-                    const size_t rb = scales ? w.K / 32 : w.code_bytes();
-                    GGML_ASSERT((size_t) nr * rb == bb);
-                    axera_host_pool().run(nr, [&](int64_t r) {
-                        int64_t src = r0 + r;
-                        if (vrow >= 0 && src >= vrow) {
-                            const int64_t j = src - vrow;
-                            src             = vrow + tiled((int) (j / hr)) * hr + j % hr;
-                        }
-                        w.row(src, scales ? nullptr : dst + r * rb, scales ? dst + r * rb : nullptr);
-                    });
-                };
-                auto cols = [&](const mx4 & w, bool scales) {  // value heads of the input (columns) in HF order
-                    const size_t rb = scales ? w.K / 32 : w.code_bytes(), cb = rb / VH;
-                    GGML_ASSERT((size_t) w.N * rb == bb);
-                    axera_host_pool().run(w.N, [&](int64_t r) {
-                        thread_local std::vector<uint8_t> src;
-                        src.resize(rb);
-                        w.row(r, scales ? nullptr : src.data(), scales ? src.data() : nullptr);
-                        for (int g = 0; g < VH; ++g) {
-                            memcpy(dst + r * rb + g * cb, src.data() + tiled(g) * cb, cb);
-                        }
-                    });
-                };
-                auto vec = [&](const std::string & g, bool heads, float scale = 1.0f) {
-                    std::vector<float> v = f32_of(T(il, g));
-                    if (heads) {
-                        std::vector<float> u(v.size());
-                        for (int h = 0; h < VH; ++h) {
-                            u[h] = v[tiled(h)];
-                        }
-                        v = u;
-                    }
-                    put(v, scale);
-                };
-                if (n.find("scale2") != std::string::npos) {
-                    fill_v(1.0f);
-                } else if (n.rfind("w_zeropoint_", 0) == 0) {
-                    memset(dst, 0, bb);
-                } else if (moe) {
-                    if (n == "input_norm_w") {
-                        vec("post_attention_norm.weight", false);
-                    } else if (n == "shared_expert_gate") {
-                        vec("ffn_gate_inp_shexp.weight", false);
-                    } else if (n == "w_route") {
-                        vec("ffn_gate_inp.weight", false);
-                    } else if (n == "w_scale_route") {
-                        fill_v(1.0f);
-                    } else if (n == "w_gate" || n == "w_scale_gate") {  // per expert: gate rows, then up rows
-                        const mx4     g(T(il, "ffn_gate_exps.weight"), f8), u(T(il, "ffn_up_exps.weight"), f8);
-                        const bool    sc = n != "w_gate";
-                        const int64_t E = g.w->ne[2], F = g.w->ne[1], rb = sc ? g.K / 32 : g.code_bytes();
-                        GGML_ASSERT((size_t) E * 2 * F * rb == bb);
-                        axera_host_pool().run(E * 2 * F, [&](int64_t r) {
-                            const int64_t e = r / (2 * F), j = r % (2 * F);
-                            const mx4 &   w = j < F ? g : u;
-                            w.row(e * F + j % F, sc ? nullptr : dst + r * rb, sc ? dst + r * rb : nullptr);
-                        });
-                    } else if (n == "w_down" || n == "w_scale_down") {
-                        const mx4 w(T(il, "ffn_down_exps.weight"), f8);
-                        rows(w, 0, w.N, n != "w_down");
-                    } else {
-                        static const std::map<std::string, const char *> S = { { "gate", "ffn_gate_shexp.weight" },
-                                                                                { "up", "ffn_up_shexp.weight" },
-                                                                                { "down", "ffn_down_shexp.weight" } };
-                        const size_t p = n.rfind('_');
-                        if (n.find("shared_expert_mlp_") == std::string::npos || !S.count(n.substr(p + 1))) {
-                            GGML_ABORT("axera qwen35_35b_a3b: unexpected MoE input %s\n", d.name.c_str());
-                        }
-                        const mx4 w(T(il, S.at(n.substr(p + 1))), f8);
-                        rows(w, 0, w.N, n.rfind("w_scale_", 0) == 0);
-                    }
-                } else if (phase == 3) {  // gated attention
-                    static const std::map<std::string, const char *> W = { { "q", "attn_q.weight" }, { "k", "attn_k.weight" },
-                                                                            { "v", "attn_v.weight" }, { "o", "attn_output.weight" } };
-                    const std::string p = n.substr(n.rfind('_') + 1);
-                    if (n == "w_norm_attn") {
-                        vec("attn_norm.weight", false);
-                    } else if (n == "w_norm_q") {  // the attention scale folded in
-                        vec("attn_q_norm.weight", false, 1.0f / std::sqrt((float) d.shape.back()));
-                    } else if (n == "w_norm_k") {
-                        vec("attn_k_norm.weight", false);
-                    } else if (W.count(p) && (n == "w_" + p || n == "w_scale_" + p)) {
-                        const mx4 w(T(il, W.at(p)), f8);
-                        rows(w, 0, w.N, n != "w_" + p);
-                    } else {
-                        GGML_ABORT("axera qwen35_35b_a3b: unexpected attention input %s\n", d.name.c_str());
-                    }
-                } else if (n == "input_norm_w") {  // gated delta net
-                    vec("attn_norm.weight", false);
-                } else if (n == "o_norm_w") {
-                    vec("ssm_norm.weight", false);
-                } else if (n == "a_log") {
-                    std::vector<float> a = f32_of(T(il, "ssm_a")), u(VH);
-                    for (int h = 0; h < VH; ++h) {
-                        u[h] = logf(-a[tiled(h)]);  // GGUF ssm_a = -exp(A_log)
-                    }
-                    put(u);
-                } else if (n == "dt_bias") {
-                    vec("ssm_dt.bias", true);
-                } else if (n == "w_q_conv" || n == "w_k_conv" || n == "w_v_conv") {
-                    // [C][1][taps] in the checkpoint's tap order: channels q, k (C each) then v (the rest, value heads)
-                    const ggml_tensor *      w  = T(il, "ssm_conv1d.weight");
-                    const std::vector<float> v  = f32_of(w);
-                    const int64_t            tp = w->ne[0], C = d.shape[1], v0 = w->ne[1] - C;
-                    const int64_t            c0 = n[2] == 'q' ? 0 : n[2] == 'k' ? C : v0;
-                    std::vector<float>       u((size_t) C * tp);
+                {
+                    const ggml_tensor * w = T(il, "ssm_out.weight");
+                    const std::vector<int64_t> m = head_blocks(w->ne[0]);
+                    put_nv(pa, "w_o", w, 0, ggml_nrows(w), b, 0, 0, nullptr, &m);
+                }
+                const std::vector<float> a = f32_of(T(il, "ssm_a"));
+                std::vector<float>       al(VH);
+                for (int h = 0; h < VH; ++h) {
+                    al[h] = logf(-a[tiled(h)]);  // GGUF ssm_a = -exp(A_log)
+                }
+                put(pa + "a_log", b, al);
+                put(pa + "dt_bias", b, head_perm(f32_of(T(il, "ssm_dt.bias"))));
+                put(pa + "o_norm_w", b, f32_of(T(il, "ssm_norm.weight")));
+                const ggml_tensor *      w  = T(il, "ssm_conv1d.weight");
+                const std::vector<float> cv = f32_of(w);
+                const int64_t            tp = w->ne[0];
+                for (char c : { 'q', 'k', 'v' }) {
+                    const int64_t C  = (int64_t) bank_n.at(pa + std::string("w_") + c + "_conv") / NB / (tp * 2);
+                    const int64_t v0 = w->ne[1] - C;
+                    std::vector<float> u((size_t) C * tp);
                     for (int64_t r = 0; r < C; ++r) {
                         const int64_t hr  = C / VH;
-                        const int64_t src = n[2] == 'v' ? v0 + tiled((int) (r / hr)) * hr + r % hr : c0 + r;
-                        memcpy(&u[(size_t) r * tp], &v[(size_t) src * tp], tp * sizeof(float));
+                        const int64_t src = c == 'v' ? v0 + tiled((int) (r / hr)) * hr + r % hr
+                                                     : (c == 'q' ? 0 : C) + r;
+                        memcpy(&u[(size_t) r * tp], &cv[(size_t) src * tp], tp * sizeof(float));
                     }
-                    put(u);
-                } else if (n.rfind("w_", 0) == 0 && n.size() >= 3) {  // w_<p>, w_<p>_scale for p in q k v z a b o
-                    const char        p      = n[2];
-                    const std::string suffix = n.substr(3);
-                    const bool        scales = suffix == "_scale";
-                    GGML_ASSERT(suffix.empty() || scales);
-                    if (p == 'q' || p == 'k' || p == 'v') {
-                        const mx4     w(T(il, "attn_qkv.weight"), f8);
-                        const int64_t nr = d.shape[1];  // rows q, k (nr each), then v (the rest)
-                        if (p == 'v') {
-                            rows(w, w.N - nr, nr, scales, w.N - nr, nr / VH);
-                        } else {
-                            rows(w, p == 'q' ? 0 : nr, nr, scales);
-                        }
-                    } else if (p == 'z') {
-                        const mx4 w(T(il, "attn_gate.weight"), f8);
-                        rows(w, 0, w.N, scales, 0, w.N / VH);
-                    } else if (p == 'a' || p == 'b') {
-                        const mx4 w(T(il, p == 'a' ? "ssm_alpha.weight" : "ssm_beta.weight"), f8);
-                        rows(w, 0, w.N, scales, 0, 1);
-                    } else if (p == 'o') {
-                        const mx4 w(T(il, "ssm_out.weight"), f8);
-                        cols(w, scales);
-                    } else {
-                        GGML_ABORT("axera qwen35_35b_a3b: unexpected delta-net input %s\n", d.name.c_str());
-                    }
-                } else {
-                    GGML_ABORT("axera qwen35_35b_a3b: unexpected delta-net input %s\n", d.name.c_str());
+                    put(pa + std::string("w_") + c + "_conv", b, u);
+                }
+            } else {  // gated attention
+                put(pa + "w_norm_attn", b, f32_of(T(il, "attn_norm.weight")));
+                put(pa + "w_norm_q", b, f32_of(T(il, "attn_q_norm.weight")), 1.0f / std::sqrt(256.0f));
+                put(pa + "w_norm_k", b, f32_of(T(il, "attn_k_norm.weight")));
+                for (const char * n : { "q", "k", "v", "o" }) {
+                    const std::string g = std::string("attn_") + (n[0] == 'o' ? "output" : n) + ".weight";
+                    const ggml_tensor * w = T(il, g);
+                    put_nv(pa, std::string("w_") + n, w, 0, ggml_nrows(w), b, 0, 0, nullptr, nullptr,
+                           pa + "w_scale_" + n, pa + "w_scale2_" + n);
                 }
             }
-            if (keep_pages) {
+            // MoE of this layer
+            put(pm + "input_norm_w", b, f32_of(T(il, "post_attention_norm.weight")));
+            put(pm + "shared_expert_gate", b, f32_of(T(il, "ffn_gate_inp_shexp.weight")));
+            put(pm + "w_route", b, f32_of(T(il, "ffn_gate_inp.weight")));
+            put(pm + "w_scale_route", b, std::vector<float>(256, 1.0f));
+            ((float *) slot(pm + "w_scale2_route", b))[0] = 1.0f;
+            {
+                const ggml_tensor * g = T(il, "ffn_gate_exps.weight");
+                const ggml_tensor * u = T(il, "ffn_up_exps.weight");
+                GGML_ASSERT(g->ne[0] == u->ne[0] && g->ne[1] == u->ne[1] && g->ne[2] == u->ne[2]);
+                const int64_t F = g->ne[1], E = g->ne[2];
+                for (int64_t e = 0; e < E; ++e) {
+                    put_nv(pm, "w_gate", g, e * F, F, b, e * 2 * F, e * 2, nullptr, nullptr, pm + "w_scale_gate",
+                           pm + "w_scale2_gate");
+                    put_nv(pm, "w_gate", u, e * F, F, b, e * 2 * F + F, e * 2 + 1, nullptr, nullptr,
+                           pm + "w_scale_gate", pm + "w_scale2_gate");
+                }
+                if (!keep) {
+                    axera_drop_mapped(g);
+                    axera_drop_mapped(u);
+                }
+                const ggml_tensor * d = T(il, "ffn_down_exps.weight");
+                const int64_t Rd = d->ne[1], Ed = d->ne[2];
+                for (int64_t e = 0; e < Ed; ++e) {
+                    put_nv(pm, "w_down", d, e * Rd, Rd, b, e * Rd, e, nullptr, nullptr, pm + "w_scale_down",
+                           pm + "w_scale2_down");
+                }
+                if (!keep) {
+                    axera_drop_mapped(d);
+                }
+            }
+            for (const char * n : { "gate", "up", "down" }) {
+                const std::string g = std::string("ffn_") + n + "_shexp.weight";
+                const ggml_tensor * w = T(il, g);
+                const std::string base = std::string("w_shared_expert_mlp_") + n;
+                put_nv(pm, base, w, 0, ggml_nrows(w), b, 0, 0, nullptr, nullptr,
+                       pm + "w_scale_shared_expert_mlp_" + n, pm + "w_scale2_shared_expert_mlp_" + n);
+            }
+            if (!keep) {
                 for (const ggml_tensor * w : read) {
                     axera_drop_mapped(w);
                 }
@@ -516,7 +468,22 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     banks.clear();
     {
         axera_timer tb("init: banks");
-        fill_pack(dk, rope(rope_node, names.find("inp_pos"), 1));
+        const rope  rq(rope_node, names.find("inp_pos"), 1);
+        // Release path: build every NVFP4 bank in memory from the GGUF rows. The offline pack is a debug fallback
+        // only, explicit (AXERA_SGL35_BANKS=1) and absent from the release package.
+        const char * want_pack = std::getenv("AXERA_SGL35_BANKS");
+        std::string  pack_dir  = man.dir + "/banks/";
+        std::ifstream probe(pack_dir + "b0_attn_w_q.bin", std::ios::binary);
+        if (!probe) {
+            pack_dir = man.dir + "/";
+            probe.open(pack_dir + "b0_attn_w_q.bin", std::ios::binary);
+        }
+        if (want_pack && std::string(want_pack) != "0" && probe) {
+            GGML_LOG_INFO("axera qwen35_35b_a3b: NVFP4 banks from the debug pack %s\n", pack_dir.c_str());
+            fill_pack(dk, rq);
+        } else {
+            fill(t, dk, rq);
+        }
     }
     ST2  = axera_cmm_alloc(B("b0_attn_state_in")->size);
     CQ2  = axera_cmm_alloc(B("b0_attn_q_conv_state_in")->size);

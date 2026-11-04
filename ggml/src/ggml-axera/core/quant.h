@@ -7,6 +7,7 @@
 #include "ggml-backend-impl.h"
 
 #include <thread>
+#include <vector>
 
 // [N, K] weight of any GGUF type -> MXFP8 elements [N, K] and scales [N, K / 32] in new CMM buffers
 void axera_quantize_mxfp8(const ggml_tensor * w, axera_cmm & q, axera_cmm & s);
@@ -18,6 +19,18 @@ struct axera_nv4 {
     float     scale2 = 1.0f;
 };
 axera_nv4 axera_quantize_nvfp4_rows(const ggml_tensor * w, int64_t r0, int64_t nr);
+// the global scale (amax / (448 * 6)) of rows r0 .. r0 + nr of such a weight
+float axera_nvfp4_amax_rows(const ggml_tensor * w, int64_t r0, int64_t nr);
+// rows r0 .. r0 + nr -> NVFP4 at q + r * q_row_bytes / s + r * s_row_bytes (q_row_bytes = K / 2, s_row_bytes = K / 16)
+void axera_quantize_nvfp4_into(const ggml_tensor * w, int64_t r0, int64_t nr, float scale2,
+                               uint8_t * q, int64_t q_row_bytes, uint8_t * s, int64_t s_row_bytes);
+// the same, computing the slice's global scale: returns it (the slice is decoded once, host memory nr * K * 4 B)
+float axera_quantize_nvfp4_slice(const ggml_tensor * w, int64_t r0, int64_t nr, uint8_t * q, int64_t q_row_bytes,
+                                 uint8_t * s, int64_t s_row_bytes);
+// the same, with a destination row / 16-input block permutation (null = identity)
+float axera_quantize_nvfp4_slice_perm(const ggml_tensor * w, int64_t r0, int64_t nr, const std::vector<int64_t> * row_src,
+                                      const std::vector<int64_t> * blk_src, uint8_t * q, int64_t q_row_bytes,
+                                      uint8_t * s, int64_t s_row_bytes);
 // [N, K] weight of another GGUF type (quantized, f16, f32) -> bf16 copy in a new CMM buffer
 axera_cmm axera_to_bf16(const ggml_tensor * w);
 // ggml block_mxfp4 rows -> the kernels' layout: codes [rows][K / 2] (FP4 pairs, low nibble first), scales [rows][K / 32]
