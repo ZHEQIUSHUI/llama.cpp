@@ -58,6 +58,13 @@ class qwen35_whole final : public model {
     axera_cmm              ST, CQ, CK, CV;
     std::vector<axera_cmm> KVC;  // the KV cache: one buffer per prefill call's attention layers (a CMM allocation is < 4 GB)
     size_t    kv_b = 0, st_b = 0, cq_b = 0, cv_b = 0;
+    // the pages of the cache the pools hold (llama.cpp's -c through the buffer type, GGML_AXERA_KV_PAGES overrides;
+    // default: the kernels' context): the kernels keep their declared IO size but touch only the pages up to the runtime
+    // page count, so a smaller context needs only its pages (a single-block prefill kernel only: a call of several
+    // layers has fixed layer strides in its KV IO)
+    int       kv_pages = 0;
+    int64_t   kv_cells = 0;
+    size_t    kv_alloc = 0;  // the bytes of one layer's pool
     // the recurrent state at the first cell of the current page (snap_cell), and the inputs of that page's cells so far
     std::vector<uint8_t>     snap;
     int64_t                  snap_cell = -1;
@@ -441,9 +448,22 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
                 in_of(dk, "ck0").bytes == cq_b && in_of(dk, "cv0").bytes == cv_b);
     NBLK = (int) pkv.shape[1];
     GGML_ASSERT(pkv.shape[3] == PG && (int64_t) NBLK * PG == man.context);
+    kv_pages = NBLK;
+    if (const int64_t cells = axera_kv_cells(); cells > 0 && pna == 1) {  // llama.cpp's -c (its own cache's cells)
+        kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(NBLK, (cells + PG - 1) / PG));
+    }
+    if (const char * e = getenv("GGML_AXERA_KV_PAGES")) {
+        kv_pages = std::max(1, std::min(NBLK, atoi(e)));
+    }
+    GGML_ASSERT(kv_pages == NBLK || pna == 1);
+    kv_cells = (int64_t) kv_pages * PG;
+    kv_alloc = kv_b / NBLK * kv_pages;
+    if (kv_pages < NBLK) {
+        GGML_LOG_INFO("axera qwen35_whole: the KV pools hold %d of the kernels' %d pages (%lld cells)\n", kv_pages, NBLK, (long long) kv_cells);
+    }
     KVC.resize(ncall);
     for (int k = 0; k < ncall; ++k) {
-        KVC[k] = axera_cmm_alloc(kv_b * pna);
+        KVC[k] = axera_cmm_alloc(kv_alloc * pna);
     }
     ST = axera_cmm_alloc((size_t) ng * st_b);
     CQ = axera_cmm_alloc((size_t) ng * cq_b);
@@ -689,7 +709,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
                 // (cos / sin are bound whole; the weight banks hold every call's blocks)
                 off = (*b)->size >= (size_t) ncall * d.bytes ? (size_t) k * d.bytes : 0;
             }
-            GGML_ASSERT((*b)->size >= off + d.bytes);
+            GGML_ASSERT((*b)->size >= off + (n == "b3_kv" ? kv_alloc : d.bytes));
             c.in.push_back(axera_io(b->get(), (char *) (*b)->vir + off, (uint32_t) d.bytes));
         }
         c.out.push_back(axera_io(POUT[k & 1], pk.desc->out[0].bytes));
@@ -822,6 +842,7 @@ void qwen35_whole::load_state() {
 void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0) {
     GGML_ASSERT(c0 % PG == 0);
     GGML_ASSERT(c0 >= 0 && n >= 0 && c0 + n <= man.context);
+    GGML_ASSERT(c0 + n <= kv_cells);  // (the pools' pages)
     for (int64_t r = 0; r < n; ++r) {
         for (int s = 0; s < 4; ++s) {
             GGML_ASSERT(p4[r * 4 + s] >= 0 && p4[r * 4 + s] < man.context);
@@ -1034,7 +1055,7 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
             ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]), xb.data() + (size_t) r * H, H);
         });
     }
-    if (T > 1 && T <= 4 && !ver.empty() && c0 > 0 && c0 + 4 <= man.context) {
+    if (T > 1 && T <= 4 && !ver.empty() && c0 > 0 && c0 + 4 <= kv_cells) {
         axera_timer tv("verify (all groups)");
         const ggml_status st = verify(kv, rp, xb.data(), pb.data(), T, h.data());
         if (st != GGML_STATUS_SUCCESS) {
@@ -1065,7 +1086,7 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
         snap_prompt = true;  // (its page's restart point outlives the decode's next pages)
     } else {
         // one token through the decode groups; at a page's first cell the state there is the restart point
-        GGML_ASSERT(c0 >= 0 && c0 < man.context);
+        GGML_ASSERT(c0 >= 0 && c0 < kv_cells);
         if (c0 % PG == 0) {
             save_state(c0);
         }
@@ -1082,7 +1103,7 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
         ((int32_t *) PN->vir)[0] = (int32_t) c0;
         ((int32_t *) PN->vir)[1] = nblk;
         ((int32_t *) PN->vir)[2] = (int32_t) ((c0 / PG) * 2 * PG + c0 % PG);
-        GGML_ASSERT(((int32_t *) PN->vir)[2] >= 0 && ((int32_t *) PN->vir)[2] < NBLK * 2 * PG);
+        GGML_ASSERT(((int32_t *) PN->vir)[2] >= 0 && ((int32_t *) PN->vir)[2] < kv_pages * 2 * PG);
         PN->flush();
         {
             axera_timer tl("layers (decode)");
