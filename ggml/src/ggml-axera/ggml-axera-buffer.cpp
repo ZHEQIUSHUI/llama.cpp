@@ -88,8 +88,9 @@ static const struct ggml_backend_buffer_i ggml_backend_axera_buffer_i = {
 };
 
 // the llama.cpp KV / recurrent-state caches of an adapter that keeps the model's state in its own CMM pools (the
-// manifest's model qwen38_27b): nothing reads or writes them, so they live in lazily-backed host memory (anonymous
-// mmap: untouched pages cost nothing; clear() is a no-op, the pages are zero), not in CMM (16 GB at a 256k context)
+// manifests' models qwen38_27b and qwen35_whole): nothing reads or writes them, so they live in lazily-backed host
+// memory (anonymous mmap: untouched pages cost nothing; clear() is a no-op, the pages are zero), not in CMM (16 GB at
+// a 256k context)
 struct ggml_backend_axera_lazy_context {
     void * base = nullptr;
     size_t size = 0;
@@ -236,7 +237,8 @@ ggml_backend_buffer_type_t ggml_backend_axera_lazy_buffer_type(void) {
 // the buffer type of the llama.cpp caches: lazy host memory for an adapter that does not use them, else CMM
 ggml_backend_buffer_type_t ggml_backend_axera_kv_buffer_type(void) {
     const axera::manifest * m = axera::kernels();
-    return m && m->model == "qwen38_27b" ? ggml_backend_axera_lazy_buffer_type() : ggml_backend_axera_buffer_type();
+    return m && (m->model == "qwen38_27b" || m->model == "qwen35_whole") ? ggml_backend_axera_lazy_buffer_type() :
+                                                                             ggml_backend_axera_buffer_type();
 }
 
 ggml_backend_buffer_type_t ggml_backend_axera_buffer_type(void) {
