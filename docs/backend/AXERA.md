@@ -9,8 +9,8 @@ parts of the TTS codec decoder) run on the CPU backend on the same memory.
 | Model | Adapter (`models/`) | Graphs on the NPU | Context |
 |---|---|---|---|
 | Qwen3.5-35B-A3B (MoE, MXFP4 experts) | `qwen35_moe` + `qwen35_vit` | language model, 4-core ViT | 16k |
-| Qwen3.8-27B (MXFP4) | `qwen35_dense` + `qwen35_vit` | language model, 4-core ViT | 16k |
-| Qwen3.5-9B (MXFP4) | `qwen35_dense` | language model | 16k |
+| Qwen3.8-27B (MXFP4) | `qwen38_27b` + `qwen35_vit` | whole language model, 4-core ViT | 16k / 128k / 256k |
+| Qwen3.5-9B / 2B (MXFP4) | `qwen35_whole` + `qwen35_vit` | whole language model, 4-core ViT | 16k / 128k / 256k |
 | Qwen3-Embedding-0.6B | `qwen3` | model up to the final norm (pooling on the CPU) | 16k |
 | Qwen3-ASR-0.6B / 1.7B | `qwen3` + `qwen3_asr` | text model, audio encoder | 4k |
 | Qwen3-TTS-0.6B / 1.7B | `qwen3` + `qwen3_tts` | talker, code predictor frames, codec decoder GEMMs / convolutions | 4k |
@@ -33,7 +33,9 @@ parts of the TTS codec decoder) run on the CPU backend on the same memory.
   RoPE / M-RoPE tables, the output head, CPU slices of a graph.
 - **Memory**: CMM (physically contiguous, mapped into the process): the CPU backend reads and writes the same buffers,
   the NPU addresses them physically. The GGUF stays mapped (mmap); adapters convert what their kernels read into CMM.
-  The KV cache and recurrent state live in llama.cpp's memory, in CMM.
+  The KV cache and recurrent state of adapters that use llama.cpp's caches live in CMM. The whole-model adapters
+  (`qwen38_27b`, `qwen35_whole`) keep their own paged KV / recurrent pools in CMM; llama.cpp's cache tensors get the lazy
+  host buffer type and are never read by those adapters.
 - **One sequence** per context for the language models (`-np 1` with llama-server).
 
 ## Build
@@ -58,8 +60,10 @@ On the board, with the BSP runtime libraries on the library path and the model's
 
 ```bash
 export LD_LIBRARY_PATH=/opt/lib:$PWD/build-axera/bin GGML_AXERA_KERNEL_DIR=$PWD/kernels
-# language models (27B, 35B-A3B, 9B)
+# language models (27B, 35B-A3B, 9B, 2B); put the context's kernel directory in GGML_AXERA_KERNEL_DIR
 llama-completion -m qwen3.8-27b-mxfp4.gguf -ngl 99 -c 16384 -p "The capital of France is" -n 64
+# 9B / 2B long context: the 128k or 256k kernel directory, and -c up to that context
+llama-completion -m qwen3.5-9b-mxfp4.gguf -ngl 99 -c 131072 -ub 4096 -b 4096 -p "The capital of France is" -n 64
 # images (27B, 35B-A3B): at most 3072 patches per image
 llama-mtmd-cli -m qwen3.8-27b-mxfp4.gguf --mmproj mmproj-qwen3.8-27b-bf16.gguf -ngl 99 -c 16384 \
     --image bus.jpg --image-max-tokens 768 -p "Describe this image."
@@ -98,6 +102,8 @@ None of them changes a result.
 | `models/model.cpp` | the adapter by manifest model name; a composite per graph kind (vision, audio, TTS generation) |
 | `models/qwen35_moe/` | Qwen3.5-35B-A3B: 8-layer decode groups, 256-row prefill groups with routed-expert slots |
 | `models/qwen35_dense/` | Qwen3.5 dense (9B, 27B): decode groups (9B: whole model with the head), padded prefill chunks |
+| `models/qwen38_27b/` | Qwen3.8-27B whole-model path: banked multi-call prefill, decode groups, MTP |
+| `models/qwen35_whole/` | Qwen3.5-9B / 2B whole-model path: banked multi-call prefill, decode groups, paged state |
 | `models/qwen3/` | Qwen3 text decoders: Embedding, the ASR text model, the TTS talker |
 | `models/qwen35_vit/` | the Qwen3.5 vision encoder (4-core ViT) |
 | `models/qwen3_asr/` | the Qwen3-ASR audio encoder |
@@ -106,6 +112,6 @@ None of them changes a result.
 ## Regression gate
 
 Every change runs, per model, fixed cases whose outputs must stay bit-identical (md5) and whose prefill / decode speed
-must stay within 2 %: 27B / 35B-A3B / 9B short, 4k prompt + 1k tokens, 16k prompt, an image (27B / 35B-A3B); Embedding
-six inputs; ASR three recordings; TTS a Chinese and an English sentence. No kernel directory may contain single-core
-kernels.
+must stay within 2 %: 27B / 35B-A3B / 9B / 2B short, 4k prompt + 1k tokens, 16k prompt, an image; 9B / 2B also needle
+in a haystack at 32k / 64k / 120k with their 128k and 256k kernel sets; Embedding six inputs; ASR three recordings; TTS
+a Chinese and an English sentence. No kernel directory may contain single-core kernels.
