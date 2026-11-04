@@ -327,6 +327,10 @@ AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, vo
 }
 
 axera_pool & axera_host_pool() {
-    static axera_pool pool(std::min(15, std::max(1, (int) std::thread::hardware_concurrency() - 1)));
+    static axera_pool pool([] {
+        const char * e = std::getenv("AXERA_HOST_POOL_THREADS");
+        const int    n = e ? std::atoi(e) : 0;
+        return n > 0 ? n : std::min(15, std::max(1, (int) std::thread::hardware_concurrency() - 1));
+    }());
     return pool;
 }

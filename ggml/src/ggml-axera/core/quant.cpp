@@ -2,7 +2,61 @@
 
 #include "quant.h"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <set>
+
+// AXERA_SGL35_SPLIT=1: time a read-only page-in pass separately from the dequantize + NVFP4 encode pass. The normal
+// loader (and every release run) reads the mapped GGUF rows inside the conversion pass; this mode is measurement only.
+namespace {
+bool axera_split_profile() {
+    static const bool on = [] {
+        const char * e = std::getenv("AXERA_SGL35_SPLIT");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+std::atomic<long long> axera_split_read_us{ 0 };
+std::atomic<long long> axera_split_conv_us{ 0 };
+std::atomic<long long> axera_split_bytes{ 0 };
+std::atomic<long long> axera_split_slices{ 0 };
+
+void axera_split_touch(const ggml_tensor * w, int64_t r0, int64_t nr) {
+    if (!axera_split_profile()) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    const size_t  stride2 = w->nb[2] ? w->nb[2] : (size_t) w->ne[1] * w->nb[1];
+    axera_host_pool().run(nr, [&](int64_t r) {
+        const int64_t rr = r0 + r, d1 = rr % w->ne[1], d2 = rr / w->ne[1];
+        const uint8_t * p = (const uint8_t *) w->data + (size_t) d2 * stride2 + (size_t) d1 * w->nb[1];
+        volatile uint8_t sink = 0;
+        for (size_t o = 0; o < w->nb[1]; o += 4096) {
+            sink = (uint8_t) (sink ^ p[o]);
+        }
+        (void) sink;
+    });
+    axera_split_read_us.fetch_add(ggml_time_us() - t0);
+    axera_split_bytes.fetch_add((long long) nr * (long long) w->nb[1]);
+    axera_split_slices.fetch_add(1);
+}
+
+struct axera_split_report {
+    ~axera_split_report() {
+        if (!axera_split_profile()) {
+            return;
+        }
+        const double rs = axera_split_read_us.load() / 1e6, cs = axera_split_conv_us.load() / 1e6;
+        const double mb = axera_split_bytes.load() / (1024.0 * 1024.0);
+        std::fprintf(stderr, "axera split: read %.1f s (%.1f MiB/s), convert %.1f s, total %.1f s, "
+                             "%lld slices, %.1f MiB\n", rs, rs > 0 ? mb / rs : 0.0, cs, rs + cs,
+                     (long long) axera_split_slices.load(), mb);
+    }
+};
+axera_split_report axera_split_report_instance;
+}  // namespace
 
 // [N, K] weight of any GGUF type -> MXFP8 elements [N, K] and scales [N, K / 32] in new CMM buffers
 void axera_quantize_mxfp8(const ggml_tensor * w, axera_cmm & q, axera_cmm & s) {
@@ -170,6 +224,8 @@ float axera_quantize_nvfp4_slice(const ggml_tensor * w, int64_t r0, int64_t nr, 
     const int64_t K = w->ne[0];
     GGML_ASSERT(K % 16 == 0 && r0 >= 0 && nr > 0 && r0 + nr <= ggml_nrows(w));
     GGML_ASSERT(q_row_bytes == K / 2 && s_row_bytes == K / 16);
+    axera_split_touch(w, r0, nr);
+    const int64_t      t0 = ggml_time_us();
     std::vector<float> rows((size_t) nr * K);
     axera_nvfp4_rows_f32(w, r0, nr, [&](int64_t r, const float * v) {
         memcpy(rows.data() + (size_t) r * K, v, K * sizeof(float));
@@ -183,6 +239,7 @@ float axera_quantize_nvfp4_slice(const ggml_tensor * w, int64_t r0, int64_t nr, 
         axera_nvfp4_row(rows.data() + (size_t) r * K, K, scale2, q + (size_t) r * q_row_bytes,
                         s + (size_t) r * s_row_bytes);
     });
+    axera_split_conv_us.fetch_add(ggml_time_us() - t0);
     return scale2;
 }
 
@@ -196,6 +253,8 @@ float axera_quantize_nvfp4_slice_perm(const ggml_tensor * w, int64_t r0, int64_t
     GGML_ASSERT(q_row_bytes == K / 2 && s_row_bytes == K / 16);
     GGML_ASSERT(!row_src || (int64_t) row_src->size() == nr);
     GGML_ASSERT(!blk_src || (int64_t) blk_src->size() == K / 16);
+    axera_split_touch(w, r0, nr);
+    const int64_t      t0 = ggml_time_us();
     std::vector<float>   rows((size_t) nr * K);
     std::vector<int64_t> dst_of;
     if (row_src) {
@@ -233,6 +292,7 @@ float axera_quantize_nvfp4_slice_perm(const ggml_tensor * w, int64_t r0, int64_t
             }
         }
     });
+    axera_split_conv_us.fetch_add(ggml_time_us() - t0);
     return scale2;
 }
 
