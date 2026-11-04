@@ -1,20 +1,19 @@
-// Axera NPU backend: the Qwen3.5 dense whole-model design (Qwen3.5-9B and Qwen3.5-2B). Every model of a manifest
-// gets this adapter; the manifest names its kernels, and the kernel IO gives the model's layer counts and head sizes.
+// Axera NPU backend: the Qwen3.5 dense whole-model design (4B, 9B and 2B). Every model of a manifest gets this
+// adapter; the manifest names its kernels, and the kernel IO gives the model's layer counts and head sizes.
 //
-// One path, the manifest's kernels (ax-dsl-kernels models/qwen35_whole):
-//   prefill  role prefill: the model in one or more calls per page of 256 cells (each call covers B blocks, a runtime
-//            loop over them, the layers' weights in banks [all blocks, ...] sliced per call), the last page of a batch
-//            padded (valid_tokens). A call's x is the previous call's output; the KV cache is one CMM pool per call.
+// One path, the manifest's kernels (ax-dsl-kernels models/qwen35_{2b,4b,9b}/whole):
+//   prefill  role prefill: the whole model in one call per page of 256 cells (a runtime loop over the manifest's
+//            blocks, the layers' weights in banks [blocks, ...] indexed by the block), the last page of a batch padded
+//            (valid_tokens).
 //            Its history is whole pages: a batch that starts inside a page restarts at the page's first cell from the
 //            recurrent state saved there, with the page's earlier inputs (kept) before its own
-//   decode   role decode.group: one group's consecutive layers per call (weights in packs), L / G calls per token,
-//            then lm_head
+//   decode   role decode.group: G consecutive layers per call (weights in packs), L / G calls per token, then lm_head
 //   verify   role decode.verify, optional (speculative decoding): a batch of 2 - 4 tokens in one call
 //   mtp      roles mtp.*, optional: a draft context's MTP block
 // The state is this adapter's (CMM pools in the prefill kernel's layouts, the decode group bound to each layer's part):
-// the KV cache paged by prefill call [attention layers][pages][K, V][256][key heads][head dim] bf16, the delta-net
-// states [delta-net layers][value heads][key dim][value dim] f32 and their q / k / v conv states bf16 (value heads in
-// HF order); the manifest's IO sizes give every model's exact geometry. After a verification the current state of a
+// the KV cache paged [blocks][pages][K, V][256][kv heads x head dim] bf16, the delta-net states
+// [layers][value heads][key dim][value dim] f32 and conv states q / k [layers][3][key heads x key dim], v
+// [layers][3][value heads x value dim] bf16 (value heads in HF order); after a verification the current state of a
 // delta-net layer is a snapshot's row (where[]). One sequence. Weights only from the GGUF.
 
 #include "../model.h"
@@ -474,7 +473,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
         return axera_io(p.get(), (char *) p->vir + ord[il] * b, (uint32_t) b);
     };
     // the prefill kernel's weight banks [blocks, ..] from the GGUF (first: decode and verification calls may read
-    // their row-split weights from them, inputs k_<bank>: the blocks of each prefill call)
+    // their row-split weights from them, inputs k_<bank>: the blocks of the call's G layers)
     const rope rp(rope_node, names.find("inp_pos"), 1);
     banks.clear();
     {
