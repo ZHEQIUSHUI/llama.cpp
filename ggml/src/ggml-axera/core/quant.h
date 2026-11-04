@@ -12,6 +12,12 @@
 void axera_quantize_mxfp8(const ggml_tensor * w, axera_cmm & q, axera_cmm & s);
 // [N, K] weight of any GGUF type -> MXFP4 elements [N, K / 2] and scales [N, K / 32] in new CMM buffers
 void axera_quantize_mxfp4(const ggml_tensor * w, axera_cmm & q, axera_cmm & s);
+// rows r0 .. r0 + nr of an [N, K] weight -> NVFP4 codes [nr, K / 2], E4M3 scales [nr, K / 16], one global scale
+struct axera_nv4 {
+    axera_cmm q, s;
+    float     scale2 = 1.0f;
+};
+axera_nv4 axera_quantize_nvfp4_rows(const ggml_tensor * w, int64_t r0, int64_t nr);
 // [N, K] weight of another GGUF type (quantized, f16, f32) -> bf16 copy in a new CMM buffer
 axera_cmm axera_to_bf16(const ggml_tensor * w);
 // ggml block_mxfp4 rows -> the kernels' layout: codes [rows][K / 2] (FP4 pairs, low nibble first), scales [rows][K / 32]

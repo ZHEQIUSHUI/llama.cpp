@@ -73,6 +73,75 @@ void axera_quantize_mxfp4(const ggml_tensor * w, axera_cmm & q, axera_cmm & s) {
     s->flush(s->vir, s->size);
 }
 
+static float axera_e4m3_to_f32(uint8_t b) {
+    const float sign = b & 0x80 ? -1.0f : 1.0f;
+    const int   e    = (b >> 3) & 15, m = b & 7;
+    if (e == 0) {
+        return sign * ldexpf((float) m, -9);
+    }
+    return sign * ldexpf(1.0f + (float) m / 8.0f, e - 7);
+}
+
+static uint8_t axera_f32_to_e2m1(float x) {
+    static const float v[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    const float       a     = fabsf(x);
+    int               best  = 0;
+    for (int i = 1; i < 8; ++i) {
+        const float di = fabsf(a - v[i]), db = fabsf(a - v[best]);
+        if (di < db || (di == db && (i & 1) == 0)) {
+            best = i;
+        }
+    }
+    return (uint8_t) (best | (x < 0.0f ? 8 : 0));
+}
+
+axera_nv4 axera_quantize_nvfp4_rows(const ggml_tensor * w, int64_t r0, int64_t nr) {
+    GGML_ASSERT(w->ne[0] % 16 == 0 && r0 >= 0 && nr >= 0 && r0 + nr <= ggml_nrows(w));
+    const int64_t K = w->ne[0];
+    std::vector<float> rows((size_t) nr * K);
+    const auto * traits = ggml_get_type_traits(w->type);
+    GGML_ASSERT(w->type == GGML_TYPE_F32 || traits->to_float != nullptr);
+    axera_host_pool().run(nr, [&](int64_t r) {
+        const int64_t rr = r0 + r, d1 = rr % w->ne[1], d2 = rr / w->ne[1];
+        const void *  src = (const char *) w->data + (size_t) d2 * w->nb[2] + (size_t) d1 * w->nb[1];
+        if (w->type == GGML_TYPE_F32) {
+            memcpy(rows.data() + r * K, src, K * sizeof(float));
+        } else {
+            traits->to_float(src, rows.data() + r * K, K);
+        }
+    });
+    float amax = 0.0f;
+    for (float v : rows) {
+        amax = fmaxf(amax, fabsf(v));
+    }
+    axera_nv4 out;
+    out.scale2 = amax ? amax / (448.0f * 6.0f) : 1.0f;
+    out.q      = axera_cmm_alloc((size_t) nr * K / 2);
+    out.s      = axera_cmm_alloc((size_t) nr * K / 16);
+    axera_host_pool().run(nr, [&](int64_t r) {
+        uint8_t * qr = (uint8_t *) out.q->vir + (size_t) r * K / 2;
+        uint8_t * sr = (uint8_t *) out.s->vir + (size_t) r * K / 16;
+        for (int64_t g = 0; g < K / 16; ++g) {
+            const float * v  = rows.data() + (size_t) r * K + g * 16;
+            float         bm = 0.0f;
+            for (int i = 0; i < 16; ++i) {
+                bm = fmaxf(bm, fabsf(v[i]));
+            }
+            const uint8_t sb = axera_f32_to_e4m3(bm / (6.0f * out.scale2));
+            sr[g]            = sb;
+            const float ds   = axera_e4m3_to_f32(sb) * out.scale2;
+            for (int i = 0; i < 16; i += 2) {
+                const uint8_t a = axera_f32_to_e2m1(ds ? v[i] / ds : 0.0f);
+                const uint8_t b = axera_f32_to_e2m1(ds ? v[i + 1] / ds : 0.0f);
+                qr[(g * 16 + i) / 2] = (uint8_t) (a | (b << 4));
+            }
+        }
+    });
+    out.q->flush();
+    out.s->flush();
+    return out;
+}
+
 // [N, K] weight of another GGUF type (quantized, f16, f32) -> bf16 copy in a new CMM buffer
 axera_cmm axera_to_bf16(const ggml_tensor * w) {
     const int64_t K = w->ne[0], N = ggml_nrows(w);
