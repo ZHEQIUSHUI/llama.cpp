@@ -44,15 +44,18 @@
 
 | 项 | 内容 |
 |---|---|
-| GGUF | 9B / 4B / 2B：`qwen3.5-<size>-mxfp4.gguf`；0.8B：`qwen3.5-0.8b-q8_0.gguf`（加载时转 MXFP8）。均配 `mmproj-qwen3.5-<size>-bf16.gguf` |
+| GGUF | 9B / 4B：`qwen3.5-<size>-mxfp4.gguf`；2B / 0.8B：`qwen3.5-<size>-q8_0.gguf`（加载时转 MXFP8）。均配 `mmproj-qwen3.5-<size>-bf16.gguf` |
 | kernel | `prefill`：整个模型一个 kernel，运行时按 block 循环读取 `b0..b3` 权重 bank<br>`decode.group`：每次 16 层（9B / 4B）/ 12 层（2B / 0.8B）<br>`lm_head`：输出头<br>`vit`：整个 ViT（最多 3072 patch） |
 | 上下文 | 16384 |
-| 权重 | 9B / 4B / 2B 为 MXFP4，0.8B 为 MXFP8（E4M3 + E8M0/32）；decode group 的投影权重通过 `k_<bank>` 直接读 prefill 的 bank，CMM 里只有一份主干权重 |
+| 权重 | 9B / 4B 为 MXFP4；2B / 0.8B 为 MXFP8（E4M3 + E8M0/32）；decode group 的投影权重通过 `k_<bank>` 直接读 prefill 的 bank，CMM 里只有一份主干权重 |
 | 状态 | KV cache 分页存放（256 token 一页），GDN 递归 / conv 状态由适配器管理 |
 | 限制 | 单序列（`-np 1`），整模型加载（`-ngl 99`） |
 
 适配器目录是 `models/qwen35_whole`，由 manifest 的 `"model": "qwen35_whole"` 选择。四种尺寸共用适配器，层数和
 decode group 大小从 manifest / kernel 的层数得到。
+
+2B / 0.8B 发布 Q8_0 GGUF，加载时由适配器按 prefill bank 的 IO 选择并转换成 MXFP8；MXFP4 bank 仍走原来的
+MXFP4 转换路径，因此 9B / 4B 的发布包不受影响。
 
 ## Qwen3-Embedding-0.6B（`qwen3`）
 
