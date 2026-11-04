@@ -12,6 +12,7 @@ parts of the TTS codec decoder) run on the CPU backend on the same memory.
 | Qwen3.8-27B (MXFP4) | `qwen35_dense` + `qwen35_vit` | language model, 4-core ViT | 16k |
 | Qwen3.5-9B (MXFP4) | `qwen35_dense` | language model | 16k |
 | Qwen3.5-9B / 4B (MXFP4), 2B / 0.8B (MXFP8) | `qwen35_whole` + `qwen35_vit` | whole-model language path, one-call ViT | 16k |
+| Qwen3.5-2B mixed (per-tensor MXFP8 / MXFP4) | `qwen35_whole` + `qwen35_vit` | attention / GDN + head MXFP8, MLP MXFP4 (down optionally MXFP8) | 16k |
 | Qwen3-Embedding-0.6B | `qwen3` | model up to the final norm (pooling on the CPU) | 16k |
 | Qwen3-ASR-0.6B / 1.7B | `qwen3` + `qwen3_asr` | text model, audio encoder | 4k |
 | Qwen3-TTS-0.6B / 1.7B | `qwen3` + `qwen3_tts` | talker, code predictor frames, codec decoder GEMMs / convolutions | 4k |
@@ -25,6 +26,13 @@ parts of the TTS codec decoder) run on the CPU backend on the same memory.
   file, an IO table that differs from the manifest's, or a role an adapter asks for and the manifest lacks stops the
   process. Manifests are generated in ax-dsl-kernels (`tools/manifest/mkmanifest.py`) from the kernels' IO tables and
   layouts.
+- **Per-tensor formats**: a whole-model manifest may name a different MX format for each parameter. The Qwen3.5-2B
+  mixed package converts the Q8_0 GGUF at load per kernel IO: attention / GDN projections and the tied output head to
+  MXFP8, MLP gate / up to MXFP4, and either MLP down to MXFP4 (strict) or MXFP8 (quality fallback). The decode packs
+  carry the same per-member formats. On the fixed Q8_0 GGUF the strict variant gives zh PPL `34.3732` (+7.10% over
+  all-MXFP8); the down-FP8 fallback gives `33.6479` (+4.84%) at `81.67 tok/s` bench / `87.19 tok/s` completion and
+  `19.878 ms/page` 4k prefill. The directory must contain `manifest.json` (the generated
+  `qwen35_2b.manifest.json` is renamed); without it no AXERA device registers and inference silently runs on CPU.
 - **Adapters** (`models/<model>/`): one per model family, depending on `core/` and `ops/` only, never on each other. An
   adapter has one path: no fallbacks, no switches. A new model is a new adapter (or a manifest for an existing one);
   the others do not change.

@@ -46,7 +46,7 @@ class qwen35_whole final : public model {
     graph_names      names;
     const void *     bound = nullptr;
     int              L = 0, H = 0, G = 0, ROT = 0, NBLK = 0;
-    bool             fp8 = false;  // the prefill banks' projections: MXFP8 (else MXFP4), from the kernel IO shapes
+    std::map<std::string, bool> bank_fp8;  // prefill bank name -> MXFP8 (else MXFP4)
     int              KH = 16, VH = 0, REP = 1;  // delta-net key / value heads (from the prefill kernels' IO)
     std::vector<int> ord;  // layer -> its index among the delta-net layers / the attention layers
 
@@ -119,7 +119,7 @@ class qwen35_whole final : public model {
 
 // rows of an [N, K] weight of the GGUF in the kernels' MX layout: MXFP8 codes [K] or MXFP4 codes [K / 2], and scales
 // [K / 32]. A matching MXFP4 GGUF tensor is converted row by row as read; every other type (a community GGUF: Q4_K,
-// Q8_0, ...) is quantized once, in the format the prefill kernel's bank IO selected.
+// Q8_0, ...) is quantized once in the format of that bank's kernel IO.
 struct mx4 {
     const ggml_tensor * w;
     axera_cmm           q, s;
@@ -168,6 +168,11 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
     const int         phase = std::stoi(mt[1]);
     const bool        mlp   = mt[2] == "mlp";
     const std::string n     = mt[3];
+    auto is_fp8 = [&]() {
+        const auto it = bank_fp8.find(d.name);
+        GGML_ASSERT(it != bank_fp8.end());
+        return it->second;
+    };
     const int         nb    = L / 4;
     GGML_ASSERT(d.shape.size() >= 2 && d.shape[0] == nb && d.bytes % nb == 0);
     axera_cmm     c  = axera_cmm_alloc(d.bytes);
@@ -251,10 +256,10 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
             } else if (n.rfind("w_zp_scale", 0) == 0) {
                 fill(0.0f);
             } else if (n.size() == 2 && W.count(n.substr(1))) {
-                const mx4 w(T(il, W.at(n.substr(1))), fp8);
+                const mx4 w(T(il, W.at(n.substr(1))), is_fp8());
                 rows(w, 0, w.N, false);
             } else if (n.rfind("w_scale", 0) == 0 && W.count(n.substr(7))) {
-                const mx4 w(T(il, W.at(n.substr(7))), fp8);
+                const mx4 w(T(il, W.at(n.substr(7))), is_fp8());
                 rows(w, 0, w.N, true);
             } else {
                 GGML_ABORT("axera qwen35_whole: prefill: unexpected MLP input %s\n", d.name.c_str());
@@ -285,7 +290,7 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
             } else if (n.rfind("w_zeropoint_", 0) == 0) {
                 fill(0.0f);
             } else if (W.count(p) && (n == "w_" + p || n == "w_scale_" + p)) {
-                const mx4 w(T(il, W.at(p)), fp8);
+                const mx4 w(T(il, W.at(p)), is_fp8());
                 rows(w, 0, w.N, n != "w_" + p);
             } else {
                 GGML_ABORT("axera qwen35_whole: prefill: unexpected attention input %s\n", d.name.c_str());
@@ -329,7 +334,7 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
             const bool scales = suffix == "_scale";
             GGML_ASSERT(suffix.empty() || scales);
             if (p == 'q' || p == 'k' || p == 'v') {
-                const mx4     w(T(il, "attn_qkv.weight"), fp8);
+                const mx4     w(T(il, "attn_qkv.weight"), is_fp8());
                 const int64_t nr = d.shape[1];  // rows q, k (nr each), then v (the rest)
                 if (p == 'v') {
                     rows(w, w.N - nr, nr, scales, w.N - nr, nr / VH);
@@ -337,13 +342,13 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
                     rows(w, p == 'q' ? 0 : nr, nr, scales);
                 }
             } else if (p == 'z') {
-                const mx4 w(T(il, "attn_gate.weight"), fp8);
+                const mx4 w(T(il, "attn_gate.weight"), is_fp8());
                 rows(w, 0, w.N, scales, 0, w.N / VH);
             } else if (p == 'a' || p == 'b') {  // small GGUF tensors: quantized to the bank's MX format like every projection
-                const mx4 w(T(il, p == 'a' ? "ssm_alpha.weight" : "ssm_beta.weight"), fp8);
+                const mx4 w(T(il, p == 'a' ? "ssm_alpha.weight" : "ssm_beta.weight"), is_fp8());
                 rows(w, 0, w.N, scales, 0, 1);
             } else if (p == 'o') {
-                const mx4 w(T(il, "ssm_out.weight"), fp8);
+                const mx4 w(T(il, "ssm_out.weight"), is_fp8());
                 cols(w, scales);
             } else {
                 GGML_ABORT("axera qwen35_whole: prefill: unexpected delta-net input %s\n", d.name.c_str());
@@ -454,23 +459,44 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     banks.clear();
     {
         axera_timer tb("init: prefill banks");
-        // The prefill bank IO distinguishes the two MX layouts without relying on the GGUF type (Q8_0 is converted at
-        // load): an MXFP8 code row is K bytes, an MXFP4 code row K / 2, while both scale rows are K / 32. The first
-        // MLP gate bank is present in every whole-model prefill, in either format.
-        const io_desc * code = nullptr, * scale = nullptr;
+        // Each prefill bank carries its own MX format. Pair every code bank with its E8M0 scale bank: an MXFP8 code
+        // row is K bytes, an MXFP4 code row K / 2, while both scale rows are K / 32.
+        static const std::regex rbank("b([0-3])_(attn|mlp)_(.+)");
+        std::map<std::string, const io_desc *> desc;
         for (const auto & d : pk.desc->in) {
-            if (d.name == "b0_mlp_w1") {
-                code = &d;
-            } else if (d.name == "b0_mlp_w_scale1") {
-                scale = &d;
-            }
+            desc[d.name] = &d;
         }
-        GGML_ASSERT(code && scale && code->shape.size() >= 2 && scale->shape.size() >= 2);
-        const int64_t code_k = code->shape.back(), scale_k = scale->shape.back() * 32;
-        GGML_ASSERT(code_k == scale_k || code_k * 2 == scale_k);
-        fp8 = code_k == scale_k;
-        GGML_LOG_INFO("axera qwen35_whole: prefill banks are MXFP%d (%lld codes, %lld scales per row)\n",
-                      fp8 ? 8 : 4, (long long) code_k, (long long) scale->shape.back());
+        bank_fp8.clear();
+        int n8 = 0, n4 = 0;
+        for (const auto & d : pk.desc->in) {
+            std::smatch m;
+            if (!std::regex_match(d.name, m, rbank) || d.shape.size() < 2) {
+                continue;
+            }
+            const std::string prefix = "b" + m[1].str() + "_" + m[2].str() + "_";
+            const std::string n      = m[3].str();
+            std::string       code;
+            if (n.rfind("w_scale2_", 0) == 0 || n.rfind("w_zp_scale", 0) == 0) {
+                continue;
+            } else if (n.rfind("w_scale_", 0) == 0) {
+                code = "w_" + n.substr(8);
+            } else if (n.rfind("w_scale", 0) == 0) {
+                code = "w" + n.substr(7);
+            } else if (n.size() > 6 && n.compare(n.size() - 6, 6, "_scale") == 0) {
+                code = n.substr(0, n.size() - 6);
+            } else {
+                continue;
+            }
+            const std::string cname = prefix + code;
+            const auto        it    = desc.find(cname);
+            GGML_ASSERT(it != desc.end() && it->second->shape.size() >= 2);
+            const int64_t code_k = it->second->shape.back(), scale_k = d.shape.back() * 32;
+            GGML_ASSERT(code_k == scale_k || code_k * 2 == scale_k);
+            const bool f = code_k == scale_k;
+            bank_fp8[cname] = bank_fp8[d.name] = f;
+            f ? ++n8 : ++n4;
+        }
+        GGML_LOG_INFO("axera qwen35_whole: prefill banks: %d MXFP8, %d MXFP4 code banks\n", n8, n4);
         static const std::set<std::string> pools = { "x", "position_ids", "indptr", "indices", "last_page_len", "cache_location",
                                                      "valid_tokens", "b3_kv" };
         // b0 / b1 / b2: the recurrent state banks of the three delta-net phases (a build may use one common b0 for all)

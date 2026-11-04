@@ -47,7 +47,7 @@
 | GGUF | 9B / 4B：`qwen3.5-<size>-mxfp4.gguf`；2B / 0.8B：`qwen3.5-<size>-q8_0.gguf`（加载时转 MXFP8）。均配 `mmproj-qwen3.5-<size>-bf16.gguf` |
 | kernel | `prefill`：整个模型一个 kernel，运行时按 block 循环读取 `b0..b3` 权重 bank<br>`decode.group`：每次 16 层（9B / 4B）/ 12 层（2B / 0.8B）<br>`lm_head`：输出头<br>`vit`：整个 ViT（最多 3072 patch） |
 | 上下文 | 16384 |
-| 权重 | 9B / 4B 为 MXFP4；2B / 0.8B 为 MXFP8（E4M3 + E8M0/32）；decode group 的投影权重通过 `k_<bank>` 直接读 prefill 的 bank，CMM 里只有一份主干权重 |
+| 权重 | 9B / 4B 为 MXFP4；2B / 0.8B 为 MXFP8（E4M3 + E8M0/32）；2B mixed 包按 tensor 选择：attention / GDN 投影与输出头 MXFP8，MLP gate / up MXFP4，down 为 MXFP4（strict）或 MXFP8（质量回退）；decode group 的投影权重通过 `k_<bank>` 直接读 prefill 的 bank，CMM 里只有一份主干权重 |
 | 状态 | KV cache 分页存放（256 token 一页），GDN 递归 / conv 状态由适配器管理 |
 | 限制 | 单序列（`-np 1`），整模型加载（`-ngl 99`） |
 
@@ -55,7 +55,14 @@
 decode group 大小从 manifest / kernel 的层数得到。
 
 2B / 0.8B 发布 Q8_0 GGUF，加载时由适配器按 prefill bank 的 IO 选择并转换成 MXFP8；MXFP4 bank 仍走原来的
-MXFP4 转换路径，因此 9B / 4B 的发布包不受影响。
+MXFP4 转换路径，因此 9B / 4B 的发布包不受影响。2B mixed 包进一步允许每个 tensor 独立选择格式：strict 策略
+（MLP gate / up / down 全 MXFP4）在固定 Q8_0 GGUF 上中文 PPL `34.3732`，比全 MXFP8 `32.0935` 高 7.10%，超出
+5% 门限；回退包只把 down_proj 改为 MXFP8，PPL `33.6479`（+4.84%，通过），decode `81.67 tok/s` bench /
+`87.19 tok/s` completion，4k prefill `19.878 ms/page`。
+
+`GGML_AXERA_KERNEL_DIR` 下必须存在 `manifest.json`；构建脚本常生成 `qwen35_2b.manifest.json`，打包时需改名。
+缺少该文件时后端设备数为 0，llama.cpp 会静默退回 CPU（`--gpu-layers option will be ignored` 警告在 AXERA 后端
+本身是正常的，不能据此判断是否真的运行在 NPU 上；用 `-v` 查看 layer 是否 assigned to CPU）。
 
 ## Qwen3-Embedding-0.6B（`qwen3`）
 
