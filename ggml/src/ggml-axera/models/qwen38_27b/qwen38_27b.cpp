@@ -61,7 +61,13 @@ class qwen38_27b final : public model {
     // the state pools; their sizes per layer
     axera_cmm              KV, ST, CQ, CK, CV;
     std::vector<axera_cmm> KVC;  // the KV cache: one buffer per prefill call's attention layers (a CMM allocation is < 4 GB)
-    size_t    kv_b = 0, st_b = 0, cq_b = 0, cv_b = 0;
+    std::vector<axera_cmm> KVSC;  // its scales (an int8 cache: a bf16 scale per row and head), the same split
+    size_t    kv_b = 0, kvs_b = 0, st_b = 0, cq_b = 0, cv_b = 0;
+    // the pages of the cache the pools hold (GGML_AXERA_KV_PAGES; default: the kernels' context): the kernels keep their
+    // declared IO size but touch only the pages up to the runtime page count, so a smaller context needs only its pages
+    int       kv_pages = 0;
+    int64_t   kv_cells = 0;
+    size_t    kv_alloc = 0, kvs_alloc = 0;  // the bytes of one layer's pool
     // the recurrent state at the first cell of the current page (snap_cell), and the inputs of that page's cells so far
     std::vector<uint8_t>     snap;
     int64_t                  snap_cell = -1;
@@ -410,10 +416,17 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
     };
     const io_desc & pkv = in_of(pk, "b3_kv"), &pst = in_of(pk, "b0_attn_state_in");
     const io_desc & pcq = in_of(pk, "b0_attn_q_conv_state_in"), &pcv = in_of(pk, "b0_attn_v_conv_state_in");
+    const io_desc * pkvs = nullptr;  // an int8 cache: its scales
+    for (const auto & d : pk.desc->in) {
+        if (d.name == "b3_attn_kv_scale") {
+            pkvs = &d;
+        }
+    }
     const int pna = (int) pkv.shape[0], png = (int) pst.shape[0];  // the prefill kernel's layers per call
     GGML_ASSERT(pna > 0 && na % pna == 0 && png == 3 * pna && pcq.shape[0] == png && pcv.shape[0] == png);
     ncall = na / pna;
     kv_b  = pkv.bytes / pna;
+    kvs_b = pkvs ? pkvs->bytes / pna : 0;
     st_b  = pst.bytes / png;
     cq_b  = pcq.bytes / png;
     cv_b  = pcv.bytes / png;
@@ -421,9 +434,34 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
                 in_of(dk, "ck0").bytes == cq_b && in_of(dk, "cv0").bytes == cv_b);
     NBLK = (int) pkv.shape[1];
     GGML_ASSERT(pkv.shape[3] == PG && (int64_t) NBLK * PG == man.context);
+    kv_pages = NBLK;
+    if (const int64_t cells = axera_kv_cells(); cells > 0) {  // llama.cpp's -c (its own cache's cells)
+        kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(NBLK, (cells + PG - 1) / PG));
+    }
+    if (const char * e = getenv("GGML_AXERA_KV_PAGES")) {
+        kv_pages = std::max(1, std::min(NBLK, atoi(e)));
+    }
+    GGML_ASSERT(kv_pages == NBLK || pna == 1);  // (a prefill call of several layers: fixed layer strides in its IO)
+    kv_cells  = (int64_t) kv_pages * PG;
+    kv_alloc  = kv_b / NBLK * kv_pages;
+    kvs_alloc = kvs_b / NBLK * kv_pages;
+    if (kv_pages < NBLK) {
+        GGML_LOG_INFO("axera qwen38_27b: the KV pools hold %d of the kernels' %d pages (%lld cells)\n", kv_pages, NBLK, (long long) kv_cells);
+    }
     KVC.resize(ncall);
+    KVSC.resize(kvs_b ? ncall : 0);
     for (int k = 0; k < ncall; ++k) {
-        KVC[k] = axera_cmm_alloc(kv_b * pna);
+        KVC[k] = axera_cmm_alloc(kv_alloc * pna);
+        if (kvs_b) {
+            KVSC[k] = axera_cmm_alloc(kvs_alloc * pna);
+        }
+    }
+    for (const auto & d : dk.desc->out) {  // the decode kernels' cache IO matches the prefill's (kv<j>, kvs<j>)
+        if (d.name.rfind("kvs", 0) == 0) {
+            GGML_ASSERT(kvs_b && d.bytes == kvs_b);
+        } else if (d.name.rfind("kv", 0) == 0) {
+            GGML_ASSERT(d.bytes == kv_b);
+        }
     }
     ST = axera_cmm_alloc(st_b * ng);
     CQ = axera_cmm_alloc(cq_b * ng);
@@ -444,6 +482,11 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
     MASK = axera_cmm_alloc(dk.in_bytes("mask"));
     GGML_ASSERT(dk.in_bytes("pn") == 3 * sizeof(int32_t) && dk.in_bytes("mask") == (size_t) man.context * sizeof(ggml_bf16_t));
     auto pool_io = [&](const std::string & n, int il) {
+        if (n.rfind("kvs", 0) == 0) {
+            const int a = ord[il];
+            GGML_ASSERT(kvs_b);
+            return axera_io(KVSC[a / pna].get(), (char *) KVSC[a / pna]->vir + (size_t) (a % pna) * kvs_b, (uint32_t) kvs_b);
+        }
         if (n.rfind("kv", 0) == 0) {
             const int a = ord[il];
             return axera_io(KVC[a / pna].get(), (char *) KVC[a / pna]->vir + (size_t) (a % pna) * kv_b, (uint32_t) kv_b);
@@ -459,7 +502,7 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
     {
         axera_timer tb("init: prefill banks");
         static const std::set<std::string> pools = { "x", "position_ids", "indptr", "indices", "last_page_len", "cache_location",
-                                                     "valid_tokens", "b3_kv", "b0_attn_state_in", "b0_attn_q_conv_state_in",
+                                                     "valid_tokens", "b3_kv", "b3_attn_kv_scale", "b0_attn_state_in", "b0_attn_q_conv_state_in",
                                                      "b0_attn_k_conv_state_in", "b0_attn_v_conv_state_in" };
         for (const auto & d : pk.desc->in) {
             if (!pools.count(d.name)) {
@@ -505,7 +548,7 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
             c.in.push_back(axera_io(*b, d.bytes));
         }
         for (const auto & d : dk.desc->out) {
-            c.out.push_back(d.name == "out" ? axera_io(A, d.bytes) : pool_io(d.name, gi * G + atoi(d.name.c_str() + 2)));
+            c.out.push_back(d.name == "out" ? axera_io(A, d.bytes) : pool_io(d.name, gi * G + atoi(d.name.c_str() + strspn(d.name.c_str(), "abcdefghijklmnopqrstuvwxyz"))));
         }
         // this group's converted parameters, read only through its packs now: freed before the next group's
         // (the load's peak: the packs so far and one group's conversions, not every layer's)
@@ -591,7 +634,7 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
                     k = d.name == SN[j] ? j : k;
                 }
                 c.out.push_back(d.name == "out" ? axera_io(VX, d.bytes) : k >= 0 ? axera_io(snaps[0][gi][k], d.bytes) :
-                                                   pool_io(d.name, gi * G + atoi(d.name.c_str() + 2)));
+                                                   pool_io(d.name, gi * G + atoi(d.name.c_str() + strspn(d.name.c_str(), "abcdefghijklmnopqrstuvwxyz"))));
             }
             state_outs(c, gi * G);
         }
@@ -626,6 +669,8 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
             size_t off = 0;
             if (!b && n == "b3_kv") {
                 b = &KVC[k];
+            } else if (!b && n == "b3_attn_kv_scale") {
+                b = &KVSC[k];
             } else if (!b) {
                 b = n == "b0_attn_state_in" ? &ST : n == "b0_attn_q_conv_state_in" ? &CQ :
                     n == "b0_attn_k_conv_state_in" ? &CK : n == "b0_attn_v_conv_state_in" ? &CV : nullptr;
@@ -636,7 +681,7 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
                     off = (*b)->size >= (size_t) ncall * d.bytes ? (size_t) k * d.bytes : 0;  // (cos / sin: whole)
                 }
             }
-            GGML_ASSERT((*b)->size >= off + d.bytes);
+            GGML_ASSERT((*b)->size >= off + (n == "b3_kv" ? kv_alloc : n == "b3_attn_kv_scale" ? kvs_alloc : d.bytes));
             c.in.push_back(axera_io(b->get(), (char *) (*b)->vir + off, d.bytes));
         }
         c.out.push_back(axera_io(POUT[k & 1], pk.desc->out[0].bytes));
@@ -652,7 +697,7 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
         bb += b->size;
     }
     GGML_LOG_INFO("axera qwen38_27b: %d layers (%d per decode call), prefill banks %.1f GiB, state %.2f GiB, %lld cells\n",
-                  L, G, bb / 1073741824.0, (kv_b * na + ST->size + CQ->size + CK->size + CV->size) / 1073741824.0,
+                  L, G, bb / 1073741824.0, ((kv_b + kvs_b) * na + ST->size + CQ->size + CK->size + CV->size) / 1073741824.0,
                   (long long) man.context);
 }
 
@@ -767,6 +812,7 @@ void qwen38_27b::load_state() {
 // states of the rows from out0 on into h
 void qwen38_27b::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0) {
     GGML_ASSERT(c0 % PG == 0);
+    GGML_ASSERT(c0 + n <= kv_cells);  // (the pools' pages)
     for (int r0 = 0; r0 < n; r0 += PG) {
         const int     v    = std::min(PG, n - r0);
         const int64_t cell = c0 + r0;
@@ -973,7 +1019,7 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
             ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]), xb.data() + (size_t) r * H, H);
         });
     }
-    if (T > 1 && T <= 4 && !ver.empty() && c0 > 0 && c0 + 4 <= man.context) {
+    if (T > 1 && T <= 4 && !ver.empty() && c0 > 0 && c0 + 4 <= kv_cells) {
         axera_timer tv("verify (all groups)");
         const ggml_status st = verify(kv, rp, xb.data(), pb.data(), T, h.data());
         if (st != GGML_STATUS_SUCCESS) {
@@ -1065,7 +1111,7 @@ void qwen38_27b::init_mtp(const std::map<std::string, ggml_tensor *> & t, int il
     const kernel & k1 = man.get("mtp.t1");
     const kernel & kp = man.get("mtp.prompt");
     GGML_ASSERT(k1.desc->packs == kp.desc->packs && k1.out_bytes("kv") == kp.out_bytes("kv"));
-    MKV = axera_cmm_alloc(k1.out_bytes("kv"));
+    MKV = axera_cmm_alloc(k1.out_bytes("kv") / NBLK * kv_pages);  // (paged like the layers' caches)
     auto bind = [&](call & c, const kernel & k, std::initializer_list<std::pair<const char *, axera_cmm *>> io) {
         c   = {};
         c.k = &k;
@@ -1099,7 +1145,7 @@ void qwen38_27b::init_mtp(const std::map<std::string, ggml_tensor *> & t, int il
             if (!*b) {
                 *b = axera_cmm_alloc(d.bytes);
             }
-            c.out.push_back(axera_io(*b, d.bytes));
+            c.out.push_back(d.name == std::string("kv") ? axera_io(b->get(), (*b)->vir, (uint32_t) d.bytes) : axera_io(*b, d.bytes));
         }
     };
     bind(mtp1, k1, { { "e", &ME }, { "h", &MH }, { "cs", &MCS }, { "pn", &MPN }, { "mask", &MMASK }, { "hnext", &MOUT },
@@ -1253,7 +1299,7 @@ ggml_status qwen38_27b::compute_mtp(ggml_cgraph * g) {
             for (int r = 0; r < P; ++r) {
                 const int     rr = std::min(r, n - 1);  // padded rows: the last row's positions and mask, later cells
                 const int64_t c  = kv.cell_of(it + rr) + (r - rr);
-                GGML_ASSERT(c < man.context);
+                GGML_ASSERT(c < kv_cells);
                 if (r < n) {
                     row_bf16(embd, it + r, (ggml_bf16_t *) PE->vir + (size_t) r * H);
                     row_bf16(hin, it + r, (ggml_bf16_t *) PH->vir + (size_t) r * H);
