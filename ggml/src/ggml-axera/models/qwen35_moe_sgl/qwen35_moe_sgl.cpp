@@ -39,6 +39,37 @@ struct call {
     std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
 };
 
+// GGML_AXERA_SGL35_BANK_SUM=1: print one FNV-1a hash per bank after load. The loader must produce the same bytes
+// before and after a conversion optimisation; this is the cheap check that it did (debug only).
+void axera_bank_checksums(const std::map<std::string, axera_cmm> & banks) {
+    const char * e = std::getenv("GGML_AXERA_SGL35_BANK_SUM");
+    if (!e || std::atoi(e) == 0) {
+        return;
+    }
+    uint64_t all = 1469598103934665603ULL;
+    size_t   nb  = 0;
+    for (const auto & [n, c] : banks) {
+        uint64_t h = 1469598103934665603ULL;
+        const uint8_t * p = (const uint8_t *) c->vir;
+        size_t i = 0;
+        for (; i + 8 <= c->size; i += 8) {
+            uint64_t v;
+            memcpy(&v, p + i, 8);
+            h = (h ^ v) * 1099511628211ULL;
+            all = (all ^ v) * 1099511628211ULL;
+        }
+        for (; i < c->size; ++i) {
+            h = (h ^ p[i]) * 1099511628211ULL;
+            all = (all ^ p[i]) * 1099511628211ULL;
+        }
+        all ^= c->size;
+        fprintf(stderr, "GGML_AXERA_SGL35_BANK_SUM bank %-40s %10zu %016llx\n", n.c_str(), c->size,
+                (unsigned long long) h);
+        nb += c->size;
+    }
+    fprintf(stderr, "GGML_AXERA_SGL35_BANK_SUM all %zu bytes %016llx\n", nb, (unsigned long long) all);
+}
+
 // GGUF's tiled value head of HF (grouped) head g
 inline int tiled(int g) {
     return (g % REP) * KH + g / REP;
@@ -215,40 +246,55 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
         return t.at(nm);
     };
     // allocate every bank; the state / KV pools stay zero, the RoPE table is generated
-    for (const auto & d : dk.desc->in) {
-        bank_n[d.name] = d.bytes;
-        dtype[d.name]  = d.dtype;
-    }
-    for (const auto & d : dk.desc->in) {
-        if (banks.count(d.name)) {
-            continue;
+    {
+        axera_timer ta("fill: alloc");
+        for (const auto & d : dk.desc->in) {
+            bank_n[d.name] = d.bytes;
+            dtype[d.name]  = d.dtype;
         }
-        std::smatch mt;
-        if (!std::regex_match(d.name, mt, re)) {
-            if (d.name == "b3_kv") {  // the KV cache pool: zero
-                banks[d.name] = axera_cmm_alloc(d.bytes);
+        for (const auto & d : dk.desc->in) {
+            if (banks.count(d.name)) {
+                continue;
             }
-            continue;
-        }
-        axera_cmm & c = banks[d.name] = axera_cmm_alloc(d.bytes);
-        const std::string n = mt[3];
-        if (n == "state_in" || n == "q_conv_state_in" || n == "k_conv_state_in" || n == "v_conv_state_in" || n == "kv") {
-            continue;  // the state pools: zero
-        }
-        if (n == "cos_sin_cache") {  // [positions][cos | sin of ROT / 2] f32
-            const int64_t P = d.shape[1], R = d.shape[2] / 2;
-            GGML_ASSERT((size_t) R == rp.inv_freq.size() && d.dtype == 3);
-            for (int64_t q = 0; q < P; ++q) {
-                for (int64_t i = 0; i < R; ++i) {
-                    const double th = (double) q * rp.freq_scale * rp.inv_freq[i];
-                    ((float *) c->vir)[q * 2 * R + i]     = (float) std::cos(th);
-                    ((float *) c->vir)[q * 2 * R + R + i] = (float) std::sin(th);
+            std::smatch mt;
+            if (!std::regex_match(d.name, mt, re)) {
+                if (d.name == "b3_kv") {  // the KV cache pool: zero
+                    banks[d.name] = axera_cmm_alloc_raw(d.bytes);
                 }
+                continue;
             }
-            c->flush();
-            continue;
+            axera_cmm &       c = banks[d.name] = axera_cmm_alloc_raw(d.bytes);
+            const std::string n = mt[3];
+            if (n == "state_in" || n == "q_conv_state_in" || n == "k_conv_state_in" || n == "v_conv_state_in" ||
+                n == "kv") {
+                continue;  // the state pools: zero
+            }
+            if (n == "cos_sin_cache") {  // [positions][cos | sin of ROT / 2] f32
+                const int64_t P = d.shape[1], R = d.shape[2] / 2;
+                GGML_ASSERT((size_t) R == rp.inv_freq.size() && d.dtype == 3);
+                memset(c->vir, 0, c->size);  // raw allocation: zero the alignment tail (this bank is not in the batch)
+                for (int64_t q = 0; q < P; ++q) {
+                    for (int64_t i = 0; i < R; ++i) {
+                        const double th = (double) q * rp.freq_scale * rp.inv_freq[i];
+                        ((float *) c->vir)[q * 2 * R + i]     = (float) std::cos(th);
+                        ((float *) c->vir)[q * 2 * R + R + i] = (float) std::sin(th);
+                    }
+                }
+                c->flush();
+                continue;
+            }
+            GGML_ASSERT(d.shape[0] == NB && d.bytes % NB == 0);
         }
-        GGML_ASSERT(d.shape[0] == NB && d.bytes % NB == 0);
+        // The state / KV pools need zeroes and the weight banks would otherwise be zeroed one at a time before the
+        // fill overwrites them. Zero all banks in parallel once; the fill's final pass does the only cache flush.
+        std::vector<axera_cmm *> bv;
+        bv.reserve(banks.size());
+        for (auto & [n, c] : banks) {
+            if (n.find("cos_sin_cache") == std::string::npos) {  // already generated above
+                bv.push_back(&c);
+            }
+        }
+        axera_host_pool().run((int64_t) bv.size(), [&](int64_t i) { memset((*bv[i])->vir, 0, (*bv[i])->size); });
     }
     auto slot = [&](const std::string & n, int b) -> uint8_t * {
         if (!banks.count(n) || !bank_n.count(n)) {
@@ -270,16 +316,24 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
             if (v.size() * 4 != bb) {
                 GGML_ABORT("axera qwen35_moe_sgl: %s f32 %zu floats, bank slot %zu bytes\n", n.c_str(), v.size(), bb);
             }
+            std::vector<float> tmp(v.size());
             for (size_t i = 0; i < v.size(); ++i) {
-                ((float *) d)[i] = v[i] * scale;
+                tmp[i] = v[i] * scale;
             }
+            memcpy(d, tmp.data(), bb);
         } else {
             if (v.size() * 2 != bb) {
                 GGML_ABORT("axera qwen35_moe_sgl: %s bf16 %zu floats, bank slot %zu bytes\n", n.c_str(), v.size(), bb);
             }
+            std::vector<float> scaled(scale == 1.0f ? 0 : v.size());
             for (size_t i = 0; i < v.size(); ++i) {
-                ((ggml_bf16_t *) d)[i] = ggml_fp32_to_bf16(v[i] * scale);
+                if (scale != 1.0f) {
+                    scaled[i] = v[i] * scale;
+                }
             }
+            std::vector<ggml_bf16_t> tmp(v.size());
+            ggml_fp32_to_bf16_row(scale == 1.0f ? v.data() : scaled.data(), tmp.data(), v.size());
+            memcpy(d, tmp.data(), bb);
         }
     };
     // rows r0 .. r0 + nr of a GGUF tensor -> this block's NVFP4 code / scale banks, its global scale at scale2 index
@@ -331,6 +385,7 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
         return u;
     };
 
+    axera_timer tl("fill: layers");
     for (int b = 0; b < NB; ++b) {
         for (int phase = 0; phase < 4; ++phase) {
             const int         il = 4 * b + phase;
@@ -407,6 +462,7 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
             {
                 const ggml_tensor * g = T(il, "ffn_gate_exps.weight");
                 const ggml_tensor * u = T(il, "ffn_up_exps.weight");
+                const ggml_tensor * d = T(il, "ffn_down_exps.weight");
                 GGML_ASSERT(g->ne[0] == u->ne[0] && g->ne[1] == u->ne[1] && g->ne[2] == u->ne[2]);
                 const int64_t F = g->ne[1], E = g->ne[2];
                 for (int64_t e = 0; e < E; ++e) {
@@ -419,7 +475,6 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
                     axera_drop_mapped(g);
                     axera_drop_mapped(u);
                 }
-                const ggml_tensor * d = T(il, "ffn_down_exps.weight");
                 const int64_t Rd = d->ne[1], Ed = d->ne[2];
                 for (int64_t e = 0; e < Ed; ++e) {
                     put_nv(pm, "w_down", d, e * Rd, Rd, b, e * Rd, e, nullptr, nullptr, pm + "w_scale_down",
@@ -443,8 +498,12 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
             }
         }
     }
-    for (auto & [n, c] : banks) {
-        c->flush();
+    tl.stop();
+    {
+        axera_timer tf("fill: flush");
+        for (auto & [n, c] : banks) {
+            c->flush();
+        }
     }
 }
 
@@ -610,6 +669,7 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     for (const auto & [n, b] : banks) {
         bb += b->size;
     }
+    axera_bank_checksums(banks);
     GGML_LOG_INFO("axera qwen35_35b_a3b: %d layers, banks (weights + state) %.2f GiB, %lld cells\n", L, bb / 1073741824.0,
                   (long long) man.context);
 }

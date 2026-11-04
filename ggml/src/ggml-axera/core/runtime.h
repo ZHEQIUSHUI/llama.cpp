@@ -112,6 +112,7 @@ struct ggml_backend_axera_buffer_context {
 using axera_cmm = std::unique_ptr<ggml_backend_axera_buffer_context>;
 
 axera_cmm axera_cmm_alloc(size_t size);     // cached, zeroed
+axera_cmm axera_cmm_alloc_raw(size_t size); // cached, no zero / cache flush (the caller zeroes it)
 axera_cmm axera_cmm_alloc_nc(size_t size);  // non-cacheable (host writes only)
 // bytes off .. off + size of b as a buffer of its own (b outlives it)
 axera_cmm axera_cmm_view(const ggml_backend_axera_buffer_context * b, size_t off, size_t size);
