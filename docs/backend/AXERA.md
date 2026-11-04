@@ -11,6 +11,7 @@ parts of the TTS codec decoder) run on the CPU backend on the same memory.
 | Qwen3.5-35B-A3B (MoE, MXFP4 experts) | `qwen35_moe` + `qwen35_vit` | language model, 4-core ViT | 16k |
 | Qwen3.8-27B (MXFP4) | `qwen35_dense` + `qwen35_vit` | language model, 4-core ViT | 16k |
 | Qwen3.5-9B (MXFP4) | `qwen35_dense` | language model | 16k |
+| Qwen3.5-4B (MXFP4) | `qwen35_whole` + `qwen35_vit` | language model, 4-core ViT | 16k |
 | Qwen3-Embedding-0.6B | `qwen3` | model up to the final norm (pooling on the CPU) | 16k |
 | Qwen3-ASR-0.6B / 1.7B | `qwen3` + `qwen3_asr` | text model, audio encoder | 4k |
 | Qwen3-TTS-0.6B / 1.7B | `qwen3` + `qwen3_tts` | talker, code predictor frames, codec decoder GEMMs / convolutions | 4k |
@@ -58,9 +59,9 @@ On the board, with the BSP runtime libraries on the library path and the model's
 
 ```bash
 export LD_LIBRARY_PATH=/opt/lib:$PWD/build-axera/bin GGML_AXERA_KERNEL_DIR=$PWD/kernels
-# language models (27B, 35B-A3B, 9B)
+# language models (27B, 35B-A3B, 9B, 4B)
 llama-completion -m qwen3.8-27b-mxfp4.gguf -ngl 99 -c 16384 -p "The capital of France is" -n 64
-# images (27B, 35B-A3B): at most 3072 patches per image
+# images (27B, 35B-A3B, 4B): at most 3072 patches per image
 llama-mtmd-cli -m qwen3.8-27b-mxfp4.gguf --mmproj mmproj-qwen3.8-27b-bf16.gguf -ngl 99 -c 16384 \
     --image bus.jpg --image-max-tokens 768 -p "Describe this image."
 # speech recognition
@@ -98,6 +99,7 @@ None of them changes a result.
 | `models/model.cpp` | the adapter by manifest model name; a composite per graph kind (vision, audio, TTS generation) |
 | `models/qwen35_moe/` | Qwen3.5-35B-A3B: 8-layer decode groups, 256-row prefill groups with routed-expert slots |
 | `models/qwen35_dense/` | Qwen3.5 dense (9B, 27B): decode groups (9B: whole model with the head), padded prefill chunks |
+| `models/qwen35_whole/` | Qwen3.5 dense whole-model kernels (4B, 9B, 2B): banked prefill, bank-reading decode groups |
 | `models/qwen3/` | Qwen3 text decoders: Embedding, the ASR text model, the TTS talker |
 | `models/qwen35_vit/` | the Qwen3.5 vision encoder (4-core ViT) |
 | `models/qwen3_asr/` | the Qwen3-ASR audio encoder |
@@ -106,6 +108,6 @@ None of them changes a result.
 ## Regression gate
 
 Every change runs, per model, fixed cases whose outputs must stay bit-identical (md5) and whose prefill / decode speed
-must stay within 2 %: 27B / 35B-A3B / 9B short, 4k prompt + 1k tokens, 16k prompt, an image (27B / 35B-A3B); Embedding
+must stay within 2 %: 27B / 35B-A3B / 9B / 4B short, 4k prompt + 1k tokens, 16k prompt, an image (27B / 35B-A3B / 4B); Embedding
 six inputs; ASR three recordings; TTS a Chinese and an English sentence. No kernel directory may contain single-core
 kernels.
