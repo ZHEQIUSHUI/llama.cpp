@@ -90,6 +90,7 @@ void output_norm(const graph_names & names, const std::vector<float> & h, int T)
 // the last row) as they are, the projection of any other row on the CPU (a small head: the TTS codec head's)
 struct output_head {
     const kernel * k = nullptr;
+    const kernel * kv = nullptr;  // optional multi-row verification head
     const ggml_tensor * w = nullptr;  // output.weight
     axera_cmm  q, s, x;               // the projection in the kernel's format, the bf16 input row(s)
     axera_cmm  yk, mk;                // a kernel of R rows per call (input m: the valid ones): its output, m
@@ -137,6 +138,7 @@ struct output_head {
     bool fused_ready(ggml_cgraph * g, const graph_names & names) const;
     // the fused head's one row, from the layer kernel's bf16 hidden row
     void run_fused(ggml_cgraph * g, const graph_names & names, const axera_cmm & xb);
+    void bind_verify(const kernel & lm);
     void bind_draft(const kernel & dlm, const std::vector<int32_t> & ids);  // after bind (MXFP4)
     void bind_cpu(const ggml_tensor * output_weight);
     // compact_rows: h holds only the output rows, in the same order as the graph's output row indices

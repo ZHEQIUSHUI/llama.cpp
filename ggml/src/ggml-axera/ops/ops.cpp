@@ -743,6 +743,22 @@ void output_head::bind_draft(const kernel & dlm, const std::vector<int32_t> & id
     ds->flush();
 }
 
+void output_head::bind_verify(const kernel & lm) {
+    GGML_ASSERT(k && mx4);
+    GGML_ASSERT(lm.in_bytes("w") == k->in_bytes("w") && lm.in_bytes("s") == k->in_bytes("s"));
+    kv = &lm;
+    const int64_t K = w->ne[0];
+    const int     Rv = lm.find_input("m") >= 0 ? (int) (lm.in_bytes("x") / (K * sizeof(ggml_bf16_t))) : 1;
+    GGML_ASSERT(Rv > 1);
+    if (!yk) {
+        yk = axera_cmm_alloc((size_t) Rv * w->ne[1] * sizeof(float));
+        mk = axera_cmm_alloc(sizeof(int32_t));
+    }
+    if (x->size < lm.in_bytes("x")) {
+        x = axera_cmm_alloc(lm.in_bytes("x"));
+    }
+}
+
 // a TOP_K of the draft head's single row: over its vocabulary's logits only (the others are -inf)
 static const output_head * top_k_draft = nullptr;
 // with a TOP_K in its sampler, a draft head writes no logits: the TOP_K writes those of its rows (here and in the
@@ -886,18 +902,19 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         return;
     }
     draft = false;
-    axera_timer tl(k ? "lm_head" : "lm_head (cpu)");
-    in.resize(k ? k->info->nInputSize : 0);
-    out.resize(k ? k->info->nOutputSize : 0);
-    if (k) {
-        in[k->input("x")] = axera_io(x);
-        in[k->input("w")] = axera_io(q, mx4 ? N * K / 2 : N * K);
-        in[k->input("s")] = axera_io(s, N * K / AXERA_MX_GROUP);
+    const kernel * kk = kv && n_out > 1 ? kv : k;
+    const int      Rk = kk && kk->find_input("m") >= 0 ? (int) (kk->in_bytes("x") / (K * sizeof(ggml_bf16_t))) : 1;
+    axera_timer tl(kk ? "lm_head" : "lm_head (cpu)");
+    std::vector<AX_ENGINE_IO_BUFFER_T> in(kk ? kk->info->nInputSize : 0), out(kk ? kk->info->nOutputSize : 0);
+    if (kk) {
+        in[kk->input("x")] = axera_io(x);
+        in[kk->input("w")] = axera_io(q, mx4 ? N * K / 2 : N * K);
+        in[kk->input("s")] = axera_io(s, N * K / AXERA_MX_GROUP);
     }
     std::vector<int> kr;  // the output rows of a kernel of R > 1 rows
     for (int r = 0; r < n_out; ++r) {
         float * o = (float *) ((char *) logits->data + r * logits->nb[1]);
-        if ((last && rows[r] == T - 1) || !k) {
+        if ((last && rows[r] == T - 1) || !kk) {
             if (last && rows[r] == T - 1) {
                 memcpy(o, last, N * sizeof(float));
             } else {
@@ -915,51 +932,44 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
             dctx->flush(o, N * sizeof(float));
             continue;
         }
-        if (R > 1) {  // (R rows per call, below)
+        if (Rk > 1) {  // (R rows per call, below)
             kr.push_back(r);
             continue;
         }
-        {
-            axera_timer tx("head: input");
-            ggml_fp32_to_bf16_row(y.data() + (size_t) r * K, (ggml_bf16_t *) x->vir, K);
-            x->flush(x->vir, K * sizeof(ggml_bf16_t));
-        }
-        out[k->output("out")] = axera_io(dctx, o, (uint32_t) (N * sizeof(float)));
-        {
-            axera_timer tr("head: run");
-            k->run(in, out, "output head");
-        }
-        {
-            axera_timer ti("head: output");
-            dctx->invalidate(o, N * sizeof(float));
-            dctx->clean_p     = o;  // the host reads these logits back without more cache maintenance this graph
-            dctx->clean_n     = N * sizeof(float);
-            dctx->clean_epoch = axera_graph_epoch;
-        }
+        ggml_fp32_to_bf16_row(y.data() + (size_t) r * K, (ggml_bf16_t *) x->vir, K);
+        x->flush(x->vir, K * sizeof(ggml_bf16_t));
+        dctx->flush(o, N * sizeof(float));
+        out[kk->output("out")] = axera_io(dctx, o, (uint32_t) (N * sizeof(float)));
+        kk->run(in, out, "output head");
+        dctx->invalidate(o, N * sizeof(float));
+        dctx->clean_p     = o;  // the host reads these logits back without more cache maintenance this graph
+        dctx->clean_n     = N * sizeof(float);
+        dctx->clean_epoch = axera_graph_epoch;
     }
-    for (size_t i0 = 0; i0 < kr.size(); i0 += R) {  // the kernel's rows R at a time, the weights read once per call
-        const int nr = (int) std::min<size_t>(R, kr.size() - i0);
+    for (size_t i0 = 0; i0 < kr.size(); i0 += Rk) {  // the kernel's rows R at a time, the weights read once per call
+        const int nr = (int) std::min<size_t>(Rk, kr.size() - i0);
         for (int j = 0; j < nr; ++j) {
             ggml_fp32_to_bf16_row(y.data() + (size_t) kr[i0 + j] * K, (ggml_bf16_t *) x->vir + (size_t) j * K, K);
         }
         x->flush();
         *(int32_t *) mk->vir = nr;
         mk->flush();
-        in[k->input("m")] = axera_io(mk);
+        in[kk->input("m")] = axera_io(mk);
         // R consecutive logits rows: the kernel writes them in place (a verification batch), else through y
-        const bool direct = nr == R && kr[i0 + R - 1] == kr[i0] + R - 1 && logits->nb[1] == N * sizeof(float);
+        const bool direct = nr == Rk && kr[i0 + Rk - 1] == kr[i0] + Rk - 1 && logits->nb[1] == N * sizeof(float);
         if (direct) {
             float * o = (float *) ((char *) logits->data + kr[i0] * logits->nb[1]);
-            out[k->output("out")] = axera_io(dctx, o, (uint32_t) (R * N * sizeof(float)));
-            k->run(in, out, "output head");
-            dctx->invalidate(o, (size_t) R * N * sizeof(float));
+            dctx->flush(o, (size_t) Rk * N * sizeof(float));
+            out[kk->output("out")] = axera_io(dctx, o, (uint32_t) (Rk * N * sizeof(float)));
+            kk->run(in, out, "output head");
+            dctx->invalidate(o, (size_t) Rk * N * sizeof(float));
             dctx->clean_p     = o;
-            dctx->clean_n     = (size_t) R * N * sizeof(float);
+            dctx->clean_n     = (size_t) Rk * N * sizeof(float);
             dctx->clean_epoch = axera_graph_epoch;
             continue;
         }
-        out[k->output("out")] = axera_io(yk);
-        k->run(in, out, "output head");
+        out[kk->output("out")] = axera_io(yk);
+        kk->run(in, out, "output head");
         yk->invalidate(yk->vir, (size_t) nr * N * sizeof(float));
         for (int j = 0; j < nr; ++j) {
             float * o = (float *) ((char *) logits->data + kr[i0 + j] * logits->nb[1]);
