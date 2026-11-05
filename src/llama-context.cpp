@@ -211,6 +211,7 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
+    cparams.dummy_batch             = false;
 
     // a backend adapter that replaces the whole attention path may never read the KQ mask: it then needs only the
     // tensor's shape, so do not fill the (n_kv x n_batch) host matrix. The same proc identifies the input offload.
@@ -1428,6 +1429,10 @@ void llama_context::set_warmup(bool value) {
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
+}
+
+void llama_context::set_dummy_batch(bool value) {
+    cparams.dummy_batch = value;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -4601,6 +4606,10 @@ bool llama_get_causal_attn(const llama_context * ctx) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_dummy_batch(llama_context * ctx, bool dummy) {
+    ctx->set_dummy_batch(dummy);
 }
 
 void llama_synchronize(llama_context * ctx) {

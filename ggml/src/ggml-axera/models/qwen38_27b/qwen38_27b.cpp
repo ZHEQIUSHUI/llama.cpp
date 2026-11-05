@@ -137,6 +137,7 @@ class qwen38_27b final : public model {
     std::vector<std::array<axera_cmm, 4>> snaps[2];
     axera_cmm                             VX, VCS, VPN, VMASK, VNT;
     int     cur_set = -1;              // the snapshot set holding the current state, -1: the pools
+    bool    state_zero = true;         // the pools hold the zero state (axera_cmm_alloc zeroes them; zero_state sets it)
     int64_t ver_c0  = -1;              // the last verification's first cell, rows, snapshot set
     int     ver_T = 0, ver_set = -1;
     // the MTP block (draft context graphs): its kernels' IO, its KV cache
@@ -821,6 +822,7 @@ void qwen38_27b::state_home() {
         pool(k)->flush();
     }
     cur_set = -1;
+    state_zero = false;
     bind_state();
 }
 
@@ -840,10 +842,15 @@ void qwen38_27b::state_at(int set, int row) {
 void qwen38_27b::zero_state() {
     axera_timer tl("state zero");
     // The pools are zeroed below, so a copy of the current (snapshot) state into them first would be wasted.
-    for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
-        memset((*p)->vir, 0, (*p)->size);
-        (*p)->flush();
+    // A sequence that starts while the pools already hold the zero state (a fresh allocation, or the dummy warm-up
+    // batch zeroed at its end below) skips the 154 MB memset.
+    if (!state_zero || cur_set >= 0) {
+        for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
+            memset((*p)->vir, 0, (*p)->size);
+            (*p)->flush();
+        }
     }
+    state_zero = true;
     for (int k = 0; k < 4; ++k) {
         for (size_t g = 0; g < where[k].size(); ++g) {
             char * dst = (char *) pool(k)->vir + g * part(k);
@@ -918,6 +925,7 @@ void qwen38_27b::load_state() {
         (*p)->flush();
         o += (*p)->size;
     }
+    state_zero = false;
 }
 
 // llama.cpp's sequence state (prompt cache / context checkpoint): see qwen35_whole. The private CMM pools are not the
@@ -1192,6 +1200,7 @@ void qwen38_27b::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t
             for (auto & c : P->calls) {
                 c.k->run(c.in, c.out, "prefill");
             }
+            state_zero = false;
         }
         axera_timer       to("prefill out rows");
         const axera_cmm & po = P->OUT[(P->calls.size() - 1) & 1];
@@ -1368,6 +1377,9 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
             ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]), xb.data() + (size_t) r * H, H);
         });
     }
+    // common.cpp marks its warm-up batch with llama_set_dummy_batch(): its state is not needed. Zero it here, while
+    // the batch is still being timed as warm-up, so the prompt's own zero_state() can skip the 154 MB memset.
+    const bool warmup = c0 == 0 && names.find("inp_mixed_slots_dummy");
     if (T > 1 && T <= 4 && !ver.empty() && c0 > 0 && c0 + 4 <= kv_cells) {
         axera_timer tv("verify (all groups)");
         const ggml_status st = verify(kv, rp, xb.data(), pb.data(), T, h.data());
@@ -1420,6 +1432,7 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
             for (auto & c : dec) {
                 c.k->run(c.in, c.out, "decode group");
             }
+            state_zero = false;
         }
         A->invalidate(A->vir, H * sizeof(ggml_bf16_t));
         ggml_bf16_to_fp32_row((const ggml_bf16_t *) A->vir, h.data(), H);
@@ -1451,6 +1464,9 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
     axera_timer th("output head");
     head.bind(man.get("lm_head"), logits->src[0]);
     head.run(g, names, h, T);
+    if (warmup) {
+        zero_state();
+    }
     return GGML_STATUS_SUCCESS;
 }
 
