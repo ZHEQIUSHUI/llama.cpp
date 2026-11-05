@@ -154,10 +154,17 @@ class qwen38_27b final : public model {
             mtp_bg.join();
         }
     }
-    std::vector<call>              pres;  // the prefill calls of a page (the kernel's blocks each)
+    // the prefill kernel variants: 256 rows, and the 128 / 64-row tails that hold the last page of a prompt
+    struct prefill_set {
+        const kernel *    k = nullptr;
+        int               rows = 0;
+        std::vector<call> calls;  // the kernel's calls of a page (its blocks each)
+        axera_cmm         X, POS, OUT[2];
+    };
+    prefill_set                    pfs[3];
     int                            ncall = 1;
     std::map<std::string, axera_cmm> banks;
-    axera_cmm                      PX, POS, INDPTR, INDICES, LASTLEN, CLOC, VALID, POUT[2];
+    axera_cmm                      INDPTR, INDICES, LASTLEN, CLOC, VALID;
     output_head                    head;
 
     void init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
@@ -455,7 +462,25 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
         }
         GGML_ABORT("axera qwen38_27b: %s has no IO %s\n", k.desc->file.c_str(), n.c_str());
     };
-    const io_desc & pkv = in_of(pk, "b3_kv"), &pst = in_of(pk, "b0_attn_state_in");
+    // A split prefill kernel binds one KV pool per block (b3_kv<block>): every
+    // block's K+V is then one IO, below the runtime's 2 GiB IO limit, and a
+    // single call can run the whole model.
+    auto split_kv_index = [](const std::string & n) -> int {
+        if (n.rfind("b3_kv", 0) != 0 || n.size() <= 5) {
+            return -1;
+        }
+        for (size_t i = 5; i < n.size(); ++i) {
+            if (!isdigit((unsigned char) n[i])) {
+                return -1;
+            }
+        }
+        return atoi(n.c_str() + 5);
+    };
+    bool split_kv = false;
+    for (const auto & d : pk.desc->in) {
+        split_kv = split_kv || split_kv_index(d.name) >= 0;
+    }
+    const io_desc & pkv = in_of(pk, split_kv ? "b3_kv0" : "b3_kv"), &pst = in_of(pk, "b0_attn_state_in");
     const io_desc & pcq = in_of(pk, "b0_attn_q_conv_state_in"), &pcv = in_of(pk, "b0_attn_v_conv_state_in");
     const io_desc * pkvs = nullptr;  // an int8 cache: its scales
     for (const auto & d : pk.desc->in) {
@@ -463,38 +488,41 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
             pkvs = &d;
         }
     }
-    const int pna = (int) pkv.shape[0], png = (int) pst.shape[0];  // the prefill kernel's layers per call
+    const int png = (int) pst.shape[0];  // GDN layers the prefill banks cover (3 per block)
+    const int pna = split_kv ? png / 3 : (int) pkv.shape[0];  // the prefill kernel's blocks per call
     GGML_ASSERT(pna > 0 && na % pna == 0 && png == 3 * pna && pcq.shape[0] == png && pcv.shape[0] == png);
     ncall = na / pna;
-    kv_b  = pkv.bytes / pna;
-    kvs_b = pkvs ? pkvs->bytes / pna : 0;
+    const int kv_layers = split_kv ? 1 : pna;  // each b3_kv<block> IO is one layer, a b3_kv bank is pna layers
+    kv_b  = pkv.bytes / kv_layers;
+    kvs_b = pkvs ? pkvs->bytes / kv_layers : 0;
     st_b  = pst.bytes / png;
     cq_b  = pcq.bytes / png;
     cv_b  = pcv.bytes / png;
     GGML_ASSERT(in_of(dk, "kv3").bytes == kv_b && in_of(dk, "st0").bytes == st_b && in_of(dk, "cq0").bytes == cq_b &&
                 in_of(dk, "ck0").bytes == cq_b && in_of(dk, "cv0").bytes == cv_b);
-    NBLK = (int) pkv.shape[1];
-    GGML_ASSERT(pkv.shape[3] == PG && (int64_t) NBLK * PG == man.context);
+    NBLK = (int) pkv.shape[split_kv ? 0 : 1];
+    GGML_ASSERT(pkv.shape[split_kv ? 2 : 3] == PG && (int64_t) NBLK * PG == man.context);
     kv_pages = NBLK;
-    if (const int64_t cells = axera_kv_cells(); cells > 0 && pna == 1) {  // llama.cpp's -c (its own cache's cells); a
+    if (const int64_t cells = axera_kv_cells(); cells > 0 && (split_kv || pna == 1)) {  // llama.cpp's -c (its own cache's cells); a
         kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(NBLK, (cells + PG - 1) / PG));  // multi-layer prefill
     }                                                                                            // call needs every page
     if (const char * e = getenv("GGML_AXERA_KV_PAGES")) {
         kv_pages = std::max(1, std::min(NBLK, atoi(e)));
     }
-    GGML_ASSERT(kv_pages == NBLK || pna == 1);  // (a prefill call of several layers: fixed layer strides in its IO)
+    GGML_ASSERT(kv_pages == NBLK || pna == 1 || split_kv);  // (a multi-layer bank needs fixed layer strides in its IO)
     kv_cells  = (int64_t) kv_pages * PG;
     kv_alloc  = kv_b / NBLK * kv_pages;
     kvs_alloc = kvs_b / NBLK * kv_pages;
     if (kv_pages < NBLK) {
         GGML_LOG_INFO("axera qwen38_27b: the KV pools hold %d of the kernels' %d pages (%lld cells)\n", kv_pages, NBLK, (long long) kv_cells);
     }
-    KVC.resize(ncall);
-    KVSC.resize(kvs_b ? ncall : 0);
-    for (int k = 0; k < ncall; ++k) {
-        KVC[k] = axera_cmm_alloc(kv_alloc * pna);
+    const int npool = split_kv || pna == 1 ? na : ncall;  // one pool per attention layer, or one per prefill call
+    KVC.resize(npool);
+    KVSC.resize(kvs_b ? npool : 0);
+    for (int k = 0; k < npool; ++k) {
+        KVC[k] = axera_cmm_alloc(kv_alloc * (split_kv ? 1 : pna));
         if (kvs_b) {
-            KVSC[k] = axera_cmm_alloc(kvs_alloc * pna);
+            KVSC[k] = axera_cmm_alloc(kvs_alloc * (split_kv ? 1 : pna));
         }
     }
     for (const auto & d : dk.desc->out) {  // the decode kernels' cache IO matches the prefill's (kv<j>, kvs<j>)
@@ -522,15 +550,16 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
     PN   = axera_cmm_alloc(3 * sizeof(int32_t));
     MASK = axera_cmm_alloc(dk.in_bytes("mask"));
     GGML_ASSERT(dk.in_bytes("pn") == 3 * sizeof(int32_t) && dk.in_bytes("mask") == (size_t) man.context * sizeof(ggml_bf16_t));
+    const int kl = split_kv ? 1 : pna;  // layers per KV pool (a split pool is one block's)
     auto pool_io = [&](const std::string & n, int il) {
         if (n.rfind("kvs", 0) == 0) {
             const int a = ord[il];
             GGML_ASSERT(kvs_b);
-            return axera_io(KVSC[a / pna].get(), (char *) KVSC[a / pna]->vir + (size_t) (a % pna) * kvs_b, (uint32_t) kvs_b);
+            return axera_io(KVSC[a / kl].get(), (char *) KVSC[a / kl]->vir + (size_t) (a % kl) * kvs_b, (uint32_t) kvs_b);
         }
         if (n.rfind("kv", 0) == 0) {
             const int a = ord[il];
-            return axera_io(KVC[a / pna].get(), (char *) KVC[a / pna]->vir + (size_t) (a % pna) * kv_b, (uint32_t) kv_b);
+            return axera_io(KVC[a / kl].get(), (char *) KVC[a / kl]->vir + (size_t) (a % kl) * kv_b, (uint32_t) kv_b);
         }
         const axera_cmm & p = n[0] == 's' ? ST : n[1] == 'q' ? CQ : n[1] == 'k' ? CK : CV;
         const size_t      b = n[0] == 's' ? st_b : n[1] == 'v' ? cv_b : cq_b;
@@ -546,7 +575,7 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
                                                      "valid_tokens", "b3_kv", "b3_attn_kv_scale", "b0_attn_state_in", "b0_attn_q_conv_state_in",
                                                      "b0_attn_k_conv_state_in", "b0_attn_v_conv_state_in" };
         for (const auto & d : pk.desc->in) {
-            if (!pools.count(d.name)) {
+            if (!pools.count(d.name) && split_kv_index(d.name) < 0) {
                 // the weights of all L / 4 blocks (a call's slice of them bound below); the cos / sin tables are the
                 // same for every block: the kernel's blocks of them, bound whole to every call
                 const bool cs = d.name.size() > 4 && (d.name.compare(d.name.size() - 4, 4, "_cos") == 0 ||
@@ -681,51 +710,72 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
         }
     }
 
-    // prefill: the weight banks (above), the pools, one page's inputs
-    PX      = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
-    POUT[0] = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
-    POUT[1] = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
-    POS     = axera_cmm_alloc(pk.in_bytes("position_ids"));
+    // prefill: the weight banks (above), the pools, one page's inputs; three row variants share the banks and pools
     INDPTR  = axera_cmm_alloc(2 * sizeof(int32_t));
     INDICES = axera_cmm_alloc(pk.in_bytes("indices"));
     LASTLEN = axera_cmm_alloc(sizeof(int32_t));
     CLOC    = axera_cmm_alloc(2 * sizeof(int32_t));
     VALID   = axera_cmm_alloc(sizeof(int32_t));
-    GGML_ASSERT(pk.in_bytes("x") == PX->size && pk.in_bytes("position_ids") == 3 * PG * sizeof(int32_t) &&
-                pk.in_bytes("indices") == (size_t) NBLK * sizeof(int32_t));
+    GGML_ASSERT(pk.in_bytes("indices") == (size_t) NBLK * sizeof(int32_t));
     for (int i = 0; i < NBLK; ++i) {
         ((int32_t *) INDICES->vir)[i] = i;
     }
     INDICES->flush();
-    GGML_ASSERT(pk.desc->out.size() == 1 && pk.desc->out[0].name == "output" && pk.desc->out[0].bytes == POUT[0]->size);
-    pres.assign(ncall, {});
-    for (int k = 0; k < ncall; ++k) {  // call k: blocks k * pna .. of the banks, its layers of the pools
-        call & c = pres[k];
-        c.k      = &pk;
-        for (const auto & d : pk.desc->in) {
-            const std::string & n = d.name;
-            const axera_cmm *   b = n == "x" ? (k == 0 ? &PX : &POUT[(k - 1) & 1]) : n == "position_ids" ? &POS :
-                                    n == "indptr" ? &INDPTR : n == "indices" ? &INDICES : n == "last_page_len" ? &LASTLEN :
-                                    n == "cache_location" ? &CLOC : n == "valid_tokens" ? &VALID : nullptr;
-            size_t off = 0;
-            if (!b && n == "b3_kv") {
-                b = &KVC[k];
-            } else if (!b && n == "b3_attn_kv_scale") {
-                b = &KVSC[k];
-            } else if (!b) {
-                b = n == "b0_attn_state_in" ? &ST : n == "b0_attn_q_conv_state_in" ? &CQ :
-                    n == "b0_attn_k_conv_state_in" ? &CK : n == "b0_attn_v_conv_state_in" ? &CV : nullptr;
-                if (b) {
-                    off = (size_t) k * d.bytes;  // (the pools: the prefill order of the layers, kind by kind)
-                } else {
-                    b   = &banks.at(n);
-                    off = (*b)->size >= (size_t) ncall * d.bytes ? (size_t) k * d.bytes : 0;  // (cos / sin: whole)
+    auto bind_prefill = [&](int idx, const char * role, int rows) {
+        prefill_set &     p = pfs[idx];
+        const kernel &    k = man.get(role);
+        p.k                 = &k;
+        p.rows              = rows;
+        p.X                 = axera_cmm_alloc((size_t) rows * H * sizeof(ggml_bf16_t));
+        p.OUT[0]            = axera_cmm_alloc((size_t) rows * H * sizeof(ggml_bf16_t));
+        p.OUT[1]            = axera_cmm_alloc((size_t) rows * H * sizeof(ggml_bf16_t));
+        p.POS               = axera_cmm_alloc(k.in_bytes("position_ids"));
+        GGML_ASSERT(k.in_bytes("x") == p.X->size && k.in_bytes("position_ids") == 3 * (size_t) rows * sizeof(int32_t));
+        GGML_ASSERT(k.desc->out.size() == 1 && k.desc->out[0].name == "output" && k.desc->out[0].bytes == p.OUT[0]->size);
+        const io_desc & kv = in_of(k, split_kv ? "b3_kv0" : "b3_kv");
+        const io_desc & st = in_of(k, "b0_attn_state_in");
+        const int       pna_k = split_kv ? (int) st.shape[0] / 3 : (int) kv.shape[0];
+        GGML_ASSERT(pna_k == pna && na % pna_k == 0);
+        const int nc = na / pna_k;
+        GGML_ASSERT(kv.bytes == kv_b && st.bytes == pst.bytes);
+        p.calls.assign(nc, {});
+        for (int c_i = 0; c_i < nc; ++c_i) {  // call c_i: blocks c_i * pna .. of the banks, its layers of the pools
+            call & c = p.calls[c_i];
+            c.k      = &k;
+            for (const auto & d : k.desc->in) {
+                const std::string & n = d.name;
+                const int           ki = split_kv_index(n);
+                const axera_cmm *   b = n == "x" ? (c_i == 0 ? &p.X : &p.OUT[(c_i - 1) & 1]) : n == "position_ids" ? &p.POS :
+                                        n == "indptr" ? &INDPTR : n == "indices" ? &INDICES : n == "last_page_len" ? &LASTLEN :
+                                        n == "cache_location" ? &CLOC : n == "valid_tokens" ? &VALID : nullptr;
+                size_t off = 0;
+                if (!b && (n == "b3_kv" || ki >= 0)) {
+                    b = &KVC[ki >= 0 ? c_i * pna + ki : c_i];
+                } else if (!b && n == "b3_attn_kv_scale") {
+                    b = &KVSC[c_i];
+                } else if (!b) {
+                    b = n == "b0_attn_state_in" ? &ST : n == "b0_attn_q_conv_state_in" ? &CQ :
+                        n == "b0_attn_k_conv_state_in" ? &CK : n == "b0_attn_v_conv_state_in" ? &CV : nullptr;
+                    if (b) {
+                        off = (size_t) c_i * d.bytes;  // (the pools: the prefill order of the layers, kind by kind)
+                    } else {
+                        b   = &banks.at(n);
+                        off = (*b)->size >= (size_t) nc * d.bytes ? (size_t) c_i * d.bytes : 0;  // (cos / sin: whole)
+                    }
                 }
+                const bool kvio = n == "b3_kv" || ki >= 0;
+                GGML_ASSERT((*b)->size >= off + (kvio ? kv_alloc : n == "b3_attn_kv_scale" ? kvs_alloc : d.bytes));
+                c.in.push_back(axera_io(b->get(), (char *) (*b)->vir + off, d.bytes));
             }
-            GGML_ASSERT((*b)->size >= off + (n == "b3_kv" ? kv_alloc : n == "b3_attn_kv_scale" ? kvs_alloc : d.bytes));
-            c.in.push_back(axera_io(b->get(), (char *) (*b)->vir + off, d.bytes));
+            c.out.push_back(axera_io(p.OUT[c_i & 1], k.desc->out[0].bytes));
         }
-        c.out.push_back(axera_io(POUT[k & 1], pk.desc->out[0].bytes));
+    };
+    bind_prefill(0, "prefill", PG);
+    if (man.has("prefill128")) {
+        bind_prefill(1, "prefill128", 128);
+    }
+    if (man.has("prefill64")) {
+        bind_prefill(2, "prefill64", 64);
     }
 
     std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> live;
@@ -784,11 +834,19 @@ void qwen38_27b::state_at(int set, int row) {
 
 void qwen38_27b::zero_state() {
     axera_timer tl("state zero");
-    state_home();
+    // The pools are zeroed below, so a copy of the current (snapshot) state into them first would be wasted.
     for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
         memset((*p)->vir, 0, (*p)->size);
         (*p)->flush();
     }
+    for (int k = 0; k < 4; ++k) {
+        for (size_t g = 0; g < where[k].size(); ++g) {
+            char * dst = (char *) pool(k)->vir + g * part(k);
+            where[k][g] = { pool(k).get(), dst };
+        }
+    }
+    cur_set     = -1;
+    bind_state();
     snap_cell   = -1;
     ksnap_cell  = -1;
     snap_prompt = false;
@@ -826,11 +884,19 @@ void qwen38_27b::save_state(int64_t cell) {
     snap_prompt = false;
     snap.resize(ksnap.size() ? ksnap.size() : snap.size());
     size_t o = 0;
-    for (int k = 0; k < 4; ++k) {  // from where the state is, in the pools' layout
-        for (const place & w : where[k]) {
-            w.b->invalidate(w.p, part(k));
-            memcpy(snap.data() + o, w.p, part(k));
-            o += part(k);
+    if (cur_set < 0) {  // the state is in the pools: one contiguous copy per kind instead of one per layer
+        for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
+            (*p)->invalidate((*p)->vir, (*p)->size);
+            memcpy(snap.data() + o, (*p)->vir, (*p)->size);
+            o += (*p)->size;
+        }
+    } else {  // a verification snapshot: its rows are not contiguous in the pools' order
+        for (int k = 0; k < 4; ++k) {
+            for (const place & w : where[k]) {
+                w.b->invalidate(w.p, part(k));
+                memcpy(snap.data() + o, w.p, part(k));
+                o += part(k);
+            }
         }
     }
     snap_cell = cell;
@@ -1088,16 +1154,19 @@ void qwen38_27b::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t
         if (v < PG) {  // a partial last page: the state before it is the restart point of a later batch
             save_state(cell);
         }
-        memcpy(PX->vir, x + (size_t) r0 * H, (size_t) v * H * sizeof(ggml_bf16_t));
-        memset((ggml_bf16_t *) PX->vir + (size_t) v * H, 0, (size_t) (PG - v) * H * sizeof(ggml_bf16_t));
-        PX->flush();
-        auto * pp = (int32_t *) POS->vir;
+        // the smallest row variant that holds this page's valid rows (the 128 / 64 tails save the padding work)
+        prefill_set & P = pfs[2].k && v <= pfs[2].rows ? pfs[2] : pfs[1].k && v <= pfs[1].rows ? pfs[1] : pfs[0];
+        GGML_ASSERT(P.k && v <= P.rows);
+        memcpy(P.X->vir, x + (size_t) r0 * H, (size_t) v * H * sizeof(ggml_bf16_t));
+        memset((ggml_bf16_t *) P.X->vir + (size_t) v * H, 0, (size_t) (P.rows - v) * H * sizeof(ggml_bf16_t));
+        P.X->flush();
+        auto * pp = (int32_t *) P.POS->vir;
         for (int s = 0; s < 3; ++s) {
-            for (int r = 0; r < PG; ++r) {
-                pp[s * PG + r] = r < v ? p4[(size_t) (r0 + r) * 4 + s] : 0;
+            for (int r = 0; r < P.rows; ++r) {
+                pp[s * P.rows + r] = r < v ? p4[(size_t) (r0 + r) * 4 + s] : 0;
             }
         }
-        POS->flush();
+        P.POS->flush();
         ((int32_t *) INDPTR->vir)[0]  = 0;
         ((int32_t *) INDPTR->vir)[1]  = (int32_t) (cell / PG);
         *(int32_t *) LASTLEN->vir     = PG;
@@ -1109,12 +1178,12 @@ void qwen38_27b::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t
         }
         {
             axera_timer tl("prefill (page)");
-            for (auto & c : pres) {
+            for (auto & c : P.calls) {
                 c.k->run(c.in, c.out, "prefill");
             }
         }
         axera_timer       to("prefill out rows");
-        const axera_cmm & po = POUT[(ncall - 1) & 1];
+        const axera_cmm & po = P.OUT[(P.calls.size() - 1) & 1];
         po->invalidate(po->vir, (size_t) v * H * sizeof(ggml_bf16_t));
         axera_host_pool().run(v - std::max(0, out0 - r0), [&](int64_t i) {
             const int r = std::max(0, out0 - r0) + (int) i;
