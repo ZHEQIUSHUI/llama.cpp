@@ -914,8 +914,8 @@ ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, c
     auto * pos = (int32_t *) VPOSN->vir;
     auto * pid = (int32_t *) VPIDS->vir;
     auto * loc = (int32_t *) VLOC->vir;
-    const int rows = (int) (VPOSN->size / sizeof(int32_t));
-    const int axes = (int) (VPIDS->size / (rows * sizeof(int32_t)));
+    const int rows = (int) (ver.k->in_bytes("positions") / sizeof(int32_t));
+    const int axes = (int) (ver.k->in_bytes("position_ids") / (rows * sizeof(int32_t)));
     GGML_ASSERT(rows == 4 && axes >= 1 && axes <= 4);
     for (int r = 0; r < 4; ++r) {
         const int     rr = std::min(r, T - 1);
@@ -938,9 +938,9 @@ ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, c
     const int set = cur_set == 0 ? 1 : 0;
     static const char * SN[4] = { "ssnap", "cqsnap", "cksnap", "cvsnap" };
     for (int k = 0; k < 4; ++k) {
-        ver.in[ver.k->input(SN[k])] = axera_io(VSNAP[set][k], VSNAP[set][k]->size);
+        ver.in[ver.k->input(SN[k])] = axera_io(VSNAP[set][k], ver.k->in_bytes(SN[k]));
     }
-    ver.out[ver.k->output("output")] = axera_io(VOUT, VOUT->size);
+    ver.out[ver.k->output("output")] = axera_io(VOUT, ver.k->out_bytes("output"));
     {
         axera_timer tl("layers (verify)");
         ver.k->run(ver.in, ver.out, "verify");
@@ -1855,6 +1855,23 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         mtp_bound = w0->data;
     }
     const kv_view kv(kidx, kqm, man.context, PG);
+    auto cell_of = [&](int r) -> int64_t {
+        const int64_t c = kv.cell_of(r);
+        if (c < 0 || c >= man.context) {
+            GGML_LOG_ERROR("axera qwen35_moe_sgl: MTP row %d has cell %lld outside [0,%lld); k_idxs[%d] = %lld\n",
+                           r, (long long) c, (long long) man.context, r,
+                           (long long) ((const int64_t *) kidx->data)[r]);
+            GGML_ABORT("axera qwen35_moe_sgl: MTP cell out of range\n");
+        }
+        return c;
+    };
+    static int mtp_log_t = -1;
+    if (T != mtp_log_t) {
+        mtp_log_t = T;
+        GGML_LOG_INFO("axera qwen35_moe_sgl: MTP T=%d cells %lld..%lld pages %lld\n", T,
+                      (long long) cell_of(0), (long long) cell_of(T - 1),
+                      (long long) (cell_of(T - 1) / PG + 1));
+    }
     auto row_bf16 = [&](const ggml_tensor * x, int r, ggml_bf16_t * d) {
         ggml_fp32_to_bf16_row((const float *) ((const char *) x->data + (size_t) r * x->nb[1]), d, H);
     };
@@ -1879,19 +1896,19 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         }
         c->flush();
     };
-    auto fill_pos = [&](axera_cmm & c, int T_, int row0, int pad_from, const kv_view & k) {
+    auto fill_pos = [&](axera_cmm & c, int T_, int row0, int pad_from, const kv_view &, auto & cell) {
         auto * d = (int32_t *) c->vir;
         for (int r = 0; r < T_; ++r) {
-            d[r] = (int32_t) k.cell_of(row0 + std::min(r, pad_from));
+            d[r] = (int32_t) cell(row0 + std::min(r, pad_from));
         }
         c->flush();
     };
-    auto fill_loc = [&](axera_cmm & c, int T_, int row0, int pad_from, const kv_view & k) {
+    auto fill_loc = [&](axera_cmm & c, int T_, int row0, int pad_from, const kv_view &, auto & cell) {
         auto * d = (int32_t *) c->vir;
         for (int r = 0; r < T_; ++r) {
-            const int64_t cell = k.cell_of(row0 + std::min(r, pad_from));
-            d[2 * r]          = (int32_t) (cell / PG);
-            d[2 * r + 1]      = (int32_t) (cell % PG);
+            const int64_t c_ = cell(row0 + std::min(r, pad_from));
+            d[2 * r]          = (int32_t) (c_ / PG);
+            d[2 * r + 1]      = (int32_t) (c_ % PG);
         }
         c->flush();
     };
@@ -1914,26 +1931,26 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         ch->flush();
     };
 
-    if (T >= 2 && T <= R8) {  // the rows accepted by a verification, in one call
+    if (T >= 2 && T <= R8 && !std::getenv("GGML_AXERA_MTP_T1")) {  // the rows accepted by a verification, in one call
         rows_in(mtp8.e, mtp8.h, R8, 0, T - 1);
         fill_pids(mtp8.pids, paxes, R8, 0, T - 1);
-        fill_pos(mtp8.pos, R8, 0, T - 1, kv);
-        fill_loc(mtp8.loc, R8, 0, T - 1, kv);
+        fill_pos(mtp8.pos, R8, 0, T - 1, kv, cell_of);
+        fill_loc(mtp8.loc, R8, 0, T - 1, kv, cell_of);
         set_ntok(mtp8.ntok, T);
-        set_indptr(mtp8.indptr, kv.cell_of(T - 1));
+        set_indptr(mtp8.indptr, cell_of(T - 1));
         mtp8.c.k->run(mtp8.c.in, mtp8.c.out, "mtp m8");
         mtp8.hnext->invalidate(mtp8.hnext->vir, (size_t) T * H * sizeof(ggml_bf16_t));
         for (int r = 0; r < T; ++r) {
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp8.hnext->vir + (size_t) r * H, h.data() + (size_t) r * H, H);
         }
-    } else if (T <= 8) {  // a draft step: row by row
+    } else if (T <= 8 || std::getenv("GGML_AXERA_MTP_T1")) {  // a draft step: row by row
         for (int r = 0; r < T; ++r) {
             rows_in(mtp1.e, mtp1.h, 1, r, 0);
             fill_pids(mtp1.pids, paxes, 1, r, 0);
-            fill_pos(mtp1.pos, 1, r, 0, kv);
-            fill_loc(mtp1.loc, 1, r, 0, kv);
+            fill_pos(mtp1.pos, 1, r, 0, kv, cell_of);
+            fill_loc(mtp1.loc, 1, r, 0, kv, cell_of);
             set_ntok(mtp1.ntok, 1);
-            set_indptr(mtp1.indptr, kv.cell_of(r));
+            set_indptr(mtp1.indptr, cell_of(r));
             mtp1.c.k->run(mtp1.c.in, mtp1.c.out, "mtp t1");
             mtp1.hnext->invalidate(mtp1.hnext->vir, H * sizeof(ggml_bf16_t));
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp1.hnext->vir, h.data() + (size_t) r * H, H);
@@ -1945,10 +1962,10 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
             const int n = std::min(P, T - it);
             rows_in(mtpP.e, mtpP.h, P, it, n - 1);  // padded rows repeat the last valid row
             fill_pids(mtpP.pids, paxes, P, it, n - 1);
-            fill_pos(mtpP.pos, P, it, n - 1, kv);
-            fill_loc(mtpP.loc, P, it, n - 1, kv);
+            fill_pos(mtpP.pos, P, it, n - 1, kv, cell_of);
+            fill_loc(mtpP.loc, P, it, n - 1, kv, cell_of);
             set_ntok(mtpP.ntok, n);
-            set_indptr(mtpP.indptr, kv.cell_of(it + n - 1));
+            set_indptr(mtpP.indptr, cell_of(it + n - 1));
             mtpP.c.k->run(mtpP.c.in, mtpP.c.out, "mtp prompt");
             mtpP.hnext->invalidate(mtpP.hnext->vir, (size_t) n * H * sizeof(ggml_bf16_t));
             for (int r = 0; r < n; ++r) {
