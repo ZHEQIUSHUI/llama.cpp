@@ -24,6 +24,7 @@
 #include "vocab_embedding_axmodel.h"
 #include "fused_head_axmodel.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -111,9 +112,15 @@ class qwen35_moe_sgl final : public model {
     axera_cmm                        ST2, CQ2, CK2, CV2;  // the second recurrent-state set (prefill outputs)
     axera_cmm                        ONES, ZERO;           // global scales (1) and zero points (0) of the prefill kernels
     call                             dec;
+    struct dec_more_t {
+        call               c;
+        std::array<int, 4> state = { -1, -1, -1, -1 };
+        int                pages = 0;
+    };
+    std::vector<dec_more_t>          dec_more;  // optional smaller-context decode kernels, ascending pages
     call                             pad;
     std::array<int, 4>               dec_state = { -1, -1, -1, -1 };
-    bool                             dec_state_dirty = false;  // dec.in's state entries follow the prefill's swaps
+    bool                             dec_state_dirty = false;  // the decode calls' state entries follow the prefill's swaps
     std::vector<call>                pre_attn[2], pre_moe;  // per layer and recurrent-state parity
     int                              state_parity = 0;
     axera_cmm DX, DA, DOUT, DPOS, INDICES, PX, PA, XB, POS, META;
@@ -687,33 +694,64 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         }
     }
 
-    // decode: the banks, its own rows and paging
-    dec   = {};
-    dec.k = &dk;
-    for (const auto & d : dk.desc->in) {
-        const std::string & n = d.name;
-        const int st = n == "state_in" ? 0 : n == "q_conv_state_in" ? 1 : n == "k_conv_state_in" ? 2 :
-                       n == "v_conv_state_in" ? 3 : -1;
-        if (st >= 0) {
-            dec_state[st] = (int) dec.in.size();
-        }
-        if (n == "indptr") {
-            dec.in.push_back(axera_io(META.get(), (char *) META->vir + META_INDPTR, d.bytes));
-        } else if (n == "last_page_len") {
-            dec.in.push_back(axera_io(META.get(), (char *) META->vir + META_LASTLEN, d.bytes));
-        } else if (n == "cache_location") {
-            dec.in.push_back(axera_io(META.get(), (char *) META->vir + META_CLOC, d.bytes));
-        } else {
-            const axera_cmm * b = n == "x" ? &DX : n == "attention" ? &DA : n == "position_ids" ? &DPOS :
-                                  n == "indices" ? &INDICES : nullptr;
-            if (split && n.rfind("b3_kv", 0) == 0) {
-                dec.in.push_back(kv_io(std::stoi(n.substr(5)), d.bytes));
+    // decode: the banks, its own rows and paging. Optional smaller-context kernels share every pointer except the
+    // page table, RoPE prefix and KV extent, so switching a decode bucket does not copy weights or cache state.
+    auto bind_decode = [&](const kernel & k, call & c, std::array<int, 4> & state) {
+        c   = {};
+        c.k = &k;
+        for (const auto & d : k.desc->in) {
+            const std::string & n = d.name;
+            const int st = n == "state_in" ? 0 : n == "q_conv_state_in" ? 1 : n == "k_conv_state_in" ? 2 :
+                           n == "v_conv_state_in" ? 3 : -1;
+            if (st >= 0) {
+                state[st] = (int) c.in.size();
+            }
+            if (n == "indptr") {
+                c.in.push_back(axera_io(META.get(), (char *) META->vir + META_INDPTR, d.bytes));
+            } else if (n == "last_page_len") {
+                c.in.push_back(axera_io(META.get(), (char *) META->vir + META_LASTLEN, d.bytes));
+            } else if (n == "cache_location") {
+                c.in.push_back(axera_io(META.get(), (char *) META->vir + META_CLOC, d.bytes));
             } else {
-                dec.in.push_back(axera_io(b ? *b : B(n), d.bytes));
+                const axera_cmm * b = n == "x" ? &DX : n == "attention" ? &DA : n == "position_ids" ? &DPOS :
+                                      n == "indices" ? &INDICES : nullptr;
+                if (split && n.rfind("b3_kv", 0) == 0) {
+                    c.in.push_back(kv_io(std::stoi(n.substr(5)), d.bytes));
+                } else {
+                    c.in.push_back(axera_io(b ? *b : B(n), d.bytes));
+                }
             }
         }
+        c.out.push_back(axera_io(DOUT, k.out_bytes("output")));
+    };
+    bind_decode(dk, dec, dec_state);
+    dec_more.clear();
+    static const bool decode_buckets = [] {
+        const char * e = std::getenv("GGML_AXERA_DECODE_BUCKET");
+        return !e || std::atoi(e) != 0;
+    }();
+    if (split && decode_buckets) {
+        for (const char * role : { "decode16k", "decode64k" }) {
+            if (!man.has(role)) {
+                continue;
+            }
+            const kernel & k  = man.get(role);
+            const int      np = (int) (k.in_bytes("b3_kv0") / page_kv);
+            if (np <= 0 || np >= NP) {
+                GGML_ABORT("axera qwen35_moe_sgl: %s has %d of the base's %d pages\n", role, np, NP);
+            }
+            dec_more.emplace_back();
+            dec_more.back().pages = np;
+            bind_decode(k, dec_more.back().c, dec_more.back().state);
+        }
+        std::sort(dec_more.begin(), dec_more.end(), [](const dec_more_t & a, const dec_more_t & b) {
+            return a.pages < b.pages;
+        });
+        for (const auto & d : dec_more) {
+            GGML_LOG_INFO("axera qwen35_moe_sgl: decode bucket %s: %d pages (%lld cells)\n",
+                          d.c.k->desc->role.c_str(), d.pages, (long long) d.pages * PG);
+        }
     }
-    dec.out.push_back(axera_io(DOUT, dk.out_bytes("output")));
 
     // prefill: per layer and state parity, the slices of the decode banks of its phase and block. Both parities are
     // bound once: a page only swaps the four state pools and selects the other call, no IO scanning per layer.
@@ -837,12 +875,19 @@ void qwen35_moe_sgl::sync_dec_states() {
     if (!dec_state_dirty) {
         return;
     }
-    int st = 0;
-    for (const char * n : { "b0_attn_state_in", "b0_attn_q_conv_state_in", "b0_attn_k_conv_state_in", "b0_attn_v_conv_state_in" }) {
-        if (dec_state[st] >= 0) {
-            dec.in[dec_state[st]] = axera_io(B(n), dec.in[dec_state[st]].nSize);
+    auto update = [&](call & c, const std::array<int, 4> & at) {
+        int st = 0;
+        for (const char * n : { "b0_attn_state_in", "b0_attn_q_conv_state_in", "b0_attn_k_conv_state_in",
+                                "b0_attn_v_conv_state_in" }) {
+            if (at[st] >= 0) {
+                c.in[at[st]] = axera_io(B(n), c.in[at[st]].nSize);
+            }
+            ++st;
         }
-        ++st;
+    };
+    update(dec, dec_state);
+    for (auto & d : dec_more) {
+        update(d.c, d.state);
     }
     dec_state_dirty = false;
 }
@@ -1439,18 +1484,42 @@ void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4
     }
     {
         axera_timer tl("layers (decode)");
-        dec.k->run(dec.in, dec.out, "decode");
-    }
-    // debug: the same call again immediately (the IO and state are unchanged): the second call's time separates a
-    // kernel's real cost from the state that a different model's call in between leaves behind
-    static const bool dec_twice = getenv("GGML_AXERA_DECODE_TWICE") != nullptr;
-    if (dec_twice) {
-        static int64_t n = 0, us = 0;
-        const auto     t0 = std::chrono::steady_clock::now();
-        dec.k->run(dec.in, dec.out, "decode (twice)");
-        us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
-        if (++n % 8 == 0) {
-            fprintf(stderr, "decode twice: second %.3f ms over %lld\n", us / 1e3 / n, (long long) n);
+        call * dc = &dec;
+        static const bool buckets_on = [] {
+            const char * e = std::getenv("GGML_AXERA_DECODE_BUCKET");
+            return !e || std::atoi(e) != 0;
+        }();
+        // A very short history keeps the released kernel: its arithmetic is the reference for short-prompt gates,
+        // while the 4k speed case is above this threshold and takes the smaller variant.
+        static const int64_t bucket_min = [] {
+            const char * e = std::getenv("GGML_AXERA_DECODE_BUCKET_MIN");
+            return e ? std::max<int64_t>(0, std::atoll(e)) : 2048;
+        }();
+        if (buckets_on && c >= bucket_min) {
+            const int64_t need = c / PG + 1;  // the history pages and the page this token writes
+            for (auto & d : dec_more) {
+                if (d.pages >= need) {
+                    dc = &d.c;
+                    break;
+                }
+            }
+        }
+        static const void * last_kernel = nullptr;
+        if (last_kernel != dc->k) {
+            GGML_LOG_INFO("axera qwen35_moe_sgl: decode cell %lld uses %s (%u pages)\n", (long long) c,
+                          dc->k->desc->role.c_str(), dc->k->in_bytes("indices") / (uint32_t) sizeof(int32_t));
+            last_kernel = dc->k;
+        }
+        static const bool dec_twice = getenv("GGML_AXERA_DECODE_TWICE") != nullptr;
+        dc->k->run(dc->in, dc->out, "decode");
+        if (dec_twice) {
+            static int64_t n = 0, us = 0;
+            const auto     t0 = std::chrono::steady_clock::now();
+            dc->k->run(dc->in, dc->out, "decode (twice)");
+            us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            if (++n % 8 == 0) {
+                fprintf(stderr, "decode twice: second %.3f ms over %lld\n", us / 1e3 / n, (long long) n);
+            }
         }
     }
     {
@@ -1515,7 +1584,10 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     }
     axera_timer temb("compute pre: embed");
     const ggml_tensor * inp_tokens = names.find("inp_tokens");
-    const bool npu_emb = emb && inp_tokens && inp_tokens->type == GGML_TYPE_I32 && inp_tokens->ne[0] == T;
+    // A multimodal batch also carries inp_tokens, but its xin is the image embedding, not a table gather. Only take
+    // the NPU token-embedding path when xin really is the gather from that token tensor.
+    const bool npu_emb = emb && inp_tokens && inp_tokens->type == GGML_TYPE_I32 && inp_tokens->ne[0] == T &&
+                         xin->op == GGML_OP_GET_ROWS && xin->src[1] == inp_tokens;
     // The table is a dropped file mapping here, so llama.cpp's CPU GET_ROWS faults a row in and walks the generic
     // backend (0.18 ms/token, measured); the one-row NPU gather costs more (0.32 ms). Read the bf16 copy the loader
     // already keeps on the NPU (EMBW) directly instead: one 4 KiB memcpy.

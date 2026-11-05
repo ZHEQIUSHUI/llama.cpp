@@ -847,6 +847,17 @@ struct argmax_pool {
     }
 };
 
+// GGML_AXERA_SAMPLE_DEBUG=1: log the selected ids as a token-level correctness trace. This does not read logits, so it
+// also works with the combined head's greedy path, which deliberately leaves the full row untouched.
+static void debug_sample_id(llama_token id, float logit, bool npu) {
+    static const bool enabled = getenv("GGML_AXERA_SAMPLE_DEBUG") != nullptr;
+    static int64_t     call    = 0;
+    if (enabled) {
+        fprintf(stderr, "SAMPLE_DEBUG call=%lld npu=%d id=%d logit=%.9g\n",
+                (long long) call++, npu ? 1 : 0, id, logit);
+    }
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -868,6 +879,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             int32_t id_argmax = LLAMA_TOKEN_NULL;
             float   logit     = 0.0f;
             if (api->take(idx, &id_argmax, &logit)) {
+                debug_sample_id((llama_token) id_argmax, logit, true);
                 gsmpl->cur.resize(1);
                 gsmpl->cur[0] = llama_token_data{ (llama_token) id_argmax, logit, 1.0f };
                 cur_p         = { gsmpl->cur.data(), 1, 0, true };
@@ -920,6 +932,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (best < 0) {  // every logit -inf: the first token, as the greedy sampler over the array
             best = 0;
         }
+        debug_sample_id(best, bv, false);
         gsmpl->cur.resize(1);
         gsmpl->cur[0] = llama_token_data{ best, bv, 1.0f };
         cur_p         = { gsmpl->cur.data(), 1, 0, true };
