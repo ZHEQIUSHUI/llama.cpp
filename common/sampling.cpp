@@ -654,6 +654,12 @@ static void npu_chain_check(common_sampler * gsmpl, struct llama_context * ctx, 
 static void npu_apply_chain_on(common_sampler * gsmpl, llama_sampler * chain, llama_token_data_array * cur_p,
                                float sumexp, int force_cut) {
     bool      top_k_applied = false;
+    // With no top-k and top_p >= 1, llama.cpp's top-p sampler is a no-op and leaves the full-vocabulary
+    // array in token order.  Its min-p sampler therefore takes the unsorted path and the dist sampler
+    // draws in token-id order.  The kernel candidates arrive sorted by logit; mirror that order before
+    // the draw so the same RNG state selects the same token.
+    const bool minp_token_order = gsmpl->params.top_k == 0 && gsmpl->params.top_p >= 1.0f &&
+                                  gsmpl->params.min_p > 0.0f;
     const int n             = llama_sampler_chain_n(chain);
     for (int i = 0; i < n; ++i) {
         llama_sampler * s     = llama_sampler_chain_get(chain, i);
@@ -680,6 +686,12 @@ static void npu_apply_chain_on(common_sampler * gsmpl, llama_sampler * chain, ll
             continue;
         }
         llama_sampler_apply(s, cur_p);
+        if (minp_token_order && strcmp(nm, "min-p") == 0 &&
+            cur_p->size >= gsmpl->params.min_keep) {
+            std::sort(cur_p->data, cur_p->data + cur_p->size,
+                      [](const llama_token_data & a, const llama_token_data & b) { return a.id < b.id; });
+            cur_p->sorted = false;
+        }
     }
 }
 
