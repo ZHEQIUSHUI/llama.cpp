@@ -1412,6 +1412,7 @@ void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const flo
 
 // one token at cell c > 0, its history the c cells before it
 void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h) {
+    GGML_ASSERT(c >= 0 && c < kv_cells);  // (the pools pages)
     {
         axera_timer ts("decode host: sync states");
         sync_dec_states();
