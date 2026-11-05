@@ -1896,7 +1896,10 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     }
     axera_timer temb("compute pre: embed");
     const ggml_tensor * inp_tokens = names.find("inp_tokens");
-    const bool npu_emb = emb && inp_tokens && inp_tokens->type == GGML_TYPE_I32 && inp_tokens->ne[0] == T;
+    // Only a graph whose input embeddings are the token table gather is text: a multimodal batch carries its own
+    // image embeddings through xin even though inp_tokens exists, and must not be replaced by a token-id gather.
+    const bool npu_emb = emb && inp_tokens && inp_tokens->type == GGML_TYPE_I32 && inp_tokens->ne[0] == T &&
+                         xin->op == GGML_OP_GET_ROWS && xin->src[1] == inp_tokens;
     // The table is a dropped file mapping here, so llama.cpp's CPU GET_ROWS faults a row in and walks the generic
     // backend (0.18 ms/token, measured); the one-row NPU gather costs more (0.32 ms). Read the bf16 copy the loader
     // already keeps on the NPU (EMBW) directly instead: one 4 KiB memcpy.
@@ -1966,7 +1969,7 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     tpos.stop();
     axera_timer tout("compute pre: out rows");
     const int n_out = (int) logits->ne[1];
-    GGML_ASSERT(n_out >= 0 && n_out <= T);
+    GGML_ASSERT(n_out >= 0 && n_out <= T);  // a warmup or an image-only batch may request no output rows
     const ggml_tensor * out_ids = n_out > 0 && n_out < T ? names.find("out_ids") : nullptr;
     if (out_ids && (out_ids->type != GGML_TYPE_I32 || out_ids->ne[0] != n_out)) {
         out_ids = nullptr;
