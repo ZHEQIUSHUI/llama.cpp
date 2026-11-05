@@ -2,6 +2,8 @@
 
 #include "ops.h"
 
+#include "../core/npu_sampling.h"
+
 #include <algorithm>
 #include <cmath>
 #include <mutex>
@@ -305,6 +307,39 @@ void output_head::bind(const kernel & lm, const ggml_tensor * output_weight) {
     x = axera_cmm_alloc(R * K * sizeof(ggml_bf16_t));
 }
 
+void output_head::bind_topk(const kernel & lm) {
+    GGML_ASSERT(k && mx4 && w);
+    if (tk == &lm) {
+        return;
+    }
+    tk = &lm;
+    const int64_t N = w->ne[1], K = w->ne[0];
+    tK              = (int) (lm.out_bytes("values") / sizeof(float));
+    GGML_ASSERT(tK > 0 && lm.find_input("m") < 0 && lm.find_input("bias") >= 0 && lm.find_input("mul_pos") >= 0 &&
+                lm.find_input("mul_neg") >= 0 && lm.find_input("temp") >= 0 &&
+                lm.in_bytes("x") == K * sizeof(ggml_bf16_t) && lm.in_bytes("w") == N * K / 2 &&
+                lm.in_bytes("s") == N * K / AXERA_MX_GROUP && lm.in_bytes("bias") == N * sizeof(float) &&
+                lm.in_bytes("mul_pos") == N * sizeof(float) && lm.in_bytes("mul_neg") == N * sizeof(float) &&
+                lm.in_bytes("temp") == sizeof(float) && lm.out_bytes("ids") == tK * sizeof(int32_t) &&
+                lm.out_bytes("vmax") == sizeof(float) && lm.out_bytes("sumexp") == sizeof(float));
+    // the penalty state is the host sampler's: only the 1-2 rows that change per step are written (non-cacheable, so
+    // the NPU sees them without a clean)
+    tbias = axera_cmm_alloc_nc(N * sizeof(float));
+    tmulp = axera_cmm_alloc_nc(N * sizeof(float));
+    tmuln = axera_cmm_alloc_nc(N * sizeof(float));
+    std::fill((float *) tmulp->vir, (float *) tmulp->vir + N, 1.0f);
+    std::fill((float *) tmuln->vir, (float *) tmuln->vir + N, 1.0f);
+    ttemp = axera_cmm_alloc_nc(sizeof(float));
+    *(float *) ttemp->vir = 1.0f;
+    tval  = axera_cmm_alloc(tK * sizeof(float));
+    tids  = axera_cmm_alloc(tK * sizeof(int32_t));
+    tmax  = axera_cmm_alloc(sizeof(float));
+    tsum  = axera_cmm_alloc(sizeof(float));
+    tv.resize(tK);
+    ti.resize(tK);
+    tgen = -1;
+}
+
 void output_head::bind_draft(const kernel & dlm, const std::vector<int32_t> & ids) {
     GGML_ASSERT(k && mx4);
     const int64_t N = w->ne[1], K = w->ne[0], NS = (int64_t) ids.size();
@@ -423,6 +458,81 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         ((ggml_backend_axera_buffer_context *) rn->buffer->context)->flush(rn->data, ggml_nbytes(rn));
     }
     auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+    // the fused head: one decode row through lm_head.topk, which applies the host sampler's penalty state and keeps
+    // the exact top-K, so common/sampling can run the chain on K candidates instead of the vocabulary
+    if (tk && !draft && n_out == 1 && T == 1 && !last &&
+        (!names.find("result_output") || graph_head(names) == names.find("result_output"))) {
+        const npu_opts opts = npu_get_options();
+        if (opts.enabled && opts.K == tK) {
+            ggml_fp32_to_bf16_row(y.data(), (ggml_bf16_t *) x->vir, K);
+            x->flush(x->vir, K * sizeof(ggml_bf16_t));
+            std::vector<npu_penalty_row> upd;
+            int64_t                      gen = 0;
+            npu_take_updates(upd, &gen);
+            if (gen != tgen) {  // a new request (or a reset): the neutral state
+                std::fill((float *) tbias->vir, (float *) tbias->vir + N, 0.0f);
+                std::fill((float *) tmulp->vir, (float *) tmulp->vir + N, 1.0f);
+                std::fill((float *) tmuln->vir, (float *) tmuln->vir + N, 1.0f);
+                tgen = gen;
+            }
+            for (const auto & r : upd) {
+                GGML_ASSERT(r.token >= 0 && r.token < N);
+                memcpy((float *) tbias->vir + r.token, &r.bias,    sizeof(float));
+                memcpy((float *) tmulp->vir + r.token, &r.mul_pos, sizeof(float));
+                memcpy((float *) tmuln->vir + r.token, &r.mul_neg, sizeof(float));
+            }
+            *(float *) ttemp->vir = opts.temp;
+            std::vector<AX_ENGINE_IO_BUFFER_T> tin(tk->info->nInputSize), tout(tk->info->nOutputSize);
+            tin[tk->input("x")]       = axera_io(x, K * sizeof(ggml_bf16_t));
+            tin[tk->input("w")]       = axera_io(q, N * K / 2);
+            tin[tk->input("s")]       = axera_io(s, N * K / AXERA_MX_GROUP);
+            tin[tk->input("bias")]    = axera_io(tbias, N * sizeof(float));
+            tin[tk->input("mul_pos")] = axera_io(tmulp, N * sizeof(float));
+            tin[tk->input("mul_neg")] = axera_io(tmuln, N * sizeof(float));
+            tin[tk->input("temp")]    = axera_io(ttemp, sizeof(float));
+            tout[tk->output("values")] = axera_io(tval, tK * sizeof(float));
+            tout[tk->output("ids")]    = axera_io(tids, tK * sizeof(int32_t));
+            tout[tk->output("vmax")]   = axera_io(tmax, sizeof(float));
+            tout[tk->output("sumexp")] = axera_io(tsum, sizeof(float));
+            {
+                axera_timer ttk("lm_head.topk");
+                tk->run(tin, tout, "lm_head.topk");
+            }
+            tval->invalidate(tval->vir, tK * sizeof(float));
+            tids->invalidate(tids->vir, tK * sizeof(int32_t));
+            tmax->invalidate(tmax->vir, sizeof(float));
+            tsum->invalidate(tsum->vir, sizeof(float));
+            memcpy(tv.data(), tval->vir, tK * sizeof(float));
+            memcpy(ti.data(), tids->vir, tK * sizeof(int32_t));
+            const float vmax_ = *(const float *) tmax->vir;
+            const float zsum_ = *(const float *) tsum->vir;
+            // with no top-k the chain's top-p normalises over the whole vocabulary: the K candidates are enough only
+            // when the nucleus (and the min-p set) ends inside them. Otherwise the full logits are needed after all.
+            bool fits = true;
+            if (opts.top_k == 0) {
+                if (opts.min_p > 0.0f && tv[tK - 1] >= vmax_ + opts.temp_minp * logf(opts.min_p)) {
+                    fits = false;
+                }
+                if (fits && opts.top_p < 1.0f) {
+                    const double thr = (double) opts.top_p * (double) zsum_;
+                    double       cum = 0.0;
+                    bool         hit = false;
+                    for (int i = 0; i < tK && !hit; ++i) {
+                        cum += (double) expf((tv[i] - vmax_) / opts.temp);
+                        hit  = cum >= thr;
+                    }
+                    fits = hit;
+                } else if (fits && opts.top_p >= 1.0f && opts.min_p <= 0.0f) {
+                    fits = false;  // the distribution would run over the vocabulary
+                }
+            }
+            if (fits) {
+                npu_publish(tv.data(), ti.data(), tK, vmax_, zsum_);
+                after(g, names);
+                return;
+            }
+        }
+    }
     if (draft && dk && n_out == 1 && !(last && rows[0] == T - 1)) {  // the draft head
         draft = false;
         axera_timer tl("lm_head (draft)");

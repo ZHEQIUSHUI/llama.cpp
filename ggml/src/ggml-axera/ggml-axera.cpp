@@ -1,6 +1,8 @@
 // Axera NPU backend: backend, device and registry (the design: ggml-axera-impl.h)
 
 #include "ggml-axera-impl.h"
+#include "core/manifest.h"
+#include "core/npu_sampling.h"
 #include "models/model.h"
 
 #include <atomic>
@@ -277,7 +279,40 @@ uint32_t axera_n_seq_max() {
     return g_axera_n_seq_max.load();
 }
 
+static int npu_configure_c(int enabled, int32_t top_k, float top_p, float min_p, float temp_sumexp, float temp_minp,
+                           int32_t penalty_last_n, float repeat, float freq, float present) {
+    return axera::npu_configure(enabled != 0, top_k, top_p, min_p, temp_sumexp, temp_minp,
+                                penalty_last_n, repeat, freq, present);
+}
+
+static void npu_reset_c() {
+    axera::npu_reset();
+}
+
+static void npu_accept_c(int32_t token) {
+    axera::npu_accept(token);
+}
+
+static int npu_take_c(float * values, int32_t * ids, int32_t max_k, int32_t * n, float * vmax, float * sumexp) {
+    return axera::npu_take(values, ids, max_k, n, vmax, sumexp);
+}
+
+static int64_t npu_config_id_c() {
+    return axera::npu_config_id();
+}
+
+static const ggml_axera_npu_sampling g_npu_sampling = {
+    /* .configure = */ npu_configure_c,
+    /* .reset     = */ npu_reset_c,
+    /* .accept    = */ npu_accept_c,
+    /* .take      = */ npu_take_c,
+    /* .config_id = */ npu_config_id_c,
+};
+
 static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_axera_npu_sampling") == 0) {
+        return (void *) &g_npu_sampling;
+    }
     if (strcmp(name, "ggml_backend_pin_host_weights") == 0) {
         return (void *) ggml_backend_axera_pin_host_weights;
     }
