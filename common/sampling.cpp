@@ -692,10 +692,37 @@ static float max_of(const float * x, int n) {
     return m;
 }
 
-// the greedy fast path's argmax over a vocabulary row (1 MB for 248k tokens: one core reads it at ~2 GB/s): the
-// maximum in parts on a few persistent workers, then the first index holding it (as a strict > scan)
+// the first index of m in x[b .. e)
+static int first_of(const float * x, int b, int e, float m) {
+    int i = b;
+#if defined(__ARM_NEON)
+    const float32x4_t mv = vdupq_n_f32(m);
+    for (; i + 16 <= e; i += 16) {
+        const uint32x4_t c0 = vceqq_f32(vld1q_f32(x + i), mv);
+        const uint32x4_t c1 = vceqq_f32(vld1q_f32(x + i + 4), mv);
+        const uint32x4_t c2 = vceqq_f32(vld1q_f32(x + i + 8), mv);
+        const uint32x4_t c3 = vceqq_f32(vld1q_f32(x + i + 12), mv);
+        if (vmaxvq_u32(vorrq_u32(vorrq_u32(c0, c1), vorrq_u32(c2, c3)))) {
+            for (int j = i; j < i + 16; ++j) {
+                if (x[j] == m) {
+                    return j;
+                }
+            }
+        }
+    }
+#endif
+    for (; i < e; ++i) {
+        if (x[i] == m) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// the greedy fast path's argmax over a vocabulary row (1 MB for 248k tokens): the maximum in parts on persistent
+// workers, then only the winning part is scanned again for the first index
 struct argmax_pool {
-    static constexpr int     NW = 3;  // workers; the caller takes part 0
+    static constexpr int     NW = 15; // workers; the caller takes part 0 (16 threads for a 1 MiB row)
     std::mutex               mu;
     std::condition_variable  cv;
     std::vector<std::thread> th;
@@ -761,12 +788,7 @@ struct argmax_pool {
         if (w0 < 0) {
             return -1;
         }
-        for (int j = w0 * per; j < nv; ++j) {
-            if (v[j] == m) {
-                return j;
-            }
-        }
-        return -1;
+        return first_of(v, w0 * per, std::min(nv, w0 * per + per), m);
     }
 };
 
@@ -795,8 +817,17 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_token i    = 0;
         if (gsmpl->fast_bias.empty()) {
             static argmax_pool & pool = *new argmax_pool;  // (never destroyed: its workers wait on its condition variable)
+            static const bool prof = getenv("LLAMA_GRAPH_PROF") != nullptr;
+            static int64_t prof_n = 0, prof_us = 0;
+            const int64_t  prof_t0 = prof ? ggml_time_us() : 0;
             i    = n_vocab;
             best = pool.argmax(logits, n_vocab, &bv);
+            if (prof) {
+                prof_us += ggml_time_us() - prof_t0;
+                if (++prof_n % 32 == 0) {
+                    fprintf(stderr, "greedy argmax: %.3f ms/call (%lld)\n", prof_us / 1e3 / prof_n, (long long) prof_n);
+                }
+            }
         }
         auto        run  = [&](llama_token end) {
             for (; i < end; ++i) {

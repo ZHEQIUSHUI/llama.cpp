@@ -11,6 +11,13 @@ static const char * ggml_backend_axera_get_name(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+static bool axera_warmup = false;
+static void axera_set_warmup(bool value) { axera_warmup = value; }
+
+namespace axera {
+bool warmup_active() { return axera_warmup; }
+}
+
 static void ggml_backend_axera_free(ggml_backend_t backend) {
     delete (ggml_backend_axera_context *) backend->context;
     delete backend;
@@ -30,7 +37,10 @@ static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend,
         axera_timer tm("graph_compute");
         st = ctx->model->compute(cgraph);
     }
-    axera_flush_file_pages();  // the model's init is done: release its converted tensors' file pages once
+    {
+        axera_timer tf("backend post-compute");
+        axera_flush_file_pages();  // the model's init is done: release its converted tensors' file pages once
+    }
     static const bool trace = std::getenv("GGML_AXERA_TRACE") != nullptr;  // every graph: nodes, host gap, run
     if (trace) {
         const auto now = std::chrono::steady_clock::now();
@@ -277,15 +287,49 @@ uint32_t axera_n_seq_max() {
     return g_axera_n_seq_max.load();
 }
 
+static bool ggml_backend_axera_offload_input_layer() {
+    // only this adapter replaces the CPU GET_ROWS with its own NPU gather
+    const axera::manifest * m = axera::kernels();
+    return m && m->model == "qwen35_moe_sgl";
+}
+
+static bool ggml_backend_axera_host_visible_output() {
+    // this adapter writes the logits in host-visible CMM: llama.cpp reads them in place instead of copying 1 MiB
+    const axera::manifest * m = axera::kernels();
+    return m && m->model == "qwen35_moe_sgl";
+}
+
+// llama.cpp built a graph it will compute next (a decode graph at the end of a prompt's call): let the adapter do its
+// one-time host setup now instead of inside the first token's compute
+static void ggml_backend_axera_prewarm_graph(ggml_backend_t backend, struct ggml_cgraph * g) {
+    auto * ctx = (ggml_backend_axera_context *) backend->context;
+    if (!ctx->model) {
+        ctx->model = axera::make_model(*axera::kernels());
+    }
+    ctx->model->prewarm(g);
+}
+
 static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_pin_host_weights") == 0) {
         return (void *) ggml_backend_axera_pin_host_weights;
     }
+    if (strcmp(name, "ggml_backend_offload_input_layer") == 0) {
+        return (void *) ggml_backend_axera_offload_input_layer;
+    }
+    if (strcmp(name, "ggml_backend_host_visible_output") == 0) {
+        return (void *) ggml_backend_axera_host_visible_output;
+    }
     if (strcmp(name, "ggml_backend_set_n_seq_max") == 0) {
         return (void *) ggml_backend_axera_set_n_seq_max;
     }
+    if (strcmp(name, "ggml_backend_axera_set_warmup") == 0) {
+        return (void *) axera_set_warmup;
+    }
     if (strcmp(name, "ggml_backend_axera_kv_buffer_type") == 0) {
         return (void *) ggml_backend_axera_kv_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_axera_prewarm_graph") == 0) {
+        return (void *) ggml_backend_axera_prewarm_graph;
     }
     return NULL;
     GGML_UNUSED(reg);

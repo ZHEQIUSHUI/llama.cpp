@@ -53,6 +53,10 @@ struct param_desc {
 
 struct kernel_desc {
     std::string                   role, file;
+    // The adapter owns this kernel's bytes and loads it with manifest::load_memory after it has resolved the GGUF
+    // tensors the kernel is built around (the token embedding and fused head). The package still describes it here,
+    // but the runtime must not create a second handle from the file.
+    bool                          embedded = false;
     std::vector<io_desc>          in, out;
     std::map<std::string, size_t> packs;  // pack input -> bytes
     std::vector<pack_member>      members;
@@ -64,11 +68,11 @@ struct kernel {
     AX_ENGINE_HANDLE      handle = nullptr;
     AX_ENGINE_IO_INFO_T * info   = nullptr;
     std::vector<char>     model;  // the axmodel's bytes, kept for the handle's lifetime
-
     ~kernel();
     int  input(const std::string & name) const;   // index, aborts if absent
     int  output(const std::string & name) const;  // index, aborts if absent
     int  find_input(const std::string & name) const;  // index, -1 if absent
+    int  find_output(const std::string & name) const;  // index, -1 if absent
     uint32_t in_bytes(const std::string & name) const { return info->pInputs[input(name)].nSize; }
     uint32_t out_bytes(const std::string & name) const { return info->pOutputs[output(name)].nSize; }
     // one call; aborts with `what` and the IO on failure
@@ -87,7 +91,12 @@ struct manifest {
     bool     has(const std::string & role) const { return kernels.count(role) > 0; }
     const param_desc & param(const std::string & kind, const std::string & name) const;
 
-    std::map<std::string, std::unique_ptr<kernel>> loaded;
+    // a kernel from bytes (an optional helper the adapter ships, e.g. the NPU token embedding): the runtime's IO
+    // table, no manifest entry
+    kernel & load_memory(const std::string & role, std::vector<char> model) const;
+
+    mutable std::map<std::string, std::unique_ptr<kernel>> loaded;
+    mutable std::vector<std::unique_ptr<kernel_desc>>     extra_desc;
 };
 
 // the manifest of GGML_AXERA_KERNEL_DIR (default ./axera_kernels), its kernels loaded; nullptr if the directory has no
