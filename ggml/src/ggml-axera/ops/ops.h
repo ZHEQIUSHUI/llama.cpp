@@ -105,6 +105,14 @@ struct output_head {
     std::vector<int32_t> dids;
     axera_cmm            dq, ds, dy;
     bool                 draft = false;  // the next run's single output row through the draft head
+    // the fused head + penalties + exact top-K (role lm_head.topk): the penalty arrays the host sampler maintains, the
+    // candidates and the full-vocabulary max / sumexp it returns
+    const kernel *       tk = nullptr;
+    int                  tK = 0;
+    axera_cmm            tbias, tmulp, tmuln, ttemp, tval, tids, tmax, tsum;
+    int64_t              tgen = -1;  // the penalty state's generation tbias/tmulp/tmuln hold
+    std::vector<float>   tv;
+    std::vector<int32_t> ti;
     // the fused RMSNorm + projection head (role lm_head_fused): it consumes the layer kernel's bf16 hidden row
     // directly, so a decode saves the host final norm, the bf16 conversion and the hidden-row cache round trip
     const kernel *                             fk = nullptr;
@@ -125,6 +133,7 @@ struct output_head {
     std::vector<AX_ENGINE_IO_BUFFER_T> c4in, c4out;
 
     void bind(const kernel & lm, const ggml_tensor * output_weight);
+    void bind_topk(const kernel & lm);  // after bind, when the manifest has lm_head.topk
     bool bind_fused(const kernel & lm, const ggml_tensor * output_weight);
     bool bind_combined(const kernel & lm, const ggml_tensor * output_weight);
     bool bind_combined4(const kernel & lm, const ggml_tensor * output_weight);

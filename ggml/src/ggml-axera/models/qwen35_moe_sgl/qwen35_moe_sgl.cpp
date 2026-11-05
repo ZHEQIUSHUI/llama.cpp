@@ -2069,6 +2069,9 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     if (n_out > 0) {
         if (npu_heads) {
             head.bind(man.get("lm_head"), logits->src[0]);
+            if (man.has("lm_head.topk")) {
+                head.bind_topk(man.get("lm_head.topk"));
+            }
             combined_dec = head.bind_combined(man.get("lm_head"), logits->src[0]);
             combined_dec = combined_dec && head.combined_ready(g, names);
             if (man.has("lm_head.verify")) {

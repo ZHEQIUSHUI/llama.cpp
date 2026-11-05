@@ -14,6 +14,7 @@ ggml_add_backend_library(ggml-axera
                          core/manifest.cpp
                          core/quant.cpp
                          core/params.cpp
+                         core/npu_sampling.cpp
                          core/argmax_state.cpp
                          ops/ops.cpp
                          models/model.cpp

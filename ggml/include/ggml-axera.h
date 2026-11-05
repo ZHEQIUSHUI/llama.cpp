@@ -23,6 +23,21 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_axera_lazy_buffer_type(
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_axera_reg(void);
 
+// the host sampler's side of the fused lm_head.topk kernel (common/sampling.cpp), fetched through the registry's
+// proc address ("ggml_backend_axera_npu_sampling"); NULL when the manifest has no such kernel
+typedef struct ggml_axera_npu_sampling {
+    // the chain the host will run; returns the kernel's candidate count K, 0 when the chain is unsupported
+    int (*configure)(int enabled, int32_t top_k, float top_p, float min_p, float temp_sumexp, float temp_minp,
+                     int32_t penalty_last_n, float repeat, float freq, float present);
+    void (*reset)(void);
+    void (*accept)(int32_t token);
+    // the adapter's candidates: sorted by logit, the penalised logits and their token ids, max and the full-vocabulary
+    // sum(exp((l - max) / temp)); returns 0 when there are none (the full logits are then the only path)
+    int (*take)(float * values, int32_t * ids, int32_t max_k, int32_t * n, float * vmax, float * sumexp);
+    // the configuration's id: a sampler that is freed disables the path only when it still owns it
+    int64_t (*config_id)(void);
+} ggml_axera_npu_sampling;
+
 // The combined final-RMSNorm + lm-head + greedy-argmax head: common/sampling.cpp uses the NPU's (id, logit) for a
 // pure greedy chain instead of reading the full logits. Fetched through the registry proc address
 // "ggml_backend_axera_argmax"; NULL when the loaded manifest has no combined lm_head role.

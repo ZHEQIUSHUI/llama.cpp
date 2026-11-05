@@ -14,6 +14,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -147,6 +148,15 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // the fused lm_head.topk path: the backend's K candidates (penalties already applied on the NPU) and the chain
+    // over them; top-p uses the kernel's full-vocabulary sumexp when no top-k has narrowed the set
+    const ggml_axera_npu_sampling * npu = nullptr;
+    bool                 npu_sampling = false;
+    int32_t              npu_K = 0;
+    int64_t              npu_cfg = 0;  // the backend configuration this sampler owns
+    std::vector<float>   npu_v;
+    std::vector<int32_t> npu_i;
+
     void reset() {
         prev.clear();
 
@@ -208,6 +218,227 @@ std::string common_params_sampling::print() const {
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
     return std::string(result);
+}
+
+// the backend's fused lm_head.topk: is this chain one its K candidates serve exactly? (the sampler names carry a
+// +/- prefix once the backend sampler support has been probed, so ignore it)
+static const char * npu_strip(const char * n, bool * empty = nullptr) {
+    if (empty) {
+        *empty = false;
+    }
+    if (!n) {
+        return nullptr;
+    }
+    if (n[0] == '?') {  // llama.cpp's no-op sampler for a disabled option
+        if (empty) {
+            *empty = true;
+        }
+        return n + 1;
+    }
+    return n[0] == '+' || n[0] == '-' ? n + 1 : n;
+}
+
+static const ggml_axera_npu_sampling * npu_api() {
+    static const ggml_axera_npu_sampling * api = nullptr;
+    if (!api) {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name(GGML_AXERA_NAME);
+        if (reg) {
+            api = (const ggml_axera_npu_sampling *) ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_axera_npu_sampling");
+        }
+    }
+    return api;
+}
+
+struct npu_chain_plan {
+    bool  ok = false;
+    float temp_sumexp = 1.0f;  // the accumulated temperature at the top-p sampler
+    float temp_minp   = 1.0f;  // ... and at the min-p sampler
+};
+
+static npu_chain_plan npu_plan_chain(llama_sampler * chain, const common_params_sampling & params) {
+    npu_chain_plan p;
+    if (params.mirostat != 0 || params.n_probs != 0 || params.backend_sampling || params.dynatemp_range != 0.0f ||
+        !params.logit_bias.empty() ||
+        !std::isfinite(params.temp) || params.temp < 0.0f || params.penalty_last_n < 0 ||
+        !std::isfinite(params.top_p) || !std::isfinite(params.min_p) || !std::isfinite(params.penalty_repeat)) {
+        return p;
+    }
+    const int n = llama_sampler_chain_n(chain);
+    int n_pen = 0, n_k = 0, n_p = 0, n_m = 0, n_t = 0;
+    int i_pen = -1, i_p = -1, i_m = -1;
+    float tacc = 1.0f;
+    bool seen_select = false;
+    for (int i = 0; i < n; ++i) {
+        bool         empty = false;
+        const char * nm    = npu_strip(llama_sampler_name(llama_sampler_chain_get(chain, i)), &empty);
+        if (!nm) {
+            return p;
+        }
+        if (empty) {
+            continue;  // a disabled option's no-op sampler
+        }
+        if (seen_select) {
+            return p;  // dist / greedy must be last
+        }
+        if      (strcmp(nm, "penalties") == 0) { if (++n_pen > 1) return p; i_pen = i; }
+        else if (strcmp(nm, "top-k")     == 0) { if (++n_k   > 1) return p; }
+        else if (strcmp(nm, "top-p")     == 0) {
+            if (++n_p > 1 || !(tacc > 0.0f) || (params.top_k > 0 && n_k == 0)) {
+                return p;  // top-p before top-k would normalise over more than the K candidates
+            }
+            i_p = i;
+            p.temp_sumexp = tacc;
+        }
+        else if (strcmp(nm, "min-p")     == 0) { if (++n_m   > 1) return p; i_m = i; p.temp_minp = tacc; }
+        else if (strcmp(nm, "temp")      == 0 || strcmp(nm, "temp-ext") == 0) { if (++n_t > 1) return p; tacc *= params.temp; }
+        else if (strcmp(nm, "dist")      == 0 || strcmp(nm, "greedy")   == 0) { if (seen_select) return p; seen_select = true; }
+        else { return p; }  // DRY, XTC, typical, mirostat, grammar, logit bias, ...
+    }
+    if (!seen_select || (n_pen && i_pen != 0)) {
+        return p;  // penalties must run on the whole vocabulary, before everything else
+    }
+    if (n_p && n_m && i_m < i_p) {
+        return p;  // the host applies top-p before min-p, so min-p must come after it
+    }
+    if (params.top_k == 0) {
+        // no top-k: the chain's distribution runs over the whole vocabulary unless top-p/min-p keep it inside K
+        if (!(params.top_p < 1.0f || params.min_p > 0.0f)) {
+            return p;
+        }
+    }
+    p.ok = true;
+    return p;
+}
+
+// top-p over the K (or top-k) candidates. With a top-k above it llama.cpp normalises over that set; without one it
+// normalises over the whole vocabulary, whose sumexp the kernel returns.
+static void npu_top_p_apply(llama_token_data_array * cur_p, float p, size_t min_keep, bool local, float sumexp) {
+    if (p >= 1.0f || cur_p->size == 0) {
+        return;
+    }
+    const float max_l = cur_p->data[0].logit;  // the candidates are sorted
+    float       cum   = 0.0f;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        const float q       = expf(cur_p->data[i].logit - max_l);
+        cur_p->data[i].p    = q;
+        cum                += q;
+    }
+    const float denom = local ? cum : sumexp;
+    if (denom > 0.0f) {
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            cur_p->data[i].p /= denom;
+        }
+    }
+    float  c        = 0.0f;
+    size_t last_idx = cur_p->size;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        c += cur_p->data[i].p;
+        if (c >= p && i + 1 >= min_keep) {
+            last_idx = i + 1;
+            break;
+        }
+    }
+    cur_p->size   = last_idx;
+    cur_p->sorted = true;
+}
+
+// LLAMA_NPU_SAMPLING_DEBUG=<file>: one block per sampling step, the candidates the chain ran on and its choice.
+// fused=1 is the kernel's list (penalties already applied); fused=0 is the full-logit reference after the penalties
+// sampler, sorted by logit (the first 24 rows are enough to see a value difference that can move a sampled draw).
+static bool npu_dbg_on() {
+    static const char * p = getenv("LLAMA_NPU_SAMPLING_DEBUG");
+    return p && p[0];
+}
+
+static long long npu_dbg_step = 0;
+
+static void npu_dbg_mark(const char * what, int fused, int K, int top_k, float top_p, float min_p, float temp) {
+    if (!npu_dbg_on()) {
+        return;
+    }
+    FILE * f = fopen(getenv("LLAMA_NPU_SAMPLING_DEBUG"), "a");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "MARK %s fused=%d K=%d top_k=%d top_p=%.9g min_p=%.9g temp=%.9g\n",
+            what, fused, K, top_k, top_p, min_p, temp);
+    fclose(f);
+}
+
+static void npu_dbg_dump(int fused, int n, float vmax, float sumexp, const float * val, const int32_t * ids,
+                         llama_token chosen, size_t size) {
+    if (!npu_dbg_on()) {
+        return;
+    }
+    FILE * f = fopen(getenv("LLAMA_NPU_SAMPLING_DEBUG"), "a");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "STEP %lld fused=%d n=%d vmax=%.9g sumexp=%.9g chosen=%d size=%zu\n",
+            npu_dbg_step++, fused, n, vmax, sumexp, chosen, size);
+    const int m = n < 24 ? n : 24;
+    for (int i = 0; i < m; ++i) {
+        fprintf(f, " %d %.9g\n", ids[i], val[i]);
+    }
+    fclose(f);
+}
+
+static void npu_dbg_full(common_sampler * gsmpl, llama_token chosen) {
+    if (!npu_dbg_on()) {
+        return;
+    }
+    std::vector<llama_token_data> ref = gsmpl->cur;
+    llama_token_data_array       rp  = { ref.data(), ref.size(), -1, false };
+    const int                    nc  = llama_sampler_chain_n(gsmpl->chain);
+    for (int i = 0; i < nc; ++i) {
+        bool         empty = false;
+        const char * nm    = npu_strip(llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, i)), &empty);
+        if (empty) {
+            continue;
+        }
+        if (strcmp(nm, "penalties") == 0) {
+            llama_sampler_apply(llama_sampler_chain_get(gsmpl->chain, i), &rp);
+        }
+        break;  // penalties are first, or absent
+    }
+    const int m = std::min<int>(24, (int) rp.size);
+    std::partial_sort(rp.data, rp.data + m, rp.data + rp.size,
+                      [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; });
+    std::vector<float>   val(m);
+    std::vector<int32_t> ids(m);
+    for (int i = 0; i < m; ++i) {
+        val[i] = rp.data[i].logit;
+        ids[i] = rp.data[i].id;
+    }
+    npu_dbg_dump(0, m, rp.data[0].logit, 0.0f, val.data(), ids.data(), chosen, rp.size);
+}
+
+// the host chain over the candidates: penalties were applied by the kernel; top-p without a top-k above it uses the
+// full-vocabulary sumexp; everything else is the sampler itself (the same RNG for dist)
+static void npu_apply_chain(common_sampler * gsmpl, llama_token_data_array * cur_p, float sumexp) {
+    bool      top_k_applied = false;
+    const int n             = llama_sampler_chain_n(gsmpl->chain);
+    for (int i = 0; i < n; ++i) {
+        llama_sampler * s     = llama_sampler_chain_get(gsmpl->chain, i);
+        bool            empty = false;
+        const char *    nm    = npu_strip(llama_sampler_name(s), &empty);
+        if (empty || strcmp(nm, "penalties") == 0) {
+            continue;
+        }
+        if (strcmp(nm, "top-k") == 0) {
+            if (gsmpl->params.top_k > 0) {
+                cur_p->size = std::min<size_t>(cur_p->size, (size_t) gsmpl->params.top_k);
+                top_k_applied = true;
+            }
+            continue;
+        }
+        if (strcmp(nm, "top-p") == 0) {
+            npu_top_p_apply(cur_p, gsmpl->params.top_p, gsmpl->params.min_keep, top_k_applied, sumexp);
+            continue;
+        }
+        llama_sampler_apply(s, cur_p);
+    }
 }
 
 static const ggml_axera_argmax * argmax_api() {
@@ -514,6 +745,12 @@ struct common_sampler * common_sampler_init(
         /* .fast_bias   = */ fast_bias,
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .npu     = */ nullptr,
+        /* .npu_sampling = */ false,
+        /* .npu_K   = */ 0,
+        /* .npu_cfg = */ 0,
+        /* .npu_v   = */ {},
+        /* .npu_i   = */ {},
     };
 
     // LLAMA_SAMPLER_FAST=0: always the candidate array and the chain (a check)
@@ -526,15 +763,48 @@ struct common_sampler * common_sampler_init(
             __func__, result->greedy_fast ? "on" : "off", greedy_chain, fast_bias.size(), grmr != nullptr, rbudget != nullptr,
             params.backend_sampling);
 
+    // the fused lm_head.topk: the backend applies the penalty state and keeps the exact top-K, and the chain above runs
+    // on those candidates. Only when every sampler in it is covered exactly (see npu_plan_chain).
+    // LLAMA_NPU_SAMPLING=0: the full-logit path (the gate's A/B run)
+    static const bool npu_off = [] {
+        const char * e = getenv("LLAMA_NPU_SAMPLING");
+        return e && strcmp(e, "0") == 0;
+    }();
+    if (!npu_off) if (const ggml_axera_npu_sampling * api = npu_api()) {
+        // grammar, the reasoning budget and llama.cpp's own backend samplers read or write the full logits: always
+        // reconfigure (so a previous request cannot leave the fused head on for a request that needs them). A pure
+        // greedy chain keeps the existing argmax thread pool: it is exact and cheaper than the fused head.
+        const bool eligible = !params.backend_sampling && !grmr && !rbudget && !result->greedy_fast;
+        const npu_chain_plan plan = eligible ? npu_plan_chain(chain, params) : npu_chain_plan{};
+        const int K = api->configure(eligible && plan.ok, params.top_k, params.top_p, params.min_p,
+                                     plan.temp_sumexp, plan.temp_minp, params.penalty_last_n,
+                                     params.penalty_repeat, params.penalty_freq, params.penalty_present);
+        // top_k > K cannot be served exactly: top-p would normalise over candidates the kernel did not return
+        if (eligible && plan.ok && K > 0 && params.top_k <= K && (size_t) params.min_keep <= (size_t) K) {
+            result->npu          = api;
+            result->npu_sampling = true;
+            result->npu_K        = K;
+            result->npu_cfg      = api->config_id();
+            result->npu_v.assign(K, 0.0f);
+            result->npu_i.assign(K, 0);
+            result->greedy_fast  = false;
+            npu_dbg_mark("sampler", 1, K, params.top_k, params.top_p, params.min_p, plan.temp_sumexp);
+            LOG_INF("%s: fused lm_head.topk sampling (K = %d)\n", __func__, K);
+        } else {
+            if (K > 0) {
+                // the planner enabled the kernel but this request cannot consume its candidates: put the head back
+                // on the full logits (top_k > K, min_keep > K)
+                api->configure(0, 0, 0.0f, 0.0f, 1.0f, 1.0f, 0, 1.0f, 0.0f, 0.0f);
+            }
+            npu_dbg_mark("sampler", 0, 0, params.top_k, params.top_p, params.min_p, 1.0f);
+        }
+    }
+
     // The combined lm_head returns both the full logits and one (id, logit) per row. A pure greedy chain with no
     // caller-visible logits/probs and no grammar takes the NPU row; every other chain leaves this off and reads the
     // logits the same kernel wrote. GGML_AXERA_ARGMAX=0 is the A/B switch.
     static const bool argmax_off = [] {
         const char * e = getenv("GGML_AXERA_ARGMAX");
-        return e && strcmp(e, "0") == 0;
-    }();
-    static const bool npu_off = [] {
-        const char * e = getenv("LLAMA_NPU_SAMPLING");
         return e && strcmp(e, "0") == 0;
     }();
     bool suppress_only = true;
@@ -562,6 +832,12 @@ struct common_sampler * common_sampler_init(
 void common_sampler_free(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return;
+    }
+
+    // a request without sampling frees its sampler: the fused head must go back to writing the full logits (but a
+    // sampler created after this one already owns the configuration, so only disable while this one still does)
+    if (gsmpl->npu && gsmpl->npu_sampling && gsmpl->npu_cfg == gsmpl->npu->config_id()) {
+        gsmpl->npu->configure(0, 0, 0.0f, 0.0f, 1.0f, 1.0f, 0, 1.0f, 0.0f, 0.0f);
     }
 
     if (gsmpl->npu_argmax) {
@@ -623,6 +899,10 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
 
     llama_sampler_accept(gsmpl->chain, token);
 
+    if (gsmpl->npu_sampling) {
+        gsmpl->npu->accept(token);  // the same ring buffer and counts, for the kernel's penalty arrays
+    }
+
     gsmpl->prev.push_back(token);
 }
 
@@ -632,6 +912,10 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     }
 
     gsmpl->reset();
+
+    if (gsmpl->npu) {
+        gsmpl->npu->reset();  // the backend's penalty arrays go back to their neutral state before the prompt's tokens
+    }
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
@@ -647,6 +931,12 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .npu_argmax  = */ gsmpl->npu_argmax,
         /* .fast_bias   = */ gsmpl->fast_bias,
         /* .rng     = */ gsmpl->rng,
+        /* .npu     = */ nullptr,
+        /* .npu_sampling = */ false,
+        /* .npu_K   = */ 0,
+        /* .npu_cfg = */ 0,
+        /* .npu_v   = */ {},
+        /* .npu_i   = */ {},
     };
 }
 
@@ -670,6 +960,8 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->greedy_fast = src->greedy_fast;
     dst->fast_bias   = src->fast_bias;
     dst->rng        = src->rng;
+    // keep dst's backend binding: a clone is CPU-only (it may sample on a draft head), but copying a saved clone
+    // back into the live sampler must not drop the fused head it was using
     dst->t_total_us = src->t_total_us;
 }
 
@@ -871,6 +1163,24 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
+    // the fused head's K candidates: penalties already applied on the NPU, sorted by logit
+    if (gsmpl->npu_sampling) {
+        int32_t n = 0;
+        float   vmax = 0.0f, sumexp = 0.0f;
+        if (gsmpl->npu->take(gsmpl->npu_v.data(), gsmpl->npu_i.data(), gsmpl->npu_K, &n, &vmax, &sumexp)) {
+            gsmpl->cur.resize(n);
+            for (int32_t i = 0; i < n; ++i) {
+                gsmpl->cur[i] = llama_token_data{ gsmpl->npu_i[i], gsmpl->npu_v[i], 0.0f };
+            }
+            cur_p = llama_token_data_array{ gsmpl->cur.data(), (size_t) n, 0, true };
+            npu_apply_chain(gsmpl, &cur_p, sumexp);
+            GGML_ASSERT(cur_p.selected >= 0 && (size_t) cur_p.selected < cur_p.size);
+            const llama_token npu_id = cur_p.data[cur_p.selected].id;
+            npu_dbg_dump(1, n, vmax, sumexp, gsmpl->npu_v.data(), gsmpl->npu_i.data(), npu_id, cur_p.size);
+            return npu_id;
+        }
+    }
+
     // The combined head already ran the final norm, projection and greedy reduction on the NPU. Consume its row
     // directly; a missing row (non-greedy graph, prompt batch, suppress-token winner) falls through to the full
     // logits, which the same kernel wrote.
@@ -940,6 +1250,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     }
 
     gsmpl->set_logits(ctx, idx);
+    npu_dbg_full(gsmpl, LLAMA_TOKEN_NULL);  // the full-logit reference, before the chain mutates it
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
