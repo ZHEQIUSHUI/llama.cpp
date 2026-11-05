@@ -161,7 +161,7 @@ class qwen38_27b final : public model {
         std::vector<call> calls;  // the kernel's calls of a page (its blocks each)
         axera_cmm         X, POS, OUT[2];
     };
-    prefill_set                    pfs[3];
+    prefill_set                    pfs[5];  // the manifest's prefill variants, rows descending
     int                            ncall = 1;
     std::map<std::string, axera_cmm> banks;
     axera_cmm                      INDPTR, INDICES, LASTLEN, CLOC, VALID;
@@ -721,9 +721,14 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
         ((int32_t *) INDICES->vir)[i] = i;
     }
     INDICES->flush();
-    auto bind_prefill = [&](int idx, const char * role, int rows) {
+    auto bind_prefill = [&](int idx, const char * role) {
+        if (!man.has(role)) {
+            return;
+        }
         prefill_set &     p = pfs[idx];
         const kernel &    k = man.get(role);
+        const int         rows = (int) (k.in_bytes("x") / (H * sizeof(ggml_bf16_t)));
+        GGML_ASSERT(rows >= 2 && rows <= PG);
         p.k                 = &k;
         p.rows              = rows;
         p.X                 = axera_cmm_alloc((size_t) rows * H * sizeof(ggml_bf16_t));
@@ -770,13 +775,13 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
             c.out.push_back(axera_io(p.OUT[c_i & 1], k.desc->out[0].bytes));
         }
     };
-    bind_prefill(0, "prefill", PG);
-    if (man.has("prefill128")) {
-        bind_prefill(1, "prefill128", 128);
-    }
-    if (man.has("prefill64")) {
-        bind_prefill(2, "prefill64", 64);
-    }
+    // the manifests carry the 256-row prefill and any tail variants (128 / 96 / 80 / 64 rows); the rows are the
+    // kernel's x input, not a naming convention, and a missing role is simply not a candidate
+    bind_prefill(0, "prefill");
+    bind_prefill(1, "prefill128");
+    bind_prefill(2, "prefill96");
+    bind_prefill(3, "prefill80");
+    bind_prefill(4, "prefill64");
 
     std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> live;
     for (auto & c : dec) {
@@ -1154,19 +1159,25 @@ void qwen38_27b::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t
         if (v < PG) {  // a partial last page: the state before it is the restart point of a later batch
             save_state(cell);
         }
-        // the smallest row variant that holds this page's valid rows (the 128 / 64 tails save the padding work)
-        prefill_set & P = pfs[2].k && v <= pfs[2].rows ? pfs[2] : pfs[1].k && v <= pfs[1].rows ? pfs[1] : pfs[0];
-        GGML_ASSERT(P.k && v <= P.rows);
-        memcpy(P.X->vir, x + (size_t) r0 * H, (size_t) v * H * sizeof(ggml_bf16_t));
-        memset((ggml_bf16_t *) P.X->vir + (size_t) v * H, 0, (size_t) (P.rows - v) * H * sizeof(ggml_bf16_t));
-        P.X->flush();
-        auto * pp = (int32_t *) P.POS->vir;
-        for (int s = 0; s < 3; ++s) {
-            for (int r = 0; r < P.rows; ++r) {
-                pp[s * P.rows + r] = r < v ? p4[(size_t) (r0 + r) * 4 + s] : 0;
+        // the smallest row variant that holds this page's valid rows (the tails save the padding work)
+        prefill_set * P = nullptr;
+        for (int i = 4; i >= 0; --i) {
+            if (pfs[i].k && v <= pfs[i].rows) {
+                P = &pfs[i];
+                break;
             }
         }
-        P.POS->flush();
+        GGML_ASSERT(P && v <= P->rows);
+        memcpy(P->X->vir, x + (size_t) r0 * H, (size_t) v * H * sizeof(ggml_bf16_t));
+        memset((ggml_bf16_t *) P->X->vir + (size_t) v * H, 0, (size_t) (P->rows - v) * H * sizeof(ggml_bf16_t));
+        P->X->flush();
+        auto * pp = (int32_t *) P->POS->vir;
+        for (int s = 0; s < 3; ++s) {
+            for (int r = 0; r < P->rows; ++r) {
+                pp[s * P->rows + r] = r < v ? p4[(size_t) (r0 + r) * 4 + s] : 0;
+            }
+        }
+        P->POS->flush();
         ((int32_t *) INDPTR->vir)[0]  = 0;
         ((int32_t *) INDPTR->vir)[1]  = (int32_t) (cell / PG);
         *(int32_t *) LASTLEN->vir     = PG;
@@ -1178,12 +1189,12 @@ void qwen38_27b::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t
         }
         {
             axera_timer tl("prefill (page)");
-            for (auto & c : P.calls) {
+            for (auto & c : P->calls) {
                 c.k->run(c.in, c.out, "prefill");
             }
         }
         axera_timer       to("prefill out rows");
-        const axera_cmm & po = P.OUT[(P.calls.size() - 1) & 1];
+        const axera_cmm & po = P->OUT[(P->calls.size() - 1) & 1];
         po->invalidate(po->vir, (size_t) v * H * sizeof(ggml_bf16_t));
         axera_host_pool().run(v - std::max(0, out0 - r0), [&](int64_t i) {
             const int r = std::max(0, out0 - r0) + (int) i;
