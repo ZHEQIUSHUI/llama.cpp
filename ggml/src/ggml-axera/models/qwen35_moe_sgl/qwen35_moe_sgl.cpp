@@ -161,8 +161,18 @@ class qwen35_moe_sgl final : public model {
     axera_cmm                        VX, VOUT, VPOSN, VPIDS, VINDPTR, VLOC, VNT;
     axera_cmm                        VSNAP[2][4];  // ssnap / cqsnap / cksnap / cvsnap per verification set
     int                              cur_set = -1, cur_row = 0;  // the current state: the pools, or a snapshot row
+    call                             ver;  // role decode.verify: four rows, one rank-1 delta per row
+    call                             app;  // role gdn.apply: advance the recurrent state by accepted deltas
+    axera_cmm                        VX, VOUT, VPOSN, VPIDS, VINDPTR, VLOC, VNT, VNPREV, VST0;
+    axera_cmm                        VDELTA[2][3];  // u / k / g per verification set
+    axera_cmm                        VSNAP[2][3];   // q / k / v Conv history per verification set
+    std::vector<uint8_t>             conv_entry;    // Conv state before the latest verify (j = 0)
+    bool                             conv_entry_valid = false;
+    int                              conv_set = -1, conv_n = 0;
+    int                              delta_set = -1, delta_n = 0;
+    bool                             delta_live = false;
     int64_t                          ver_c0 = -1;
-    int                              ver_T = 0, ver_set = 0;
+    int                              ver_T = 0;
     call                             pad;
     std::array<int, 4>               dec_state = { -1, -1, -1, -1 };
     bool                             dec_state_dirty = false;  // the decode calls' state entries follow the prefill's swaps
@@ -201,6 +211,8 @@ class qwen35_moe_sgl final : public model {
     mtp_call                         mtp1, mtp8, mtpP;
     std::map<std::string, axera_cmm> mtp_w;
     axera_cmm                        MKV, MINDICES;
+    int                              mtp_kv_pages = 0;
+    size_t                           mtp_kv_bytes = 0;
     const void *                     mtp_bound = nullptr;
 
     // the fused prefill (roles prefill.gdn_moe / prefill.attn_moe, moe.slots, moe.combine): per layer and state parity
@@ -272,9 +284,10 @@ class qwen35_moe_sgl final : public model {
     void         save_state(int64_t cell);
     void         load_state();
     void         state_home();
-    void         state_at(int set, int row);
+    void         materialize_deltas();
+    void         restore_conv(int accepted);
+    void         bind_deltas(call & c, int out_set, int prev_set);
     void         bind_state();
-    void *       state_ptr(int kind);
     AX_ENGINE_IO_BUFFER_T state_io(const std::string & name);
     ggml_status  verify(const kv_view & kv, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h);
     void         init_mtp(const std::map<std::string, ggml_tensor *> & t, int il, const rope & rq);
@@ -1064,7 +1077,8 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         }
     }
 
-    // verification (role decode.verify): x / out in place, four rows' positions, the per-row state snapshots
+    // verification (role decode.verify): four rows' positions, the entry state, the accepted-delta
+    // prologue, one rank-1 delta per row, and the small Conv history snapshots
     ver = {};
     if (man.has("decode.verify")) {
         const kernel & vk = man.get("decode.verify");
@@ -1077,12 +1091,22 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         VINDPTR = axera_cmm_alloc(vk.in_bytes("indptr"));
         VLOC    = axera_cmm_alloc(vk.in_bytes("cache_location"));
         VNT     = axera_cmm_alloc(vk.in_bytes("ntok"));
+        VNPREV  = axera_cmm_alloc(vk.in_bytes("nprev"));
+        VST0    = axera_cmm_alloc(logical(STATE_BANK[0]));
         GGML_ASSERT(vk.in_bytes("indices") == INDICES->size);
-        static const char * SN[4] = { "ssnap", "cqsnap", "cksnap", "cvsnap" };
+        GGML_ASSERT(vk.in_bytes("du") == vk.in_bytes("pu") && vk.in_bytes("dk") == vk.in_bytes("pk") &&
+                    vk.in_bytes("dg") == vk.in_bytes("pg"));
+        static const char * DN[3] = { "du", "dk", "dg" };
+        static const char * SN[3] = { "cqsnap", "cksnap", "cvsnap" };
         for (auto & set : VSNAP) {
-            for (int k = 0; k < 4; ++k) {
+            for (int k = 0; k < 3; ++k) {
                 set[k] = axera_cmm_alloc(vk.in_bytes(SN[k]));
-                GGML_ASSERT(vk.in_bytes(SN[k]) == 4 * logical(STATE_BANK[k]));
+                GGML_ASSERT(vk.in_bytes(SN[k]) == 4 * logical(STATE_BANK[k + 1]));
+            }
+        }
+        for (auto & set : VDELTA) {
+            for (int k = 0; k < 3; ++k) {
+                set[k] = axera_cmm_alloc(vk.in_bytes(DN[k]));
             }
         }
         ver.k = &vk;
@@ -1090,13 +1114,18 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
             const std::string & n = d.name;
             const axera_cmm *   b = n == "x" ? &VX : n == "output" ? &VOUT : n == "positions" ? &VPOSN :
                                     n == "position_ids" ? &VPIDS : n == "indptr" ? &VINDPTR : n == "ntok" ? &VNT :
-                                    n == "cache_location" ? &VLOC : n == "indices" ? &INDICES : nullptr;
+                                    n == "cache_location" ? &VLOC : n == "indices" ? &INDICES : n == "nprev" ? &VNPREV : nullptr;
             if (b) {
                 ver.in.push_back(axera_io(*b, d.bytes));
             } else if (state_kind(n) >= 0) {
                 ver.in.push_back(state_io(n));
-            } else if (int k = n == SN[0] ? 0 : n == SN[1] ? 1 : n == SN[2] ? 2 : n == SN[3] ? 3 : -1; k >= 0) {
+            } else if (int k = n == DN[0] || n == "pu" ? 0 : n == DN[1] || n == "pk" ? 1 : n == DN[2] || n == "pg" ? 2 : -1;
+                       k >= 0) {
+                ver.in.push_back(axera_io(VDELTA[0][k], d.bytes));
+            } else if (int k = n == SN[0] ? 0 : n == SN[1] ? 1 : n == SN[2] ? 2 : -1; k >= 0) {
                 ver.in.push_back(axera_io(VSNAP[0][k], d.bytes));
+            } else if (n.rfind("b3_kv", 0) == 0) {
+                ver.in.push_back(kv_io(std::stoi(n.substr(5)), d.bytes));
             } else if (banks.count(n) && bank_n.at(n) == d.bytes) {
                 ver.in.push_back(axera_io(B(n), d.bytes));
             } else {
@@ -1108,6 +1137,29 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
             GGML_ASSERT(n == "output");
             ver.out.push_back(axera_io(VOUT, d.bytes));
         }
+
+        app = {};
+        GGML_ASSERT(man.has("gdn.apply") && "decode.verify needs the gdn.apply delta kernel");
+        const kernel & ak = man.get("gdn.apply");
+        GGML_ASSERT(ak.in_bytes("state_in") == logical(STATE_BANK[0]) &&
+                    ak.out_bytes("state_out") == logical(STATE_BANK[0]) && ak.in_bytes("nprev") == sizeof(int32_t));
+        GGML_ASSERT(ak.in_bytes("pu") == vk.in_bytes("pu") && ak.in_bytes("pk") == vk.in_bytes("pk") &&
+                    ak.in_bytes("pg") == vk.in_bytes("pg"));
+        app.k = &ak;
+        for (const auto & d : ak.desc->in) {
+            const std::string & n = d.name;
+            const axera_cmm *   b = n == "state_in" ? &B(STATE_BANK[0]) : n == "nprev" ? &VNPREV :
+                                    n == "pu" ? &VDELTA[0][0] : n == "pk" ? &VDELTA[0][1] : n == "pg" ? &VDELTA[0][2] : nullptr;
+            if (!b) {
+                GGML_ABORT("axera qwen35_moe_sgl: gdn.apply: unexpected input %s\n", n.c_str());
+            }
+            app.in.push_back(axera_io(*b, d.bytes));
+        }
+        for (const auto & d : ak.desc->out) {
+            GGML_ASSERT(d.name == "state_out");
+            app.out.push_back(axera_io(B(STATE_BANK[0]), d.bytes));
+        }
+        conv_entry.resize((size_t) (logical(STATE_BANK[1]) + logical(STATE_BANK[2]) + logical(STATE_BANK[3])));
         bind_state();
     }
     fused = man.has("prefill.gdn_moe") && man.has("prefill.attn_moe") && man.has("moe.slots") && man.has("moe.combine");
@@ -1148,6 +1200,8 @@ void qwen35_moe_sgl::states_swap() {
         rebind(dec.in);
         if (ver.k) {
             rebind(ver.in);
+            rebind(app.in);
+            rebind(app.out);
         }
         for (auto & c : pre_attn) {
             rebind(c.in);
@@ -1185,29 +1239,71 @@ void qwen35_moe_sgl::sync_dec_states() {
     dec_state_dirty = false;
 }
 
-// where the current recurrent state is: the pools (cur_set < 0) or row cur_row of a verification snapshot
-void * qwen35_moe_sgl::state_ptr(int kind) {
-    const size_t bytes = logical(STATE_BANK[kind]);
-    if (cur_set < 0) {
-        axera_cmm & pool = B(STATE_BANK[kind]);
-        pool->invalidate(pool->vir, bytes);
-        return pool->vir;
+// Bind a verify / apply call's delta rows.  The recurrent state itself always
+// lives in its original pool; only an accepted prefix of (u, k, g) is pending.
+void qwen35_moe_sgl::bind_deltas(call & c, int out_set, int prev_set) {
+    for (size_t i = 0; i < c.in.size(); ++i) {
+        const std::string & n = c.k->desc->in[i].name;
+        const int k = n == "du" || n == "pu" ? 0 : n == "dk" || n == "pk" ? 1 : n == "dg" || n == "pg" ? 2 : -1;
+        if (k < 0) {
+            continue;
+        }
+        const bool prev = n[0] == 'p';
+        const int  set  = prev ? prev_set : out_set;
+        GGML_ASSERT(set >= 0 && set < 2);
+        c.in[i] = axera_io(VDELTA[set][k], c.k->desc->in[i].bytes);
     }
-    axera_cmm & s = VSNAP[cur_set][kind];
-    char *      p = (char *) s->vir + (size_t) cur_row * bytes;
-    s->invalidate(p, bytes);
-    return p;
+}
+
+// Apply the accepted rows to the recurrent-state pool on the NPU.  Verify
+// consumes them in its prologue; decode / prefill use this tiny kernel first.
+void qwen35_moe_sgl::materialize_deltas() {
+    if (delta_n <= 0) {
+        delta_live = false;
+        return;
+    }
+    GGML_ASSERT(app.k && delta_set >= 0 && delta_set < 2);
+    axera_timer ta("gdn delta apply");
+    bind_deltas(app, -1, delta_set);
+    *(int32_t *) VNPREV->vir = delta_n;
+    VNPREV->flush();
+    app.k->run(app.in, app.out, "gdn apply");
+    delta_n    = 0;
+    delta_live = false;
+}
+
+// Restore the tiny Conv history at the state before cell c0 + accepted.  Row
+// `accepted - 1` of the verify set is the history after that accepted token;
+// accepted == 0 uses the pre-verify copy.
+void qwen35_moe_sgl::restore_conv(int accepted) {
+    if (!conv_entry_valid) {
+        return;
+    }
+    GGML_ASSERT(accepted >= 0 && accepted <= conv_n);
+    GGML_ASSERT(accepted == 0 || (conv_set >= 0 && conv_set < 2));
+    size_t o = 0;
+    for (int k = 0; k < 3; ++k) {
+        axera_cmm & pool  = B(STATE_BANK[k + 1]);
+        const size_t bytes = logical(STATE_BANK[k + 1]);
+        const void * src = conv_entry.data() + o;
+        if (accepted > 0) {
+            void * p = (char *) VSNAP[conv_set][k]->vir + (size_t) (accepted - 1) * bytes;
+            VSNAP[conv_set][k]->invalidate(p, bytes);
+            src = p;
+        }
+        memcpy(pool->vir, src, bytes);
+        pool->flush(pool->vir, bytes);
+        o += bytes;
+    }
+    conv_entry_valid = false;
+    conv_set         = -1;
+    conv_n           = 0;
 }
 
 AX_ENGINE_IO_BUFFER_T qwen35_moe_sgl::state_io(const std::string & name) {
     const int kind = state_kind(name);
     GGML_ASSERT(kind >= 0);
-    const size_t bytes = logical(name);
-    if (cur_set < 0) {
-        return axera_io(B(name), (uint32_t) bytes);
-    }
-    axera_cmm & s = VSNAP[cur_set][kind];
-    return axera_io(s.get(), (char *) s->vir + (size_t) cur_row * bytes, (uint32_t) bytes);
+    return axera_io(B(name), (uint32_t) logical(name));
 }
 
 void qwen35_moe_sgl::bind_state() {
@@ -1224,28 +1320,9 @@ void qwen35_moe_sgl::bind_state() {
     }
 }
 
-// the current state into the pools (the prefill kernels' inputs)
+// The recurrent state is always in the pools; bring the pending deltas in too.
 void qwen35_moe_sgl::state_home() {
-    if (cur_set < 0) {
-        return;
-    }
-    axera_timer tl("state home");
-    for (int k = 0; k < 4; ++k) {
-        axera_cmm & pool = B(STATE_BANK[k]);
-        const void * src = state_ptr(k);
-        memcpy(pool->vir, src, logical(STATE_BANK[k]));
-        pool->flush(pool->vir, logical(STATE_BANK[k]));
-    }
-    cur_set = -1;
-    bind_state();
-}
-
-// the current state: the snapshot after row `row` of verification set `set`
-void qwen35_moe_sgl::state_at(int set, int row) {
-    GGML_ASSERT(set >= 0 && set < 2 && row >= 0);
-    cur_set = set;
-    cur_row = row;
-    bind_state();
+    materialize_deltas();
 }
 
 void qwen35_moe_sgl::zero_state() {
@@ -1259,6 +1336,13 @@ void qwen35_moe_sgl::zero_state() {
             B(n)->flush();
         }
     }
+    delta_n          = 0;
+    delta_live       = false;
+    delta_set        = -1;
+    conv_entry_valid = false;
+    conv_set         = -1;
+    conv_n           = 0;
+    ver_c0           = -1;
     state_dirty = false;
     snap_cell  = -1;
     snap_parity = -1;
@@ -1269,6 +1353,7 @@ void qwen35_moe_sgl::zero_state() {
 
 void qwen35_moe_sgl::save_state(int64_t cell) {
     GGML_ASSERT(cell % PG == 0);
+    materialize_deltas();
     axera_timer tl("state save");
     if (cell == 0) {  // a fresh sequence's state is zero and load_state() restores it without a snapshot copy
         snap_cell = 0;
@@ -1279,8 +1364,10 @@ void qwen35_moe_sgl::save_state(int64_t cell) {
     }
     size_t o = 0;
     for (int k = 0; k < 4; ++k) {
+        axera_cmm & pool = B(STATE_BANK[k]);
         const size_t bytes = logical(STATE_BANK[k]);
-        memcpy(snap.data() + o, state_ptr(k), bytes);
+        pool->invalidate(pool->vir, bytes);
+        memcpy(snap.data() + o, pool->vir, bytes);
         o += bytes;
     }
     snap_cell = cell;
@@ -1292,6 +1379,11 @@ void qwen35_moe_sgl::save_state(int64_t cell) {
 void qwen35_moe_sgl::load_state() {
     axera_timer tl("state load");
     state_home();
+    delta_n          = 0;
+    delta_live       = false;
+    conv_entry_valid = false;
+    conv_set         = -1;
+    conv_n           = 0;
     if (snap_cell == 0) {
         for (const char * n : { "b0_attn_state_in", "b0_attn_q_conv_state_in", "b0_attn_k_conv_state_in", "b0_attn_v_conv_state_in" }) {
             memset(B(n)->vir, 0, B(n)->size);
@@ -1460,13 +1552,26 @@ size_t qwen35_moe_sgl::state_read(const void * src, size_t size) {
     state_cell  = h.state_cell;
     return (size_t) (p - (const char *) src);
 // T (2 - 4) consecutive tokens from cell c0 through the verification kernel: the four rows' hidden
-// states into h, the per-row recurrent / conv snapshots into the verification set.  A page start
-// inside the batch is saved as a restart point.  The state after the batch is row T - 1 of the set.
+// states into h, one rank-1 state delta per row, and the small Conv snapshots.  The recurrent state
+// stays in its pool at the entry cell; the accepted prefix is folded in by the next call.
 ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h) {
     GGML_ASSERT(ver.k && T >= 1 && T <= 4);
     const int64_t c0 = kv.cell_of(0);
     if (c0 % PG == 0) {
+        materialize_deltas();
         save_state(c0);
+    }
+    {
+        axera_timer tc("conv save");
+        size_t      o = 0;
+        for (int k = 0; k < 3; ++k) {
+            axera_cmm &  pool  = B(STATE_BANK[k + 1]);
+            const size_t bytes = logical(STATE_BANK[k + 1]);
+            pool->invalidate(pool->vir, bytes);
+            memcpy(conv_entry.data() + o, pool->vir, bytes);
+            o += bytes;
+        }
+        conv_entry_valid = true;
     }
     memset(VX->vir, 0, VX->size);
     memcpy(VX->vir, xb, (size_t) T * H * sizeof(ggml_bf16_t));
@@ -1474,8 +1579,8 @@ ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, c
     auto * pos = (int32_t *) VPOSN->vir;
     auto * pid = (int32_t *) VPIDS->vir;
     auto * loc = (int32_t *) VLOC->vir;
-    const int rows = (int) (VPOSN->size / sizeof(int32_t));
-    const int axes = (int) (VPIDS->size / (rows * sizeof(int32_t)));
+    const int rows = (int) (ver.k->in_bytes("positions") / sizeof(int32_t));
+    const int axes = (int) (ver.k->in_bytes("position_ids") / (rows * sizeof(int32_t)));
     GGML_ASSERT(rows == 4 && axes >= 1 && axes <= 4);
     for (int r = 0; r < 4; ++r) {
         const int     rr = std::min(r, T - 1);
@@ -1495,12 +1600,17 @@ ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, c
     for (const axera_cmm * b : { &VPOSN, &VPIDS, &VLOC, &VINDPTR, &VNT }) {
         (*b)->flush();
     }
-    const int set = cur_set == 0 ? 1 : 0;
-    static const char * SN[4] = { "ssnap", "cqsnap", "cksnap", "cvsnap" };
-    for (int k = 0; k < 4; ++k) {
-        ver.in[ver.k->input(SN[k])] = axera_io(VSNAP[set][k], VSNAP[set][k]->size);
+    const int stale    = delta_set >= 0 ? delta_set : 0;
+    const int set      = 1 - (delta_live ? delta_set : stale);
+    const int prev_set = delta_live ? delta_set : stale;
+    static const char * SN[3] = { "cqsnap", "cksnap", "cvsnap" };
+    bind_deltas(ver, set, prev_set);
+    for (int k = 0; k < 3; ++k) {
+        ver.in[ver.k->input(SN[k])] = axera_io(VSNAP[set][k], ver.k->in_bytes(SN[k]));
     }
-    ver.out[ver.k->output("output")] = axera_io(VOUT, VOUT->size);
+    *(int32_t *) VNPREV->vir = delta_n;
+    VNPREV->flush();
+    ver.out[ver.k->output("output")] = axera_io(VOUT, ver.k->out_bytes("output"));
     {
         axera_timer tl("layers (verify)");
         ver.k->run(ver.in, ver.out, "verify");
@@ -1509,19 +1619,42 @@ ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, c
     for (int r = 0; r < T; ++r) {
         ggml_bf16_to_fp32_row((const ggml_bf16_t *) VOUT->vir + (size_t) r * H, h + (size_t) r * H, H);
     }
+    conv_set         = set;
+    conv_n           = T;
+    conv_entry_valid = true;
     for (int r = 0; r < T; ++r) {
         if (r > 0 && (c0 + r) % PG == 0) {  // a page's first cell inside the batch: the state before it
-            state_at(set, r - 1);
+            axera_cmm &  state = B(STATE_BANK[0]);
+            const size_t sb    = logical(STATE_BANK[0]);
+            state->invalidate(state->vir, sb);
+            memcpy(VST0->vir, state->vir, sb);
+            const int saved_set = delta_set, saved_n = delta_n;
+            const bool saved_live = delta_live;
+            delta_set  = set;
+            delta_n    = r;
+            delta_live = true;
+            materialize_deltas();
+            restore_conv(r);
             save_state(c0 + r);
+            memcpy(state->vir, VST0->vir, sb);
+            state->flush();
+            delta_set        = saved_set;
+            delta_n          = saved_n;
+            delta_live       = saved_live;
+            conv_entry_valid = true;  // the bytes above were not overwritten
         }
         page_x.insert(page_x.end(), xb + (size_t) r * H, xb + (size_t) (r + 1) * H);
         page_p.insert(page_p.end(), pb + (size_t) r * 4, pb + (size_t) (r + 1) * 4);
     }
-    state_at(set, T - 1);
+    delta_set  = set;
+    delta_n    = T;
+    delta_live = true;
+    conv_set   = set;
+    conv_n     = T;
+    conv_entry_valid = true;
     ver_c0  = c0;
     ver_T   = T;
-    ver_set = set;
-    state_cell = c0 + T;
+    state_cell = c0;  // the pool is at the entry cell until the next call accepts rows
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2340,9 +2473,19 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     const int64_t ct_bind = ct_on ? ggml_time_us() : 0;
     axera_timer        tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
     const int64_t      c0 = kv.cell_of(0);
-    if (ver_c0 >= 0 && c0 > ver_c0 && c0 < ver_c0 + ver_T) {
-        // the last verification's rows from c0 on rejected: its state after row c0 - 1
-        state_at(ver_set, (int) (c0 - ver_c0 - 1));
+    if (ver_c0 >= 0 && c0 != 0) {
+        if (c0 < ver_c0 || c0 > ver_c0 + ver_T) {
+            GGML_LOG_ERROR("axera qwen35_moe_sgl: cell %lld is outside the last verify's %lld..%lld window\n",
+                           (long long) c0, (long long) ver_c0, (long long) (ver_c0 + ver_T));
+            return GGML_STATUS_FAILED;
+        }
+        // The sampler accepted c0 - ver_c0 rows.  The recurrent state pool is
+        // still at the verify's entry cell; keep the accepted prefix pending
+        // for the next verify prologue (or gdn.apply before decode / prefill).
+        const int accepted = (int) (c0 - ver_c0);
+        restore_conv(accepted);
+        delta_n    = accepted;
+        delta_live = accepted > 0;
         if (snap_cell > c0) {  // (no restart point of c0's page kept)
             snap_cell = -1;
             page_x.clear();
@@ -2352,8 +2495,13 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             page_p.resize((size_t) (c0 - snap_cell) * 4);
         }
         state_cell = c0;
+        ver_c0     = -1;
+        ver_T      = 0;
     }
-    ver_c0 = -1;
+    if (c0 == 0) {
+        ver_c0 = -1;
+        ver_T  = 0;
+    }
     if (c0 == 0) {  // a new sequence
         zero_state();
     }
@@ -2422,6 +2570,7 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
                            (long long) state_cell);
             return GGML_STATUS_FAILED;
         }
+        materialize_deltas();
         const bool direct_x = combined_dec && T == 1 && n_out == 1;
         float * hd = (fused_dec || direct_x) ? nullptr : h.data();
         if (direct_embed) {
@@ -2509,6 +2658,17 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
         const kernel & k8 = man.get("mtp.m8");
         GGML_ASSERT(k8.in_bytes("paged_kv") == k1.in_bytes("paged_kv"));
     }
+    const size_t mtp_page_kv = (size_t) 2 * PG * 2 * 256 * 2;
+    GGML_ASSERT(k1.in_bytes("paged_kv") % mtp_page_kv == 0);
+    const int mtp_np = (int) (k1.in_bytes("paged_kv") / mtp_page_kv);
+    mtp_kv_pages     = mtp_np;
+    if (kv_cells > 0) {
+        mtp_kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(mtp_np, (kv_cells + PG - 1) / PG));
+    }
+    if (const char * e = getenv("GGML_AXERA_MTP_KV_PAGES")) {
+        mtp_kv_pages = std::max(1, std::min(mtp_np, atoi(e)));
+    }
+    mtp_kv_bytes = (size_t) mtp_kv_pages * mtp_page_kv;
     // one buffer per weight input, shared by t1 / m8 / prompt (they have the same layout)
     for (const auto & d : k1.desc->in) {
         if (d.name.rfind("w_", 0) == 0 && !mtp_w.count(d.name)) {
@@ -2675,9 +2835,13 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
                 GGML_ABORT("axera qwen35_moe_sgl: MTP: %s: unexpected input %s\n", k.desc->role.c_str(), d.name.c_str());
             }
             if (!*b) {
-                *b = axera_cmm_alloc(d.bytes);
+                *b = axera_cmm_alloc(b == &MKV ? mtp_kv_bytes : d.bytes);
+                if (b == &MKV) {
+                    memset((*b)->vir, 0, (*b)->size);
+                    (*b)->flush();
+                }
             }
-            GGML_ASSERT((*b)->size >= d.bytes);
+            GGML_ASSERT(b == &MKV ? (*b)->size >= mtp_kv_bytes : (*b)->size >= d.bytes);
             mc.c.in.push_back(axera_io(*b, d.bytes));
         }
         for (const auto & d : k.desc->out) {
@@ -2687,9 +2851,13 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
                 GGML_ABORT("axera qwen35_moe_sgl: MTP: %s: unexpected output %s\n", k.desc->role.c_str(), d.name.c_str());
             }
             if (!*b) {
-                *b = axera_cmm_alloc(d.bytes);
+                *b = axera_cmm_alloc(b == &MKV ? mtp_kv_bytes : d.bytes);
+                if (b == &MKV) {
+                    memset((*b)->vir, 0, (*b)->size);
+                    (*b)->flush();
+                }
             }
-            GGML_ASSERT((*b)->size >= d.bytes);
+            GGML_ASSERT(b == &MKV ? (*b)->size >= mtp_kv_bytes : (*b)->size >= d.bytes);
             mc.c.out.push_back(axera_io(*b, d.bytes));
         }
     };
@@ -2697,9 +2865,13 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
     bind(mtpP, kp);
     if (man.has("mtp.m8")) {
         bind(mtp8, man.get("mtp.m8"));
+    } else if (man.has("mtp.m4")) {  // a 4-row catch-up variant (the board rejects the 8-row one)
+        bind(mtp8, man.get("mtp.m4"));
     }
-    GGML_ASSERT(MKV && MKV->size == k1.in_bytes("paged_kv") && MINDICES &&
+    GGML_ASSERT(MKV && MKV->size >= mtp_kv_bytes && MINDICES &&
                 MINDICES->size >= k1.in_bytes("indices"));
+    GGML_LOG_INFO("axera qwen35_moe_sgl: MTP KV pool of %d of the kernels' %d pages, %.2f GiB\n", mtp_kv_pages,
+                  mtp_np, mtp_kv_bytes / 1073741824.0);
     for (int i = 0; i < (int) (MINDICES->size / sizeof(int32_t)); ++i) {
         ((int32_t *) MINDICES->vir)[i] = i;
     }
@@ -2756,6 +2928,31 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         mtp_bound = w0->data;
     }
     const kv_view kv(kidx, kqm, man.context, PG);
+    auto cell_of = [&](int r) -> int64_t {
+        const int64_t c = kv.cell_of(r);
+        if (c < 0 || c >= man.context) {
+            GGML_LOG_ERROR("axera qwen35_moe_sgl: MTP row %d has cell %lld outside [0,%lld); k_idxs[%d] = %lld\n",
+                           r, (long long) c, (long long) man.context, r,
+                           (long long) ((const int64_t *) kidx->data)[r]);
+            GGML_ABORT("axera qwen35_moe_sgl: MTP cell out of range\n");
+        }
+        return c;
+    };
+    static bool mtp_logged[9] = {};
+    static int  mtp_log_prompt = -1;
+    if (T >= 1 && T <= 8) {
+        if (!mtp_logged[T]) {
+            mtp_logged[T] = true;
+            GGML_LOG_INFO("axera qwen35_moe_sgl: MTP T=%d cells %lld..%lld pages %lld\n", T,
+                          (long long) cell_of(0), (long long) cell_of(T - 1),
+                          (long long) (cell_of(T - 1) / PG + 1));
+        }
+    } else if (T != mtp_log_prompt) {
+        mtp_log_prompt = T;
+        GGML_LOG_INFO("axera qwen35_moe_sgl: MTP T=%d cells %lld..%lld pages %lld\n", T,
+                      (long long) cell_of(0), (long long) cell_of(T - 1),
+                      (long long) (cell_of(T - 1) / PG + 1));
+    }
     auto row_bf16 = [&](const ggml_tensor * x, int r, ggml_bf16_t * d) {
         ggml_fp32_to_bf16_row((const float *) ((const char *) x->data + (size_t) r * x->nb[1]), d, H);
     };
@@ -2780,19 +2977,19 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         }
         c->flush();
     };
-    auto fill_pos = [&](axera_cmm & c, int T_, int row0, int pad_from, const kv_view & k) {
+    auto fill_pos = [&](axera_cmm & c, int T_, int row0, int pad_from, const kv_view &, auto & cell) {
         auto * d = (int32_t *) c->vir;
         for (int r = 0; r < T_; ++r) {
-            d[r] = (int32_t) k.cell_of(row0 + std::min(r, pad_from));
+            d[r] = (int32_t) cell(row0 + std::min(r, pad_from));
         }
         c->flush();
     };
-    auto fill_loc = [&](axera_cmm & c, int T_, int row0, int pad_from, const kv_view & k) {
+    auto fill_loc = [&](axera_cmm & c, int T_, int row0, int pad_from, const kv_view &, auto & cell) {
         auto * d = (int32_t *) c->vir;
         for (int r = 0; r < T_; ++r) {
-            const int64_t cell = k.cell_of(row0 + std::min(r, pad_from));
-            d[2 * r]          = (int32_t) (cell / PG);
-            d[2 * r + 1]      = (int32_t) (cell % PG);
+            const int64_t c_ = cell(row0 + std::min(r, pad_from));
+            d[2 * r]          = (int32_t) (c_ / PG);
+            d[2 * r + 1]      = (int32_t) (c_ % PG);
         }
         c->flush();
     };
@@ -2815,26 +3012,26 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         ch->flush();
     };
 
-    if (T >= 2 && T <= R8) {  // the rows accepted by a verification, in one call
+    if (T >= 2 && T <= R8 && !std::getenv("GGML_AXERA_MTP_T1")) {  // the rows accepted by a verification, in one call
         rows_in(mtp8.e, mtp8.h, R8, 0, T - 1);
         fill_pids(mtp8.pids, paxes, R8, 0, T - 1);
-        fill_pos(mtp8.pos, R8, 0, T - 1, kv);
-        fill_loc(mtp8.loc, R8, 0, T - 1, kv);
+        fill_pos(mtp8.pos, R8, 0, T - 1, kv, cell_of);
+        fill_loc(mtp8.loc, R8, 0, T - 1, kv, cell_of);
         set_ntok(mtp8.ntok, T);
-        set_indptr(mtp8.indptr, kv.cell_of(T - 1));
-        mtp8.c.k->run(mtp8.c.in, mtp8.c.out, "mtp m8");
+        set_indptr(mtp8.indptr, cell_of(T - 1));
+        mtp8.c.k->run(mtp8.c.in, mtp8.c.out, mtp8.c.k->desc->role.c_str());
         mtp8.hnext->invalidate(mtp8.hnext->vir, (size_t) T * H * sizeof(ggml_bf16_t));
         for (int r = 0; r < T; ++r) {
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp8.hnext->vir + (size_t) r * H, h.data() + (size_t) r * H, H);
         }
-    } else if (T <= 8) {  // a draft step: row by row
+    } else if (T <= 8 || std::getenv("GGML_AXERA_MTP_T1")) {  // a draft step: row by row
         for (int r = 0; r < T; ++r) {
             rows_in(mtp1.e, mtp1.h, 1, r, 0);
             fill_pids(mtp1.pids, paxes, 1, r, 0);
-            fill_pos(mtp1.pos, 1, r, 0, kv);
-            fill_loc(mtp1.loc, 1, r, 0, kv);
+            fill_pos(mtp1.pos, 1, r, 0, kv, cell_of);
+            fill_loc(mtp1.loc, 1, r, 0, kv, cell_of);
             set_ntok(mtp1.ntok, 1);
-            set_indptr(mtp1.indptr, kv.cell_of(r));
+            set_indptr(mtp1.indptr, cell_of(r));
             mtp1.c.k->run(mtp1.c.in, mtp1.c.out, "mtp t1");
             mtp1.hnext->invalidate(mtp1.hnext->vir, H * sizeof(ggml_bf16_t));
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp1.hnext->vir, h.data() + (size_t) r * H, H);
@@ -2846,10 +3043,10 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
             const int n = std::min(P, T - it);
             rows_in(mtpP.e, mtpP.h, P, it, n - 1);  // padded rows repeat the last valid row
             fill_pids(mtpP.pids, paxes, P, it, n - 1);
-            fill_pos(mtpP.pos, P, it, n - 1, kv);
-            fill_loc(mtpP.loc, P, it, n - 1, kv);
+            fill_pos(mtpP.pos, P, it, n - 1, kv, cell_of);
+            fill_loc(mtpP.loc, P, it, n - 1, kv, cell_of);
             set_ntok(mtpP.ntok, n);
-            set_indptr(mtpP.indptr, kv.cell_of(it + n - 1));
+            set_indptr(mtpP.indptr, cell_of(it + n - 1));
             mtpP.c.k->run(mtpP.c.in, mtpP.c.out, "mtp prompt");
             mtpP.hnext->invalidate(mtpP.hnext->vir, (size_t) n * H * sizeof(ggml_bf16_t));
             for (int r = 0; r < n; ++r) {
@@ -2871,6 +3068,9 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
     if (logits && logits->ne[1] > 0 && (logits->flags & GGML_TENSOR_FLAG_COMPUTE)) {
         const std::vector<char> normed(T, 1);  // (the kernel's shared head norm)
         head.bind(man.get("lm_head"), logits->src[0]);
+        if (man.has("lm_head.verify")) {
+            head.bind_verify(man.get("lm_head.verify"));
+        }
         if (T == 1 && man.has("lm_head.draft")) {
             if (!head.dk) {
                 const std::string    f  = man.dir + "/draft_vocab.i32";
