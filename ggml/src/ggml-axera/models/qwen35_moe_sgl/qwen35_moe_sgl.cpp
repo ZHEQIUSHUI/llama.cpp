@@ -1203,9 +1203,11 @@ void qwen35_moe_sgl::states_swap() {
             rebind(app.in);
             rebind(app.out);
         }
-        for (auto & c : pre_attn) {
-            rebind(c.in);
-            rebind(c.out);
+        for (auto & par : pre_attn) {
+            for (auto & c : par) {
+                rebind(c.in);
+                rebind(c.out);
+            }
         }
         for (auto & v : pre_f) {
             for (auto & c : v) {
@@ -1328,8 +1330,8 @@ void qwen35_moe_sgl::state_home() {
 void qwen35_moe_sgl::zero_state() {
     page_x.reserve((size_t) PG * H);
     page_p.reserve((size_t) PG * 4);
-    if (state_dirty || cur_set >= 0) {  // CMM starts zero; a new sequence needs the memset only after an earlier one ran
-        state_home();
+    state_home();  // apply a verification prefix that the sampler accepted
+    if (state_dirty) {  // CMM starts zero; a new sequence needs the memset only after an earlier one ran
         axera_timer tl("state zero");
         for (const char * n : { "b0_attn_state_in", "b0_attn_q_conv_state_in", "b0_attn_k_conv_state_in", "b0_attn_v_conv_state_in" }) {
             memset(B(n)->vir, 0, B(n)->size);
@@ -2507,7 +2509,18 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     }
     if (T > 1 && T <= 4 && ver.k && c0 > 0 && c0 + 4 <= man.context) {
         axera_timer tv("verify (all layers)");
-        const ggml_status st = verify(kv, xb.data(), pb.data(), T, h.data());
+        std::vector<ggml_bf16_t> vxb((size_t) T * H);
+        if (token_ids) {
+            embed_tokens(token_ids, T);
+            XB->invalidate(XB->vir, (size_t) T * H * sizeof(ggml_bf16_t));
+            memcpy(vxb.data(), XB->vir, vxb.size() * sizeof(ggml_bf16_t));
+        } else {
+            axera_host_pool().run(T, [&](int64_t r) {
+                ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]),
+                                      vxb.data() + (size_t) r * H, H);
+            });
+        }
+        const ggml_status st = verify(kv, vxb.data(), pb.data(), T, h.data());
         if (st != GGML_STATUS_SUCCESS) {
             return st;
         }
@@ -2957,6 +2970,7 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         ggml_fp32_to_bf16_row((const float *) ((const char *) x->data + (size_t) r * x->nb[1]), d, H);
     };
     std::vector<float> h((size_t) T * H);
+    std::vector<float> hr((size_t) T * H);  // the pre-shared-head-norm rows, for the combined head
     axera_timer tm(T == 1 ? "mtp (draft)" : T <= 8 ? "mtp (catch-up rows)" : "mtp (prompt)");
     const int  R8    = mtp8.c.k ? (int) (mtp8.e->size / (H * sizeof(ggml_bf16_t))) : 0;
     const int  paxes = 3;
@@ -3021,8 +3035,10 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         set_indptr(mtp8.indptr, cell_of(T - 1));
         mtp8.c.k->run(mtp8.c.in, mtp8.c.out, mtp8.c.k->desc->role.c_str());
         mtp8.hnext->invalidate(mtp8.hnext->vir, (size_t) T * H * sizeof(ggml_bf16_t));
+        mtp8.hraw->invalidate(mtp8.hraw->vir, (size_t) T * H * sizeof(ggml_bf16_t));
         for (int r = 0; r < T; ++r) {
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp8.hnext->vir + (size_t) r * H, h.data() + (size_t) r * H, H);
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp8.hraw->vir + (size_t) r * H, hr.data() + (size_t) r * H, H);
         }
     } else if (T <= 8 || std::getenv("GGML_AXERA_MTP_T1")) {  // a draft step: row by row
         for (int r = 0; r < T; ++r) {
@@ -3034,7 +3050,9 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
             set_indptr(mtp1.indptr, cell_of(r));
             mtp1.c.k->run(mtp1.c.in, mtp1.c.out, "mtp t1");
             mtp1.hnext->invalidate(mtp1.hnext->vir, H * sizeof(ggml_bf16_t));
+            mtp1.hraw->invalidate(mtp1.hraw->vir, H * sizeof(ggml_bf16_t));
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp1.hnext->vir, h.data() + (size_t) r * H, H);
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp1.hraw->vir, hr.data() + (size_t) r * H, H);
         }
     } else {
         const int P = (int) (mtpP.e->size / (H * sizeof(ggml_bf16_t)));
@@ -3049,9 +3067,12 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
             set_indptr(mtpP.indptr, cell_of(it + n - 1));
             mtpP.c.k->run(mtpP.c.in, mtpP.c.out, "mtp prompt");
             mtpP.hnext->invalidate(mtpP.hnext->vir, (size_t) n * H * sizeof(ggml_bf16_t));
+            mtpP.hraw->invalidate(mtpP.hraw->vir, (size_t) n * H * sizeof(ggml_bf16_t));
             for (int r = 0; r < n; ++r) {
                 ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtpP.hnext->vir + (size_t) r * H,
                                       h.data() + (size_t) (it + r) * H, H);
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtpP.hraw->vir + (size_t) r * H,
+                                      hr.data() + (size_t) (it + r) * H, H);
             }
         }
     }
@@ -3066,11 +3087,7 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
     }
     ggml_tensor * logits = names.find("result_output");
     if (logits && logits->ne[1] > 0 && (logits->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-        const std::vector<char> normed(T, 1);  // (the kernel's shared head norm)
         head.bind(man.get("lm_head"), logits->src[0]);
-        if (man.has("lm_head.verify")) {
-            head.bind_verify(man.get("lm_head.verify"));
-        }
         if (T == 1 && man.has("lm_head.draft")) {
             if (!head.dk) {
                 const std::string    f  = man.dir + "/draft_vocab.i32";
@@ -3082,8 +3099,18 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
                 head.bind_draft(man.get("lm_head.draft"), ids);
             }
             head.draft = true;
+            const std::vector<char> normed(T, 1);  // (the draft kernel projects the MTP shared-head norm)
+            head.run(g, names, h, T, &normed);
+        } else {
+            if (!head.bind_combined(man.get("lm_head"), logits->src[0])) {
+                GGML_LOG_ERROR("axera qwen35_moe_sgl: the MTP head is not a combined lm_head\n");
+                return GGML_STATUS_FAILED;
+            }
+            if (man.has("lm_head.verify")) {
+                head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
+            }
+            head.run_combined(g, names, hr, T, nullptr, nullptr);
         }
-        head.run(g, names, h, T, &normed);
     }
     return GGML_STATUS_SUCCESS;
 }
