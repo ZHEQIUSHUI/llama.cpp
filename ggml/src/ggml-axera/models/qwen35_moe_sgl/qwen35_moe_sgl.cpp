@@ -230,6 +230,9 @@ class qwen35_moe_sgl final : public model {
     std::vector<axera_cmm> KVL;
     int                    kv_pages = 0;
     int64_t                kv_cells = 0;
+    // Short contexts use the 16k shared-KV decode/prefill pair; longer ones use the released 256k split-KV pair.
+    bool                   short16 = false;
+    int64_t                kv_context = 0;
     AX_ENGINE_IO_BUFFER_T  kv_io(int j, uint32_t bytes) {
         if (KVL.empty()) {
             return slice("b3_kv", j, bytes);
@@ -606,9 +609,13 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         }
         ord[il] = g ? ng++ : na++;
     }
-    const kernel & dk = man.get("decode");
+    const char * short16_env = getenv("GGML_AXERA_SHORT16");
+    const int64_t cells_hint = axera_kv_cells();
+    short16 = (!short16_env || atoi(short16_env) != 0) && cells_hint > 0 && cells_hint <= 16384 &&
+              man.has("decode16") && man.has("prefill.attn16");
+    const kernel & dk = man.get(short16 ? "decode16" : "decode");
     const kernel & gk = man.get("prefill.gdn");
-    const kernel & ak = man.get("prefill.attn");
+    const kernel & ak = man.get(short16 ? "prefill.attn16" : "prefill.attn");
     const kernel & mk = man.get("prefill.moe");
     banks.clear();
     {
@@ -650,6 +657,7 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     const size_t page_kv = (size_t) 2 * PG * 2 * 256 * 2;
     const int    NP      = (int) (split ? logical("b3_kv0") / page_kv : logical("b3_kv") / (NB * page_kv));  // pages
     kv_pages             = NP;
+    kv_context           = short16 ? (int64_t) NP * PG : man.context;
     KVL.clear();
     if (split) {
         if (const int64_t cells = axera_kv_cells(); cells > 0) {  // llama.cpp's -c
@@ -679,7 +687,7 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     POS     = axera_cmm_alloc((size_t) WN * ak.in_bytes("position_ids") / PG);
     META    = axera_cmm_alloc_nc(32);  // host-written scalars: the NPU sees each write without a cache flush
     AX      = (int) (ak.in_bytes("position_ids") / (PG * sizeof(int32_t)));
-    GGML_ASSERT((AX == 1 || AX == 3) && (int64_t) NP * PG == man.context && dk.in_bytes("indices") == INDICES->size);
+    GGML_ASSERT((AX == 1 || AX == 3) && (int64_t) NP * PG == kv_context && dk.in_bytes("indices") == INDICES->size);
     for (int i = 0; i < NP; ++i) {
         ((int32_t *) INDICES->vir)[i] = i;
     }
@@ -949,8 +957,8 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         bb += b->size;
     }
     axera_bank_checksums(banks);
-    GGML_LOG_INFO("axera qwen35_35b_a3b: %d layers, banks (weights + state) %.2f GiB, %lld cells\n", L, bb / 1073741824.0,
-                  (long long) man.context);
+    GGML_LOG_INFO("axera qwen35_35b_a3b: %d layers, banks (weights + state) %.2f GiB, %lld cells (%s KV)\n", L,
+                  bb / 1073741824.0, (long long) kv_context, short16 ? "16k shared" : "256k split");
 }
 
 // the prefill kernels' new recurrent states become the current ones. Both state parities' calls are bound once, so
@@ -1452,7 +1460,7 @@ void qwen35_moe_sgl::prefill_fused(int64_t c0, int n, const ggml_bf16_t * x, con
                         for (int r = 0; r < PG; ++r) {
                             pp[s * PG + r] = r < v ? p4[(size_t) (r0 + r) * 4 + s] : 0;
                             // (an index out of the kernel's tables hangs the NPU: stop here instead)
-                            GGML_ASSERT(pp[s * PG + r] >= 0 && pp[s * PG + r] < man.context);
+                            GGML_ASSERT(pp[s * PG + r] >= 0 && pp[s * PG + r] < kv_context);
                         }
                     }
                     FPOS->flush();
@@ -1938,7 +1946,7 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     const ggml_tensor * k_idxs = names.find("attn_inp_k_idxs");
     const ggml_tensor * kqm    = names.find("attn_inp_kq_mask");
     GGML_ASSERT(k_idxs && k_idxs->type == GGML_TYPE_I64 && k_idxs->ne[0] == T && kqm);
-    const kv_view kv(k_idxs, kqm, man.context, PG);
+    const kv_view kv(k_idxs, kqm, kv_context, PG);
     if (axera_n_seq_max() != 1) {
         GGML_LOG_ERROR("axera qwen35_35b_a3b: one sequence only (-np 1)\n");
         return GGML_STATUS_FAILED;
