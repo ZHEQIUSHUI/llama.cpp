@@ -24,6 +24,10 @@
 
 #include <memory>
 
+namespace axera {
+bool warmup_active();
+}
+
 bool ggml_backend_buffer_is_axera(ggml_backend_buffer_t buffer);
 ggml_backend_buffer_type_t ggml_backend_axera_mapped_buffer_type(void);
 ggml_backend_buffer_t axera_mapped_buffer(void * ptr, size_t size);

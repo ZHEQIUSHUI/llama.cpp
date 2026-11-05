@@ -1492,6 +1492,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
     if (params.warmup) {
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
+        llama_set_warmup(lctx, true);
 
         std::vector<llama_token> tmp;
         llama_token bos = llama_vocab_bos(vocab);
@@ -1525,6 +1526,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             common_batch_set_zero_state(batch, model, zeros);
             llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         }
+        llama_set_warmup(lctx, false);
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);

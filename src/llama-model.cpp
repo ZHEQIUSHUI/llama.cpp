@@ -1676,8 +1676,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // there is very little benefit to offloading the input layer, so keep it on the CPU unless a device asks for it
+    // (the Axera adapter runs the token embedding as an NPU kernel instead of a CPU GET_ROWS split)
+    bool input_offload = false;
+    for (const auto & dev : devices) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev.dev);
+        auto fn = (bool (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_offload_input_layer");
+        if (fn && fn()) {
+            input_offload = true;
+            pimpl->dev_input = { dev.dev, &pimpl->gpu_buft_list.at(dev.dev) };
+            break;
+        }
+    }
+    if (!input_offload) {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);

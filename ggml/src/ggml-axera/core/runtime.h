@@ -157,9 +157,13 @@ inline axera_prof g_axera_prof;
 
 struct axera_timer {
     const char *                          what;
-    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point t0;
 
-    explicit axera_timer(const char * w) : what(g_axera_prof.on ? w : nullptr) {}
+    explicit axera_timer(const char * w) : what(g_axera_prof.on ? w : nullptr) {
+        if (what) {
+            t0 = std::chrono::steady_clock::now();
+        }
+    }
     ~axera_timer() { stop(); }
     void stop() {
         if (what) {

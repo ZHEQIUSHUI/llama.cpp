@@ -15,6 +15,9 @@ struct model {
     virtual ~model() = default;
     // the whole graph (llama.cpp's model graph: up to the logits); a graph the model does not run fails
     virtual ggml_status compute(ggml_cgraph * g) = 0;
+    // one-time host work for a graph that a later compute will run (llama.cpp can hand the next graph over before
+    // its first token, e.g. a decode graph built while the prompt's call is still open: no output is produced here)
+    virtual void prewarm(ggml_cgraph * g) { GGML_UNUSED(g); }
 };
 
 // the adapter of the manifest's model; aborts for a model this backend has no adapter for

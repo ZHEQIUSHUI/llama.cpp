@@ -778,7 +778,20 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    static const bool kprof = getenv("LLAMA_GRAPH_PROF") != nullptr;
+    static int64_t k_find = 0, k_apply = 0, k_n = 0;
     llama_kv_cache::slot_info_vec_t res;
+
+    // A single ubatch needs no simulated placement: the caller's apply() applies it once. The save/restore below only
+    // exists so that the slots of the next ubatch are found against the cells the previous ones placed.
+    if (ubatches.size() == 1) {
+        auto sinfo = find_slot(ubatches[0], false);
+        if (sinfo.empty()) {
+            return {};
+        }
+        res.push_back(std::move(sinfo));
+        return res;
+    }
 
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
@@ -793,9 +806,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     bool success = true;
 
+    int64_t k_find_t = 0, k_state_t = 0, k_apply_t = 0;
     for (const auto & ubatch : ubatches) {
+        const int64_t kf0 = kprof ? ggml_time_us() : 0;
         // only find a suitable slot for the ubatch. don't modify the cells yet
         const auto sinfo_new = find_slot(ubatch, false);
+        if (kprof) k_find_t += ggml_time_us() - kf0;
         if (sinfo_new.empty()) {
             success = false;
             break;
@@ -817,8 +833,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             states.push_back(std::move(state));
         }
 
+        const int64_t ka0 = kprof ? ggml_time_us() : 0;
         // now emplace the ubatch
         apply_ubatch(sinfo_new, ubatch);
+        if (kprof) k_apply_t += ggml_time_us() - ka0;
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -838,6 +856,14 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     if (!success) {
         return {};
+    }
+    if (kprof) {
+        k_find += k_find_t;
+        k_apply += k_apply_t;
+        if (++k_n % 32 == 0) {
+            fprintf(stderr, "kv prof: find %.3f, apply %.3f ms/call (%lld)\n",
+                    k_find / 1e3 / k_n, k_apply / 1e3 / k_n, (long long) k_n);
+        }
     }
 
     return res;
