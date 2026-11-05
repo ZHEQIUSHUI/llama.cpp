@@ -274,6 +274,21 @@ AX_ENGINE_IO_BUFFER_T params::convert(const std::map<std::string, ggml_tensor *>
         }
         return axera_io(b, size);
     }
+    if (p.convert == "nvfp4" || p.convert == "nvfp4_scales" || p.convert == "nvfp4_scale2") {
+        auto & q = nv[w];
+        if (!q.q) {
+            q = axera_quantize_nvfp4_rows(w, 0, ggml_nrows(w));
+            axera_drop_mapped(w);
+        }
+        if (p.convert == "nvfp4_scale2") {
+            return owned([&](void * d) { *(float *) d = q.scale2; });
+        }
+        const axera_cmm & b = p.convert == "nvfp4_scales" ? q.s : q.q;
+        if (b->size < size) {
+            GGML_ABORT("axera: %s in NVFP4 is %zu bytes, parameter %s %u\n", w->name, b->size, name.c_str(), size);
+        }
+        return axera_io(b, size);
+    }
     if (p.convert == "log_neg") {  // GGUF ssm_a = -exp(A_log)
         GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_nbytes(w) == size);
         return owned([&](void * d) {
@@ -435,6 +450,14 @@ void params::release(const std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> 
         freed += it->second.q->size + it->second.s->size;
         it = mx.erase(it);
     }
+    for (auto it = nv.begin(); it != nv.end();) {
+        if (in_use(it->second.q) || in_use(it->second.s)) {
+            ++it;
+            continue;
+        }
+        freed += it->second.q->size + it->second.s->size;
+        it = nv.erase(it);
+    }
     auto drop = [&](auto & map) {
         for (auto it = map.begin(); it != map.end();) {
             if (in_use(it->second)) {
@@ -452,6 +475,9 @@ void params::release(const std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> 
         pk += b->size;
     }
     for (const auto & [k, q] : mx) {
+        kept += q.q->size + q.s->size;
+    }
+    for (const auto & [k, q] : nv) {
         kept += q.q->size + q.s->size;
     }
     for (const auto * map : { &bf16 }) {
