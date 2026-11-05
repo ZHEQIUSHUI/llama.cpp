@@ -603,6 +603,10 @@ void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const
         axera_timer tk("lm_head (combined)");
         ck->run(cin, cout, "output head (combined)");
         tk.stop();
+        static const bool debug_logits = getenv("GGML_AXERA_SAMPLE_DEBUG") != nullptr;
+        if (debug_logits) {  // the diagnostic reads this row on the host; the greedy path itself never does
+            dctx->invalidate(o, (size_t) N * sizeof(float));
+        }
         cids->invalidate(cids->vir, sizeof(int32_t));
         ctop->invalidate(ctop->vir, sizeof(float));
         memcpy(&pids[(size_t) r], cids->vir, sizeof(int32_t));
@@ -650,6 +654,10 @@ void output_head::run_combined4(ggml_cgraph * g, const graph_names & names, cons
         axera_timer tk("lm_head (combined m4)");
         c4k->run(c4in, c4out, "output head (combined m4)");
         tk.stop();
+    }
+    static const bool debug_logits = getenv("GGML_AXERA_SAMPLE_DEBUG") != nullptr;
+    if (debug_logits) {  // the diagnostic reads these rows on the host
+        dctx->invalidate(logits->data, (size_t) 4 * N * sizeof(float));
     }
     c4ids->invalidate(c4ids->vir, 4 * sizeof(int32_t));
     c4top->invalidate(c4top->vir, 4 * sizeof(float));

@@ -852,6 +852,41 @@ struct argmax_pool {
     }
 };
 
+// GGML_AXERA_SAMPLE_DEBUG=1: the chosen id and the full row's two largest biased logits. The fused path reads the row
+// here only for the diagnostic (it invalidates logits that the greedy path otherwise never touches).
+static void debug_sample_row(const common_sampler * gsmpl, struct llama_context * ctx, int idx, llama_token id,
+                             float logit, bool fused) {
+    static const bool enabled = getenv("GGML_AXERA_SAMPLE_DEBUG") != nullptr;
+    static int64_t     call = 0;
+    if (!enabled) {
+        return;
+    }
+    const float * logits  = llama_get_logits_ith(ctx, idx);
+    const int     n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    if (!logits) {
+        return;
+    }
+    llama_token i1 = -1, i2 = -1;
+    float       v1 = -INFINITY, v2 = -INFINITY;
+    for (llama_token i = 0; i < n_vocab; ++i) {
+        float v = logits[i];
+        for (const auto & b : gsmpl->fast_bias) {
+            if (b.token == i) {
+                v += b.bias;
+                break;
+            }
+        }
+        if (v > v1) {
+            v2 = v1; i2 = i1;
+            v1 = v;  i1 = i;
+        } else if (v > v2 && i != i1) {
+            v2 = v;  i2 = i;
+        }
+    }
+    fprintf(stderr, "SAMPLE_DEBUG call=%lld fused=%d id=%d logit=%.9g row1=%d %.9g row2=%d %.9g margin=%.9g\n",
+            (long long) call++, fused ? 1 : 0, id, logit, i1, v1, i2, v2, v1 - v2);
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -873,6 +908,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             int32_t id_argmax = LLAMA_TOKEN_NULL;
             float   logit     = 0.0f;
             if (api->take(idx, &id_argmax, &logit)) {
+                debug_sample_row(gsmpl, ctx, idx, (llama_token) id_argmax, logit, true);
                 gsmpl->cur.resize(1);
                 gsmpl->cur[0] = llama_token_data{ (llama_token) id_argmax, logit, 1.0f };
                 cur_p         = { gsmpl->cur.data(), 1, 0, true };
@@ -925,6 +961,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (best < 0) {  // every logit -inf: the first token, as the greedy sampler over the array
             best = 0;
         }
+        debug_sample_row(gsmpl, ctx, idx, best, bv, false);
         gsmpl->cur.resize(1);
         gsmpl->cur[0] = llama_token_data{ best, bv, 1.0f };
         cur_p         = { gsmpl->cur.data(), 1, 0, true };
