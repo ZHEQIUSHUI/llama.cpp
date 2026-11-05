@@ -36,6 +36,9 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
+    bool mixed_batch  = true; // false when the backend adapter consumes only token ids (no mixed embeddings path)
+    bool kq_mask_used = true; // false when the backend adapter never reads the KQ mask input
+    bool v_idxs_used  = true; // false when it never reads the transposed-V index input either
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;

@@ -6,11 +6,15 @@
 #include "reasoning-budget.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-axera.h"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <unordered_map>
@@ -134,6 +138,8 @@ struct common_sampler {
     // greedy decoding with no sampler that can change the argmax (see common_sampler_init): the token of the largest
     // logit straight from the logits, without the candidate array over the vocabulary and the chain
     bool greedy_fast = false;
+    // pure greedy chain and the combined lm_head wrote an NPU argmax: take its (id, logit), not the full row
+    bool npu_argmax = false;
     // (greedy_fast) the logit-bias sampler's biases, added in the argmax: one per token (the sum of its biases), in
     // token order, the tokens in the vocabulary
     std::vector<llama_logit_bias> fast_bias;
@@ -202,6 +208,17 @@ std::string common_params_sampling::print() const {
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
     return std::string(result);
+}
+
+static const ggml_axera_argmax * argmax_api() {
+    static const ggml_axera_argmax * api = nullptr;
+    if (!api) {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name(GGML_AXERA_NAME);
+        if (reg) {
+            api = (const ggml_axera_argmax *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_axera_argmax");
+        }
+    }
+    return api;
 }
 
 struct common_sampler * common_sampler_init(
@@ -493,6 +510,7 @@ struct common_sampler * common_sampler_init(
         /* .cur     = */ {},
         /* .cur_p   = */ {},
         /* .greedy_fast = */ false,
+        /* .npu_argmax  = */ false,
         /* .fast_bias   = */ fast_bias,
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
@@ -508,12 +526,48 @@ struct common_sampler * common_sampler_init(
             __func__, result->greedy_fast ? "on" : "off", greedy_chain, fast_bias.size(), grmr != nullptr, rbudget != nullptr,
             params.backend_sampling);
 
+    // The combined lm_head returns both the full logits and one (id, logit) per row. A pure greedy chain with no
+    // caller-visible logits/probs and no grammar takes the NPU row; every other chain leaves this off and reads the
+    // logits the same kernel wrote. GGML_AXERA_ARGMAX=0 is the A/B switch.
+    static const bool argmax_off = [] {
+        const char * e = getenv("GGML_AXERA_ARGMAX");
+        return e && strcmp(e, "0") == 0;
+    }();
+    static const bool npu_off = [] {
+        const char * e = getenv("LLAMA_NPU_SAMPLING");
+        return e && strcmp(e, "0") == 0;
+    }();
+    bool suppress_only = true;
+    for (const auto & b : fast_bias) {
+        suppress_only = suppress_only && std::isinf(b.bias) && b.bias < 0.0f;
+    }
+    const bool argmax_eligible = result->greedy_fast && suppress_only && params.n_probs == 0 &&
+                                 !params.backend_sampling && !grmr && !rbudget && !argmax_off && !npu_off;
+    if (const ggml_axera_argmax * api = argmax_api()) {
+        std::vector<int32_t> ids;
+        ids.reserve(fast_bias.size());
+        for (const auto & b : fast_bias) {
+            ids.push_back(b.token);
+        }
+        const int rows = api->configure(argmax_eligible, ids.empty() ? nullptr : ids.data(), (int32_t) ids.size());
+        result->npu_argmax = rows > 0;
+        if (result->npu_argmax) {
+            LOG_INF("%s: fused lm_head greedy sampling (R = %d)\n", __func__, rows);
+        }
+    }
+
     return result;
 }
 
 void common_sampler_free(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return;
+    }
+
+    if (gsmpl->npu_argmax) {
+        if (const ggml_axera_argmax * api = argmax_api()) {
+            api->reset();
+        }
     }
 
     llama_sampler_free(gsmpl->grmr);
@@ -590,6 +644,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .greedy_fast = */ gsmpl->greedy_fast,
+        /* .npu_argmax  = */ gsmpl->npu_argmax,
         /* .fast_bias   = */ gsmpl->fast_bias,
         /* .rng     = */ gsmpl->rng,
     };
@@ -692,10 +747,37 @@ static float max_of(const float * x, int n) {
     return m;
 }
 
-// the greedy fast path's argmax over a vocabulary row (1 MB for 248k tokens: one core reads it at ~2 GB/s): the
-// maximum in parts on a few persistent workers, then the first index holding it (as a strict > scan)
+// the first index of m in x[b .. e)
+static int first_of(const float * x, int b, int e, float m) {
+    int i = b;
+#if defined(__ARM_NEON)
+    const float32x4_t mv = vdupq_n_f32(m);
+    for (; i + 16 <= e; i += 16) {
+        const uint32x4_t c0 = vceqq_f32(vld1q_f32(x + i), mv);
+        const uint32x4_t c1 = vceqq_f32(vld1q_f32(x + i + 4), mv);
+        const uint32x4_t c2 = vceqq_f32(vld1q_f32(x + i + 8), mv);
+        const uint32x4_t c3 = vceqq_f32(vld1q_f32(x + i + 12), mv);
+        if (vmaxvq_u32(vorrq_u32(vorrq_u32(c0, c1), vorrq_u32(c2, c3)))) {
+            for (int j = i; j < i + 16; ++j) {
+                if (x[j] == m) {
+                    return j;
+                }
+            }
+        }
+    }
+#endif
+    for (; i < e; ++i) {
+        if (x[i] == m) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// the greedy fast path's argmax over a vocabulary row (1 MB for 248k tokens): the maximum in parts on persistent
+// workers, then only the winning part is scanned again for the first index
 struct argmax_pool {
-    static constexpr int     NW = 3;  // workers; the caller takes part 0
+    static constexpr int     NW = 15; // workers; the caller takes part 0 (16 threads for a 1 MiB row)
     std::mutex               mu;
     std::condition_variable  cv;
     std::vector<std::thread> th;
@@ -761,12 +843,7 @@ struct argmax_pool {
         if (w0 < 0) {
             return -1;
         }
-        for (int j = w0 * per; j < nv; ++j) {
-            if (v[j] == m) {
-                return j;
-            }
-        }
-        return -1;
+        return first_of(v, w0 * per, std::min(nv, w0 * per + per), m);
     }
 };
 
@@ -783,6 +860,22 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
+    // The combined head already ran the final norm, projection and greedy reduction on the NPU. Consume its row
+    // directly; a missing row (non-greedy graph, prompt batch, suppress-token winner) falls through to the full
+    // logits, which the same kernel wrote.
+    if (gsmpl->npu_argmax && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL) {
+        if (const ggml_axera_argmax * api = argmax_api()) {
+            int32_t id_argmax = LLAMA_TOKEN_NULL;
+            float   logit     = 0.0f;
+            if (api->take(idx, &id_argmax, &logit)) {
+                gsmpl->cur.resize(1);
+                gsmpl->cur[0] = llama_token_data{ (llama_token) id_argmax, logit, 1.0f };
+                cur_p         = { gsmpl->cur.data(), 1, 0, true };
+                return (llama_token) id_argmax;
+            }
+        }
+    }
+
     if (gsmpl->greedy_fast && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL &&
         !llama_get_sampled_logits_ith(ctx, idx) && !llama_get_sampled_probs_ith(ctx, idx)) {
         const float * logits  = llama_get_logits_ith(ctx, idx);
@@ -795,8 +888,17 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_token i    = 0;
         if (gsmpl->fast_bias.empty()) {
             static argmax_pool & pool = *new argmax_pool;  // (never destroyed: its workers wait on its condition variable)
+            static const bool prof = getenv("LLAMA_GRAPH_PROF") != nullptr;
+            static int64_t prof_n = 0, prof_us = 0;
+            const int64_t  prof_t0 = prof ? ggml_time_us() : 0;
             i    = n_vocab;
             best = pool.argmax(logits, n_vocab, &bv);
+            if (prof) {
+                prof_us += ggml_time_us() - prof_t0;
+                if (++prof_n % 32 == 0) {
+                    fprintf(stderr, "greedy argmax: %.3f ms/call (%lld)\n", prof_us / 1e3 / prof_n, (long long) prof_n);
+                }
+            }
         }
         auto        run  = [&](llama_token end) {
             for (; i < end; ++i) {

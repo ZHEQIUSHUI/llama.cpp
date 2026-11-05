@@ -260,6 +260,10 @@ public:
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
+    // build and allocate the next single-token decode graph and let the backend prewarm it, after a prompt ubatch's
+    // graph was computed and before its generated token: the graph's topology is fixed, so the first decode reuses it
+    bool graph_prebuild_decode(const llama_memory_context_i * mctx);
+
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
@@ -311,6 +315,8 @@ private:
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
+    // logits' host buffer: logits.data points into a graph's arena when the backend exposes the output there
+    float * logits_host = nullptr;
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE

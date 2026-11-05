@@ -7530,6 +7530,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
         /*.uid          =*/ 0,
+        /*.stable_uid   =*/ 0,
     };
 
     ggml_hash_set_reset(&cgraph->visited_hash_set);
@@ -7557,7 +7558,8 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
-        /*.uid              =*/ 0
+        /*.uid              =*/ 0,
+        /*.stable_uid       =*/ cgraph0->stable_uid
     };
 
     return cgraph;
@@ -7568,9 +7570,10 @@ void ggml_graph_cpy(struct ggml_cgraph * src, struct ggml_cgraph * dst) {
     GGML_ASSERT(dst->size >= src->n_nodes);
     GGML_ASSERT(dst->visited_hash_set.size >= src->visited_hash_set.size);
 
-    dst->n_leafs = src->n_leafs;
-    dst->n_nodes = src->n_nodes;
-    dst->order   = src->order;
+    dst->n_leafs    = src->n_leafs;
+    dst->n_nodes    = src->n_nodes;
+    dst->order      = src->order;
+    dst->stable_uid = src->stable_uid;
 
     for (int i = 0; i < src->n_leafs; ++i) {
         dst->leafs[i] = src->leafs[i];

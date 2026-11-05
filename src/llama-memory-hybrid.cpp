@@ -65,6 +65,10 @@ llama_memory_hybrid::llama_memory_hybrid(
     )) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    static const bool mprof = getenv("LLAMA_GRAPH_PROF") != nullptr;
+    struct macc { int64_t n = 0, split = 0, recr = 0, attn = 0, make = 0; };
+    static macc ma;
+    const int64_t mp0 = mprof ? ggml_time_us() : 0;
     do {
         balloc.split_reset();
 
@@ -101,6 +105,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             break;
         }
 
+        const int64_t mp1 = mprof ? ggml_time_us() : 0;
         // prepare the recurrent batches first
         if (!mem_recr->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
@@ -108,15 +113,30 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
+        const int64_t mp2 = mprof ? ggml_time_us() : 0;
         // prepare the attention cache
         auto heads_attn = mem_attn->prepare(ubatches);
+        const int64_t mp3 = mprof ? ggml_time_us() : 0;
         if (heads_attn.empty()) {
             LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
-        return std::make_unique<llama_memory_hybrid_context>(
+        auto mctx = std::make_unique<llama_memory_hybrid_context>(
                 this, std::move(heads_attn), std::move(ubatches));
+        if (mprof) {
+            ma.n++;
+            ma.split += mp1 - mp0;
+            ma.recr  += mp2 - mp1;
+            ma.attn  += mp3 - mp2;
+            ma.make  += ggml_time_us() - mp3;
+            if (ma.n % 32 == 0) {
+                fprintf(stderr, "mem prof: split %.3f, recr %.3f, attn %.3f, make %.3f ms/call (%lld)\n",
+                        ma.split / 1e3 / ma.n, ma.recr / 1e3 / ma.n, ma.attn / 1e3 / ma.n, ma.make / 1e3 / ma.n,
+                        (long long) ma.n);
+            }
+        }
+        return mctx;
     } while(false);
 
     return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -257,10 +277,22 @@ bool llama_memory_hybrid_context::next() {
 bool llama_memory_hybrid_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
+    static const bool ap = getenv("LLAMA_GRAPH_PROF") != nullptr;
+    static int64_t ap_n = 0, ap_a = 0, ap_r = 0;
+    const int64_t  ap_t0 = ap ? ggml_time_us() : 0;
     bool res = true;
 
     res = res & ctx_attn->apply();
+    const int64_t ap_t1 = ap ? ggml_time_us() : 0;
     res = res & ctx_recr->apply();
+    if (ap) {
+        ap_a += ap_t1 - ap_t0;
+        ap_r += ggml_time_us() - ap_t1;
+        if (++ap_n % 32 == 0) {
+            fprintf(stderr, "memory apply: attn %.3f, recr %.3f ms/token (%lld)\n",
+                    ap_a / 1e3 / ap_n, ap_r / 1e3 / ap_n, (long long) ap_n);
+        }
+    }
 
     return res;
 }
