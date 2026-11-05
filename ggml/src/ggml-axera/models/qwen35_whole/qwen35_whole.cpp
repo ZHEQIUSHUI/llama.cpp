@@ -1,4 +1,4 @@
-// Axera NPU backend: the Qwen3.5 dense whole-model design (4B, 9B and 2B). Every model of a manifest gets this
+// Axera NPU backend: the Qwen3.5 dense whole-model design (9B, 4B, 2B; 0.8B with MXFP8 weights from a Q8_0 GGUF). Every model of a manifest gets this
 // adapter; the manifest names its kernels, and the kernel IO gives the model's layer counts and head sizes.
 //
 // One path, the manifest's kernels (ax-dsl-kernels models/qwen35_{2b,4b,9b}/whole):
@@ -47,6 +47,7 @@ class qwen35_whole final : public model {
     graph_names      names;
     const void *     bound = nullptr;
     int              L = 0, H = 0, G = 0, ROT = 0, NBLK = 0;
+    bool             fp8 = false;  // the prefill banks' projections: MXFP8 (else MXFP4), from the kernel IO shapes
     int              KH = 16, VH = 0, REP = 1;  // delta-net key / value heads (from the prefill kernels' IO)
     std::vector<int> ord;  // layer -> its index among the delta-net layers / the attention layers
     std::vector<int> state_group, state_local;  // a delta-net pool slot -> its verification group / local state
@@ -127,24 +128,30 @@ class qwen35_whole final : public model {
     void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0);
 };
 
-// rows of an [N, K] weight of the GGUF in the kernels' MXFP4 layout (codes [K / 2], scales [K / 32]): an MXFP4 tensor's
-// converted row by row as read, any other type (a community GGUF: Q4_K, Q8_0, ...) quantized once
+// rows of an [N, K] weight of the GGUF in the kernels' MX layout: MXFP8 codes [K] or MXFP4 codes [K / 2], and scales
+// [K / 32]. A matching MXFP4 GGUF tensor is converted row by row as read; every other type (a community GGUF: Q4_K,
+// Q8_0, ...) is quantized once, in the format the prefill kernel's bank IO selected.
 struct mx4 {
     const ggml_tensor * w;
     axera_cmm           q, s;
+    bool                fp8 = false;
     int64_t             N = 0, K = 0;
-    explicit mx4(const ggml_tensor * w) : w(w), N(w->ne[1]), K(w->ne[0]) {
-        if (w->type != GGML_TYPE_MXFP4) {
+    mx4(const ggml_tensor * w, bool fp8) : w(w), fp8(fp8), N(w->ne[1]), K(w->ne[0]) {
+        if (fp8) {
+            axera_quantize_mxfp8(w, q, s);
+        } else if (w->type != GGML_TYPE_MXFP4) {
             axera_quantize_mxfp4(w, q, s);
         }
     }
     // row r: its codes or its scales into dst
     void row(int64_t r, bool scales, uint8_t * dst) const {
+        const size_t code = fp8 ? K : K / 2;
         if (q) {
-            memcpy(dst, scales ? (const uint8_t *) s->vir + r * (K / 32) : (const uint8_t *) q->vir + r * (K / 2),
-                   scales ? K / 32 : K / 2);
+            memcpy(dst, scales ? (const uint8_t *) s->vir + r * (K / 32) : (const uint8_t *) q->vir + r * code,
+                   scales ? K / 32 : code);
             return;
         }
+        GGML_ASSERT(!fp8 && w->type == GGML_TYPE_MXFP4);
         thread_local std::vector<uint8_t> other;
         other.resize(scales ? K / 2 : K / 32);
         const uint8_t * src = (const uint8_t *) w->data + r * w->nb[1];
@@ -208,9 +215,9 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
                 }
             }
         };
-        // MXFP4 rows r0 .. of a weight (value heads of row size hr from vrow on in HF order); scales or codes
+        // MX rows r0 .. of a weight (value heads of row size hr from vrow on in HF order); scales or codes
         auto rows = [&](const mx4 & w, int64_t r0, int64_t nr, bool scales, int64_t vrow = -1, int64_t hr = 0) {
-            const size_t rb = scales ? w.K / 32 : w.K / 2;
+            const size_t rb = scales ? w.K / 32 : w.fp8 ? w.K : w.K / 2;
             GGML_ASSERT((size_t) nr * rb == bb);
             axera_host_pool().run(nr, [&](int64_t r) {
                 int64_t src = r0 + r;
@@ -222,7 +229,7 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
             });
         };
         auto cols = [&](const mx4 & w, bool scales) {  // value heads of the input (columns) in HF order
-            const size_t rb = scales ? w.K / 32 : w.K / 2, cb = rb / VH;
+            const size_t rb = scales ? w.K / 32 : w.fp8 ? w.K : w.K / 2, cb = rb / VH;
             GGML_ASSERT((size_t) w.N * rb == bb);
             axera_host_pool().run(w.N, [&](int64_t r) {
                 thread_local std::vector<uint8_t> src;
@@ -256,10 +263,10 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
             } else if (n.rfind("w_zp_scale", 0) == 0) {
                 fill(0.0f);
             } else if (n.size() == 2 && W.count(n.substr(1))) {
-                const mx4 w(T(il, W.at(n.substr(1))));
+                const mx4 w(T(il, W.at(n.substr(1))), fp8);
                 rows(w, 0, w.N, false);
             } else if (n.rfind("w_scale", 0) == 0 && W.count(n.substr(7))) {
-                const mx4 w(T(il, W.at(n.substr(7))));
+                const mx4 w(T(il, W.at(n.substr(7))), fp8);
                 rows(w, 0, w.N, true);
             } else {
                 GGML_ABORT("axera qwen35_whole: prefill: unexpected MLP input %s\n", d.name.c_str());
@@ -290,7 +297,7 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
             } else if (n.rfind("w_zeropoint_", 0) == 0) {
                 fill(0.0f);
             } else if (W.count(p) && (n == "w_" + p || n == "w_scale_" + p)) {
-                const mx4 w(T(il, W.at(p)));
+                const mx4 w(T(il, W.at(p)), fp8);
                 rows(w, 0, w.N, n != "w_" + p);
             } else {
                 GGML_ABORT("axera qwen35_whole: prefill: unexpected attention input %s\n", d.name.c_str());
@@ -334,7 +341,7 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
             const bool scales = suffix == "_scale";
             GGML_ASSERT(suffix.empty() || scales);
             if (p == 'q' || p == 'k' || p == 'v') {
-                const mx4     w(T(il, "attn_qkv.weight"));
+                const mx4     w(T(il, "attn_qkv.weight"), fp8);
                 const int64_t nr = d.shape[1];  // rows q, k (nr each), then v (the rest)
                 if (p == 'v') {
                     rows(w, w.N - nr, nr, scales, w.N - nr, nr / VH);
@@ -342,13 +349,13 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
                     rows(w, p == 'q' ? 0 : nr, nr, scales);
                 }
             } else if (p == 'z') {
-                const mx4 w(T(il, "attn_gate.weight"));
+                const mx4 w(T(il, "attn_gate.weight"), fp8);
                 rows(w, 0, w.N, scales, 0, w.N / VH);
-            } else if (p == 'a' || p == 'b') {  // Q8_0 in the GGUF: requantized (the delta net takes all-FP4 projections)
-                const mx4 w(T(il, p == 'a' ? "ssm_alpha.weight" : "ssm_beta.weight"));
+            } else if (p == 'a' || p == 'b') {  // small GGUF tensors: quantized to the bank's MX format like every projection
+                const mx4 w(T(il, p == 'a' ? "ssm_alpha.weight" : "ssm_beta.weight"), fp8);
                 rows(w, 0, w.N, scales, 0, 1);
             } else if (p == 'o') {
-                const mx4 w(T(il, "ssm_out.weight"));
+                const mx4 w(T(il, "ssm_out.weight"), fp8);
                 cols(w, scales);
             } else {
                 GGML_ABORT("axera qwen35_whole: prefill: unexpected delta-net input %s\n", d.name.c_str());
@@ -498,6 +505,23 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     banks.clear();
     {
         axera_timer tb("init: prefill banks");
+        // The prefill bank IO distinguishes the two MX layouts without relying on the GGUF type (Q8_0 is converted at
+        // load): an MXFP8 code row is K bytes, an MXFP4 code row K / 2, while both scale rows are K / 32. The first
+        // MLP gate bank is present in every whole-model prefill, in either format.
+        const io_desc * code = nullptr, * scale = nullptr;
+        for (const auto & d : pk.desc->in) {
+            if (d.name == "b0_mlp_w1") {
+                code = &d;
+            } else if (d.name == "b0_mlp_w_scale1") {
+                scale = &d;
+            }
+        }
+        GGML_ASSERT(code && scale && code->shape.size() >= 2 && scale->shape.size() >= 2);
+        const int64_t code_k = code->shape.back(), scale_k = scale->shape.back() * 32;
+        GGML_ASSERT(code_k == scale_k || code_k * 2 == scale_k);
+        fp8 = code_k == scale_k;
+        GGML_LOG_INFO("axera qwen35_whole: prefill banks are MXFP%d (%lld codes, %lld scales per row)\n",
+                      fp8 ? 8 : 4, (long long) code_k, (long long) scale->shape.back());
         static const std::set<std::string> pools = { "x", "position_ids", "indptr", "indices", "last_page_len", "cache_location",
                                                      "valid_tokens", "b3_kv" };
         // b0 / b1 / b2: the recurrent state banks of the three delta-net phases (a build may use one common b0 for all)

@@ -32,7 +32,7 @@ core/                   manifest、kernel 运行时（AX_ENGINE）、CMM、GGUF 
 | `models/qwen38_27b` | Qwen3.8-27B |
 | `models/qwen35_moe`、`qwen35_35b_a3b` | Qwen3.5-35B-A3B（发布版 / 整模型版） |
 | `models/qwen35_dense` | Qwen3.5-9B（发布版路径） |
-| `models/qwen35_whole` | Qwen3.5-9B / 2B 整模型（prefill bank + decode group） |
+| `models/qwen35_whole` | Qwen3.5-9B / 4B / 2B / 0.8B 整模型（prefill bank + decode group） |
 | `models/qwen3` | Qwen3 文本模型：Embedding、ASR 文本部分、TTS talker |
 | `models/qwen3_asr` | Qwen3-ASR 音频编码器 |
 | `models/qwen3_tts` | Qwen3-TTS 的 code predictor 和声码器（`codec.*`） |
