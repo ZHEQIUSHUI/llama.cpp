@@ -1164,7 +1164,15 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
     }
     axera_timer th("output head");
     head.bind(man.get("lm_head"), logits->src[0]);
-    head.run(g, names, h, T);
+    const bool combined = head.bind_combined(man.get("lm_head"), logits->src[0]) && head.combined_ready(g, names);
+    if (man.has("lm_head.verify")) {
+        head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
+    }
+    if (combined) {
+        head.run_combined(g, names, h, T, nullptr, nullptr);
+    } else {
+        head.run(g, names, h, T);
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1282,6 +1290,7 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
         ggml_fp32_to_bf16_row((const float *) ((const char *) x->data + (size_t) r * x->nb[1]), d, H);
     };
     std::vector<float> h((size_t) T * H);
+    std::vector<float> hr((size_t) T * H);  // the pre-head-norm rows, for the combined head
     const size_t       half = (ROT / 2) * sizeof(ggml_bf16_t);
     axera_timer        tm(T == 1 ? "mtp (draft)" : T <= 8 ? "mtp (catch-up rows)" : "mtp (prompt)");
     const int R8 = mtp8.k ? (int) (M8E->size / (H * sizeof(ggml_bf16_t))) : 0;
@@ -1314,8 +1323,10 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
         }
         mtp8.k->run(mtp8.in, mtp8.out, "mtp m8");
         M8OUT->invalidate();
+        M8RAW->invalidate();
         for (int r = 0; r < T; ++r) {
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) M8OUT->vir + (size_t) r * H, h.data() + (size_t) r * H, H);
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) M8RAW->vir + (size_t) r * H, hr.data() + (size_t) r * H, H);
         }
     } else if (T <= 8) {  // a draft step, or a verification's accepted rows: row by row
         for (int r = 0; r < T; ++r) {
@@ -1335,7 +1346,9 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
             }
             mtp1.k->run(mtp1.in, mtp1.out, "mtp t1");
             MOUT->invalidate();
+            MRAW->invalidate();
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) MOUT->vir, h.data() + (size_t) r * H, H);
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) MRAW->vir, hr.data() + (size_t) r * H, H);
         }
     } else {
         const int P = (int) (PE->size / (H * sizeof(ggml_bf16_t)));  // rows per call
@@ -1376,8 +1389,10 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
             }
             mtpp.k->run(mtpp.in, mtpp.out, "mtp prompt");
             POUT2->invalidate();
+            PRAW->invalidate();
             for (int r = 0; r < n; ++r) {
                 ggml_bf16_to_fp32_row((const ggml_bf16_t *) POUT2->vir + (size_t) r * H, h.data() + (size_t) (it + r) * H, H);
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) PRAW->vir + (size_t) r * H, hr.data() + (size_t) (it + r) * H, H);
             }
         }
     }
@@ -1391,7 +1406,6 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
     }
     ggml_tensor * logits = names.find("result_output");
     if (logits && logits->ne[1] > 0 && (logits->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-        const std::vector<char> normed(T, 1);  // (the kernels' shared head norm)
         head.bind(man.get("lm_head"), logits->src[0]);
         if (T == 1 && man.has("lm_head.draft")) {  // a draft step: the draft vocabulary's head (draft_vocab.i32)
             if (!head.dk) {
@@ -1404,8 +1418,18 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
                 head.bind_draft(man.get("lm_head.draft"), ids);
             }
             head.draft = true;
+            const std::vector<char> normed(T, 1);  // (the draft kernel projects the MTP shared-head norm)
+            head.run(g, names, h, T, &normed);
+        } else {
+            if (!head.bind_combined(man.get("lm_head"), logits->src[0])) {
+                GGML_LOG_ERROR("axera qwen35_whole: the MTP head is not a combined lm_head\n");
+                return GGML_STATUS_FAILED;
+            }
+            if (man.has("lm_head.verify")) {
+                head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
+            }
+            head.run_combined(g, names, hr, T, nullptr, nullptr);
         }
-        head.run(g, names, h, T, &normed);
     }
     return GGML_STATUS_SUCCESS;
 }
