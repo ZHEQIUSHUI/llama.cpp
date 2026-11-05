@@ -9,6 +9,7 @@
 | `LD_LIBRARY_PATH` | 必须包含 `/opt/lib`（板子的 SDK 库）；动态构建还要包含程序所在目录 |
 | `GGML_AXERA_KERNEL_DIR` | 必填，kernel 目录（`*.axmodel` + `manifest.json`） |
 | `GGML_AXERA_PROF=1` | 进程退出时打印各阶段耗时（prefill、decode、lm_head、权重转换等） |
+| `GGML_AXERA_GRAPH_FAST=1` | 按图指针缓存名字映射（decode 图复用时省掉每次约 0.3 ms 的 3847 节点扫描；实验开关） |
 | `GGML_AXERA_TRACE=1` | 每个计算图打印节点数、两图之间的 host 间隔、NPU 运行时间 |
 | `GGML_AXERA_CODEC_DUMP=<目录>` | 仅调试用：把 TTS 声码器转换后的权重写成文件 |
 

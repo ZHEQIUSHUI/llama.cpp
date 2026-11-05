@@ -20,6 +20,12 @@ struct graph_names {
     std::map<std::string, ggml_tensor *> t;
     // the maps of the last few other graphs (llama.cpp alternates a few: a speculative target's and draft's)
     std::vector<std::pair<std::vector<uintptr_t>, std::map<std::string, ggml_tensor *>>> recent;
+    // GGML_AXERA_GRAPH_FAST=1 (experimental): llama.cpp reuses the decode graph with the same nodes; trust that reuse
+    // and skip the exact node/op scan. Off by default; a backend that rebuilds a graph in place must not enable it.
+    const ggml_cgraph * fast_g = nullptr;
+    int                 fast_n = 0;
+    const ggml_tensor * fast_first = nullptr;
+    const ggml_tensor * fast_last  = nullptr;
 
     const std::map<std::string, ggml_tensor *> & of(const ggml_cgraph * g);
     ggml_tensor * find(const std::string & name) const;

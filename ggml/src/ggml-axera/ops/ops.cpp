@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -18,6 +19,14 @@ static std::string base_name(const char * name) {  // "<backend>#<name>#<copy>" 
 
 const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph * g) {
     axera_timer tm("graph name map");
+    static const bool fast = [] {
+        const char * e = std::getenv("GGML_AXERA_GRAPH_FAST");
+        return e && std::atoi(e) != 0;
+    }();
+    if (fast && g == fast_g && g->n_nodes == fast_n &&
+        (g->n_nodes == 0 || (g->nodes[0] == fast_first && g->nodes[g->n_nodes - 1] == fast_last))) {
+        return t;
+    }
     // the graph's identity: its node pointers and their ops
     std::vector<uintptr_t> k(2 * (size_t) g->n_nodes);
     for (int i = 0; i < g->n_nodes; i++) {
@@ -68,6 +77,10 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
         }
     }
     key = std::move(k);
+    fast_g = g;
+    fast_n = g->n_nodes;
+    fast_first = g->n_nodes ? g->nodes[0] : nullptr;
+    fast_last  = g->n_nodes ? g->nodes[g->n_nodes - 1] : nullptr;
     return t;
 }
 
