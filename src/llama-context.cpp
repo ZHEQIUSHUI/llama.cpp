@@ -1598,7 +1598,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    const int64_t gp_t2 = gprof ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (gprof && ubatch.n_tokens > 1) {  // (a prompt ubatch: its own line)
+        fprintf(stderr, "graph prof ubatch %u tokens: build+alloc %.3f ms%s, inputs %.3f ms, compute %.3f ms\n", ubatch.n_tokens,
+                (gp_t1 - gp_t0) / 1e3, gp_built ? "" : " (reused)", (gp_t2 - gp_t1) / 1e3, (ggml_time_us() - gp_t2) / 1e3);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

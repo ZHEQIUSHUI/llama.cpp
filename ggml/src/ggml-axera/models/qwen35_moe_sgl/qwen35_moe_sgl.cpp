@@ -8,7 +8,9 @@
 //   prefill.padding zeros the workspace rows beyond the live token count.
 // Prefill is layer-outer over up to 4096 tokens: for each layer, run 256-row attention chunks, clear the padded rows,
 // then run the fixed 4096-row MoE. The decode and prefill kernels read the same NVFP4 weight banks.
-// The state is this adapter's (the decode kernel's banks): KV cache paged [10][64 pages][K, V][256][2 x 256] bf16,
+// The state is this adapter's (the decode kernel's banks): KV cache paged [10][64 pages][K, V][256][2 x 256] bf16 (a
+// long-context decode kernel instead takes one input b3_kv<j> [pages][K, V][256][2 x 256] per attention layer, its pools
+// holding only the pages of llama.cpp's -c),
 // delta-net states [30][32][128][128] f32, conv states q / k [30][3][2048], v [30][3][4096] bf16 (value heads in HF
 // order). The prefill kernels write the recurrent states to a second set, the two swapped after each page. One
 // sequence. Weights only from the GGUF: every projection and expert row is quantized to NVFP4 (E2M1 pairs, an E4M3
@@ -163,6 +165,16 @@ class qwen35_moe_sgl final : public model {
                        bytes);
         }
         return axera_io(c.get(), (char *) c->vir + (size_t) idx * (z / n), bytes);
+    }
+    // the paged KV of attention layer j: entry j of the shared pool b3_kv, or its own pool (inputs b3_kv<j>)
+    std::vector<axera_cmm> KVL;
+    int                    kv_pages = 0;
+    int64_t                kv_cells = 0;
+    AX_ENGINE_IO_BUFFER_T  kv_io(int j, uint32_t bytes) {
+        if (KVL.empty()) {
+            return slice("b3_kv", j, bytes);
+        }
+        return axera_io(KVL.at(j).get(), KVL[j]->vir, bytes);  // (the kernel touches only the pages up to the history)
     }
     void         states_swap();
     void         zero_state();
@@ -559,7 +571,28 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     }
     ONES->flush();
     ZERO = axera_cmm_alloc(4096);
-    const int NP = (int) logical("b3_kv") / (NB * 2 * PG * 2 * 256 * 2);  // pages
+    const bool   split   = logical("b3_kv0") > 0;  // one KV input per attention layer
+    const size_t page_kv = (size_t) 2 * PG * 2 * 256 * 2;
+    const int    NP      = (int) (split ? logical("b3_kv0") / page_kv : logical("b3_kv") / (NB * page_kv));  // pages
+    kv_pages             = NP;
+    KVL.clear();
+    if (split) {
+        if (const int64_t cells = axera_kv_cells(); cells > 0) {  // llama.cpp's -c
+            kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(NP, (cells + PG - 1) / PG));
+        }
+        if (const char * e = getenv("GGML_AXERA_KV_PAGES")) {
+            kv_pages = std::max(1, std::min(NP, atoi(e)));
+        }
+        for (int j = 0; j < NB; ++j) {
+            GGML_ASSERT(logical("b3_kv" + std::to_string(j)) == (size_t) NP * page_kv);
+            KVL.push_back(axera_cmm_alloc((size_t) kv_pages * page_kv));
+            memset(KVL[j]->vir, 0, KVL[j]->size);
+            KVL[j]->flush();
+        }
+        GGML_LOG_INFO("axera qwen35_moe_sgl: KV pools of %d of the kernels' %d pages (%lld cells), %.2f GiB\n", kv_pages, NP,
+                      (long long) kv_pages * PG, NB * (double) kv_pages * page_kv / 1073741824.0);
+    }
+    kv_cells = (int64_t) kv_pages * PG;
     DX      = axera_cmm_alloc(dk.in_bytes("x"));
     DA      = axera_cmm_alloc(dk.in_bytes("attention"));
     DOUT    = axera_cmm_alloc(dk.out_bytes("output"));
@@ -586,8 +619,12 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         const std::string & n = d.name;
         const axera_cmm *   b = n == "x" ? &DX : n == "attention" ? &DA : n == "position_ids" ? &DPOS : n == "indptr" ? &INDPTR :
                                 n == "indices" ? &INDICES : n == "last_page_len" ? &LASTLEN : n == "cache_location" ? &CLOC :
-                                &B(n);
-        dec.in.push_back(axera_io(*b, d.bytes));
+                                nullptr;
+        if (!b && split && n.rfind("b3_kv", 0) == 0) {
+            dec.in.push_back(kv_io(std::stoi(n.substr(5)), d.bytes));
+            continue;
+        }
+        dec.in.push_back(axera_io(b ? *b : B(n), d.bytes));
     }
     dec.out.push_back(axera_io(DOUT, dk.out_bytes("output")));
 
@@ -614,7 +651,7 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
             } else if (n.rfind("w_zeropoint_", 0) == 0) {
                 c.in.push_back(axera_io(ZERO, d.bytes));
             } else if (n == "paged_kv_cache") {
-                c.in.push_back(slice("b3_kv", ord[il], d.bytes));
+                c.in.push_back(kv_io(ord[il], d.bytes));
             } else if (n == "cos_sin_cache") {
                 c.in.push_back(axera_io(B("b3_attn_cos_sin_cache"), d.bytes));
             } else if (n == "state_in" || n == "q_conv_state_in" || n == "k_conv_state_in" || n == "v_conv_state_in") {
@@ -824,7 +861,7 @@ void qwen35_moe_sgl::init_fused() {
                 } else if (n.rfind("w_zeropoint_", 0) == 0) {
                     v.push_back(axera_io(ZERO, d.bytes));
                 } else if (n == "paged_kv_cache") {
-                    v.push_back(slice("b3_kv", ord[il], d.bytes));
+                    v.push_back(kv_io(ord[il], d.bytes));
                 } else if (n == "cos_sin_cache") {
                     v.push_back(axera_io(B("b3_attn_cos_sin_cache"), d.bytes));
                 } else if (n == "moe_input_norm_w" || (phase == 3 && n == "input_norm_w")) {  // the post-attention norm
@@ -871,7 +908,7 @@ void qwen35_moe_sgl::snap_layer(int il, int set) {
 // prefill with the fused kernels: groups of up to NR rows (pages) from cell c0 (a page's first), each layer by layer:
 // its pages through the layer kernel (the states alternating between the two sets page by page), then its experts
 void qwen35_moe_sgl::prefill_fused(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0) {
-    GGML_ASSERT(c0 % PG == 0 && c0 + n <= man.context);
+    GGML_ASSERT(c0 % PG == 0 && c0 + n <= kv_cells);
     const size_t xr = (size_t) H * sizeof(ggml_bf16_t);
     const int    NR = (int) (XS->size / xr);
     for (int g0 = 0; g0 < n; g0 += NR) {
@@ -1099,7 +1136,7 @@ void qwen35_moe_sgl::paging(int64_t hist, int64_t write_cell) {
 // prefill pages from cell c0 (a page's first): n rows x [n][H] bf16, their positions p4 [n][4]; the hidden states of
 // the rows from out0 on into h
 void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0) {
-    GGML_ASSERT(c0 % PG == 0 && c0 + n <= man.context);
+    GGML_ASSERT(c0 % PG == 0 && c0 + n <= kv_cells);
     const size_t xr = (size_t) H * sizeof(ggml_bf16_t);
     auto set_in = [&](call & c, const char * name, const axera_cmm & cm, size_t off) {
         for (size_t i = 0; i < c.k->desc->in.size(); ++i) {
@@ -1195,6 +1232,7 @@ void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int
 
 // one token at cell c > 0, its history the c cells before it
 void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h) {
+    GGML_ASSERT(c >= 0 && c < kv_cells);  // (the pools pages)
     if (c % WN == 0) {  // a chunk's first cell: the state here is the restart point
         save_state(c);
     }
