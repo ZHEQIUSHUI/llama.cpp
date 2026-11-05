@@ -65,6 +65,7 @@ static void spec_retune(
     // must be explicit, the default reseeds at random; mixed so it differs from the target's
     sparams.seed     = cur.seed == LLAMA_DEFAULT_SEED ? cur.seed : cur.seed ^ 0x85ebca6bu;
     sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE };
+    sparams.npu_sampling = false;
 
     smpls[seq_id].reset(common_sampler_init(model, sparams));
 }
@@ -276,6 +277,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             params.no_perf = false;
             params.top_k = 10;
             params.samplers.assign(1, COMMON_SAMPLER_TYPE_TOP_K);
+            params.npu_sampling = false;
 
             smpl.reset(common_sampler_init(llama_get_model(ctx_dft), params));
         }
@@ -577,6 +579,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             sparams.no_perf  = false;
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            sparams.npu_sampling = false;
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
@@ -1109,6 +1112,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             sparams.no_perf  = false;
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            sparams.npu_sampling = false;
             s.reset(common_sampler_init(model_dft, sparams));
         }
 
@@ -1497,6 +1501,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             sparams.no_perf  = false;
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            sparams.npu_sampling = false;
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 

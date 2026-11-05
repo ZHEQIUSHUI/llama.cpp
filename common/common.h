@@ -297,6 +297,8 @@ struct common_params_sampling {
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
+    // the AXERA fused lm_head.topk path (a draft context's sampler keeps the full logits: it has its own head)
+    bool npu_sampling = true;
 
     // print the parameters into a string
     std::string print() const;

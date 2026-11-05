@@ -1164,6 +1164,9 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
     }
     axera_timer th("output head");
     head.bind(man.get("lm_head"), logits->src[0]);
+    if (man.has("lm_head.topk")) {
+        head.bind_topk(man.get("lm_head.topk"));
+    }
     head.run(g, names, h, T);
     return GGML_STATUS_SUCCESS;
 }
@@ -1393,6 +1396,9 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
     if (logits && logits->ne[1] > 0 && (logits->flags & GGML_TENSOR_FLAG_COMPUTE)) {
         const std::vector<char> normed(T, 1);  // (the kernels' shared head norm)
         head.bind(man.get("lm_head"), logits->src[0]);
+        if (man.has("lm_head.topk")) {
+            head.bind_topk(man.get("lm_head.topk"));
+        }
         if (T == 1 && man.has("lm_head.draft")) {  // a draft step: the draft vocabulary's head (draft_vocab.i32)
             if (!head.dk) {
                 const std::string    f = man.dir + "/draft_vocab.i32";

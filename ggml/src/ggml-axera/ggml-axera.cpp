@@ -297,6 +297,22 @@ static int npu_take_c(float * values, int32_t * ids, int32_t max_k, int32_t * n,
     return axera::npu_take(values, ids, max_k, n, vmax, sumexp);
 }
 
+static int npu_full_row_c(int32_t idx, float * out, int32_t n) {
+    return axera::npu_full_row(idx, out, n);
+}
+
+static void * npu_save_c() {
+    return axera::npu_save();
+}
+
+static void npu_restore_c(void * state) {
+    axera::npu_restore(state);
+}
+
+static void npu_free_state_c(void * state) {
+    axera::npu_free_state(state);
+}
+
 static int64_t npu_config_id_c() {
     return axera::npu_config_id();
 }
@@ -306,6 +322,10 @@ static const ggml_axera_npu_sampling g_npu_sampling = {
     /* .reset     = */ npu_reset_c,
     /* .accept    = */ npu_accept_c,
     /* .take      = */ npu_take_c,
+    /* .full_row  = */ npu_full_row_c,
+    /* .save      = */ npu_save_c,
+    /* .restore   = */ npu_restore_c,
+    /* .free_state= */ npu_free_state_c,
     /* .config_id = */ npu_config_id_c,
 };
 

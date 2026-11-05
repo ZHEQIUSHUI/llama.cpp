@@ -84,6 +84,8 @@ struct output_head {
     const ggml_tensor * w = nullptr;  // output.weight
     axera_cmm  q, s, x;               // the projection in the kernel's format, the bf16 input row(s)
     axera_cmm  yk, mk;                // a kernel of R rows per call (input m: the valid ones): its output, m
+    axera_cmm  ffull;                 // the full-row fallback's output when the head kernel has no m (R == 1)
+    axera_cmm  tx;                    // the fused topk kernel's input rows (tR, independent of the head's R)
     int        R   = 1;
     bool       mx4 = false;
     std::vector<float> wf;            // the projection in f32 (the CPU's)
@@ -97,10 +99,17 @@ struct output_head {
     // candidates and the full-vocabulary max / sumexp it returns
     const kernel *       tk = nullptr;
     int                  tK = 0;
-    axera_cmm            tbias, tmulp, tmuln, ttemp, tval, tids, tmax, tsum;
+    int                  tR = 0;  // the kernel's rows per call (1, or 4 for a verification batch)
+    axera_cmm            tbias, tmulp, tmuln, ttemp, tkm, tval, tids, tmax, tsum;
     int64_t              tgen = -1;  // the penalty state's generation tbias/tmulp/tmuln hold
     std::vector<float>   tv;
     std::vector<int32_t> ti;
+    // the rows of the last fused run, for the sampler's per-row full-logits fallback
+    ggml_tensor *      flogits = nullptr;
+    void *             fdctx   = nullptr;
+    std::vector<float> fy;
+    std::vector<int>   frows;
+    int                fn_out = 0;
 
     void bind(const kernel & lm, const ggml_tensor * output_weight);
     void bind_topk(const kernel & lm);  // after bind, when the manifest has lm_head.topk
@@ -108,6 +117,10 @@ struct output_head {
     void bind_cpu(const ggml_tensor * output_weight);
     void run(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
              const std::vector<char> * normed = nullptr, const float * last = nullptr);
+    int full_row(int32_t idx, float * out, int32_t n);
+    static int full_row_cb(void * ud, int32_t idx, float * out, int32_t n) {
+        return static_cast<output_head *>(ud)->full_row(idx, out, n);
+    }
     // the logits the caller wrote (a whole-model kernel's) into the graph's: the sampler nodes after them
     static void after(ggml_cgraph * g, const graph_names & names);
 };

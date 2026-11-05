@@ -5,6 +5,8 @@
 // candidates back. The state is process wide: the adapter runs one sequence (-np 1).
 #pragma once
 
+#include "npu_correct.h"
+
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -22,13 +24,23 @@ struct npu_penalty_row {
     float   bias = 0.0f;
 };
 
+struct npu_candidates {
+    std::vector<float>   values;
+    std::vector<int32_t> ids;
+    int32_t              n = 0;  // valid candidates
+    float                vmax = 0.0f, sumexp = 0.0f;
+    bool                 valid = false;
+    bool                 full = false;  // the candidate list cannot serve this row: take() asks for its full logits
+};
+
 struct npu_sampling {
     mutable std::mutex mu;
 
     bool    enabled = false;  // the host chain is one the K candidates serve exactly
     int64_t generation = 0;   // bumps on configure / reset: the adapter initialises the arrays when it changes
     int64_t config_id  = 0;   // bumps on configure only: the sampler that owns the current configuration
-    int32_t K = 0;            // the loaded kernel's candidate count (0: no lm_head.topk kernel)
+    int32_t K = 0;            // the loaded kernel's candidate count per row (0: no lm_head.topk kernel)
+    int32_t R = 0;            // the kernel's row count (1, or 4 for the MTP verification kernels)
 
     // the chain's options the adapter needs to check the one case the candidates alone cannot answer (top_k == 0)
     int32_t top_k = 0;
@@ -44,12 +56,20 @@ struct npu_sampling {
     std::deque<int32_t>        ring;
     std::vector<npu_penalty_row> updates;  // the rows changed since the adapter last took them
 
-    // the fused kernel's last result, for the host sampler
-    std::vector<float>   values;
-    std::vector<int32_t> ids;
-    int32_t              n = 0;
-    float                vmax = 0.0f, sumexp = 0.0f;
-    bool                 valid = false;
+    // the fused kernel's last result, one entry per verification row. The penalty arrays above hold the state up to
+    // the verified prefix; `base_counts` / `base_ring` are that same snapshot. Rows after an accepted token simulate
+    // the <= 3 extra accepts on the host and correct the candidates (or ask for that row's full logits).
+    std::vector<npu_candidates> rows;
+    bool                        valid = false;
+    std::vector<npu_corrected_candidate> scratch;  // npu_take's corrected row (reused)
+    std::unordered_map<int32_t, int> base_counts;
+    std::deque<int32_t>              base_ring;
+    bool                             base_valid = false;
+    std::vector<int32_t>             row_extra;  // tokens accepted since the last publish, i.e. the next row index
+
+    // the adapter's regular head, for a row whose correction is not exact from K candidates
+    int (*full_row_cb)(void *, int32_t, float *, int32_t) = nullptr;
+    void * full_row_ud = nullptr;
 };
 
 npu_sampling & npu_state();
@@ -60,6 +80,11 @@ int  npu_configure(bool enabled, int32_t top_k, float top_p, float min_p, float 
 void npu_reset();
 void npu_accept(int32_t token);
 int  npu_take(float * values, int32_t * ids, int32_t max_k, int32_t * n, float * vmax, float * sumexp);
+int  npu_full_row(int32_t idx, float * out, int32_t n);
+void npu_set_full_row(int (*fn)(void *, int32_t, float *, int32_t), void * ud);
+void * npu_save();
+void   npu_restore(void * state);
+void   npu_free_state(void * state);
 
 struct npu_opts {
     bool    enabled = false;
@@ -71,6 +96,9 @@ int64_t  npu_config_id();
 
 // the adapter: the rows to write and whether the arrays must be reset first; the kernel's result
 void npu_take_updates(std::vector<npu_penalty_row> & rows, int64_t * generation);
-void npu_publish(const float * values, const int32_t * ids, int32_t n, float vmax, float sumexp);
+void npu_publish(const float * values, const int32_t * ids, int32_t n, int32_t rows,
+                 const float * vmax, const float * sumexp, const uint8_t * usable);
+// the kernel's penalty transform on a raw full-logits row, using the state the kernel published with (a check)
+bool npu_base_penalized_row(const float * raw, int32_t n, float * out);
 
 }  // namespace axera

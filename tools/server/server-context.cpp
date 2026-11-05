@@ -19,8 +19,10 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -3520,6 +3522,35 @@ private:
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
+
+            // LLAMA_SPEC_FIXED_DRAFT=<t1,t2,...>: a test hook for the same-process gate. Every round proposes the same
+            // tokens, so a fused run and a full-logit twin (e.g. a zero logit_bias) take the same verification batches.
+            static const std::vector<llama_token> fixed = [] {
+                std::vector<llama_token> ids;
+                const char * e = getenv("LLAMA_SPEC_FIXED_DRAFT");
+                if (!e || !e[0]) {
+                    return ids;
+                }
+                const char * p = e;
+                while (*p) {
+                    char * end = nullptr;
+                    const long v = strtol(p, &end, 10);
+                    if (end == p) {
+                        break;
+                    }
+                    if (v >= 0 && v < INT_MAX) {
+                        ids.push_back((llama_token) v);
+                    }
+                    p = *end == ',' ? end + 1 : end;
+                }
+                return ids;
+            }();
+            if (!fixed.empty() && !draft.empty()) {
+                for (size_t i = 0; i < draft.size(); ++i) {
+                    draft[i] = fixed[i % fixed.size()];
+                }
+                slot.spec_draft_q.clear();  // the fixed ids have no draft distribution
+            }
 
             slot.stats.n_draft_tokens += draft.size();
 
