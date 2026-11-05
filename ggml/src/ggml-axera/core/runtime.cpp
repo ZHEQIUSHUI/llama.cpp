@@ -308,6 +308,15 @@ axera_cmm axera_cmm_alloc(size_t size) {
     return b;
 }
 
+axera_cmm axera_cmm_alloc_raw(size_t size) {
+    auto b  = std::make_unique<ggml_backend_axera_buffer_context>();
+    b->size = GGML_PAD(std::max<size_t>(size, 1), AXERA_ALIGNMENT);
+    if (AX_SYS_MemAllocCached(&b->phy, &b->vir, (AX_U32) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera") != 0) {
+        GGML_ABORT("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
+    }
+    return b;
+}
+
 axera_cmm axera_cmm_alloc_nc(size_t size) {
     auto b  = std::make_unique<ggml_backend_axera_buffer_context>();
     b->size = GGML_PAD(std::max<size_t>(size, 1), AXERA_ALIGNMENT);
@@ -339,6 +348,10 @@ AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, vo
 }
 
 axera_pool & axera_host_pool() {
-    static axera_pool pool(std::min(15, std::max(1, (int) std::thread::hardware_concurrency() - 1)));
+    static axera_pool pool([] {
+        const char * e = std::getenv("AXERA_HOST_POOL_THREADS");
+        const int    n = e ? std::atoi(e) : 0;
+        return n > 0 ? n : std::min(15, std::max(1, (int) std::thread::hardware_concurrency() - 1));
+    }());
     return pool;
 }
