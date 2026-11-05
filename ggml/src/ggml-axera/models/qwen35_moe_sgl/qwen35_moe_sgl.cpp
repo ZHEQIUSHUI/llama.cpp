@@ -193,7 +193,6 @@ class qwen35_moe_sgl final : public model {
         return axera_io(c.get(), (char *) c->vir + (size_t) idx * (z / n), bytes);
     }
     // the paged KV of attention layer j: entry j of the shared pool b3_kv, or its own pool (inputs b3_kv<j>)
-    axera_cmm              KVALL;  // one allocation behind the per-layer views: the pools stay contiguous in CMM
     std::vector<axera_cmm> KVL;
     int                    kv_pages = 0;
     int64_t                kv_cells = 0;
@@ -616,15 +615,11 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         if (const char * e = getenv("GGML_AXERA_KV_PAGES")) {
             kv_pages = std::max(1, std::min(NP, atoi(e)));
         }
-        // One allocation: ten separate 8 MiB (at -c 8192) buffers scatter the per-layer pages across CMM, while the
-        // release's single pool kept them adjacent. The kernel still gets its ten b3_kv<j> inputs, as views here.
-        const size_t kv_stride = (size_t) kv_pages * page_kv;
-        KVALL = axera_cmm_alloc(kv_stride * NB);
-        memset(KVALL->vir, 0, KVALL->size);
-        KVALL->flush();
         for (int j = 0; j < NB; ++j) {
             GGML_ASSERT(logical("b3_kv" + std::to_string(j)) == (size_t) NP * page_kv);
-            KVL.push_back(axera_cmm_view(KVALL.get(), j * kv_stride, kv_stride));
+            KVL.push_back(axera_cmm_alloc((size_t) kv_pages * page_kv));
+            memset(KVL[j]->vir, 0, KVL[j]->size);
+            KVL[j]->flush();
         }
         GGML_LOG_INFO("axera qwen35_moe_sgl: KV pools of %d of the kernels' %d pages (%lld cells), %.2f GiB\n", kv_pages, NP,
                       (long long) kv_pages * PG, NB * (double) kv_pages * page_kv / 1073741824.0);
