@@ -2681,7 +2681,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
     if (has_mixed) {
         inp->mixed_slots = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tok_rows);
-        cb(inp->mixed_slots, "inp_mixed_slots", -1);
+        cb(inp->mixed_slots, cparams.dummy_batch ? "inp_mixed_slots_dummy" : "inp_mixed_slots", -1);
         ggml_set_input(inp->mixed_slots);
 
         inp->mixed_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);

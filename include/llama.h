@@ -1124,6 +1124,9 @@ extern "C" {
     DEPRECATED(LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup),
             "user code should do warmup runs manually [TAG_LLAMA_GRAPH_NO_WARMUP]");
 
+    // Mark the next batch as a dummy warm-up batch: the model does not need the state it leaves behind.
+    LLAMA_API void llama_set_dummy_batch(struct llama_context * ctx, bool dummy);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

@@ -1523,7 +1523,9 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             common_batch batch = common_batch_get_one(lctx, tmp);
             std::vector<float> zeros;
             common_batch_set_zero_state(batch, model, zeros);
+            llama_set_dummy_batch(lctx, true);
             llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            llama_set_dummy_batch(lctx, false);
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);

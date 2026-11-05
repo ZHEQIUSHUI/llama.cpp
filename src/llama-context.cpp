@@ -209,6 +209,7 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
+    cparams.dummy_batch             = false;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
@@ -1396,6 +1397,10 @@ void llama_context::set_warmup(bool value) {
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
+}
+
+void llama_context::set_dummy_batch(bool value) {
+    cparams.dummy_batch = value;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -4240,6 +4245,10 @@ bool llama_get_causal_attn(const llama_context * ctx) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_dummy_batch(llama_context * ctx, bool dummy) {
+    ctx->set_dummy_batch(dummy);
 }
 
 void llama_synchronize(llama_context * ctx) {
