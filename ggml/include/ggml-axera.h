@@ -31,9 +31,17 @@ typedef struct ggml_axera_npu_sampling {
                      int32_t penalty_last_n, float repeat, float freq, float present);
     void (*reset)(void);
     void (*accept)(int32_t token);
-    // the adapter's candidates: sorted by logit, the penalised logits and their token ids, max and the full-vocabulary
-    // sum(exp((l - max) / temp)); returns 0 when there are none (the full logits are then the only path)
+    // the adapter's next row of candidates (verification rows are taken in order): sorted by logit, the penalised
+    // logits and their token ids, max and the full-vocabulary sum(exp((l - max) / temp)).
+    // 1: candidates, 0: none (the full logits are already the path), -1: this row needs its full logits
     int (*take)(float * values, int32_t * ids, int32_t max_k, int32_t * n, float * vmax, float * sumexp);
+    // compute the full logits row requested by take() == -1 (the adapter's regular head), for graph logits index idx,
+    // into out[0..n); 1 on success
+    int (*full_row)(int32_t idx, float * out, int32_t n);
+    // the penalty state, for a sampler checkpoint: restore bumps the generation and republishes the restored rows
+    void * (*save)(void);
+    void   (*restore)(void * state);
+    void   (*free_state)(void * state);
     // the configuration's id: a sampler that is freed disables the path only when it still owns it
     int64_t (*config_id)(void);
 } ggml_axera_npu_sampling;

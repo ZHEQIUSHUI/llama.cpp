@@ -1466,6 +1466,9 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
     }
     axera_timer th("output head");
     head.bind(man.get("lm_head"), logits->src[0]);
+    if (man.has("lm_head.topk")) {
+        head.bind_topk(man.get("lm_head.topk"));
+    }
     head.run(g, names, h, T);
     if (warmup) {
         zero_state();

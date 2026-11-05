@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -432,14 +433,18 @@ void output_head::bind_topk(const kernel & lm) {
     }
     tk = &lm;
     const int64_t N = w->ne[1], K = w->ne[0];
-    tK              = (int) (lm.out_bytes("values") / sizeof(float));
-    GGML_ASSERT(tK > 0 && lm.find_input("m") < 0 && lm.find_input("bias") >= 0 && lm.find_input("mul_pos") >= 0 &&
+    tR              = (int) (lm.in_bytes("x") / (K * sizeof(ggml_bf16_t)));
+    GGML_ASSERT(tR == 1 || tR == 4);
+    tK              = (int) (lm.out_bytes("values") / (sizeof(float) * tR));
+    GGML_ASSERT(tK > 0 && (tR == 1 || lm.find_input("m") >= 0) && lm.find_input("bias") >= 0 && lm.find_input("mul_pos") >= 0 &&
                 lm.find_input("mul_neg") >= 0 && lm.find_input("temp") >= 0 &&
-                lm.in_bytes("x") == K * sizeof(ggml_bf16_t) && lm.in_bytes("w") == N * K / 2 &&
+                lm.in_bytes("x") == (uint32_t) (tR * K * sizeof(ggml_bf16_t)) && lm.in_bytes("w") == N * K / 2 &&
                 lm.in_bytes("s") == N * K / AXERA_MX_GROUP && lm.in_bytes("bias") == N * sizeof(float) &&
                 lm.in_bytes("mul_pos") == N * sizeof(float) && lm.in_bytes("mul_neg") == N * sizeof(float) &&
-                lm.in_bytes("temp") == sizeof(float) && lm.out_bytes("ids") == tK * sizeof(int32_t) &&
-                lm.out_bytes("vmax") == sizeof(float) && lm.out_bytes("sumexp") == sizeof(float));
+                lm.in_bytes("temp") == sizeof(float) && (tR == 1 || lm.in_bytes("m") == sizeof(int32_t)) &&
+                lm.out_bytes("ids") == (uint32_t) (tK * tR * sizeof(int32_t)) &&
+                lm.out_bytes("vmax") == (uint32_t) (tR * sizeof(float)) &&
+                lm.out_bytes("sumexp") == (uint32_t) (tR * sizeof(float)));
     // the penalty state is the host sampler's: only the 1-2 rows that change per step are written (non-cacheable, so
     // the NPU sees them without a clean)
     tbias = axera_cmm_alloc_nc(N * sizeof(float));
@@ -449,12 +454,16 @@ void output_head::bind_topk(const kernel & lm) {
     std::fill((float *) tmuln->vir, (float *) tmuln->vir + N, 1.0f);
     ttemp = axera_cmm_alloc_nc(sizeof(float));
     *(float *) ttemp->vir = 1.0f;
-    tval  = axera_cmm_alloc(tK * sizeof(float));
-    tids  = axera_cmm_alloc(tK * sizeof(int32_t));
-    tmax  = axera_cmm_alloc(sizeof(float));
-    tsum  = axera_cmm_alloc(sizeof(float));
-    tv.resize(tK);
-    ti.resize(tK);
+    tval  = axera_cmm_alloc((size_t) tR * tK * sizeof(float));
+    tids  = axera_cmm_alloc((size_t) tR * tK * sizeof(int32_t));
+    tmax  = axera_cmm_alloc((size_t) tR * sizeof(float));
+    tsum  = axera_cmm_alloc((size_t) tR * sizeof(float));
+    if (tR > 1) {
+        tkm = axera_cmm_alloc(sizeof(int32_t));
+    }
+    tv.resize((size_t) tR * tK);
+    ti.resize((size_t) tR * tK);
+    tx = axera_cmm_alloc((size_t) tR * K * sizeof(ggml_bf16_t));
     tgen = -1;
 }
 
@@ -792,6 +801,55 @@ void output_head::bind_cpu(const ggml_tensor * output_weight) {
     }
 }
 
+// the sampler found that a verification row cannot be served by the K candidates: project that row through the regular
+// head into the caller's host buffer. The run that published the candidates kept its normed rows for this.
+int output_head::full_row(int32_t idx, float * out, int32_t n) {
+    if (!k || fn_out <= 0 || !out || n <= 0) {
+        return 0;
+    }
+    const int64_t N = w->ne[1], K = w->ne[0];
+    if (n < N) {
+        return 0;
+    }
+    int r = -1;
+    for (int i = 0; i < fn_out; ++i) {
+        if (frows[i] == idx) {
+            r = i;
+            break;
+        }
+    }
+    if (r < 0) {
+        r = idx;
+    }
+    if (r < 0 || r >= fn_out || (size_t) (r + 1) * K > fy.size()) {
+        return 0;
+    }
+    ggml_fp32_to_bf16_row(fy.data() + (size_t) r * K, (ggml_bf16_t *) x->vir, K);
+    x->flush(x->vir, K * sizeof(ggml_bf16_t));
+    std::vector<AX_ENGINE_IO_BUFFER_T> in(k->info->nInputSize), out_io(k->info->nOutputSize);
+    in[k->input("x")] = axera_io(x);
+    in[k->input("w")] = axera_io(q, N * K / 2);
+    in[k->input("s")] = axera_io(s, N * K / AXERA_MX_GROUP);
+    if (R > 1) {
+        *(int32_t *) mk->vir = 1;
+        mk->flush();
+        in[k->input("m")] = axera_io(mk);
+        out_io[k->output("out")] = axera_io(yk);
+        k->run(in, out_io, "output head (fallback row)");
+        yk->invalidate(yk->vir, N * sizeof(float));
+        memcpy(out, (const float *) yk->vir, N * sizeof(float));
+    } else {
+        if (!ffull) {
+            ffull = axera_cmm_alloc(N * sizeof(float));
+        }
+        out_io[k->output("out")] = axera_io(ffull);
+        k->run(in, out_io, "output head (fallback row)");
+        ffull->invalidate(ffull->vir, N * sizeof(float));
+        memcpy(out, (const float *) ffull->vir, N * sizeof(float));
+    }
+    return 1;
+}
+
 // the projection in f32, once
 static void head_f32(const ggml_tensor * w, std::vector<float> & wf) {
     const int64_t N = w->ne[1], K = w->ne[0];
@@ -882,14 +940,31 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         ((ggml_backend_axera_buffer_context *) rn->buffer->context)->flush(rn->data, ggml_nbytes(rn));
     }
     auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
-    // the fused head: one decode row through lm_head.topk, which applies the host sampler's penalty state and keeps
-    // the exact top-K, so common/sampling can run the chain on K candidates instead of the vocabulary
-    if (tk && !draft && n_out == 1 && T == 1 && !last &&
+    static const bool fuse_dbg = [] {
+        const char * e = getenv("LLAMA_NPU_SAMPLING_FUSE_DEBUG");
+        return e && e[0] && strcmp(e, "0") != 0;
+    }();
+    if (tk && fuse_dbg) {
+        fprintf(stderr, "npu fuse: T=%d n_out=%d tR=%d draft=%d last=%d\n", T, n_out, tR, (int) draft,
+                (int) (last != nullptr));
+    }
+    // the fused head: the decode row(s) through lm_head.topk, which applies the host sampler's penalty state and keeps
+    // the exact top-K, so common/sampling can run the chain on K candidates instead of the vocabulary. A verification
+    // batch fills all of the kernel's rows in one call (m: the valid ones).
+    // the output rows are the whole batch: a single decode row or the verification's draft + target rows. A prompt
+    // batch has many input rows but only its last output row, and keeps the regular head's logits.
+    if (tk && !draft && n_out >= 1 && n_out <= tR && T == n_out && !last &&
         (!names.find("result_output") || graph_head(names) == names.find("result_output"))) {
         const npu_opts opts = npu_get_options();
         if (opts.enabled && opts.K == tK) {
-            ggml_fp32_to_bf16_row(y.data(), (ggml_bf16_t *) x->vir, K);
-            x->flush(x->vir, K * sizeof(ggml_bf16_t));
+            for (int r = 0; r < tR; ++r) {
+                if (r < n_out) {
+                    ggml_fp32_to_bf16_row(y.data() + (size_t) r * K, (ggml_bf16_t *) tx->vir + (size_t) r * K, K);
+                } else {
+                    memset((ggml_bf16_t *) tx->vir + (size_t) r * K, 0, K * sizeof(ggml_bf16_t));
+                }
+            }
+            tx->flush(tx->vir, (size_t) tR * K * sizeof(ggml_bf16_t));
             std::vector<npu_penalty_row> upd;
             int64_t                      gen = 0;
             npu_take_updates(upd, &gen);
@@ -906,55 +981,118 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
                 memcpy((float *) tmuln->vir + r.token, &r.mul_neg, sizeof(float));
             }
             *(float *) ttemp->vir = opts.temp;
+            if (tR > 1) {
+                *(int32_t *) tkm->vir = n_out;
+                tkm->flush();
+            }
             std::vector<AX_ENGINE_IO_BUFFER_T> tin(tk->info->nInputSize), tout(tk->info->nOutputSize);
-            tin[tk->input("x")]       = axera_io(x, K * sizeof(ggml_bf16_t));
+            tin[tk->input("x")]       = axera_io(tx, (size_t) tR * K * sizeof(ggml_bf16_t));
             tin[tk->input("w")]       = axera_io(q, N * K / 2);
             tin[tk->input("s")]       = axera_io(s, N * K / AXERA_MX_GROUP);
             tin[tk->input("bias")]    = axera_io(tbias, N * sizeof(float));
             tin[tk->input("mul_pos")] = axera_io(tmulp, N * sizeof(float));
             tin[tk->input("mul_neg")] = axera_io(tmuln, N * sizeof(float));
             tin[tk->input("temp")]    = axera_io(ttemp, sizeof(float));
-            tout[tk->output("values")] = axera_io(tval, tK * sizeof(float));
-            tout[tk->output("ids")]    = axera_io(tids, tK * sizeof(int32_t));
-            tout[tk->output("vmax")]   = axera_io(tmax, sizeof(float));
-            tout[tk->output("sumexp")] = axera_io(tsum, sizeof(float));
+            if (tR > 1) {
+                tin[tk->input("m")] = axera_io(tkm, sizeof(int32_t));
+            }
+            tout[tk->output("values")] = axera_io(tval, (size_t) tR * tK * sizeof(float));
+            tout[tk->output("ids")]    = axera_io(tids, (size_t) tR * tK * sizeof(int32_t));
+            tout[tk->output("vmax")]   = axera_io(tmax, (size_t) tR * sizeof(float));
+            tout[tk->output("sumexp")] = axera_io(tsum, (size_t) tR * sizeof(float));
             {
                 axera_timer ttk("lm_head.topk");
                 tk->run(tin, tout, "lm_head.topk");
             }
-            tval->invalidate(tval->vir, tK * sizeof(float));
-            tids->invalidate(tids->vir, tK * sizeof(int32_t));
-            tmax->invalidate(tmax->vir, sizeof(float));
-            tsum->invalidate(tsum->vir, sizeof(float));
-            memcpy(tv.data(), tval->vir, tK * sizeof(float));
-            memcpy(ti.data(), tids->vir, tK * sizeof(int32_t));
-            const float vmax_ = *(const float *) tmax->vir;
-            const float zsum_ = *(const float *) tsum->vir;
-            // with no top-k the chain's top-p normalises over the whole vocabulary: the K candidates are enough only
-            // when the nucleus (and the min-p set) ends inside them. Otherwise the full logits are needed after all.
-            bool fits = true;
-            if (opts.top_k == 0) {
-                if (opts.min_p > 0.0f && tv[tK - 1] >= vmax_ + opts.temp_minp * logf(opts.min_p)) {
-                    fits = false;
-                }
-                if (fits && opts.top_p < 1.0f) {
-                    const double thr = (double) opts.top_p * (double) zsum_;
-                    double       cum = 0.0;
-                    bool         hit = false;
-                    for (int i = 0; i < tK && !hit; ++i) {
-                        cum += (double) expf((tv[i] - vmax_) / opts.temp);
-                        hit  = cum >= thr;
+            tval->invalidate(tval->vir, (size_t) tR * tK * sizeof(float));
+            tids->invalidate(tids->vir, (size_t) tR * tK * sizeof(int32_t));
+            tmax->invalidate(tmax->vir, (size_t) tR * sizeof(float));
+            tsum->invalidate(tsum->vir, (size_t) tR * sizeof(float));
+            memcpy(tv.data(), tval->vir, (size_t) tR * tK * sizeof(float));
+            memcpy(ti.data(), tids->vir, (size_t) tR * tK * sizeof(int32_t));
+            std::vector<uint8_t> usable(tR, 0);
+            for (int r = 0; r < n_out; ++r) {
+                const float * vr = tv.data() + (size_t) r * tK;
+                const float   vm = ((const float *) tmax->vir)[r];
+                const float   zs = ((const float *) tsum->vir)[r];
+                // with no top-k the chain's top-p normalises over the whole vocabulary: the K candidates are enough only
+                // when the nucleus (and the min-p set) ends inside them. Otherwise this row needs its full logits.
+                bool fits = true;
+                if (opts.top_k == 0) {
+                    if (opts.min_p > 0.0f && vr[tK - 1] >= vm + opts.temp_minp * logf(opts.min_p)) {
+                        fits = false;
                     }
-                    fits = hit;
-                } else if (fits && opts.top_p >= 1.0f && opts.min_p <= 0.0f) {
-                    fits = false;  // the distribution would run over the vocabulary
+                    if (fits && opts.top_p < 1.0f) {
+                        const double thr = (double) opts.top_p * (double) zs;
+                        double       cum = 0.0;
+                        int          last = -1;
+                        for (int i = 0; i < tK; ++i) {
+                            cum += (double) expf((vr[i] - vm) / opts.temp);
+                            if (cum >= thr) {
+                                last = i;
+                                break;
+                            }
+                        }
+                        // the host cuts with float arithmetic on the same values; keep two candidates of headroom so a
+                        // rounding difference at the last row cannot silently drop a token the full nucleus keeps
+                        fits = last >= 0 && last + 2 < tK;
+                    } else if (fits && opts.top_p >= 1.0f && opts.min_p <= 0.0f) {
+                        fits = false;  // the distribution would run over the vocabulary
+                    }
+                }
+                usable[r] = fits;
+            }
+            npu_publish(tv.data(), ti.data(), tK, n_out, (const float *) tmax->vir, (const float *) tsum->vir,
+                        usable.data());
+            // the sampler's per-row fallback: the rows of this run, their normed inputs and the graph's logits
+            flogits = logits;
+            fdctx   = dctx;
+            fy      = std::move(y);
+            frows   = std::move(rows);
+            fn_out  = n_out;
+            npu_set_full_row(&output_head::full_row_cb, this);
+            // LLAMA_NPU_SAMPLING_CHECK_ROWS=1: project every row again through the regular head, apply the kernel's
+            // penalty transform on the host and compare the top of that row with the fused candidates. This checks the
+            // kernel and the row mapping independently of the sampler (it is the slow check for a short run).
+            static const bool check_rows = [] {
+                const char * e = getenv("LLAMA_NPU_SAMPLING_CHECK_ROWS");
+                return e && e[0] && strcmp(e, "0") != 0;
+            }();
+            if (check_rows) {
+                std::vector<float>   frow(N), pen(N);
+                std::vector<int32_t> order(N);
+                for (int r = 0; r < n_out; ++r) {
+                    if (!full_row(frows[r], frow.data(), (int32_t) N) ||
+                        !npu_base_penalized_row(frow.data(), (int32_t) N, pen.data())) {
+                        fprintf(stderr, "npu rows check: r=%d failed\n", r);
+                        continue;
+                    }
+                    for (int i = 0; i < N; ++i) {
+                        order[i] = i;
+                    }
+                    const int top = 16;
+                    std::partial_sort(order.begin(), order.begin() + top, order.end(),
+                                      [&](int32_t a, int32_t b) { return pen[a] > pen[b]; });
+                    const int32_t * kid = ti.data() + (size_t) r * tK;
+                    const float *   kv  = tv.data() + (size_t) r * tK;
+                    int             hit = 0;
+                    float           dv  = 0.0f;
+                    for (int j = 0; j < top; ++j) {
+                        for (int q = 0; q < top; ++q) {
+                            if ((int32_t) kid[j] == order[q]) {
+                                ++hit;
+                                dv = std::max(dv, fabsf(kv[j] - pen[order[q]]));
+                                break;
+                            }
+                        }
+                    }
+                    fprintf(stderr, "npu rows check: r=%d kernel_argmax=%d full_argmax=%d overlap16=%d maxdv=%.3g "
+                                    "vmax_diff=%.3g\n",
+                            r, (int) kid[0], (int) order[0], hit, dv, fabsf(((const float *) tmax->vir)[r] - pen[order[0]]));
                 }
             }
-            if (fits) {
-                npu_publish(tv.data(), ti.data(), tK, vmax_, zsum_);
-                after(g, names);
-                return;
-            }
+            after(g, names);
+            return;
         }
     }
     if (draft && dk && n_out == 1 && !(last && rows[0] == T - 1)) {  // the draft head
