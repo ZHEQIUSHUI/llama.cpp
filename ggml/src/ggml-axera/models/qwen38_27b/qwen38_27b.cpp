@@ -1101,7 +1101,15 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
     }
     axera_timer th("output head");
     head.bind(man.get("lm_head"), logits->src[0]);
-    head.run(g, names, h, T);
+    const bool combined = head.bind_combined(man.get("lm_head"), logits->src[0]) && head.combined_ready(g, names);
+    if (combined && man.has("lm_head.verify")) {
+        head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
+    }
+    if (combined) {
+        head.run_combined(g, names, h, T, nullptr, nullptr);
+    } else {
+        head.run(g, names, h, T);
+    }
     return GGML_STATUS_SUCCESS;
 }
 

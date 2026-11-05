@@ -8,7 +8,9 @@
 //   prefill.padding zeros the workspace rows beyond the live token count.
 // Prefill is layer-outer over up to 4096 tokens: for each layer, run 256-row attention chunks, clear the padded rows,
 // then run the fixed 4096-row MoE. The decode and prefill kernels read the same NVFP4 weight banks.
-// The state is this adapter's (the decode kernel's banks): KV cache paged [10][64 pages][K, V][256][2 x 256] bf16,
+// The state is this adapter's (the decode kernel's banks): KV cache paged [10][64 pages][K, V][256][2 x 256] bf16 (a
+// long-context decode kernel instead takes one input b3_kv<j> [pages][K, V][256][2 x 256] per attention layer, its pools
+// holding only the pages of llama.cpp's -c),
 // delta-net states [30][32][128][128] f32, conv states q / k [30][3][2048], v [30][3][4096] bf16 (value heads in HF
 // order). The prefill kernels write the recurrent states to a second set, the two swapped after each page. One
 // sequence. Weights only from the GGUF: every projection and expert row is quantized to NVFP4 (E2M1 pairs, an E4M3
@@ -123,10 +125,6 @@ class qwen35_moe_sgl final : public model {
     // the upstream fused RMSNorm + projection head, for one-row decodes (see output_head::bind_fused)
     bool      fh_loaded = false;
     bool      fh_ok     = false;
-    // the fused decode head's readiness and I/O, prepared on the prebuilt decode graph and reused per token
-    ggml_tensor * fdec_logits = nullptr;
-    uint64_t      fdec_uid    = 0;
-    bool          fdec_ok     = false;
     // the recurrent state at the first cell of the current page (snap_cell), and the inputs of that page's cells so far
     std::vector<uint8_t>     snap;
     int64_t                  snap_cell = -1;
@@ -190,6 +188,16 @@ class qwen35_moe_sgl final : public model {
         }
         return axera_io(c.get(), (char *) c->vir + (size_t) idx * (z / n), bytes);
     }
+    // the paged KV of attention layer j: entry j of the shared pool b3_kv, or its own pool (inputs b3_kv<j>)
+    std::vector<axera_cmm> KVL;
+    int                    kv_pages = 0;
+    int64_t                kv_cells = 0;
+    AX_ENGINE_IO_BUFFER_T  kv_io(int j, uint32_t bytes) {
+        if (KVL.empty()) {
+            return slice("b3_kv", j, bytes);
+        }
+        return axera_io(KVL.at(j).get(), KVL[j]->vir, bytes);  // (the kernel touches only the pages up to the history)
+    }
     void         states_swap();
     void         sync_dec_states();
     void         zero_state();
@@ -201,7 +209,6 @@ class qwen35_moe_sgl final : public model {
                          const int32_t * toks,
                          const int32_t * p4, std::vector<float> & h, const std::vector<int> & out_rows);
     void         decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h);
-    bool         fused_decode_ready(ggml_cgraph * g, const graph_names & t, ggml_tensor * logits);
     void         prewarm(ggml_cgraph * g) override;
 };
 
@@ -591,7 +598,28 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     }
     ONES->flush();
     ZERO = axera_cmm_alloc(4096);
-    const int NP = (int) logical("b3_kv") / (NB * 2 * PG * 2 * 256 * 2);  // pages
+    const bool   split   = logical("b3_kv0") > 0;  // one KV input per attention layer
+    const size_t page_kv = (size_t) 2 * PG * 2 * 256 * 2;
+    const int    NP      = (int) (split ? logical("b3_kv0") / page_kv : logical("b3_kv") / (NB * page_kv));  // pages
+    kv_pages             = NP;
+    KVL.clear();
+    if (split) {
+        if (const int64_t cells = axera_kv_cells(); cells > 0) {  // llama.cpp's -c
+            kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(NP, (cells + PG - 1) / PG));
+        }
+        if (const char * e = getenv("GGML_AXERA_KV_PAGES")) {
+            kv_pages = std::max(1, std::min(NP, atoi(e)));
+        }
+        for (int j = 0; j < NB; ++j) {
+            GGML_ASSERT(logical("b3_kv" + std::to_string(j)) == (size_t) NP * page_kv);
+            KVL.push_back(axera_cmm_alloc((size_t) kv_pages * page_kv));
+            memset(KVL[j]->vir, 0, KVL[j]->size);
+            KVL[j]->flush();
+        }
+        GGML_LOG_INFO("axera qwen35_moe_sgl: KV pools of %d of the kernels' %d pages (%lld cells), %.2f GiB\n", kv_pages, NP,
+                      (long long) kv_pages * PG, NB * (double) kv_pages * page_kv / 1073741824.0);
+    }
+    kv_cells = (int64_t) kv_pages * PG;
     DX      = axera_cmm_alloc(dk.in_bytes("x"));
     DA      = axera_cmm_alloc(dk.in_bytes("attention"));
     DOUT    = axera_cmm_alloc(dk.out_bytes("output"));
@@ -677,8 +705,12 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
             dec.in.push_back(axera_io(META.get(), (char *) META->vir + META_CLOC, d.bytes));
         } else {
             const axera_cmm * b = n == "x" ? &DX : n == "attention" ? &DA : n == "position_ids" ? &DPOS :
-                                  n == "indices" ? &INDICES : &B(n);
-            dec.in.push_back(axera_io(*b, d.bytes));
+                                  n == "indices" ? &INDICES : nullptr;
+            if (split && n.rfind("b3_kv", 0) == 0) {
+                dec.in.push_back(kv_io(std::stoi(n.substr(5)), d.bytes));
+            } else {
+                dec.in.push_back(axera_io(b ? *b : B(n), d.bytes));
+            }
         }
     }
     dec.out.push_back(axera_io(DOUT, dk.out_bytes("output")));
@@ -722,7 +754,7 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
                 } else if (n.rfind("w_zeropoint_", 0) == 0) {
                     c.in.push_back(axera_io(ZERO, d.bytes));
                 } else if (n == "paged_kv_cache") {
-                    c.in.push_back(slice("b3_kv", ord[il], d.bytes));
+                    c.in.push_back(kv_io(ord[il], d.bytes));
                 } else if (n == "cos_sin_cache") {
                     c.in.push_back(axera_io(B("b3_attn_cos_sin_cache"), d.bytes));
                 } else if (n == "state_in" || n == "q_conv_state_in" || n == "k_conv_state_in" || n == "v_conv_state_in") {
@@ -971,7 +1003,7 @@ void qwen35_moe_sgl::init_fused() {
                 } else if (n.rfind("w_zeropoint_", 0) == 0) {
                     v.push_back(axera_io(ZERO, d.bytes));
                 } else if (n == "paged_kv_cache") {
-                    v.push_back(slice("b3_kv", ord[il], d.bytes));
+                    v.push_back(kv_io(ord[il], d.bytes));
                 } else if (n == "cos_sin_cache") {
                     v.push_back(axera_io(B("b3_attn_cos_sin_cache"), d.bytes));
                 } else if (n == "moe_input_norm_w" || (phase == 3 && n == "input_norm_w")) {  // the post-attention norm
@@ -1018,7 +1050,7 @@ void qwen35_moe_sgl::snap_layer(int il, int set) {
 // prefill with the fused kernels: groups of up to NR rows (pages) from cell c0 (a page's first), each layer by layer:
 // its pages through the layer kernel (the states alternating between the two sets page by page), then its experts
 void qwen35_moe_sgl::prefill_fused(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0) {
-    GGML_ASSERT(c0 % PG == 0 && c0 + n <= man.context);
+    GGML_ASSERT(c0 % PG == 0 && c0 + n <= kv_cells);
     const size_t xr = (size_t) H * sizeof(ggml_bf16_t);
     const int    NR = (int) (XS->size / xr);
     for (int g0 = 0; g0 < n; g0 += NR) {
@@ -1257,7 +1289,7 @@ void qwen35_moe_sgl::embed_tokens(const int32_t * toks, int n) {
 void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const float * xf, size_t xf_nb1,
                              const int32_t * toks, const int32_t * p4, std::vector<float> & h,
                              const std::vector<int> & out_rows) {
-    GGML_ASSERT(c0 % PG == 0 && c0 + n <= man.context);
+    GGML_ASSERT(c0 % PG == 0 && c0 + n <= kv_cells);
     GGML_ASSERT((x != nullptr) + (xf != nullptr) + (toks != nullptr) == 1);
     const size_t xr = (size_t) H * sizeof(ggml_bf16_t);
     for (int r0 = 0; r0 < n; r0 += WN) {
@@ -1435,44 +1467,16 @@ void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4
 }
 
 void qwen35_moe_sgl::prewarm(ggml_cgraph * g) {
-    // llama.cpp prebuilds the next decode graph at the end of a prompt's call: do its one-time work there, not in the
-    // first generated token
+    // the name map is the adapter's only per-graph one-time host cost; llama.cpp prebuilds the next decode graph at
+    // the end of a prompt's call, so building its map there keeps it out of the first generated token
     names.of(g);
-    ggml_tensor * logits = names.find("result_output");
-    if (logits && logits->src[0]) {
-        fused_decode_ready(g, names, logits);
-    }
-    names.alias_first_split(g->stable_uid);
-}
-
-bool qwen35_moe_sgl::fused_decode_ready(ggml_cgraph * g, const graph_names & t, ggml_tensor * logits) {
-    // prewarm sees the parent graph, compute its one backend split: both name the same tensor objects
-    const bool cached = logits == fdec_logits &&
-        (g->stable_uid == fdec_uid || (fdec_uid && g->stable_uid == ((fdec_uid << 8) | 1)));
-    if (cached) {
-        return fdec_ok;
-    }
-    head.bind(man.get("lm_head"), logits->src[0]);
-    if (!fh_loaded) {
-        fh_loaded = true;
-        const char * e = getenv("GGML_AXERA_FUSED_HEAD");
-        if (!e || atoi(e) != 0) {
-            const auto & fk = man.load_memory("lm_head_fused", std::vector<char>(
-                (const char *) FUSED_HEAD_AXMODEL, (const char *) FUSED_HEAD_AXMODEL + FUSED_HEAD_AXMODEL_SIZE));
-            fh_ok = head.bind_fused(fk, logits->src[0]);
-        }
-    }
-    fdec_logits = logits;
-    fdec_uid    = g->stable_uid;
-    fdec_ok     = fh_ok && head.fused_ready(g, t);
-    if (fdec_ok) {
-        head.prepare_fused(g, t, DOUT);
-    }
-    return fdec_ok;
 }
 
 ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
+    static const bool ct_on = getenv("LLAMA_GRAPH_PROF") != nullptr;
+    const int64_t     ct_0  = ct_on ? ggml_time_us() : 0;
     const auto &  t       = names.of(g);
+    const int64_t ct_names = ct_on ? ggml_time_us() : 0;
     axera_timer   t_pre1("compute pre (early)");
     ggml_tensor * norm0   = names.find("attn_norm-0");
     ggml_tensor * logits  = names.find("result_output");
@@ -1581,12 +1585,12 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     tpos.stop();
     axera_timer tout("compute pre: out rows");
     const int n_out = (int) logits->ne[1];
-    GGML_ASSERT(n_out > 0 && n_out <= T);
-    const ggml_tensor * out_ids = n_out < T ? names.find("out_ids") : nullptr;
+    GGML_ASSERT(n_out >= 0 && n_out <= T);
+    const ggml_tensor * out_ids = n_out > 0 && n_out < T ? names.find("out_ids") : nullptr;
     if (out_ids && (out_ids->type != GGML_TYPE_I32 || out_ids->ne[0] != n_out)) {
         out_ids = nullptr;
     }
-    if (n_out < T && !out_ids) {
+    if (n_out > 0 && n_out < T && !out_ids) {
         for (int i = 0; i < g->n_nodes; i++) {
             const ggml_tensor * node = g->nodes[i];
             if (node->op == GGML_OP_GET_ROWS && node->src[1] && node->src[1]->type == GGML_TYPE_I32 &&
@@ -1595,7 +1599,7 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             }
         }
     }
-    GGML_ASSERT(n_out == T || out_ids);
+    GGML_ASSERT(n_out == 0 || n_out == T || out_ids);
     orows.resize((size_t) n_out);
     std::vector<int> & out_rows = orows;
     for (int r = 0; r < n_out; ++r) {
@@ -1607,10 +1611,30 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     std::vector<float> & h = hb;
     tout.stop();
     t_pre2.stop();
-    const bool fused_dec = T == 1 && n_out == 1 && fused_decode_ready(g, names, logits);
-    if (!fused_dec) {
+    const int64_t ct_pre = ct_on ? ggml_time_us() : 0;
+    bool combined_dec = false;
+    if (n_out > 0) {
         head.bind(man.get("lm_head"), logits->src[0]);
+        combined_dec = head.bind_combined(man.get("lm_head"), logits->src[0]);
+        combined_dec = combined_dec && head.combined_ready(g, names);
+        if (man.has("lm_head.verify")) {
+            head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
+        }
     }
+    bool fused_dec = false;
+    if (!combined_dec && T == 1 && n_out == 1) {
+        if (!fh_loaded) {
+            fh_loaded = true;
+            const char * e = getenv("GGML_AXERA_FUSED_HEAD");
+            if (!e || atoi(e) != 0) {
+                const auto & fk = man.load_memory("lm_head_fused", std::vector<char>(
+                    (const char *) FUSED_HEAD_AXMODEL, (const char *) FUSED_HEAD_AXMODEL + FUSED_HEAD_AXMODEL_SIZE));
+                fh_ok = head.bind_fused(fk, logits->src[0]);
+            }
+        }
+        fused_dec = fh_ok && head.fused_ready(g, names);
+    }
+    const int64_t ct_bind = ct_on ? ggml_time_us() : 0;
     axera_timer        tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
     const int64_t      c0 = kv.cell_of(0);
     if (c0 == 0) {  // a new sequence
@@ -1674,7 +1698,8 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
                            (long long) state_cell);
             return GGML_STATUS_FAILED;
         }
-        float * hd = fused_dec ? nullptr : h.data();
+        const bool direct_x = combined_dec && T == 1 && n_out == 1;
+        float * hd = (fused_dec || direct_x) ? nullptr : h.data();
         if (direct_embed) {
             decode(c0, xb1.data(), pb.data(), hd);
         } else if (token_ids) {
@@ -1691,16 +1716,36 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             decode(c0, xb.data(), pb.data(), hd);
         }
     }
-    axera_timer th(T > 256 ? "output head (prompt)" : T > 1 ? "output head (warmup)" : "output head (decode)");
-    if (fused_dec) {
-        head.run_fused(g, names, DOUT);
-    } else {
-        head.run(g, names, h, T, nullptr, nullptr, &out_rows);
+    if (n_out > 0) {
+        axera_timer th(T > 256 ? "output head (prompt)" : T > 1 ? "output head (warmup)" : "output head (decode)");
+        if (combined_dec) {
+            const bool direct_x = T == 1 && n_out == 1;
+            head.run_combined(g, names, h, T, &out_rows, direct_x ? &DOUT : nullptr);
+        } else if (fused_dec) {
+            head.run_fused(g, names, DOUT);
+        } else {
+            head.run(g, names, h, T, nullptr, nullptr, &out_rows);
+        }
     }
     if (warmup_active()) {  // the warmup's dummy sequence must not make the first real prompt clear the state
         zero_state();
     }
     tm_all.stop();
+    if (ct_on && T == 1) {
+        static int64_t cn = 0, ct_names_us = 0, ct_pre_us = 0, ct_bind_us = 0, ct_all_us = 0, ct_total_us = 0;
+        const int64_t ct_end = ggml_time_us();
+        ++cn;
+        ct_names_us += ct_names - ct_0;
+        ct_pre_us   += ct_pre - ct_names;
+        ct_bind_us  += ct_bind - ct_pre;
+        ct_all_us   += ct_end - ct_bind;
+        ct_total_us += ct_end - ct_0;
+        if (cn % 32 == 0) {
+            fprintf(stderr, "adapter compute: total %.3f = names %.3f + pre %.3f + bind %.3f + graph %.3f ms/token (%lld)\n",
+                    ct_total_us / 1e3 / cn, ct_names_us / 1e3 / cn, ct_pre_us / 1e3 / cn, ct_bind_us / 1e3 / cn,
+                    ct_all_us / 1e3 / cn, (long long) cn);
+        }
+    }
     return GGML_STATUS_SUCCESS;
 }
 

@@ -6,11 +6,16 @@
 #include "reasoning-budget.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-axera.h"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <unordered_map>
@@ -134,6 +139,8 @@ struct common_sampler {
     // greedy decoding with no sampler that can change the argmax (see common_sampler_init): the token of the largest
     // logit straight from the logits, without the candidate array over the vocabulary and the chain
     bool greedy_fast = false;
+    // pure greedy chain and the combined lm_head wrote an NPU argmax: take its (id, logit), not the full row
+    bool npu_argmax = false;
     // (greedy_fast) the logit-bias sampler's biases, added in the argmax: one per token (the sum of its biases), in
     // token order, the tokens in the vocabulary
     std::vector<llama_logit_bias> fast_bias;
@@ -202,6 +209,17 @@ std::string common_params_sampling::print() const {
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
     return std::string(result);
+}
+
+static const ggml_axera_argmax * argmax_api() {
+    static const ggml_axera_argmax * api = nullptr;
+    if (!api) {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name(GGML_AXERA_NAME);
+        if (reg) {
+            api = (const ggml_axera_argmax *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_axera_argmax");
+        }
+    }
+    return api;
 }
 
 struct common_sampler * common_sampler_init(
@@ -493,6 +511,7 @@ struct common_sampler * common_sampler_init(
         /* .cur     = */ {},
         /* .cur_p   = */ {},
         /* .greedy_fast = */ false,
+        /* .npu_argmax  = */ false,
         /* .fast_bias   = */ fast_bias,
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
@@ -508,12 +527,48 @@ struct common_sampler * common_sampler_init(
             __func__, result->greedy_fast ? "on" : "off", greedy_chain, fast_bias.size(), grmr != nullptr, rbudget != nullptr,
             params.backend_sampling);
 
+    // The combined lm_head returns both the full logits and one (id, logit) per row. A pure greedy chain with no
+    // caller-visible logits/probs and no grammar takes the NPU row; every other chain leaves this off and reads the
+    // logits the same kernel wrote. GGML_AXERA_ARGMAX=0 is the A/B switch.
+    static const bool argmax_off = [] {
+        const char * e = getenv("GGML_AXERA_ARGMAX");
+        return e && strcmp(e, "0") == 0;
+    }();
+    static const bool npu_off = [] {
+        const char * e = getenv("LLAMA_NPU_SAMPLING");
+        return e && strcmp(e, "0") == 0;
+    }();
+    bool suppress_only = true;
+    for (const auto & b : fast_bias) {
+        suppress_only = suppress_only && std::isinf(b.bias) && b.bias < 0.0f;
+    }
+    const bool argmax_eligible = result->greedy_fast && suppress_only && params.n_probs == 0 &&
+                                 !params.backend_sampling && !grmr && !rbudget && !argmax_off && !npu_off;
+    if (const ggml_axera_argmax * api = argmax_api()) {
+        std::vector<int32_t> ids;
+        ids.reserve(fast_bias.size());
+        for (const auto & b : fast_bias) {
+            ids.push_back(b.token);
+        }
+        const int rows = api->configure(argmax_eligible, ids.empty() ? nullptr : ids.data(), (int32_t) ids.size());
+        result->npu_argmax = rows > 0;
+        if (result->npu_argmax) {
+            LOG_INF("%s: fused lm_head greedy sampling (R = %d)\n", __func__, rows);
+        }
+    }
+
     return result;
 }
 
 void common_sampler_free(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return;
+    }
+
+    if (gsmpl->npu_argmax) {
+        if (const ggml_axera_argmax * api = argmax_api()) {
+            api->reset();
+        }
     }
 
     llama_sampler_free(gsmpl->grmr);
@@ -590,6 +645,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .greedy_fast = */ gsmpl->greedy_fast,
+        /* .npu_argmax  = */ gsmpl->npu_argmax,
         /* .fast_bias   = */ gsmpl->fast_bias,
         /* .rng     = */ gsmpl->rng,
     };
@@ -792,6 +848,41 @@ struct argmax_pool {
     }
 };
 
+// GGML_AXERA_SAMPLE_DEBUG=1: the chosen id and the full row's two largest biased logits. The fused path reads the row
+// here only for the diagnostic (it invalidates logits that the greedy path otherwise never touches).
+static void debug_sample_row(const common_sampler * gsmpl, struct llama_context * ctx, int idx, llama_token id,
+                             float logit, bool fused) {
+    static const bool enabled = getenv("GGML_AXERA_SAMPLE_DEBUG") != nullptr;
+    static int64_t     call = 0;
+    if (!enabled) {
+        return;
+    }
+    const float * logits  = llama_get_logits_ith(ctx, idx);
+    const int     n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    if (!logits) {
+        return;
+    }
+    llama_token i1 = -1, i2 = -1;
+    float       v1 = -INFINITY, v2 = -INFINITY;
+    for (llama_token i = 0; i < n_vocab; ++i) {
+        float v = logits[i];
+        for (const auto & b : gsmpl->fast_bias) {
+            if (b.token == i) {
+                v += b.bias;
+                break;
+            }
+        }
+        if (v > v1) {
+            v2 = v1; i2 = i1;
+            v1 = v;  i1 = i;
+        } else if (v > v2 && i != i1) {
+            v2 = v;  i2 = i;
+        }
+    }
+    fprintf(stderr, "SAMPLE_DEBUG call=%lld fused=%d id=%d logit=%.9g row1=%d %.9g row2=%d %.9g margin=%.9g\n",
+            (long long) call++, fused ? 1 : 0, id, logit, i1, v1, i2, v2, v1 - v2);
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -804,6 +895,23 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    // The combined head already ran the final norm, projection and greedy reduction on the NPU. Consume its row
+    // directly; a missing row (non-greedy graph, prompt batch, suppress-token winner) falls through to the full
+    // logits, which the same kernel wrote.
+    if (gsmpl->npu_argmax && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL) {
+        if (const ggml_axera_argmax * api = argmax_api()) {
+            int32_t id_argmax = LLAMA_TOKEN_NULL;
+            float   logit     = 0.0f;
+            if (api->take(idx, &id_argmax, &logit)) {
+                debug_sample_row(gsmpl, ctx, idx, (llama_token) id_argmax, logit, true);
+                gsmpl->cur.resize(1);
+                gsmpl->cur[0] = llama_token_data{ (llama_token) id_argmax, logit, 1.0f };
+                cur_p         = { gsmpl->cur.data(), 1, 0, true };
+                return (llama_token) id_argmax;
+            }
+        }
+    }
 
     if (gsmpl->greedy_fast && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL &&
         !llama_get_sampled_logits_ith(ctx, idx) && !llama_get_sampled_probs_ith(ctx, idx)) {
@@ -849,6 +957,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (best < 0) {  // every logit -inf: the first token, as the greedy sampler over the array
             best = 0;
         }
+        debug_sample_row(gsmpl, ctx, idx, best, bv, false);
         gsmpl->cur.resize(1);
         gsmpl->cur[0] = llama_token_data{ best, bv, 1.0f };
         cur_p         = { gsmpl->cur.data(), 1, 0, true };
