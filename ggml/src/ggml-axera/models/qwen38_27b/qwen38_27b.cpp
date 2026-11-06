@@ -143,8 +143,13 @@ class qwen38_27b final : public model {
     int64_t ver_c0  = -1;              // the last verification's first cell, rows, snapshot set
     int     ver_T = 0, ver_set = -1;
     // the MTP block (draft context graphs): its kernels' IO, its KV cache
-    call      mtp1, mtpp, mtp8;  // mtp8: role mtp.m8 (optional), up to 8 consecutive rows per call
+    call      mtp1, mtpp, mtppkv, mtp8;  // mtp8: role mtp.m8 (optional), up to 8 consecutive rows per call
     axera_cmm ME, MH, MCS, MPN, MMASK, MOUT, MRAW, PE, PH, PCS, PPN, PMASK, PNBLK, POUT2, PRAW, MKV;
+    axera_cmm PKE, PKH, PKCS;  // the compact prompt kernels use their own row width (not mtp.prompt's 256)
+    axera_cmm PK, PV;  // the K/V-only prompt pass' plain row outputs (copied into the paged MKV)
+    size_t    mtp_kv_row = 0;
+    bool      mtp_h_f32 = false;  // the K/V prompt kernel takes FP32 h rows (the EF32 build)
+    bool      mtp_e_f32 = false;  // the K/V prompt kernel takes FP32 token-embedding rows
     axera_cmm M8E, M8H, M8CS, M8PN, M8MASK, M8NT, M8OUT, M8RAW;
     const void * mtp_bound = nullptr;
     size_t       mtp_page_b = 0;  // bytes of one MTP KV page
@@ -1492,6 +1497,7 @@ void qwen38_27b::init_mtp(const std::map<std::string, ggml_tensor *> & t, int il
     GGML_ASSERT(k1.desc->packs == kp.desc->packs && k1.out_bytes("kv") == kp.out_bytes("kv"));
     MKV = axera_cmm_alloc(k1.out_bytes("kv") / NBLK * kv_pages);  // (paged like the layers' caches)
     mtp_page_b = k1.out_bytes("kv") / NBLK;
+    mtp_kv_row = (size_t) k1.out_bytes("kv") / NBLK / (2 * PG);   // one K (or V) row: HKV * D bf16
     auto bind = [&](call & c, const kernel & k, std::initializer_list<std::pair<const char *, axera_cmm *>> io) {
         c   = {};
         c.k = &k;
@@ -1535,6 +1541,22 @@ void qwen38_27b::init_mtp(const std::map<std::string, ggml_tensor *> & t, int il
     GGML_ASSERT(MCS->size == (size_t) ROT * sizeof(ggml_bf16_t) && MMASK->size == (size_t) man.context * sizeof(ggml_bf16_t) &&
                 PE->size % ((size_t) H * sizeof(ggml_bf16_t)) == 0);
     std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> live = { &mtp1.in, &mtpp.in };
+    if (man.has("mtp.promptkv")) {  // the K/V-only prompt pass (the last row uses mtp1's full block)
+        const kernel & kpk = man.get("mtp.promptkv");
+        // its compact pack has only the eh_proj / K / V weights; its K/V rows are copied into MKV by the host
+        bind(mtppkv, kpk, { { "e", &PKE }, { "h", &PKH }, { "cs", &PKCS }, { "kout", &PK }, { "vout", &PV } });
+        const io_desc * ed = nullptr;
+        for (const auto & d : kpk.desc->in) {
+            if (d.name == "e") {
+                ed = &d;
+            }
+        }
+        GGML_ASSERT(ed && ed->shape.size() >= 2);
+        const size_t P = (size_t) ed->shape[1];
+        mtp_h_f32 = PKH->size == P * H * sizeof(float);
+        mtp_e_f32 = PKE->size == P * H * sizeof(float);
+        live.push_back(&mtppkv.in);
+    }
     if (man.has("mtp.m8")) {
         const kernel & k8 = man.get("mtp.m8");
         GGML_ASSERT(k8.desc->packs == k1.desc->packs && k8.out_bytes("kv") == k1.out_bytes("kv"));
@@ -1677,44 +1699,116 @@ ggml_status qwen38_27b::compute_mtp(ggml_cgraph * g) {
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) MRAW->vir, hr.data() + (size_t) r * H, H);
         }
     } else {
-        const int P = (int) (PE->size / (H * sizeof(ggml_bf16_t)));  // rows per call
-        for (int it = 0; it < T; it += P) {
-            const int n = std::min(P, T - it);
-            if (n < P) {  // (a full chunk overwrites every row)
-                memset((ggml_bf16_t *) PE->vir + (size_t) n * H, 0, (size_t) (P - n) * H * sizeof(ggml_bf16_t));
-                memset((ggml_bf16_t *) PH->vir + (size_t) n * H, 0, (size_t) (P - n) * H * sizeof(ggml_bf16_t));
+        const bool kvonly = mtppkv.k != nullptr;  // all but the last row need only their K/V
+        axera_cmm & pv_e  = kvonly ? PKE : PE;
+        axera_cmm & pv_h  = kvonly ? PKH : PH;
+        axera_cmm & pv_cs = kvonly ? PKCS : PCS;
+        const size_t e_row = mtp_e_f32 ? sizeof(float) : sizeof(ggml_bf16_t);
+        const int  P      = (int) (pv_e->size / (H * e_row));  // rows per call
+        const int  n_rows = kvonly ? T - 1 : T;
+        auto run_t1 = [&](int r) {
+            row_bf16(embd, r, (ggml_bf16_t *) ME->vir);
+            row_bf16(hin, r, (ggml_bf16_t *) MH->vir);
+            rp.rows(r, 1, COS.get(), SIN.get());
+            memcpy(MCS->vir, COS->vir, half);
+            memcpy((char *) MCS->vir + half, SIN->vir, half);
+            const int64_t c    = kv.cell_of(r);
+            const int     nblk = kv.mask_row(r, (ggml_bf16_t *) MMASK->vir);
+            auto *        pn   = (int32_t *) MPN->vir;
+            pn[0]              = (int32_t) c;
+            pn[1]              = std::max(nblk, (int) (c / PG + 1));
+            pn[2]              = (int32_t) ((c / PG) * 2 * PG + c % PG);
+            for (const axera_cmm * b : { &ME, &MH, &MCS, &MPN, &MMASK }) {
+                (*b)->flush();
             }
-            auto * pn = (int32_t *) PPN->vir;
-            const int nmax = kv.chunk_mask((const int32_t *) pos->data, it, P, n, (ggml_bf16_t *) PMASK->vir);
+            mtp1.k->run(mtp1.in, mtp1.out, "mtp t1");
+            MOUT->invalidate();
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) MOUT->vir, h.data() + (size_t) r * H, H);
+        };
+        for (int it = 0; it < n_rows; it += P) {
+            const int n = std::min(P, n_rows - it);
+            if (n < P) {  // (a full chunk overwrites every row)
+                memset((char *) pv_e->vir + (size_t) n * H * e_row, 0, (size_t) (P - n) * H * e_row);
+                memset((char *) pv_h->vir + (size_t) n * H * (mtp_h_f32 ? sizeof(float) : sizeof(ggml_bf16_t)), 0,
+                       (size_t) (P - n) * H * (mtp_h_f32 ? sizeof(float) : sizeof(ggml_bf16_t)));
+            }
+            // mtp.promptkv has no pn input. Keep its cells in host memory instead of writing three
+            // uncached CMM words per row and reading them back again for the K/V scatter.
+            std::vector<int32_t> pn_host;
+            if (kvonly) {
+                pn_host.resize((size_t) 3 * P);
+            }
+            auto * pn = kvonly ? pn_host.data() : (int32_t *) PPN->vir;
+            const int nmax = kvonly ? 0 : kv.chunk_mask((const int32_t *) pos->data, it, P, n, (ggml_bf16_t *) PMASK->vir);
+            axera_host_pool().run((int64_t) 2 * n, [&](int64_t j) {
+                const int rr = (int) (j % n);
+                if (j < n) {
+                    if (mtp_e_f32) {
+                        memcpy((char *) pv_e->vir + (size_t) rr * H * sizeof(float),
+                               (const char *) embd->data + (size_t) (it + rr) * embd->nb[1], H * sizeof(float));
+                    } else {
+                        row_bf16(embd, it + rr, (ggml_bf16_t *) pv_e->vir + (size_t) rr * H);
+                    }
+                } else {
+                    if (mtp_h_f32) {
+                        memcpy((char *) pv_h->vir + (size_t) rr * H * sizeof(float),
+                               (const char *) hin->data + (size_t) (it + rr) * hin->nb[1], H * sizeof(float));
+                    } else {
+                        row_bf16(hin, it + rr, (ggml_bf16_t *) pv_h->vir + (size_t) rr * H);
+                    }
+                }
+            });
             for (int r = 0; r < P; ++r) {
                 const int     rr = std::min(r, n - 1);  // padded rows: the last row's positions and mask, later cells
                 const int64_t c  = kv.cell_of(it + rr) + (r - rr);
                 GGML_ASSERT(c < kv_cells);
-                if (r < n) {
-                    row_bf16(embd, it + r, (ggml_bf16_t *) PE->vir + (size_t) r * H);
-                    row_bf16(hin, it + r, (ggml_bf16_t *) PH->vir + (size_t) r * H);
-                }
                 rp.rows(it + rr, 1, COS.get(), SIN.get());
-                memcpy((char *) PCS->vir + r * 2 * half, COS->vir, half);
-                memcpy((char *) PCS->vir + r * 2 * half + half, SIN->vir, half);
+                memcpy((char *) pv_cs->vir + r * 2 * half, COS->vir, half);
+                memcpy((char *) pv_cs->vir + r * 2 * half + half, SIN->vir, half);
                 pn[3 * r]     = (int32_t) c;
                 pn[3 * r + 1] = (int32_t) (c / PG + 1);
                 pn[3 * r + 2] = (int32_t) ((c / PG) * 2 * PG + c % PG);
             }
-            *(int32_t *) PNBLK->vir = nmax;
-            PE->flush(PE->vir, (size_t) n * H * sizeof(ggml_bf16_t));
-            PH->flush(PH->vir, (size_t) n * H * sizeof(ggml_bf16_t));
-            PCS->flush(PCS->vir, (size_t) n * 2 * half);
-            PPN->flush();
-            PNBLK->flush();
-            PMASK->flush(PMASK->vir, (size_t) nmax * P * PG * sizeof(ggml_bf16_t));
-            mtpp.k->run(mtpp.in, mtpp.out, "mtp prompt");
-            POUT2->invalidate();
-            PRAW->invalidate();
-            for (int r = 0; r < n; ++r) {
-                ggml_bf16_to_fp32_row((const ggml_bf16_t *) POUT2->vir + (size_t) r * H, h.data() + (size_t) (it + r) * H, H);
-                ggml_bf16_to_fp32_row((const ggml_bf16_t *) PRAW->vir + (size_t) r * H, hr.data() + (size_t) (it + r) * H, H);
+            pv_e->flush(pv_e->vir, (size_t) n * H * e_row);
+            pv_h->flush(pv_h->vir, (size_t) n * H * (mtp_h_f32 ? sizeof(float) : sizeof(ggml_bf16_t)));
+            pv_cs->flush(pv_cs->vir, (size_t) n * 2 * half);
+            if (!kvonly) {
+                PPN->flush();
             }
+            if (kvonly) {
+                mtppkv.k->run(mtppkv.in, mtppkv.out, "mtp prompt kv");
+                PK->invalidate();
+                PV->invalidate();
+                int64_t pg0 = -1, pg1 = -1;
+                for (int r = 0; r < n; ++r) {  // each row's K/V into its paged cell (K page then V page)
+                    const int64_t cell = pn[3 * r];
+                    const int64_t page = cell / PG, cl = cell % PG;
+                    memcpy((char *) MKV->vir + (size_t) ((page * 2 + 0) * PG + cl) * mtp_kv_row,
+                           (char *) PK->vir + (size_t) r * mtp_kv_row, mtp_kv_row);
+                    memcpy((char *) MKV->vir + (size_t) ((page * 2 + 1) * PG + cl) * mtp_kv_row,
+                           (char *) PV->vir + (size_t) r * mtp_kv_row, mtp_kv_row);
+                    pg0 = pg0 < 0 ? page : std::min(pg0, page);
+                    pg1 = std::max(pg1, page);
+                }
+                if (pg1 >= 0) {
+                    MKV->flush((char *) MKV->vir + (size_t) (pg0 * 2) * PG * mtp_kv_row,
+                               (size_t) ((pg1 - pg0 + 1) * 2) * PG * mtp_kv_row);
+                }
+            } else {
+                *(int32_t *) PNBLK->vir = nmax;
+                PNBLK->flush();
+                PMASK->flush(PMASK->vir, (size_t) nmax * P * PG * sizeof(ggml_bf16_t));
+                mtpp.k->run(mtpp.in, mtpp.out, "mtp prompt");
+                POUT2->invalidate();
+                for (int r = 0; r < n; ++r) {
+                    ggml_bf16_to_fp32_row((const ggml_bf16_t *) POUT2->vir + (size_t) r * H,
+                                          h.data() + (size_t) (it + r) * H, H);
+                }
+            }
+        }
+        if (kvonly) {
+            // the last prompt row's full block: its h_nextn seeds the first draft step, and mtp1 writes its KV cell too
+            run_t1(T - 1);
         }
     }
     if (hn->flags & GGML_TENSOR_FLAG_COMPUTE) {
