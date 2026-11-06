@@ -2,6 +2,7 @@
 
 #include "ggml-axera-impl.h"
 #include "models/model.h"
+#include "core/argmax_state.h"
 
 #include <atomic>
 #include <unordered_map>
@@ -39,7 +40,19 @@ static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend,
     }
     {
         axera_timer tf("backend post-compute");
+        static const bool bp = getenv("LLAMA_GRAPH_PROF") != nullptr;
+        static int64_t    bp_n = 0, bp_us = 0;
+        const int64_t     bp_t0 = bp && cgraph->n_nodes == 3846 ? std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
         axera_flush_file_pages();  // the model's init is done: release its converted tensors' file pages once
+        if (bp_t0 && ++bp_n % 32 == 0) {
+            bp_us += (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch()).count() - bp_t0;
+            fprintf(stderr, "backend flush: %.3f ms/graph (%lld)\n", bp_us / 1e3 / bp_n, (long long) bp_n);
+        } else if (bp_t0) {
+            bp_us += (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch()).count() - bp_t0;
+        }
     }
     static const bool trace = std::getenv("GGML_AXERA_TRACE") != nullptr;  // every graph: nodes, host gap, run
     if (trace) {
@@ -283,6 +296,24 @@ static void ggml_backend_axera_set_n_seq_max(uint32_t n) {
     }
 }
 
+static int argmax_configure_c(int enabled, const int32_t * ids, int32_t n) {
+    return axera::argmax_configure(enabled != 0, ids, n);
+}
+
+static void argmax_reset_c() {
+    axera::argmax_reset();
+}
+
+static int argmax_take_c(int idx, int32_t * id, float * logit) {
+    return axera::argmax_take(idx, id, logit);
+}
+
+static const ggml_axera_argmax g_axera_argmax = {
+    /* .configure = */ argmax_configure_c,
+    /* .reset     = */ argmax_reset_c,
+    /* .take      = */ argmax_take_c,
+};
+
 uint32_t axera_n_seq_max() {
     return g_axera_n_seq_max.load();
 }
@@ -321,6 +352,9 @@ static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_set_n_seq_max") == 0) {
         return (void *) ggml_backend_axera_set_n_seq_max;
+    }
+    if (strcmp(name, "ggml_backend_axera_argmax") == 0) {
+        return (void *) &g_axera_argmax;
     }
     if (strcmp(name, "ggml_backend_axera_set_warmup") == 0) {
         return (void *) axera_set_warmup;

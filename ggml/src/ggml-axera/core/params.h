@@ -42,6 +42,7 @@ class params {
         axera_cmm q, s;
     };
     std::map<std::pair<const ggml_tensor *, int>, mx_pair> mx;    // (tensor, 8 / 4) -> MXFP8 / MXFP4
+    std::map<const ggml_tensor *, axera_nv4>                nv;    // NVFP4 codes / scales / global scale
     std::map<const ggml_tensor *, axera_cmm>               bf16;  // bf16 copies
     std::map<std::pair<int, std::string>, axera_cmm>       own;   // (layer, kind / name) -> converted copy
     std::map<std::string, axera_cmm>                       packs; // layout signature -> pack

@@ -1488,7 +1488,6 @@ void qwen35_moe_sgl::prewarm(ggml_cgraph * g) {
     if (logits && logits->src[0]) {
         fused_decode_ready(g, names, logits);
     }
-    names.alias_first_split(g->stable_uid);
 }
 
 bool qwen35_moe_sgl::fused_decode_ready(ggml_cgraph * g, const graph_names & t, ggml_tensor * logits) {
@@ -1511,9 +1510,6 @@ bool qwen35_moe_sgl::fused_decode_ready(ggml_cgraph * g, const graph_names & t, 
     fdec_logits = logits;
     fdec_uid    = g->stable_uid;
     fdec_ok     = fh_ok && head.fused_ready(g, t);
-    if (fdec_ok) {
-        head.prepare_fused(g, t, DOUT);
-    }
     return fdec_ok;
 }
 
@@ -1656,10 +1652,12 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     std::vector<float> & h = hb;
     tout.stop();
     t_pre2.stop();
-    const bool fused_dec = T == 1 && n_out == 1 && fused_decode_ready(g, names, logits);
-    if (n_out > 0 && !fused_dec) {
+    bool combined_head = false;
+    if (n_out > 0) {
         head.bind(man.get("lm_head"), logits->src[0]);
+        combined_head = head.bind_combined(man.get("lm_head"), logits->src[0]) && head.combined_ready(g, names);
     }
+    const bool fused_dec = !combined_head && T == 1 && n_out == 1 && fused_decode_ready(g, names, logits);
     axera_timer        tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
     const int64_t      c0 = kv.cell_of(0);
     if (c0 == 0) {  // a new sequence
@@ -1723,7 +1721,8 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
                            (long long) state_cell);
             return GGML_STATUS_FAILED;
         }
-        float * hd = fused_dec ? nullptr : h.data();
+        const bool combined_dec = combined_head && T == 1 && n_out == 1;
+        float * hd = (fused_dec || combined_dec) ? nullptr : h.data();
         if (direct_embed) {
             decode(c0, xb1.data(), pb.data(), hd);
         } else if (token_ids) {
@@ -1742,7 +1741,10 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     }
     if (n_out > 0) {
         axera_timer th(T > 256 ? "output head (prompt)" : T > 1 ? "output head (warmup)" : "output head (decode)");
-        if (fused_dec) {
+        const bool combined_dec = combined_head && T == 1 && n_out == 1;
+        if (combined_head) {
+            head.run_combined(g, names, h, T, &out_rows, combined_dec ? &DOUT : nullptr);
+        } else if (fused_dec) {
             head.run_fused(g, names, DOUT);
         } else {
             head.run(g, names, h, T, nullptr, nullptr, &out_rows);
