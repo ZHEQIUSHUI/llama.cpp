@@ -1894,7 +1894,9 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     t_pre2.stop();
     const int64_t ct_pre = ct_on ? ggml_time_us() : 0;
     bool combined_dec = false;
-    if (n_out > 0) {
+    const char * fused_head_env = getenv("GGML_AXERA_FUSED_HEAD");
+    const bool   npu_heads      = !fused_head_env || atoi(fused_head_env) != 0;
+    if (n_out > 0 && npu_heads) {
         head.bind(man.get("lm_head"), logits->src[0]);
         combined_dec = head.bind_combined(man.get("lm_head"), logits->src[0]);
         combined_dec = combined_dec && head.combined_ready(g, names);
@@ -1903,15 +1905,12 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
         }
     }
     bool fused_dec = false;
-    if (!combined_dec && T == 1 && n_out == 1) {
+    if (!combined_dec && npu_heads && T == 1 && n_out == 1) {
         if (!fh_loaded) {
             fh_loaded = true;
-            const char * e = getenv("GGML_AXERA_FUSED_HEAD");
-            if (!e || atoi(e) != 0) {
-                const auto & fk = man.load_memory("lm_head_fused", std::vector<char>(
-                    (const char *) FUSED_HEAD_AXMODEL, (const char *) FUSED_HEAD_AXMODEL + FUSED_HEAD_AXMODEL_SIZE));
-                fh_ok = head.bind_fused(fk, logits->src[0]);
-            }
+            const auto & fk = man.load_memory("lm_head_fused", std::vector<char>(
+                (const char *) FUSED_HEAD_AXMODEL, (const char *) FUSED_HEAD_AXMODEL + FUSED_HEAD_AXMODEL_SIZE));
+            fh_ok = head.bind_fused(fk, logits->src[0]);
         }
         fused_dec = fh_ok && head.fused_ready(g, names);
     }
