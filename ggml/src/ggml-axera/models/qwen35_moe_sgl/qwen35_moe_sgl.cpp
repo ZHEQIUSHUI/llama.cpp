@@ -157,10 +157,6 @@ class qwen35_moe_sgl final : public model {
         int                pages = 0;
     };
     std::vector<dec_more_t>          dec_more;  // optional smaller-context decode kernels, ascending pages
-    call                             ver;  // role decode.verify: four rows, the snapshots of every row
-    axera_cmm                        VX, VOUT, VPOSN, VPIDS, VINDPTR, VLOC, VNT;
-    axera_cmm                        VSNAP[2][4];  // ssnap / cqsnap / cksnap / cvsnap per verification set
-    int                              cur_set = -1, cur_row = 0;  // the current state: the pools, or a snapshot row
     call                             ver;  // role decode.verify: four rows, one rank-1 delta per row
     call                             app;  // role gdn.apply: advance the recurrent state by accepted deltas
     axera_cmm                        VX, VOUT, VPOSN, VPIDS, VINDPTR, VLOC, VNT, VNPREV, VST0;
