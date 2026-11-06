@@ -1175,7 +1175,7 @@ size_t qwen35_moe_sgl::state_write(void * dst, size_t size) {
 
     sgl_state_header h;
     memset(&h, 0, sizeof(h));
-    memcpy(h.magic, "AXSGL1", 8);
+    memcpy(h.magic, "AXSGL1", sizeof(h.magic) - 1);
     h.version        = 1;
     h.kind           = 3;
     h.state_cell     = state_cell;
@@ -1233,7 +1233,7 @@ size_t qwen35_moe_sgl::state_read(const void * src, size_t size) {
     }
     sgl_state_header h;
     memcpy(&h, src, sizeof(h));
-    if (memcmp(h.magic, "AXSGL1", 8) != 0 || h.version != 1 || h.kind != 3 || h.n_attn != NB ||
+    if (memcmp(h.magic, "AXSGL1", sizeof(h.magic) - 1) != 0 || h.version != 1 || h.kind != 3 || h.n_attn != NB ||
         h.kv_split != kv_split || h.kv_page_b != kv_page_b || h.kv_total_pages != (uint32_t) kv_total_pages ||
         h.nkv_pages > (uint32_t) kv_pages || h.state_cell < 0 || h.state_cell > kv_cells ||
         h.kv_n != (uint64_t) NB * h.nkv_pages * h.kv_page_b || h.st_b != B("b0_attn_state_in")->size ||

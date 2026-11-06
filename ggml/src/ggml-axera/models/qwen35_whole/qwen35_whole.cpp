@@ -945,7 +945,7 @@ size_t qwen35_whole::state_write(void * dst, size_t size) {
 
     whole_state_header h;
     memset(&h, 0, sizeof(h));
-    memcpy(h.magic, "AXW35S1", 8);
+    memcpy(h.magic, "AXW35S1", sizeof(h.magic) - 1);
     h.version     = 1;
     h.kind        = 1;
     h.has_target  = has_target;
@@ -1019,7 +1019,7 @@ size_t qwen35_whole::state_read(const void * src, size_t size) {
     }
     whole_state_header h;
     memcpy(&h, src, sizeof(h));
-    if (memcmp(h.magic, "AXW35S1", 8) != 0 || h.version != 1 || h.kind != 1) {
+    if (memcmp(h.magic, "AXW35S1", sizeof(h.magic) - 1) != 0 || h.version != 1 || h.kind != 1) {
         return 0;
     }
     const int pna = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;

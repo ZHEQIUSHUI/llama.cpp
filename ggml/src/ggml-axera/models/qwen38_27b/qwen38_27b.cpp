@@ -148,8 +148,8 @@ class qwen38_27b final : public model {
     int64_t      mtp_cell  = 0;   // the next MTP KV cell
     // a verification's MTP catch-up (nothing on the host reads its result: it only extends the MTP block's KV) runs
     // on its own thread while the host goes on (sampling, the next draft's setup); any next graph waits for it
-    std::thread mtp_bg;
-    void        mtp_wait() {
+    mutable std::thread mtp_bg;
+    void                mtp_wait() const {
         if (mtp_bg.joinable()) {
             mtp_bg.join();
         }
@@ -853,6 +853,7 @@ void qwen38_27b::load_state() {
 // llama.cpp cache tensors, so the checkpoint carries the KV pages before the current cell, the recurrent state and the
 // current page's restart point. The int8 KV caches' per-row scales travel with them (KVSC).
 size_t qwen38_27b::state_size() const {
+    mtp_wait();  // the MTP catch-up extends MKV and mtp_cell; size and bytes must be consistent
     if (KVC.empty() || !ST) {
         return 0;
     }
@@ -893,7 +894,7 @@ size_t qwen38_27b::state_write(void * dst, size_t size) {
 
     state_header_27b h;
     memset(&h, 0, sizeof(h));
-    memcpy(h.magic, "AXW27S1", 8);
+    memcpy(h.magic, "AXW27S1", sizeof(h.magic) - 1);
     h.version     = 1;
     h.kind        = 2;
     h.has_target  = has_target;
@@ -979,7 +980,7 @@ size_t qwen38_27b::state_read(const void * src, size_t size) {
     }
     state_header_27b h;
     memcpy(&h, src, sizeof(h));
-    if (memcmp(h.magic, "AXW27S1", 8) != 0 || h.version != 1 || h.kind != 2) {
+    if (memcmp(h.magic, "AXW27S1", sizeof(h.magic) - 1) != 0 || h.version != 1 || h.kind != 2) {
         return 0;
     }
     const int pna = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
