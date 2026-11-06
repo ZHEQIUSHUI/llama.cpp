@@ -1422,7 +1422,7 @@ private:
             ctx_dft   = nullptr;
             model_dft = nullptr;
         }
-        // a verify batch is followed by another verify batch, so the next single-token decode graph would never be used
+        // a multi-row verify batch is followed by another verify, so its single-token decode graph would never be used
         llama_set_prebuild_decode(ctx_tgt, spec == nullptr);
 
         if (!spec && params_base.speculative.has_synth()) {

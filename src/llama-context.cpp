@@ -1726,8 +1726,12 @@ bool llama_context::graph_prebuild_decode(const llama_memory_context_i * mctx) {
         }
         return false;
     };
-    if (!enabled || !prebuild_decode || !mctx || cparams.warmup || cparams.embeddings) {
-        return no(!enabled ? "disabled" : !prebuild_decode ? "disabled by caller" : !mctx ? "no memory context" :
+    // With speculative decoding, a multi-row verification is followed by another verification, so a single-token
+    // decode graph is wasted there.  Keep the end-of-prompt graph: the MTP prompt catch-up starts immediately after it
+    // and relies on the target prebuild having completed.
+    const bool skip_multirow = !prebuild_decode && n_outputs > 1;
+    if (!enabled || skip_multirow || !mctx || cparams.warmup || cparams.embeddings) {
+        return no(!enabled ? "disabled" : skip_multirow ? "disabled by caller for multi-row batch" : !mctx ? "no memory context" :
                   cparams.warmup ? "warmup" : "embeddings");
     }
 
