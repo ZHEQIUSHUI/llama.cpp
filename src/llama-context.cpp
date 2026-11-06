@@ -3206,6 +3206,10 @@ public:
         return size_written;
     }
 
+    bool is_dummy() const override {
+        return true;
+    }
+
 private:
     const bool skip_tensors;
 
@@ -3934,6 +3938,8 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
         memory->state_write(io);
     }
 
+    state_write_backends(io);
+
     return io.n_bytes();
 }
 
@@ -3960,6 +3966,8 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
         memory->state_read(io);
     }
 
+    state_read_backends(io);
+
     return io.n_bytes();
 }
 
@@ -3967,6 +3975,8 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
     if (memory) {
         memory->state_write(io, seq_id, flags);
     }
+
+    state_write_backends(io);
 
     return io.n_bytes();
 }
@@ -3976,7 +3986,77 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
         memory->state_read(io, seq_id, flags);
     }
 
+    state_read_backends(io);
+
     return io.n_bytes();
+}
+
+// a backend may keep an adapter's state outside the llama.cpp caches (ggml-axera: private CMM pools). The state stream
+// appends one blob per backend instance that reports a size, tagged with the context's backend index.
+static void * llama_backend_state_proc(ggml_backend_t backend, const char * name) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
+void llama_context::state_write_backends(llama_io_write_i & io) {
+    uint32_t count = 0;
+    for (auto & backend : backends) {
+        auto * size_fn = (size_t (*)(ggml_backend_t)) llama_backend_state_proc(backend.get(), "ggml_backend_state_size");
+        if (size_fn && size_fn(backend.get()) > 0) {
+            ++count;
+        }
+    }
+    io.write(&count, sizeof(count));
+    for (uint32_t i = 0; i < backends.size(); ++i) {
+        ggml_backend_t backend = backends[i].get();
+        auto * size_fn = (size_t (*)(ggml_backend_t)) llama_backend_state_proc(backend, "ggml_backend_state_size");
+        if (!size_fn) {
+            continue;
+        }
+        const size_t size = size_fn(backend);
+        if (size == 0) {
+            continue;
+        }
+        const uint64_t size64 = size;
+        io.write(&i, sizeof(i));
+        io.write(&size64, sizeof(size64));
+        if (io.is_dummy()) {
+            io.write(nullptr, size);  // (the dummy writer only counts)
+            continue;
+        }
+        std::vector<uint8_t> data(size);
+        auto * write_fn = (size_t (*)(ggml_backend_t, void *, size_t)) llama_backend_state_proc(backend, "ggml_backend_state_write");
+        const size_t written = write_fn ? write_fn(backend, data.data(), data.size()) : 0;
+        if (written != size) {
+            throw std::runtime_error(format("backend %u wrote %zu of %zu state bytes", i, written, size));
+        }
+        io.write(data.data(), data.size());
+    }
+}
+
+void llama_context::state_read_backends(llama_io_read_i & io) {
+    uint32_t count = 0;
+    io.read(&count, sizeof(count));
+    for (uint32_t n = 0; n < count; ++n) {
+        uint32_t i = 0;
+        uint64_t size = 0;
+        io.read(&i, sizeof(i));
+        io.read(&size, sizeof(size));
+        if (i >= backends.size() || size > SIZE_MAX) {
+            throw std::runtime_error(format("invalid backend state entry %u/%" PRIu64, i, size));
+        }
+        ggml_backend_t backend = backends[i].get();
+        auto * read_fn = (size_t (*)(ggml_backend_t, const void *, size_t)) llama_backend_state_proc(backend, "ggml_backend_state_read");
+        if (!read_fn) {
+            throw std::runtime_error(format("backend %u has state data but no state reader", i));
+        }
+        std::vector<uint8_t> data((size_t) size);
+        io.read(data.data(), data.size());
+        if (read_fn(backend, data.data(), data.size()) != data.size()) {
+            throw std::runtime_error(format("backend %u failed to restore its state", i));
+        }
+    }
 }
 
 //

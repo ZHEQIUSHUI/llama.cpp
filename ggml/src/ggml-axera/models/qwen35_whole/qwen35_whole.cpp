@@ -20,6 +20,7 @@
 #include "../../core/params.h"
 #include "../../ops/ops.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -36,10 +37,45 @@ struct call {
     std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
 };
 
+// the adapter blob in llama.cpp's sequence state (context checkpoints / prompt cache)
+struct whole_state_header {
+    char     magic[8];
+    uint32_t version;
+    uint32_t kind;
+    uint32_t has_target;
+    uint32_t has_mtp;
+    int64_t  state_cell;
+    int64_t  snap_cell;
+    int64_t  ksnap_cell;
+    int64_t  mtp_cell;
+    uint32_t snap_prompt;
+    uint32_t ncall;
+    uint32_t pna;
+    uint32_t nkv_pages;
+    uint64_t kv_page_b;
+    uint64_t kv_n;
+    uint64_t st_b;
+    uint64_t cq_b;
+    uint64_t ck_b;
+    uint64_t cv_b;
+    uint64_t snap_n;
+    uint64_t ksnap_n;
+    uint64_t page_x_n;
+    uint64_t page_p_n;
+    uint64_t kpage_x_n;
+    uint64_t kpage_p_n;
+    uint64_t mtp_pages;
+    uint64_t mtp_page_b;
+    uint64_t mtp_n;
+};
+
 class qwen35_whole final : public model {
   public:
     explicit qwen35_whole(const manifest & m) : man(m), prm(m) {}
     ggml_status compute(ggml_cgraph * g) override;
+    size_t       state_size() const override;
+    size_t       state_write(void * dst, size_t size) override;
+    size_t       state_read(const void * src, size_t size) override;
 
   private:
     const manifest & man;
@@ -104,6 +140,8 @@ class qwen35_whole final : public model {
     axera_cmm ME, MH, MCS, MPN, MMASK, MOUT, MRAW, PE, PH, PCS, PPN, PMASK, PNBLK, POUT2, PRAW, MKV;
     axera_cmm M8E, M8H, M8CS, M8PN, M8MASK, M8NT, M8OUT, M8RAW;
     const void * mtp_bound = nullptr;
+    size_t       mtp_page_b = 0;  // bytes of one MTP KV page
+    int64_t      mtp_cell  = 0;   // the next MTP KV cell
     std::vector<call>              pres;  // the prefill calls of a page (the kernel's blocks each)
     int                            ncall = 1;
     std::map<std::string, axera_cmm> banks;
@@ -126,6 +164,7 @@ class qwen35_whole final : public model {
     void      swap_kept();
     bool      restart_point(int64_t s0, int k);
     void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0);
+    int64_t   state_cell() const { return snap_cell < 0 ? 0 : snap_cell + (int64_t) (page_x.size() / std::max(1, H)); }
 };
 
 // rows of an [N, K] weight of the GGUF in the kernels' MX layout: MXFP8 codes [K] or MXFP4 codes [K / 2], and scales
@@ -861,6 +900,211 @@ void qwen35_whole::load_state() {
     }
 }
 
+// llama.cpp's sequence state (prompt cache / context checkpoint). The private CMM pools are not the cache tensors
+// llama.cpp serializes, so the state stream carries this adapter blob: the KV pages before the current cell, the
+// recurrent state, and the current page's restart point (the recurrent state at the page start plus its inputs).
+// Only the pages up to the current cell are copied, plus the current page: a later prompt can overwrite the pages
+// after the checkpoint, and a restore rewrites the checkpoint's page from its restart point.
+size_t qwen35_whole::state_size() const {
+    if (KVC.empty() || !ST) {
+        return 0;
+    }
+    const int    pna         = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
+    const int64_t cur_cell   = state_cell();
+    const bool   has_target  = cur_cell > 0 || snap_cell >= 0 || !page_x.empty();
+    const size_t nkv_pages   = has_target ? std::min<size_t>((size_t) kv_pages, (size_t) ((cur_cell + PG - 1) / PG)) : 0;
+    const size_t mtp_pages   = MKV && mtp_page_b ? std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG)) : 0;
+    const bool   has_mtp     = mtp_pages > 0;
+    if (!has_target && !has_mtp) {
+        return 0;
+    }
+    size_t n = sizeof(whole_state_header);
+    if (has_target) {
+        n += (size_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
+        n += ST->size + CQ->size + CK->size + CV->size;
+        n += snap.size() + ksnap.size() + page_x.size() * sizeof(ggml_bf16_t) + page_p.size() * sizeof(int32_t) +
+             kpage_x.size() * sizeof(ggml_bf16_t) + kpage_p.size() * sizeof(int32_t);
+    }
+    n += mtp_pages * mtp_page_b;
+    return n;
+}
+
+size_t qwen35_whole::state_write(void * dst, size_t size) {
+    const size_t total = state_size();
+    if (!total || size < total) {
+        return 0;
+    }
+    const int    pna       = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
+    const int64_t cur_cell = state_cell();
+    const bool   has_target = cur_cell > 0 || snap_cell >= 0 || !page_x.empty();
+    const size_t nkv_pages = has_target ? std::min<size_t>((size_t) kv_pages, (size_t) ((cur_cell + PG - 1) / PG)) : 0;
+    const size_t mtp_pages = MKV && mtp_page_b ? std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG)) : 0;
+    if (has_target) {
+        state_home();  // a verification leaves the current state in a snapshot row
+    }
+
+    whole_state_header h;
+    memset(&h, 0, sizeof(h));
+    memcpy(h.magic, "AXW35S1", sizeof(h.magic) - 1);
+    h.version     = 1;
+    h.kind        = 1;
+    h.has_target  = has_target;
+    h.has_mtp     = mtp_pages > 0;
+    h.state_cell  = cur_cell;
+    h.snap_cell   = snap_cell;
+    h.ksnap_cell  = ksnap_cell;
+    h.mtp_cell    = mtp_cell;
+    h.snap_prompt = snap_prompt;
+    h.ncall       = (uint32_t) KVC.size();
+    h.pna         = (uint32_t) pna;
+    h.nkv_pages   = (uint32_t) nkv_pages;
+    h.kv_page_b   = kv_b / NBLK;
+    h.kv_n        = (uint64_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
+    h.st_b        = ST->size;
+    h.cq_b        = CQ->size;
+    h.ck_b        = CK->size;
+    h.cv_b        = CV->size;
+    h.snap_n      = snap.size();
+    h.ksnap_n     = ksnap.size();
+    h.page_x_n    = page_x.size() * sizeof(ggml_bf16_t);
+    h.page_p_n    = page_p.size() * sizeof(int32_t);
+    h.kpage_x_n   = kpage_x.size() * sizeof(ggml_bf16_t);
+    h.kpage_p_n   = kpage_p.size() * sizeof(int32_t);
+    h.mtp_pages   = mtp_pages;
+    h.mtp_page_b  = mtp_page_b;
+    h.mtp_n       = mtp_pages * mtp_page_b;
+
+    char * p = (char *) dst;
+    memcpy(p, &h, sizeof(h));
+    p += sizeof(h);
+    if (has_target) {
+        const size_t page_n = nkv_pages * (kv_b / NBLK);
+        for (const axera_cmm & c : KVC) {
+            for (int j = 0; j < pna; ++j) {
+                char * src = (char *) c->vir + (size_t) j * kv_alloc;
+                c->invalidate(src, page_n);
+                memcpy(p, src, page_n);
+                p += page_n;
+            }
+        }
+        for (const axera_cmm * b : { &ST, &CQ, &CK, &CV }) {
+            (*b)->invalidate((*b)->vir, (*b)->size);
+            memcpy(p, (*b)->vir, (*b)->size);
+            p += (*b)->size;
+        }
+        const auto put = [&](const void * src, size_t n) {
+            if (n) {
+                memcpy(p, src, n);
+                p += n;
+            }
+        };
+        put(snap.data(), h.snap_n);
+        put(ksnap.data(), h.ksnap_n);
+        put(page_x.data(), h.page_x_n);
+        put(page_p.data(), h.page_p_n);
+        put(kpage_x.data(), h.kpage_x_n);
+        put(kpage_p.data(), h.kpage_p_n);
+    }
+    if (h.mtp_n) {
+        MKV->invalidate(MKV->vir, h.mtp_n);
+        memcpy(p, MKV->vir, h.mtp_n);
+        p += h.mtp_n;
+    }
+    return (size_t) (p - (char *) dst);
+}
+
+size_t qwen35_whole::state_read(const void * src, size_t size) {
+    if (size < sizeof(whole_state_header)) {
+        return 0;
+    }
+    whole_state_header h;
+    memcpy(&h, src, sizeof(h));
+    if (memcmp(h.magic, "AXW35S1", sizeof(h.magic) - 1) != 0 || h.version != 1 || h.kind != 1) {
+        return 0;
+    }
+    const int pna = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
+    if (h.has_target && (KVC.size() != h.ncall || pna != (int) h.pna || h.kv_page_b != kv_b / NBLK ||
+                         h.nkv_pages > (uint32_t) kv_pages || h.st_b != ST->size || h.cq_b != CQ->size ||
+                         h.ck_b != CK->size || h.cv_b != CV->size || h.kv_n != (uint64_t) h.ncall * h.pna * h.nkv_pages * h.kv_page_b ||
+                         h.page_x_n % (H * sizeof(ggml_bf16_t)) || h.page_p_n % (4 * sizeof(int32_t)) ||
+                         h.kpage_x_n % (H * sizeof(ggml_bf16_t)) || h.kpage_p_n % (4 * sizeof(int32_t)) ||
+                         h.state_cell < 0 || h.state_cell > kv_cells)) {
+        return 0;
+    }
+    const bool mtp_valid = h.mtp_n == 0 ? h.mtp_pages == 0 && !h.has_mtp :
+                           h.has_mtp && MKV && mtp_page_b && h.mtp_page_b == mtp_page_b &&
+                               h.mtp_pages <= MKV->size / mtp_page_b && h.mtp_pages * mtp_page_b == h.mtp_n &&
+                               h.mtp_cell >= 0 && h.mtp_cell <= kv_cells;
+    if (!mtp_valid) {
+        return 0;
+    }
+    size_t need = sizeof(h);
+    if (h.has_target) {
+        need += h.kv_n + h.st_b + h.cq_b + h.ck_b + h.cv_b + h.snap_n + h.ksnap_n + h.page_x_n + h.page_p_n + h.kpage_x_n +
+                h.kpage_p_n;
+    }
+    need += h.mtp_n;
+    if (size < need) {
+        return 0;
+    }
+
+    const char * p = (const char *) src + sizeof(h);
+    if (h.has_target) {
+        const size_t page_n = h.nkv_pages * h.kv_page_b;
+        for (const axera_cmm & c : KVC) {
+            for (int j = 0; j < (int) h.pna; ++j) {
+                char * d = (char *) c->vir + (size_t) j * kv_alloc;
+                memcpy(d, p, page_n);
+                c->flush(d, page_n);
+                p += page_n;
+            }
+        }
+        for (const axera_cmm * b : { &ST, &CQ, &CK, &CV }) {
+            memcpy((*b)->vir, p, (*b)->size);
+            (*b)->flush((*b)->vir, (*b)->size);
+            p += (*b)->size;
+        }
+        const auto get = [&](void * dst, size_t n) {
+            if (n) {
+                memcpy(dst, p, n);
+                p += n;
+            }
+        };
+        snap.resize(h.snap_n);
+        ksnap.resize(h.ksnap_n);
+        page_x.resize(h.page_x_n / sizeof(ggml_bf16_t));
+        page_p.resize(h.page_p_n / sizeof(int32_t));
+        kpage_x.resize(h.kpage_x_n / sizeof(ggml_bf16_t));
+        kpage_p.resize(h.kpage_p_n / sizeof(int32_t));
+        get(snap.data(), h.snap_n);
+        get(ksnap.data(), h.ksnap_n);
+        get(page_x.data(), h.page_x_n);
+        get(page_p.data(), h.page_p_n);
+        get(kpage_x.data(), h.kpage_x_n);
+        get(kpage_p.data(), h.kpage_p_n);
+        snap_cell   = h.snap_cell;
+        ksnap_cell  = h.ksnap_cell;
+        snap_prompt = h.snap_prompt;
+        cur_set     = -1;
+        ver_c0      = -1;
+        ver_T       = 0;
+        ver_set     = -1;
+        for (int k = 0; k < 4; ++k) {
+            for (size_t g = 0; g < where[k].size(); ++g) {
+                where[k][g] = { pool(k).get(), (char *) pool(k)->vir + g * part(k) };
+            }
+        }
+        bind_state();
+    }
+    if (h.mtp_n) {
+        memcpy(MKV->vir, p, h.mtp_n);
+        MKV->flush(MKV->vir, h.mtp_n);
+        p += h.mtp_n;
+    }
+    mtp_cell = h.mtp_cell;
+    return (size_t) (p - (const char *) src);
+}
+
 // prefill pages from cell c0 (a page's first): n rows x [n][H] bf16 and their M-RoPE positions p4 [n][4]; the hidden
 // states of the rows from out0 on into h
 void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0) {
@@ -1175,6 +1419,7 @@ void qwen35_whole::init_mtp(const std::map<std::string, ggml_tensor *> & t, int 
     const kernel & kp = man.get("mtp.prompt");
     GGML_ASSERT(k1.desc->packs == kp.desc->packs && k1.out_bytes("kv") == kp.out_bytes("kv"));
     MKV = axera_cmm_alloc(k1.out_bytes("kv"));
+    mtp_page_b = k1.out_bytes("kv") / NBLK;
     auto bind = [&](call & c, const kernel & k, std::initializer_list<std::pair<const char *, axera_cmm *>> io) {
         c   = {};
         c.k = &k;
@@ -1278,6 +1523,10 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
     }
     const rope    rp(rope_node, pos, T);
     const kv_view kv(kidx, kqm, man.context, PG);
+    mtp_cell = 0;
+    for (int r = 0; r < T; ++r) {
+        mtp_cell = std::max(mtp_cell, kv.cell_of(r) + 1);
+    }
     auto row_bf16 = [&](const ggml_tensor * x, int r, ggml_bf16_t * d) {
         ggml_fp32_to_bf16_row((const float *) ((const char *) x->data + (size_t) r * x->nb[1]), d, H);
     };
