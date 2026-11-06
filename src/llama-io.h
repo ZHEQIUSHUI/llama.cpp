@@ -14,6 +14,9 @@ public:
     virtual void write(const void * src, size_t size) = 0;
     virtual void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) = 0;
 
+    // a sizing pass only counts the bytes; a backend may skip building its data
+    virtual bool is_dummy() const { return false; }
+
     // bytes written so far
     virtual size_t n_bytes() = 0;
 

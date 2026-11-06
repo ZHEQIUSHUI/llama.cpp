@@ -7,12 +7,19 @@
 
 #include "ggml-backend.h"
 
+#include <cstddef>
 #include <memory>
 
 namespace axera {
 
 struct model {
     virtual ~model() = default;
+    // llama.cpp's sequence state (context checkpoints / prompt cache). An adapter whose caches are private CMM pools
+    // overrides these: the backend appends the blob to the state stream, so a checkpoint restore puts the state the
+    // kernels actually read back. The default is no state, which is also the CPU-backend behaviour.
+    virtual size_t state_size() const { return 0; }
+    virtual size_t state_write(void * dst, size_t size) { (void) dst; (void) size; return 0; }
+    virtual size_t state_read(const void * src, size_t size) { (void) src; (void) size; return 0; }
     // the whole graph (llama.cpp's model graph: up to the logits); a graph the model does not run fails
     virtual ggml_status compute(ggml_cgraph * g) = 0;
 };
