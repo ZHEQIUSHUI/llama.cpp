@@ -1439,10 +1439,6 @@ void llama_context::set_dummy_batch(bool value) {
     cparams.dummy_batch = value;
 }
 
-void llama_context::set_prebuild_decode(bool value) {
-    prebuild_decode = value;
-}
-
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1726,12 +1722,8 @@ bool llama_context::graph_prebuild_decode(const llama_memory_context_i * mctx) {
         }
         return false;
     };
-    // With speculative decoding, a multi-row verification is followed by another verification, so a single-token
-    // decode graph is wasted there.  Keep the end-of-prompt graph: the MTP prompt catch-up starts immediately after it
-    // and relies on the target prebuild having completed.
-    const bool skip_multirow = !prebuild_decode && n_outputs > 1;
-    if (!enabled || skip_multirow || !mctx || cparams.warmup || cparams.embeddings) {
-        return no(!enabled ? "disabled" : skip_multirow ? "disabled by caller for multi-row batch" : !mctx ? "no memory context" :
+    if (!enabled || !mctx || cparams.warmup || cparams.embeddings) {
+        return no(!enabled ? "disabled" : !mctx ? "no memory context" :
                   cparams.warmup ? "warmup" : "embeddings");
     }
 
@@ -4624,10 +4616,6 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_set_dummy_batch(llama_context * ctx, bool dummy) {
     ctx->set_dummy_batch(dummy);
-}
-
-void llama_set_prebuild_decode(llama_context * ctx, bool enabled) {
-    ctx->set_prebuild_decode(enabled);
 }
 
 void llama_synchronize(llama_context * ctx) {

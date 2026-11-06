@@ -1422,9 +1422,6 @@ private:
             ctx_dft   = nullptr;
             model_dft = nullptr;
         }
-        // a multi-row verify batch is followed by another verify, so its single-token decode graph would never be used
-        llama_set_prebuild_decode(ctx_tgt, spec == nullptr);
-
         if (!spec && params_base.speculative.has_synth()) {
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
             return false;
