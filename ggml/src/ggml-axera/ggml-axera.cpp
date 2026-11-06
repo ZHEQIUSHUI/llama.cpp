@@ -327,7 +327,7 @@ static bool ggml_backend_axera_offload_input_layer() {
 static bool ggml_backend_axera_host_visible_output() {
     // this adapter writes the logits in host-visible CMM: llama.cpp reads them in place instead of copying 1 MiB
     const axera::manifest * m = axera::kernels();
-    return m && m->model == "qwen35_moe_sgl";
+    return m && (m->model == "qwen35_moe_sgl" || m->model == "qwen35_whole" || m->model == "qwen38_27b");
 }
 
 // llama.cpp built a graph it will compute next (a decode graph at the end of a prompt's call): let the adapter do its
