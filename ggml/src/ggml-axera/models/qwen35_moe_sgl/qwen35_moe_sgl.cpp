@@ -289,7 +289,8 @@ class qwen35_moe_sgl final : public model {
     void         bind_deltas(call & c, int out_set, int prev_set);
     void         bind_state();
     AX_ENGINE_IO_BUFFER_T state_io(const std::string & name);
-    ggml_status  verify(const kv_view & kv, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h);
+    ggml_status  verify(const kv_view & kv, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h,
+                        const std::vector<int> * out_rows);
     void         init_mtp(const std::map<std::string, ggml_tensor *> & t, int il, const rope & rq);
     ggml_status  compute_mtp(ggml_cgraph * g);
     void         paging(int64_t hist, int64_t write_cell);
@@ -1556,7 +1557,8 @@ size_t qwen35_moe_sgl::state_read(const void * src, size_t size) {
 // T (2 - 4) consecutive tokens from cell c0 through the verification kernel: the four rows' hidden
 // states into h, one rank-1 state delta per row, and the small Conv snapshots.  The recurrent state
 // stays in its pool at the entry cell; the accepted prefix is folded in by the next call.
-ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h) {
+ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h,
+                                   const std::vector<int> * out_rows) {
     GGML_ASSERT(ver.k && T >= 1 && T <= 4);
     const int64_t c0 = kv.cell_of(0);
     if (c0 % PG == 0) {
@@ -1618,8 +1620,10 @@ ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, c
         ver.k->run(ver.in, ver.out, "verify");
     }
     VOUT->invalidate(VOUT->vir, (size_t) T * H * sizeof(ggml_bf16_t));
-    for (int r = 0; r < T; ++r) {
-        ggml_bf16_to_fp32_row((const ggml_bf16_t *) VOUT->vir + (size_t) r * H, h + (size_t) r * H, H);
+    for (size_t r = 0; r < (out_rows ? out_rows->size() : (size_t) T); ++r) {
+        const int row = out_rows ? out_rows->at(r) : (int) r;
+        GGML_ASSERT(row >= 0 && row < T);
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) VOUT->vir + (size_t) row * H, h + r * H, H);
     }
     conv_set         = set;
     conv_n           = T;
@@ -2520,7 +2524,7 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
                                       vxb.data() + (size_t) r * H, H);
             });
         }
-        const ggml_status st = verify(kv, vxb.data(), pb.data(), T, h.data());
+        const ggml_status st = verify(kv, vxb.data(), pb.data(), T, h.data(), &out_rows);
         if (st != GGML_STATUS_SUCCESS) {
             return st;
         }
