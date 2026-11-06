@@ -1,4 +1,5 @@
 #include "argmax_state.h"
+#include "../core/runtime.h"
 
 #include <algorithm>
 #include <mutex>
@@ -16,6 +17,7 @@ struct state {
     int32_t              n = 0;
     std::vector<uint8_t> used;
     std::vector<int32_t> suppress;
+    uint64_t             epoch = 0;
 };
 
 state & s() {
@@ -35,6 +37,7 @@ int argmax_configure(bool enabled, const int32_t * ids, int32_t n) {
     v.n = 0;
     v.used.clear();
     v.suppress.clear();
+    v.epoch = 0;
     if (ids && n > 0) {
         v.suppress.assign(ids, ids + n);
         std::sort(v.suppress.begin(), v.suppress.end());
@@ -88,13 +91,20 @@ bool argmax_publish(const int32_t * ids, const float * logits, int32_t rows) {
     std::copy(logits, logits + rows, v.logits.begin());
     v.n = rows;
     v.used.assign((size_t) rows, 0);
+    v.epoch = axera_graph_epoch;
     return true;
+}
+
+int argmax_published() {
+    state & v = s();
+    std::lock_guard<std::mutex> lk(v.mu);
+    return v.enabled && v.n > 0 && v.epoch == axera_graph_epoch ? v.n : 0;
 }
 
 int argmax_take(int idx, int32_t * id, float * logit) {
     state & v = s();
     std::lock_guard<std::mutex> lk(v.mu);
-    if (!v.enabled || !id || !logit || v.n <= 0) {
+    if (!v.enabled || !id || !logit || v.n <= 0 || v.epoch != axera_graph_epoch) {
         return 0;
     }
     const int32_t row = idx < 0 ? v.n + idx : idx;

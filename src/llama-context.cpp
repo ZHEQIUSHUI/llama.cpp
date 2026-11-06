@@ -1439,6 +1439,10 @@ void llama_context::set_dummy_batch(bool value) {
     cparams.dummy_batch = value;
 }
 
+void llama_context::set_prebuild_decode(bool value) {
+    prebuild_decode = value;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1722,8 +1726,9 @@ bool llama_context::graph_prebuild_decode(const llama_memory_context_i * mctx) {
         }
         return false;
     };
-    if (!enabled || !mctx || cparams.warmup || cparams.embeddings) {
-        return no(!enabled ? "disabled" : !mctx ? "no memory context" : cparams.warmup ? "warmup" : "embeddings");
+    if (!enabled || !prebuild_decode || !mctx || cparams.warmup || cparams.embeddings) {
+        return no(!enabled ? "disabled" : !prebuild_decode ? "disabled by caller" : !mctx ? "no memory context" :
+                  cparams.warmup ? "warmup" : "embeddings");
     }
 
     llama_batch_ext nb(this);
@@ -2332,8 +2337,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_res));
                 auto fn = (bool (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_visible_output");
-                if (fn && fn() && n_outputs_prev == 0 && ubatch.n_tokens == 1 && t_logits->type == GGML_TYPE_F32 &&
-                    ggml_is_contiguous(t_logits) && t_logits->nb[1] == n_vocab*sizeof(float)) {
+                if (fn && fn() && n_outputs_prev == 0 && ubatch.n_tokens == n_outputs && t_logits->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(t_logits) && t_logits->nb[1] == n_vocab*sizeof(float) &&
+                    t_logits->ne[1] == n_outputs) {
                     logits.data = (float *) t_logits->data;
                 } else {
                     ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
@@ -4614,6 +4620,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_set_dummy_batch(llama_context * ctx, bool dummy) {
     ctx->set_dummy_batch(dummy);
+}
+
+void llama_set_prebuild_decode(llama_context * ctx, bool enabled) {
+    ctx->set_prebuild_decode(enabled);
 }
 
 void llama_synchronize(llama_context * ctx) {

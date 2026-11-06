@@ -15,6 +15,7 @@ int  argmax_configure(bool enabled, const int32_t * ids, int32_t n);
 void argmax_reset();
 bool argmax_wanted();
 bool argmax_publish(const int32_t * ids, const float * logits, int32_t rows);
+int  argmax_published();
 int  argmax_take(int idx, int32_t * id, float * logit);
 
 }  // namespace axera
