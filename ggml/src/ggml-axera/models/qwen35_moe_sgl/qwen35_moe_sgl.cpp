@@ -1868,11 +1868,11 @@ void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4
             const char * e = std::getenv("GGML_AXERA_DECODE_BUCKET");
             return !e || std::atoi(e) != 0;
         }();
-        // A very short history keeps the released kernel: its arithmetic is the reference for short-prompt gates,
-        // while the 4k speed case is above this threshold and takes the smaller variant.
+        // Every history takes the smallest bucket that fits its context by default. GGML_AXERA_DECODE_BUCKET_MIN
+        // remains an escape hatch for reproducing the old 2048-cell threshold.
         static const int64_t bucket_min = [] {
             const char * e = std::getenv("GGML_AXERA_DECODE_BUCKET_MIN");
-            return e ? std::max<int64_t>(0, std::atoll(e)) : 2048;
+            return e ? std::max<int64_t>(0, std::atoll(e)) : 0;
         }();
         if (buckets_on && c >= bucket_min) {
             const int64_t need = c / PG + 1;  // the history pages and the page this token writes
