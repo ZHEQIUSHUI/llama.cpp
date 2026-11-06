@@ -1896,12 +1896,16 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     bool combined_dec = false;
     const char * fused_head_env = getenv("GGML_AXERA_FUSED_HEAD");
     const bool   npu_heads      = !fused_head_env || atoi(fused_head_env) != 0;
-    if (n_out > 0 && npu_heads) {
-        head.bind(man.get("lm_head"), logits->src[0]);
-        combined_dec = head.bind_combined(man.get("lm_head"), logits->src[0]);
-        combined_dec = combined_dec && head.combined_ready(g, names);
-        if (man.has("lm_head.verify")) {
-            head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
+    if (n_out > 0) {
+        if (npu_heads) {
+            head.bind(man.get("lm_head"), logits->src[0]);
+            combined_dec = head.bind_combined(man.get("lm_head"), logits->src[0]);
+            combined_dec = combined_dec && head.combined_ready(g, names);
+            if (man.has("lm_head.verify")) {
+                head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
+            }
+        } else {
+            head.bind(man.get("lm_head.gemm"), logits->src[0]);
         }
     }
     bool fused_dec = false;
