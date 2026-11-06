@@ -118,6 +118,9 @@ axera_cmm axera_cmm_alloc_nc(size_t size);  // non-cacheable (host writes only)
 axera_cmm axera_cmm_view(const ggml_backend_axera_buffer_context * b, size_t off, size_t size);
 // a kernel IO entry over p (within ctx)
 AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint32_t size);
+// a kernel IO entry over device memory whose owning allocation is not at hand (e.g. another
+// context's graph tensor); maps the virtual address back to its CMM block
+AX_ENGINE_IO_BUFFER_T axera_io_virt(void * p, uint32_t size);
 inline AX_ENGINE_IO_BUFFER_T axera_io(const axera_cmm & c, size_t size) {
     return axera_io(c.get(), c->vir, (uint32_t) size);
 }

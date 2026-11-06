@@ -79,6 +79,10 @@ uint64_t ggml_graph_next_uid(void) {
 #endif // defined(_MSC_VER)
 #endif // defined(__AVX512BF16__)
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #if defined(__linux__) || \
     defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || \
     (defined(__APPLE__) && !TARGET_OS_TV && !TARGET_OS_WATCH)
@@ -512,6 +516,25 @@ void ggml_fp32_to_bf16_row(const float * x, ggml_bf16_t * y, int64_t n) {
             (__m512i *)(y + i),
             m512i(_mm512_cvtne2ps_pbh(_mm512_loadu_ps(x + i + 16),
                                 _mm512_loadu_ps(x + i))));
+  }
+#elif defined(__aarch64__)
+  // Round to nearest even and quiet NaNs exactly like ggml_compute_fp32_to_bf16().
+  // The scalar loop is one of the largest prompt-catch-up costs on the AX8860 CPU.
+  for (; i + 16 <= n; i += 16) {
+        uint32x4_t u[4];
+        uint32x4_t r[4];
+        for (int j = 0; j < 4; ++j) {
+            u[j] = vreinterpretq_u32_f32(vld1q_f32(x + i + 4*j));
+            r[j] = vshrq_n_u32(vaddq_u32(vaddq_u32(u[j], vdupq_n_u32(0x7fff)),
+                                          vandq_u32(vshrq_n_u32(u[j], 16), vdupq_n_u32(1))), 16);
+            const uint32x4_t nan = vcgtq_u32(vandq_u32(u[j], vdupq_n_u32(0x7fffffff)),
+                                             vdupq_n_u32(0x7f800000));
+            r[j] = vbslq_u32(nan, vorrq_u32(vshrq_n_u32(u[j], 16), vdupq_n_u32(64)), r[j]);
+        }
+        vst1_u16((uint16_t *) (y + i +  0), vmovn_u32(r[0]));
+        vst1_u16((uint16_t *) (y + i +  4), vmovn_u32(r[1]));
+        vst1_u16((uint16_t *) (y + i +  8), vmovn_u32(r[2]));
+        vst1_u16((uint16_t *) (y + i + 12), vmovn_u32(r[3]));
   }
 #endif
     for (; i < n; i++) {

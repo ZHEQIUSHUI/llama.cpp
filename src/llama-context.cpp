@@ -15,6 +15,7 @@
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
+#include "ggml-axera.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -937,6 +938,54 @@ uint32_t llama_context::n_batch() const {
     return cparams.n_batch;
 }
 
+bool llama_context::has_backend(const char * name) const {
+    if (!name) {
+        return false;
+    }
+    for (const auto & backend : backends) {
+        if (backend && strcmp(ggml_backend_name(backend.get()), name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void llama_context::set_embeddings_nextn_extract_limit(int32_t n_tokens_max) {
+    embeddings_nextn_extract_limit = n_tokens_max;
+}
+
+float * llama_context::get_embeddings_nextn_backend_ith(int32_t i) {
+    ggml_tensor * h = nextn_backend_tensor;
+    if (getenv("MTPPF_PROF")) {
+        fprintf(stderr, "mtppf nextn row: i=%d tensor=%p data=%p type=%d ne1=%lld nb1=%zu ready=%d active=%p\n",
+                i, (void *) h, h ? h->data : nullptr, h ? (int) h->type : -1,
+                h ? (long long) h->ne[1] : -1, h ? h->nb[1] : 0, (int) nextn_backend_ready,
+                (void *) gf_res_prev_active);
+    }
+    if (!h || !h->data || h->type != GGML_TYPE_F32 || i < 0 || i >= h->ne[1]) {
+        return nullptr;
+    }
+    return (float *) ((char *) h->data + (size_t) i * h->nb[1]);
+}
+
+float * llama_context::get_inp_embd_backend_ith(int32_t i) {
+    if (!nextn_backend_ready || i < 0) {
+        return nullptr;
+    }
+    for (const auto & backend : backends) {
+        size_t stride = 0;
+        const void * data = ggml_backend_axera_get_input_embed(backend.get(), &stride);
+        if (getenv("MTPPF_PROF")) {
+            fprintf(stderr, "mtppf inp embd: backend=%s data=%p stride=%zu ne=%zu ready=%d\n",
+                    ggml_backend_name(backend.get()), data, stride, backends.size(), (int) nextn_backend_ready);
+        }
+        if (data && stride) {
+            return (float *) ((char *) data + (size_t) i * stride);
+        }
+    }
+    return nullptr;
+}
+
 uint32_t llama_context::n_ubatch() const {
     return cparams.n_ubatch;
 }
@@ -1520,6 +1569,8 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    static const bool mtpprof = getenv("MTPPF_PROF") != nullptr;
+    const int64_t mtp_t0 = mtpprof ? ggml_time_us() : 0;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1580,6 +1631,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gp_built           = true;
     }
     const int64_t gp_t1 = gprof ? ggml_time_us() : 0;
+    const int64_t mtp_t1 = mtpprof ? ggml_time_us() : 0;
 
     // set the input data for the input tensors
     {
@@ -1590,6 +1642,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    const int64_t mtp_t2 = mtpprof ? ggml_time_us() : 0;
     if (gprof) {
         auto & g = gp[this];
         (gp_built ? g.nb : g.nr)++;
@@ -1604,6 +1657,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (mtpprof && ubatch.n_tokens > 64) {
+        fprintf(stderr, "mtppf graph: gtype %d rows %u setup %.3f ms inputs %.3f ms compute %.3f ms\n",
+                (int) gtype, ubatch.n_tokens, (mtp_t1 - mtp_t0) / 1e3, (mtp_t2 - mtp_t1) / 1e3,
+                (ggml_time_us() - mtp_t2) / 1e3);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2014,6 +2072,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    nextn_backend_ready = false;
+    nextn_backend_tensor = nullptr;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -2166,7 +2227,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            const bool whole_batch = (int64_t) ubatch.n_tokens == (int64_t) n_tokens_all;
+            const bool copy_nextn = embeddings_nextn_extract_limit < 0 || !whole_batch ||
+                    (int64_t) ubatch.n_tokens <= embeddings_nextn_extract_limit;
+            nextn_backend_ready = !copy_nextn;
+            nextn_backend_tensor = nextn_backend_ready ? t_h_nextn : nullptr;
+            if (copy_nextn && embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -4186,6 +4252,35 @@ uint32_t llama_n_batch(const llama_context * ctx) {
 
 uint32_t llama_n_ubatch(const llama_context * ctx) {
     return ctx->n_ubatch();
+}
+
+bool llama_context_has_backend(const llama_context * ctx, const char * name) {
+    return ctx && ctx->has_backend(name);
+}
+
+void llama_set_embeddings_nextn_extract_limit(llama_context * ctx, int32_t n_tokens_max) {
+    if (ctx) {
+        ctx->set_embeddings_nextn_extract_limit(n_tokens_max);
+    }
+}
+
+bool llama_embeddings_nextn_backend_ready(const llama_context * ctx) {
+    return ctx && ctx->embeddings_nextn_backend_ready();
+}
+
+float * llama_get_embeddings_nextn_backend_ith(llama_context * ctx, int32_t i) {
+    if (!ctx) {
+        return nullptr;
+    }
+    ctx->synchronize();
+    return ctx->get_embeddings_nextn_backend_ith(i);
+}
+
+float * llama_get_inp_embd_backend_ith(llama_context * ctx, int32_t i) {
+    if (!ctx) {
+        return nullptr;
+    }
+    return ctx->get_inp_embd_backend_ith(i);
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {

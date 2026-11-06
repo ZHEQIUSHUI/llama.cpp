@@ -19,6 +19,8 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <thread>
+#include <chrono>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1449,6 +1451,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
+    bool    alias_target_h = false;  // the target's h_nextn rows can be read in place by the draft
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
@@ -1465,6 +1468,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
+
+    // A prompt catch-up only extends the draft KV; no host code reads its result until the
+    // next draft. Run it while the target processes the next prompt ubatch.
+    std::thread catchup_bg;
+    int32_t     catchup_rc = 0;
+
+    bool catchup_wait() {
+        if (catchup_bg.joinable()) {
+            catchup_bg.join();
+        }
+        if (catchup_rc != 0) {
+            SPC_ERR("async MTP prompt catch-up failed rc=%d\n", (int) catchup_rc);
+            catchup_rc = 0;
+            return false;
+        }
+        return true;
+    }
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1521,6 +1541,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+        alias_target_h = !is_mem_shared && llama_context_has_backend(ctx_tgt, "AXERA");
+        if (alias_target_h) {
+            // A prompt catch-up reads the target's backend h_nextn tensor directly. A verification
+            // or draft batch is small enough to keep the normal host copy.
+            llama_set_embeddings_nextn_extract_limit(ctx_tgt, this->params.n_max + 1);
+        }
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1543,6 +1569,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        catchup_wait();
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1557,6 +1584,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        catchup_wait();
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
 
@@ -1578,6 +1606,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const common_batch & batch_in) override {
+        if (!catchup_wait()) {
+            return false;
+        }
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -1610,6 +1641,64 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
+            const bool prompt_catchup = batch_in.size() > (int32_t) params.n_max + 1;
+            if (prompt_catchup && alias_target_h && llama_embeddings_nextn_backend_ready(ctx_tgt) && !chain_heads && n_seq == 1 &&
+                    i_batch_beg[0] == 0 && i_batch_end[0] == n_tokens - 1) {
+                // The MTP rows read the target's final-norm rows 0..T-2 in place. The graph's
+                // h0 input carries the previous step's row for MTP row 0.
+                const float * h_tgt = llama_get_embeddings_nextn_backend_ith(ctx_tgt, 0);
+                const float * e_tgt = llama_get_inp_embd_backend_ith(ctx_tgt, 1);
+                if (h_tgt && e_tgt) {
+                    if (getenv("MTPPF_PROF")) {
+                        fprintf(stderr, "mtppf alias: h=%p e=%p rows=%d\n", (const void *) h_tgt,
+                                (const void *) e_tgt, (int) n_tokens);
+                    }
+                    const auto t0 = std::chrono::steady_clock::now();
+                    // MTP row 0 uses the hidden state carried into this prompt, not target row -1.
+                    // Run it separately so every row of the aliased prompt chunk can use h[i] in
+                    // place (the h0 input is not part of the backend's split graph).
+                    batch.clear();
+                    {
+                        const auto & t = batch_in.tokens[0];
+                        if (t.id != LLAMA_TOKEN_NULL) {
+                            batch.add(t.id, t.pos[0], t.seq_id, false);
+                        } else {
+                            batch.add_embd(t.embd, t.pos.data(), t.seq_id, false);
+                        }
+                    }
+                    batch.set_embd_state(0, { pending_h[0].data(), 1, (size_t) n_embd });
+                    int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) aliased prompt row 0 failed rc=%d\n", (int) rc);
+                        return false;
+                    }
+
+                    batch.clear();
+                    for (int k = 1; k < n_tokens; ++k) {
+                        const auto & t = batch_in.tokens[k];
+                        if (t.id != LLAMA_TOKEN_NULL) {
+                            batch.add(t.id, t.pos[0], t.seq_id, false);
+                        } else {
+                            batch.add_embd(t.embd, t.pos.data(), t.seq_id, false);
+                        }
+                    }
+                    batch.set_embd_state_ext(h_tgt, (size_t) n_embd);
+                    batch.set_embd_ext(e_tgt, (size_t) n_embd);
+                    rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) aliased prompt failed rc=%d\n", (int) rc);
+                        return false;
+                    }
+                    const float * h_last = llama_get_embeddings_nextn_backend_ith(ctx_tgt, n_tokens - 1);
+                    std::memcpy(pending_h[0].data(), h_last, row_bytes);
+                    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    SPC_WRN("MTP prompt catch-up: %.1f ms for %d rows (aliased)\n", ms, (int) batch_in.size());
+                    return true;
+                }
+                SPC_ERR("%s", "MTP prompt catch-up: the target has no backend h_nextn rows\n");
+                return false;
+            }
+
             batch.clear();
 
             // pair each token with the tgt embedding shifted right by one position, and
@@ -1639,6 +1728,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             auto * mem_dft = llama_get_memory(ctx_dft);
 
+            const bool async_catchup = !chain_heads &&
+                batch_in.size() > (int32_t) params.n_max + 1;
+            if (async_catchup) {
+                // Materialize the draft batch (including the target hidden rows) before the
+                // worker starts: the target's next graph may reuse its h_nextn buffer.
+                llama_batch_ext * b = batch.get();
+                catchup_rc = 0;
+                catchup_bg = std::thread([this, ctx_dft, b] {
+                    catchup_rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, b);
+                });
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_end[seq_id] >= 0) {
+                        const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]);
+                        std::memcpy(pending_h[seq_id].data(), h, row_bytes);
+                    }
+                }
+                return true;
+            }
+
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
                 if (chain_heads) {
@@ -1652,7 +1760,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                const auto    t0 = std::chrono::steady_clock::now();
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                if (batch_in.size() > (int32_t) params.n_max + 1) {
+                    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    SPC_WRN("MTP prompt catch-up: %.1f ms for %d rows\n", ms, (int) batch_in.size());
+                }
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.tokens[0].pos[0]);
@@ -1700,6 +1813,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        catchup_wait();
         auto & ctx_dft = params.ctx_dft;
 
         batch.clear();

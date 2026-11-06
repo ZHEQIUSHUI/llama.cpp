@@ -46,6 +46,10 @@ struct composite final : model {
     int                    n = 0;
     model *                cur = nullptr;
 
+    // the language model's input-embedding rows (the MTP prompt catch-up reads them in place)
+    const void * input_embed_data() const override { return llm ? llm->input_embed_data() : nullptr; }
+    size_t       input_embed_stride() const override { return llm ? llm->input_embed_stride() : 0; }
+
     ggml_status compute(ggml_cgraph * g) override {
         if (g != last || g->n_nodes != n) {
             last = g;

@@ -4281,12 +4281,17 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        static const bool mtpprof = getenv("MTPPF_PROF") != nullptr;
+        const int64_t t_dec = mtpprof ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (mtpprof && batch.view.size() > 64) {
+            fprintf(stderr, "mtppf server: decode %.3f ms for %d rows\n", (ggml_time_us() - t_dec) / 1e3, batch.view.size());
+        }
 
         if (ret != 0) {
             {
@@ -4346,9 +4351,14 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t t_spec = mtpprof ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
             });
+            if (mtpprof && batch.view.size() > 64) {
+                fprintf(stderr, "mtppf server: speculative process %.3f ms for %d rows\n", (ggml_time_us() - t_spec) / 1e3,
+                        batch.view.size());
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");

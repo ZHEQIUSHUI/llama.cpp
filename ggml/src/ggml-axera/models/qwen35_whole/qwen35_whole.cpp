@@ -40,6 +40,8 @@ class qwen35_whole final : public model {
   public:
     explicit qwen35_whole(const manifest & m) : man(m), prm(m) {}
     ggml_status compute(ggml_cgraph * g) override;
+    const void * input_embed_data() const override { return input_embed; }
+    size_t       input_embed_stride() const override { return input_embed_row_stride; }
 
   private:
     const manifest & man;
@@ -102,10 +104,18 @@ class qwen35_whole final : public model {
     int64_t ver_c0  = -1;              // the last verification's first cell, rows, snapshot set
     int     ver_T = 0, ver_set = -1;
     // the MTP block (draft context graphs): its kernels' IO, its KV cache
-    call      mtp1, mtpp, mtp8;  // mtp8: role mtp.m8 (optional), up to 8 consecutive rows per call
+    call      mtp1, mtpp, mtppkv, mtp8;  // mtp8: role mtp.m8 (optional), up to 8 consecutive rows per call
     axera_cmm ME, MH, MCS, MPN, MMASK, MOUT, MRAW, PE, PH, PCS, PPN, PMASK, PNBLK, POUT2, PRAW, MKV;
+    axera_cmm PKE, PKH, PKCS;  // the compact prompt kernels use their own row width (not mtp.prompt's 256)
+    axera_cmm PK, PV;  // the K/V-only prompt pass' plain row outputs
+    size_t    mtp_kv_row = 0;
+    bool      mtp_h_f32 = false;
+    bool      mtp_e_f32 = false;
     axera_cmm M8E, M8H, M8CS, M8PN, M8MASK, M8NT, M8OUT, M8RAW;
     const void * mtp_bound = nullptr;
+    const void * input_embed = nullptr;
+    size_t       input_embed_row_stride = 0;
+    axera_cmm    IE;  // a prompt's token-embedding rows (F32) for the MTP catch-up (the graph's are on the CPU)
     std::vector<call>              pres;  // the prefill calls of a page (the kernel's blocks each)
     int                            ncall = 1;
     std::map<std::string, axera_cmm> banks;
@@ -994,6 +1004,11 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
         GGML_LOG_ERROR("axera qwen35_whole: a graph of %d nodes that is not the whole model (-ngl 99)\n", g->n_nodes);
         return GGML_STATUS_FAILED;
     }
+    if (const ggml_tensor * ie = names.find("model.input_embed");
+            ie && ie->data && ie->type == GGML_TYPE_F32 && ie->buffer && ggml_backend_buffer_is_axera(ie->buffer)) {
+        input_embed = ie->data;
+        input_embed_row_stride = ie->nb[1];
+    }
     ggml_tensor * x0 = norm0;
     while (x0 && x0->op != GGML_OP_RMS_NORM) {
         x0 = x0->src[0];
@@ -1144,6 +1159,23 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
         page_p.insert(page_p.end(), pb.begin(), pb.end());
     }
     ggml_tensor * hn = names.find("h_nextn");  // the MTP block's input: every row's final norm
+    // The MTP prompt catch-up reads both the token embeddings and these rows in place, so a prompt keeps every
+    // row in backend memory (the K/V-only pass otherwise fills just the last one, which the host alone reads).
+    const bool mtp_prompt_rows = hn && (hn->flags & GGML_TENSOR_FLAG_COMPUTE) && man.has("mtp.promptkv") && T > 4;
+    if (mtp_prompt_rows) {
+        const size_t esz = (size_t) T * H * sizeof(float);
+        if (!IE || IE->size < esz) {
+            IE = axera_cmm_alloc_raw(esz);
+        }
+        axera_timer tin("input embed rows");
+        axera_host_pool().run(T, [&](int64_t r) {
+            memcpy((char *) IE->vir + (size_t) r * H * sizeof(float),
+                   (const char *) x0->data + (size_t) r * x0->nb[1], H * sizeof(float));
+        });
+        IE->flush(IE->vir, esz);
+        input_embed = IE->vir;
+        input_embed_row_stride = H * sizeof(float);
+    }
     if (hn && (hn->flags & GGML_TENSOR_FLAG_COMPUTE)) {
         axera_timer tn("h_nextn");
         GGML_ASSERT(hn->type == GGML_TYPE_F32 && hn->ne[0] == H && hn->ne[1] == T);
@@ -1178,6 +1210,7 @@ void qwen35_whole::init_mtp(const std::map<std::string, ggml_tensor *> & t, int 
     const kernel & kp = man.get("mtp.prompt");
     GGML_ASSERT(k1.desc->packs == kp.desc->packs && k1.out_bytes("kv") == kp.out_bytes("kv"));
     MKV = axera_cmm_alloc(k1.out_bytes("kv"));
+    mtp_kv_row = (size_t) k1.out_bytes("kv") / NBLK / (2 * PG);
     auto bind = [&](call & c, const kernel & k, std::initializer_list<std::pair<const char *, axera_cmm *>> io) {
         c   = {};
         c.k = &k;
@@ -1221,6 +1254,21 @@ void qwen35_whole::init_mtp(const std::map<std::string, ggml_tensor *> & t, int 
     GGML_ASSERT(MCS->size == (size_t) ROT * sizeof(ggml_bf16_t) && MMASK->size == (size_t) man.context * sizeof(ggml_bf16_t) &&
                 PE->size % ((size_t) H * sizeof(ggml_bf16_t)) == 0);
     std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> live = { &mtp1.in, &mtpp.in };
+    if (man.has("mtp.promptkv")) {
+        const kernel & kpk = man.get("mtp.promptkv");
+        bind(mtppkv, kpk, { { "e", &PKE }, { "h", &PKH }, { "cs", &PKCS }, { "kout", &PK }, { "vout", &PV } });
+        const io_desc * ed = nullptr;
+        for (const auto & d : kpk.desc->in) {
+            if (d.name == "e") {
+                ed = &d;
+            }
+        }
+        GGML_ASSERT(ed && ed->shape.size() >= 2);
+        const size_t P = (size_t) ed->shape[1];
+        mtp_h_f32 = PKH->size == P * H * sizeof(float);
+        mtp_e_f32 = PKE->size == P * H * sizeof(float);
+        live.push_back(&mtppkv.in);
+    }
     if (man.has("mtp.m8")) {
         const kernel & k8 = man.get("mtp.m8");
         GGML_ASSERT(k8.desc->packs == k1.desc->packs && k8.out_bytes("kv") == k1.out_bytes("kv"));
@@ -1238,6 +1286,7 @@ void qwen35_whole::init_mtp(const std::map<std::string, ggml_tensor *> & t, int 
 // a draft context's MTP graph: token x_p (its embedding row) with the target's final-norm hidden of p - 1 through the
 // MTP block at the draft context's cells; h_nextn (the block's shared head norm) and the logits of the output rows
 ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
+    axera_timer mtp_all("mtp all");
     const auto &  t     = names.t;
     ggml_tensor * hin   = names.find("mtp_h_input");
     ggml_tensor * hn    = names.find("h_nextn");
@@ -1258,6 +1307,7 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
                 while (n0 < g->n_nodes && g->nodes[n0] != r) {
                     ++n0;
                 }
+                axera_timer tcpu("mtp input (cpu)");
                 cpu_compute(g, g->nodes, n0, "mtp input (cpu)");
             }
         }
@@ -1270,6 +1320,10 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
     const int T = (int) hin->ne[1];
     GGML_ASSERT(hin->type == GGML_TYPE_F32 && hin->ne[0] == H && embd->type == GGML_TYPE_F32 && embd->ne[0] == H &&
                 embd->ne[1] == T && hn->ne[1] == T);
+    // The prompt catch-up aliases `h` to the target's mapped rows for draft tokens 1..T.
+    // Detect the alias from the pointer.
+    const bool h_alias = hin->buffer && hin->data &&
+        hin->data != (char *) ggml_backend_buffer_get_base(hin->buffer) + hin->view_offs;
     const ggml_tensor * w0 = t.at("blk." + std::to_string(il) + ".nextn.eh_proj.weight");
     if (mtp_bound != w0->data) {
         init_mtp(t, il);
@@ -1342,46 +1396,153 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) MOUT->vir, h.data() + (size_t) r * H, H);
         }
     } else {
-        const int P = (int) (PE->size / (H * sizeof(ggml_bf16_t)));  // rows per call
-        for (int it = 0; it < T; it += P) {
-            const int n = std::min(P, T - it);
-            if (n < P) {  // (a full chunk overwrites every row)
-                memset((ggml_bf16_t *) PE->vir + (size_t) n * H, 0, (size_t) (P - n) * H * sizeof(ggml_bf16_t));
-                memset((ggml_bf16_t *) PH->vir + (size_t) n * H, 0, (size_t) (P - n) * H * sizeof(ggml_bf16_t));
+        const bool kvonly = mtppkv.k != nullptr;  // all but the last row need only their K/V
+        axera_cmm & pv_e  = kvonly ? PKE : PE;
+        axera_cmm & pv_h  = kvonly ? PKH : PH;
+        axera_cmm & pv_cs = kvonly ? PKCS : PCS;
+        const size_t e_row = mtp_e_f32 ? sizeof(float) : sizeof(ggml_bf16_t);
+        const int  P      = (int) (pv_e->size / (H * e_row));  // rows per call
+        const int  n_rows = kvonly ? T - 1 : T;
+        const bool direct_h = kvonly && mtp_h_f32 && h_alias && hin->type == GGML_TYPE_F32 && hin->data && hin->buffer &&
+            ggml_backend_buffer_is_axera(hin->buffer);
+        const bool direct_e = kvonly && mtp_e_f32 && embd->type == GGML_TYPE_F32 && embd->data && embd->buffer &&
+            ggml_backend_buffer_is_axera(embd->buffer);
+        auto run_t1 = [&](int r) {
+            row_bf16(embd, r, (ggml_bf16_t *) ME->vir);
+            row_bf16(hin, r, (ggml_bf16_t *) MH->vir);
+            rp.rows_packed(r, 1, MCS->vir);
+            const int64_t c    = kv.cell_of(r);
+            const int     nblk = kv.mask_row(r, (ggml_bf16_t *) MMASK->vir);
+            auto *        pn   = (int32_t *) MPN->vir;
+            pn[0]              = (int32_t) c;
+            pn[1]              = std::max(nblk, (int) (c / PG + 1));
+            pn[2]              = (int32_t) ((c / PG) * 2 * PG + c % PG);
+            for (const axera_cmm * b : { &ME, &MH, &MCS, &MPN, &MMASK }) {
+                (*b)->flush();
             }
-            auto * pn = (int32_t *) PPN->vir;
-            const int nmax = kv.chunk_mask((const int32_t *) pos->data, it, P, n, (ggml_bf16_t *) PMASK->vir);
-            for (int r = 0; r < P; ++r) {
-                const int     rr = std::min(r, n - 1);  // padded rows: the last row's positions and mask, later cells
-                const int64_t c  = kv.cell_of(it + rr) + (r - rr);
-                GGML_ASSERT(c < man.context);
-                if (r < n) {
-                    row_bf16(embd, it + r, (ggml_bf16_t *) PE->vir + (size_t) r * H);
-                    row_bf16(hin, it + r, (ggml_bf16_t *) PH->vir + (size_t) r * H);
+            mtp1.k->run(mtp1.in, mtp1.out, "mtp t1");
+            MOUT->invalidate();
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) MOUT->vir, h.data() + (size_t) r * H, H);
+        };
+        for (int it = 0; it < n_rows; it += P) {
+            const int n = std::min(P, n_rows - it);
+            const bool use_direct = direct_h && direct_e && n == P && (int64_t) it + P <= T;
+            if (n < P) {
+                memset((char *) pv_e->vir + (size_t) n * H * e_row, 0, (size_t) (P - n) * H * e_row);
+                if (!mtp_h_f32 || !use_direct) {
+                    memset((char *) pv_h->vir + (size_t) n * H * (mtp_h_f32 ? sizeof(float) : sizeof(ggml_bf16_t)), 0,
+                           (size_t) (P - n) * H * (mtp_h_f32 ? sizeof(float) : sizeof(ggml_bf16_t)));
                 }
-                rp.rows(it + rr, 1, COS.get(), SIN.get());
-                memcpy((char *) PCS->vir + r * 2 * half, COS->vir, half);
-                memcpy((char *) PCS->vir + r * 2 * half + half, SIN->vir, half);
+            }
+            axera_timer tprep("mtp prompt prep");
+            // mtp.promptkv has no pn input. Keep its cells in host memory instead of writing three
+            // uncached CMM words per row and reading them back again for the K/V scatter.
+            std::vector<int32_t> pn_host;
+            if (kvonly) {
+                pn_host.resize((size_t) 3 * P);
+            }
+            auto * pn = kvonly ? pn_host.data() : (int32_t *) PPN->vir;
+            const int nmax = kvonly ? 0 : kv.chunk_mask((const int32_t *) pos->data, it, P, n, (ggml_bf16_t *) PMASK->vir);
+            {
+                axera_timer ts("mtp prep rope");
+                rp.rows_packed(it, n, pv_cs->vir);
+                for (int r = n; r < P; ++r) {
+                    memcpy((char *) pv_cs->vir + (size_t) r * 2 * half,
+                           (char *) pv_cs->vir + (size_t) (n - 1) * 2 * half, 2 * half);
+                }
+            }
+            axera_timer ts("mtp prep rows");
+            for (int r = 0; r < P; ++r) {
+                const int     rr = std::min(r, n - 1);
+                const int64_t c  = kv.cell_of(it + rr) + (r - rr);
+                GGML_ASSERT(c < kv_cells);
+                if (r == 0 && n > 0 && !use_direct) {
+                    axera_host_pool().run((int64_t) 2 * n, [&](int64_t j) {
+                        const int rr_ = (int) (j % n);
+                        if (j < n) {
+                            if (mtp_e_f32) {
+                                memcpy((char *) pv_e->vir + (size_t) rr_ * H * sizeof(float),
+                                       (const char *) embd->data + (size_t) (it + rr_) * embd->nb[1], H * sizeof(float));
+                            } else {
+                                row_bf16(embd, it + rr_, (ggml_bf16_t *) pv_e->vir + (size_t) rr_ * H);
+                            }
+                        } else {
+                            if (mtp_h_f32) {
+                                memcpy((char *) pv_h->vir + (size_t) rr_ * H * sizeof(float),
+                                       (const char *) hin->data + (size_t) (it + rr_) * hin->nb[1], H * sizeof(float));
+                            } else {
+                                row_bf16(hin, it + rr_, (ggml_bf16_t *) pv_h->vir + (size_t) rr_ * H);
+                            }
+                        }
+                    });
+                }
                 pn[3 * r]     = (int32_t) c;
                 pn[3 * r + 1] = (int32_t) (c / PG + 1);
                 pn[3 * r + 2] = (int32_t) ((c / PG) * 2 * PG + c % PG);
             }
-            *(int32_t *) PNBLK->vir = nmax;
-            PE->flush(PE->vir, (size_t) n * H * sizeof(ggml_bf16_t));
-            PH->flush(PH->vir, (size_t) n * H * sizeof(ggml_bf16_t));
-            PCS->flush(PCS->vir, (size_t) n * 2 * half);
-            PPN->flush();
-            PNBLK->flush();
-            PMASK->flush(PMASK->vir, (size_t) nmax * P * PG * sizeof(ggml_bf16_t));
-            mtpp.k->run(mtpp.in, mtpp.out, "mtp prompt");
-            POUT2->invalidate();
-            for (int r = 0; r < n; ++r) {
-                ggml_bf16_to_fp32_row((const ggml_bf16_t *) POUT2->vir + (size_t) r * H, h.data() + (size_t) (it + r) * H, H);
+            {
+                axera_timer ts("mtp prep flush");
+                if (!use_direct) {
+                    pv_e->flush(pv_e->vir, (size_t) n * H * e_row);
+                }
+                if (!use_direct) {
+                    pv_h->flush(pv_h->vir, (size_t) n * H * (mtp_h_f32 ? sizeof(float) : sizeof(ggml_bf16_t)));
+                }
+                pv_cs->flush(pv_cs->vir, (size_t) n * 2 * half);
+                if (!kvonly) {
+                    PPN->flush();
+                }
             }
+            if (kvonly) {
+                {
+                    axera_timer trun("mtp prompt kv run");
+                    call kv = mtppkv;
+                    if (use_direct) {
+                        kv.in[kv.k->input("e")] = axera_io_virt((char *) embd->data + (size_t) it * embd->nb[1],
+                                                                kv.k->in_bytes("e"));
+                        kv.in[kv.k->input("h")] = axera_io_virt((char *) hin->data + (size_t) it * hin->nb[1],
+                                                                 kv.k->in_bytes("h"));
+                    }
+                    kv.k->run(kv.in, kv.out, "mtp prompt kv");
+                }
+                axera_timer tcopy("mtp prompt kv host copy");
+                PK->invalidate();
+                PV->invalidate();
+                int64_t pg0 = -1, pg1 = -1;
+                for (int r = 0; r < n; ++r) {
+                    const int64_t cell = pn[3 * r];
+                    const int64_t page = cell / PG, cl = cell % PG;
+                    memcpy((char *) MKV->vir + (size_t) ((page * 2 + 0) * PG + cl) * mtp_kv_row,
+                           (char *) PK->vir + (size_t) r * mtp_kv_row, mtp_kv_row);
+                    memcpy((char *) MKV->vir + (size_t) ((page * 2 + 1) * PG + cl) * mtp_kv_row,
+                           (char *) PV->vir + (size_t) r * mtp_kv_row, mtp_kv_row);
+                    pg0 = pg0 < 0 ? page : std::min(pg0, page);
+                    pg1 = std::max(pg1, page);
+                }
+                if (pg1 >= 0) {
+                    MKV->flush((char *) MKV->vir + (size_t) (pg0 * 2) * PG * mtp_kv_row,
+                               (size_t) ((pg1 - pg0 + 1) * 2) * PG * mtp_kv_row);
+                }
+            } else {
+                *(int32_t *) PNBLK->vir = nmax;
+                PNBLK->flush();
+                PMASK->flush(PMASK->vir, (size_t) nmax * P * PG * sizeof(ggml_bf16_t));
+                mtpp.k->run(mtpp.in, mtpp.out, "mtp prompt");
+                POUT2->invalidate();
+                for (int r = 0; r < n; ++r) {
+                    ggml_bf16_to_fp32_row((const ggml_bf16_t *) POUT2->vir + (size_t) r * H,
+                                          h.data() + (size_t) (it + r) * H, H);
+                }
+            }
+        }
+        if (kvonly) {
+            run_t1(T - 1);
         }
     }
     if (hn->flags & GGML_TENSOR_FLAG_COMPUTE) {
-        for (int r = 0; r < T; ++r) {
+        // a prompt keeps every row (the host aliases them to the MTP catch-up's input); the small batches
+        // need only the last one
+        for (int r = (T <= 4 && mtppkv.k) ? std::max(0, T - 1) : 0; r < T; ++r) {
             memcpy((char *) hn->data + r * hn->nb[1], h.data() + (size_t) r * H, H * sizeof(float));
         }
         if (ggml_backend_buffer_is_axera(hn->buffer)) {

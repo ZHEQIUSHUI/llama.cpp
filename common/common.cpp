@@ -2176,6 +2176,10 @@ common_batch::common_batch(llama_context * ctx) : batch(llama_batch_ext_init(ctx
 
 void common_batch::clear() {
     tokens.clear();
+    embd_ext = nullptr;
+    embd_ext_stride = 0;
+    state_ext = nullptr;
+    state_ext_stride = 0;
 }
 
 int32_t common_batch::add(llama_token id, llama_pos pos, llama_seq_id seq_id, bool output) {
@@ -2223,6 +2227,16 @@ bool common_batch::set_embd_state(int32_t idx, llama_embd state) {
     }
     tokens[idx].state = state;
     return true;
+}
+
+void common_batch::set_embd_state_ext(const float * data, size_t stride) {
+    state_ext = data;
+    state_ext_stride = stride;
+}
+
+void common_batch::set_embd_ext(const float * data, size_t stride) {
+    embd_ext = data;
+    embd_ext_stride = stride;
 }
 
 int32_t common_batch::add_embd(llama_embd embd, const llama_pos * pos, llama_seq_id seq_id, bool output) {
@@ -2276,6 +2290,18 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         }
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);
+        }
+    }
+
+    if (state_ext) {
+        if (!llama_batch_ext_set_embd_state_ext(res, state_ext + (size_t) off * state_ext_stride, state_ext_stride)) {
+            GGML_ABORT("%s: failed to set the external state at offset %d\n", __func__, off);
+        }
+    }
+
+    if (embd_ext) {
+        if (!llama_batch_ext_set_embd_ext(res, embd_ext + (size_t) off * embd_ext_stride, embd_ext_stride)) {
+            GGML_ABORT("%s: failed to set external embeddings at offset %d\n", __func__, off);
         }
     }
 

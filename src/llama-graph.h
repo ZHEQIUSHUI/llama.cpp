@@ -164,6 +164,8 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch]
+    void        * embd_alloc = nullptr; // embd's own allocation while external target rows alias it
+    void        * h_alloc = nullptr; // h's own allocation while an external state aliases it
 
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;

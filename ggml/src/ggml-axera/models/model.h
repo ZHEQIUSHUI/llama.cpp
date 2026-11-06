@@ -15,6 +15,9 @@ struct model {
     virtual ~model() = default;
     // the whole graph (llama.cpp's model graph: up to the logits); a graph the model does not run fails
     virtual ggml_status compute(ggml_cgraph * g) = 0;
+    // the target graph's input embeddings after the last compute, when they are in backend memory
+    virtual const void * input_embed_data() const { return nullptr; }
+    virtual size_t       input_embed_stride() const { return 0; }
 };
 
 // the adapter of the manifest's model; aborts for a model this backend has no adapter for

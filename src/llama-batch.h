@@ -34,6 +34,16 @@ struct llama_ubatch {
         return type != nullptr;
     }
 
+    // embd_state points into caller-owned memory that is already visible to the backend
+    bool is_embd_state_external() const {
+        return embd_state != nullptr && data && data->embd_state.empty();
+    }
+
+    // embd points into caller-owned backend memory (the target's token-embedding rows)
+    bool is_embd_external() const {
+        return embd_ext != nullptr;
+    }
+
     uint32_t b_equal_seqs; // note: this is a boolean, but we use an int32_t for alignment
                            //       otherwise address sanitizer complains
     // TODO: whole_seqs for embeddings?
@@ -51,6 +61,7 @@ struct llama_ubatch {
     //                          // size                     | idx | val
     llama_token  *  token;      // [n_tokens]               | i   | id, token
     float        *  embd;       // [n_embd, n_tokens]       | i   | embd
+    const float  *  embd_ext;   // [n_embd, n_tokens]       | i   | external backend rows
     float        *  embd_state; // [n_embd_state, n_tokens] | i   | hidden state carried over from a previous stage (e.g. MTP)
     llama_pos    *  pos;        // [n_tokens*n_pos]         | i   | pos
     int32_t      *  n_seq_id;   // [n_tokens]         | i   | -
@@ -122,6 +133,11 @@ struct llama_batch_ext {
     std::vector<token> tokens;
     std::vector<float> embd;
     std::vector<float> state;
+    const float * embd_ext = nullptr;
+    size_t        embd_ext_stride = 0;
+    // a contiguous state for the whole batch, kept where the caller produced it (no state copy)
+    const float * state_ext = nullptr;
+    size_t        state_ext_stride = 0;
 
     llama_batch_ext(llama_context * ctx);
 
@@ -144,7 +160,9 @@ struct llama_batch_ext {
     bool add_seq(int32_t idx, llama_seq_id seq_id);
     bool set_token_id(int32_t idx, llama_token id);
     bool set_token_embd(int32_t idx, llama_embd embd_in);
+    void set_embd_ext(const float * embd, size_t stride);
     bool set_token_state(int32_t idx, llama_embd state_in);
+    void set_state_ext(const float * state, size_t stride);
     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
     bool set_output(int32_t idx, bool output_last);
     bool set_decision_order(int32_t idx, int32_t order);
@@ -223,6 +241,10 @@ private:
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
     std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
+    const float *               embd_ext = nullptr;
+    size_t                      embd_ext_stride = 0;
+    const float *               state_ext = nullptr;
+    size_t                      state_ext_stride = 0;
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;

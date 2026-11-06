@@ -69,6 +69,11 @@ struct llama_context {
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
+    bool has_backend(const char * name) const;
+    void set_embeddings_nextn_extract_limit(int32_t n_tokens_max);
+    bool embeddings_nextn_backend_ready() const { return nextn_backend_ready; }
+    float * get_embeddings_nextn_backend_ith(int32_t i);
+    float * get_inp_embd_backend_ith(int32_t i);
     uint32_t n_seq_max() const;
 
     uint32_t n_threads()       const;
@@ -321,6 +326,9 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+    int32_t embeddings_nextn_extract_limit = -1;
+    bool    nextn_backend_ready = false;
+    ggml_tensor * nextn_backend_tensor = nullptr;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

@@ -579,6 +579,17 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
+    // whether the context has a backend of this name (e.g. "AXERA")
+    LLAMA_API bool llama_context_has_backend(const struct llama_context * ctx, const char * name);
+    // Skip the host copy of the target's h_nextn rows for ubatches larger than n_tokens_max.
+    // The MTP prompt catch-up reads the backend tensor directly; -1 copies every ubatch.
+    LLAMA_API void llama_set_embeddings_nextn_extract_limit(struct llama_context * ctx, int32_t n_tokens_max);
+    // Whether the last decode skipped the host h_nextn copy and the backend rows cover the whole batch.
+    LLAMA_API bool llama_embeddings_nextn_backend_ready(const struct llama_context * ctx);
+    // One h_nextn row in its backend buffer (AXERA's tensor memory is host mapped), or NULL.
+    LLAMA_API float * llama_get_embeddings_nextn_backend_ith(struct llama_context * ctx, int32_t i);
+    // One prompt input-embedding row in the target's backend buffer (AXERA), or NULL.
+    LLAMA_API float * llama_get_inp_embd_backend_ith(struct llama_context * ctx, int32_t i);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 
@@ -1062,6 +1073,19 @@ extern "C" {
                                 struct llama_batch_ext * batch,
                                                int32_t   idx,
                                      struct llama_embd   embd);
+
+    // Set one contiguous state row per batch entry, already resident where the backend can read it.
+    // Used by the MTP prompt catch-up to alias the target's h_nextn rows instead of copying them.
+    LLAMA_API bool llama_batch_ext_set_embd_state_ext(
+                                struct llama_batch_ext * batch,
+                                    const float * data,
+                                         size_t   stride);
+
+    // Use one contiguous embedding row per batch entry, already resident where the backend reads it.
+    LLAMA_API bool llama_batch_ext_set_embd_ext(
+                                struct llama_batch_ext * batch,
+                                    const float * data,
+                                         size_t   stride);
 
     // Set if output embeddings should be available for the token at index idx in the batch
     // Note: for now, this is equivalent to setting the output logits

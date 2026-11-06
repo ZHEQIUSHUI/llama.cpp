@@ -347,6 +347,20 @@ AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, vo
     return b;
 }
 
+AX_ENGINE_IO_BUFFER_T axera_io_virt(void * p, uint32_t size) {
+    AX_ENGINE_IO_BUFFER_T b;
+    memset(&b, 0, sizeof(b));
+    AX_U64 phy = 0;
+    AX_S32 mem_type = 0;
+    if (AX_SYS_MemGetBlockInfoByVirt(p, &phy, &mem_type) != 0) {
+        GGML_ABORT("%s: no CMM block for %p\n", __func__, p);
+    }
+    b.phyAddr = phy;
+    b.pVirAddr = p;
+    b.nSize = size;
+    return b;
+}
+
 axera_pool & axera_host_pool() {
     static axera_pool pool([] {
         const char * e = std::getenv("AXERA_HOST_POOL_THREADS");

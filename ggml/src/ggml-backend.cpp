@@ -1821,10 +1821,33 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
 }
 
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+    static const bool cprof = getenv("MTPPF_SPLIT_PROF") != nullptr;
+    const int64_t      cprof_t0 = cprof ? ggml_time_us() : 0;
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+    static thread_local std::unordered_map<ggml_tensor *, void *> external_alias;
+    auto prof = [&]() {
+        if (cprof) {
+            fprintf(stderr, "mtppf copy %s bytes %zu flags %d external %d %.3f ms\n",
+                    input->name, ggml_nbytes(input), (int) input->flags,
+                    (int) (input->flags & GGML_TENSOR_FLAG_EXTERNAL), (ggml_time_us() - cprof_t0) / 1e3);
+        }
+    };
+
+    if (input->flags & GGML_TENSOR_FLAG_EXTERNAL) {
+        // the tensor already has a pointer to backend-visible caller memory (e.g. the target's
+        // h_nextn rows); point the split's view at it instead of copying it across contexts
+        external_alias.emplace(input_cpy, input_cpy->data);
+        input_cpy->data = input->data;
+        prof();
+        return;
+    }
+    if (const auto it = external_alias.find(input_cpy); it != external_alias.end()) {
+        input_cpy->data = it->second;
+        external_alias.erase(it);
+    }
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1834,6 +1857,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             ggml_backend_synchronize(split_backend);
         }
         ggml_backend_tensor_copy(input, input_cpy);
+        prof();
         return;
     }
 
@@ -1846,6 +1870,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 
     if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+        prof();
         return;
     }
 
@@ -1860,11 +1885,13 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         }
         ggml_backend_tensor_copy(input, input_cpy);
     }
+    prof();
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+    static const bool sprof = getenv("MTPPF_SPLIT_PROF") != nullptr;
 
     int prev_backend_id = -1;
 
@@ -1872,6 +1899,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t prof_t0 = sprof ? ggml_time_us() : 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1895,9 +1923,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+        const int64_t prof_t1 = sprof ? ggml_time_us() : 0;
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (sprof) {
+                fprintf(stderr, "mtppf split %d %s nodes %d inputs %d copy %.3f run %.3f\n",
+                        split_id, ggml_backend_name(split_backend), split->graph.n_nodes, split->n_inputs,
+                        (prof_t1 - prof_t0) / 1e3, (ggml_time_us() - prof_t1) / 1e3);
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }

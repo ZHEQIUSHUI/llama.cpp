@@ -18,28 +18,43 @@ static std::string base_name(const char * name) {  // "<backend>#<name>#<copy>" 
 
 const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph * g) {
     axera_timer tm("graph name map");
-    // the graph's identity: its node pointers and their ops
-    std::vector<uintptr_t> k(2 * (size_t) g->n_nodes);
+    // the graph's identity: a 128-bit hash of its nodes' pointers, ops and shapes. The shapes
+    // matter: llama.cpp rebuilds prompt graphs in the same buffer at the same node addresses
+    // when only the ubatch row count changes (e.g. a checkpoint split's 1024 / 547 / 1020
+    // rows). A hash (not a vector) keeps this O(nodes) with no per-graph allocation.
+    graph_names::key_t k{ 0xcbf29ce484222325ull, 0x9e3779b97f4a7c15ull };
+    auto mix = [](uint64_t & a, uint64_t & b, uint64_t v) {
+        a ^= v;      a *= 0x100000001b3ull;
+        b ^= v + 7;  b *= 0xff51afd7ed558ccdull;
+        b ^= b >> 33;
+    };
     for (int i = 0; i < g->n_nodes; i++) {
-        k[2 * i]     = (uintptr_t) g->nodes[i];
-        k[2 * i + 1] = (uintptr_t) g->nodes[i]->op;
+        const ggml_tensor * nd = g->nodes[i];
+        mix(k[0], k[1], (uint64_t) (uintptr_t) nd);
+        mix(k[0], k[1], (uint64_t) nd->op);
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            mix(k[0], k[1], (uint64_t) nd->ne[d]);
+        }
     }
-    if (k == key) {
+    if (key_valid && k == key) {
         return t;
     }
     for (auto & r : recent) {
         if (r.first == k) {
             std::swap(r.first, key);
             std::swap(r.second, t);
+            key_valid = true;
             return t;
         }
     }
-    if (!key.empty()) {
+    if (key_valid) {
         if (recent.size() >= 4) {
             recent.erase(recent.begin());
         }
-        recent.emplace_back(std::move(key), std::move(t));
+        recent.emplace_back(key, std::move(t));
     }
+    key = k;
+    key_valid = true;
     // each tensor once (in the order met: the first of a name wins), sorted by name into the map
     std::unordered_set<const ggml_tensor *>             seen;
     std::vector<std::pair<std::string, ggml_tensor *>> named;
@@ -217,6 +232,20 @@ rope::rope(const ggml_tensor * rope_node, const ggml_tensor * inp_pos, int T) : 
             sect[i] = k % 3 == 1 && k < 3 * sc[1] ? 1 : k % 3 == 2 && k < 3 * sc[2] ? 2 : k % 3 == 0 && k < 3 * sc[0] ? 0 : 3;
         } else {
             sect[i] = k < sc[0] ? 0 : k < sc[0] + sc[1] ? 1 : k < sc[0] + sc[1] + sc[2] ? 2 : 3;
+        }
+    }
+}
+
+void rope::rows_packed(int t0, int n, void * dst) const {
+    const size_t row = (size_t) ROT * sizeof(ggml_bf16_t);  // cos half + sin half
+    for (int r = 0; r < n; ++r) {
+        auto * c = (ggml_bf16_t *) ((char *) dst + (size_t) r * row);
+        auto * s = c + ROT / 2;
+        for (int i = 0; i < ROT / 2; ++i) {
+            const int32_t p = pos[(mrope ? sect[i] * T : 0) + t0 + r];
+            const float   a = (float) p * freq_scale * inv_freq[i];
+            c[i] = ggml_fp32_to_bf16(std::cos(a));
+            s[i] = ggml_fp32_to_bf16(std::sin(a));
         }
     }
 }

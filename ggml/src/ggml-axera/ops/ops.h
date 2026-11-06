@@ -9,6 +9,8 @@
 
 #include <map>
 #include <string>
+#include <array>
+#include <cstdint>
 #include <vector>
 
 namespace axera {
@@ -16,10 +18,12 @@ namespace axera {
 // the graph's tensors by name (the scheduler's copies "<backend>#<name>#<copy>" by <name>), rebuilt when the graph's
 // nodes change (llama.cpp reuses the decode graph: rebuilding the map of a 35B graph takes ~10 ms on the A55)
 struct graph_names {
-    std::vector<uintptr_t>               key;
+    using key_t = std::array<uint64_t, 2>;
+    key_t                                key{};
+    bool                                 key_valid = false;
     std::map<std::string, ggml_tensor *> t;
     // the maps of the last few other graphs (llama.cpp alternates a few: a speculative target's and draft's)
-    std::vector<std::pair<std::vector<uintptr_t>, std::map<std::string, ggml_tensor *>>> recent;
+    std::vector<std::pair<key_t, std::map<std::string, ggml_tensor *>>> recent;
 
     const std::map<std::string, ggml_tensor *> & of(const ggml_cgraph * g);
     ggml_tensor * find(const std::string & name) const;
@@ -64,6 +68,8 @@ struct rope {
     rope(const ggml_tensor * rope_node, const ggml_tensor * inp_pos, int T);
     // the rows of tokens t0 .. t0 + n - 1 into cb / sb (flushed)
     void rows(int t0, int n, ggml_backend_axera_buffer_context * cb, ggml_backend_axera_buffer_context * sb) const;
+    // the same rows packed per row as cos[ROT / 2] then sin[ROT / 2] (bf16) into dst; the caller flushes
+    void rows_packed(int t0, int n, void * dst) const;
 };
 
 // the output projection of a graph: result_output, or the codec head (Qwen3-TTS) whose logits llama.cpp pads to the

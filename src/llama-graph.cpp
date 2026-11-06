@@ -142,9 +142,24 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_tokens = ubatch->n_tokens;
 
+    if (ubatch->embd_ext) {
+        // the target already produced these rows in backend memory; use them in place
+        if (!embd_alloc) {
+            embd_alloc = embd->data;
+        }
+        embd->data = const_cast<float *>(ubatch->embd_ext);
+        embd->flags |= GGML_TENSOR_FLAG_EXTERNAL;
+    } else {
+        embd->flags &= ~GGML_TENSOR_FLAG_EXTERNAL;
+        if (embd_alloc) {
+            embd->data = embd_alloc;
+            embd_alloc = nullptr;
+        }
+    }
+
     if (ubatch->token) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
-    } else {
+    } else if (!ubatch->embd_ext) {
         // note: mtmd embedding input goes through here
         GGML_ASSERT(ubatch->embd);
         GGML_ASSERT(n_embd == embd->ne[0]);
@@ -155,7 +170,21 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ubatch->embd_state && "this graph requires a state embedding, see llama_batch_ext_set_embd_state()");
     GGML_ASSERT(n_embd_state == h->ne[0]);
 
-    ggml_backend_tensor_set(h, ubatch->embd_state, 0, n_tokens*n_embd_state*ggml_element_size(h));
+    if (ubatch->is_embd_state_external()) {
+        // the rows are already in memory the backend reads (the MTP prompt catch-up aliases the target's h_nextn)
+        if (!h_alloc) {
+            h_alloc = h->data;
+        }
+        h->data = ubatch->embd_state;
+        h->flags |= GGML_TENSOR_FLAG_EXTERNAL;
+    } else {
+        h->flags &= ~GGML_TENSOR_FLAG_EXTERNAL;
+        if (h_alloc) {
+            h->data = h_alloc;
+            h_alloc = nullptr;
+        }
+        ggml_backend_tensor_set(h, ubatch->embd_state, 0, n_tokens*n_embd_state*ggml_element_size(h));
+    }
 }
 
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {

@@ -1090,6 +1090,10 @@ struct common_batch {
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
     llama_batch_ext_ptr batch;
+    const float * embd_ext = nullptr;  // one contiguous embedding row per entry, kept in place
+    size_t        embd_ext_stride = 0;
+    const float * state_ext = nullptr; // one contiguous state row per entry, kept in place
+    size_t        state_ext_stride = 0;
 
     int32_t n_pos = 1; // positions per embedding entry, GGML_MROPE_SECTIONS for MROPE/IMROPE
 
@@ -1123,6 +1127,12 @@ struct common_batch {
 
     // attach a state embedding (e.g. the target hidden state for MTP) to the entry at idx, can only be set once per entry
     bool set_embd_state(int32_t idx, llama_embd state);
+
+    // use the same contiguous embedding rows for every entry, without copying them into the batch
+    void set_embd_ext(const float * data, size_t stride);
+
+    // use the same contiguous state rows for every entry, without copying them into the batch
+    void set_embd_state_ext(const float * data, size_t stride);
 
     // add an embedding-only entry (no token id)
     // pos points to n_pos positions

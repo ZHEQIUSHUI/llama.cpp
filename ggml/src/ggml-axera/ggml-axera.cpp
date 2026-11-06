@@ -4,6 +4,7 @@
 #include "models/model.h"
 
 #include <atomic>
+#include <mutex>
 #include <unordered_map>
 
 static const char * ggml_backend_axera_get_name(ggml_backend_t backend) {
@@ -27,6 +28,13 @@ static enum ggml_status ggml_backend_axera_graph_compute(ggml_backend_t backend,
     }
     enum ggml_status st;
     {
+        // one adapter (weights, kernels, graph-name map, IO buffers) per kernel directory is
+        // shared by the target and the draft context, so two llama_process calls (e.g. an
+        // async MTP prompt catch-up next to the target's next ubatch) must not compute at
+        // the same time. Host-side graph setup still runs in parallel; only the adapter's
+        // compute is serialized.
+        static std::mutex compute_mu;
+        std::lock_guard<std::mutex> lock(compute_mu);
         axera_timer tm("graph_compute");
         st = ctx->model->compute(cgraph);
     }
@@ -60,6 +68,27 @@ static struct ggml_backend_i axera_backend_i = {
     /* .event_wait              = */ NULL,
     /* .graph_optimize          = */ NULL,
 };
+
+const void * ggml_backend_axera_get_input_embed(ggml_backend_t backend, size_t * stride) {
+    if (!ggml_backend_is_axera(backend)) {
+        return nullptr;
+    }
+    auto * ctx = (ggml_backend_axera_context *) backend->context;
+    if (!ctx->model) {
+        if (getenv("MTPPF_PROF")) {
+            fprintf(stderr, "mtppf inp embd: backend ctx has no model (backend %p)\n", (void *) backend);
+        }
+        return nullptr;
+    }
+    if (getenv("MTPPF_PROF")) {
+        fprintf(stderr, "mtppf inp embd: model=%p data=%p stride=%zu\n", (void *) ctx->model.get(),
+                ctx->model->input_embed_data(), ctx->model->input_embed_stride());
+    }
+    if (stride) {
+        *stride = ctx->model->input_embed_stride();
+    }
+    return ctx->model->input_embed_data();
+}
 
 static ggml_guid_t ggml_backend_axera_guid(void) {
     static ggml_guid guid = { 0x61, 0x78, 0x65, 0x72, 0x61, 0x2d, 0x6e, 0x70, 0x75, 0x2d, 0x38, 0x38, 0x36, 0x30, 0x00, 0x01 };
