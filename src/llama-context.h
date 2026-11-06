@@ -297,6 +297,11 @@ private:
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
+    // opaque per-backend state (a backend whose adapter keeps its caches outside the llama.cpp tensors), appended to
+    // the memory-module state so checkpoints restore it too
+    void state_write_backends(llama_io_write_i & io);
+    void state_read_backends (llama_io_read_i  & io);
+
     //
     // members
     //

@@ -287,6 +287,23 @@ static bool ggml_backend_axera_pin_host_weights(void) {
     return axera_keep_pages();
 }
 
+// llama.cpp's state API: an adapter with private CMM caches appends this opaque blob to a sequence state, so a
+// checkpoint / prompt-cache restore restores what the kernels read (KV pages, recurrent state, page restart point).
+static size_t ggml_backend_axera_state_size(ggml_backend_t backend) {
+    auto * ctx = (ggml_backend_axera_context *) backend->context;
+    return ctx && ctx->model ? ctx->model->state_size() : 0;
+}
+
+static size_t ggml_backend_axera_state_write(ggml_backend_t backend, void * dst, size_t size) {
+    auto * ctx = (ggml_backend_axera_context *) backend->context;
+    return ctx && ctx->model ? ctx->model->state_write(dst, size) : 0;
+}
+
+static size_t ggml_backend_axera_state_read(ggml_backend_t backend, const void * src, size_t size) {
+    auto * ctx = (ggml_backend_axera_context *) backend->context;
+    return ctx && ctx->model ? ctx->model->state_read(src, size) : 0;
+}
+
 // llama.cpp tells each context's sequence count: the largest is kept (a padded prefill chunk needs one sequence)
 static std::atomic<uint32_t> g_axera_n_seq_max{ 0 };
 
@@ -341,6 +358,15 @@ static void ggml_backend_axera_prewarm_graph(ggml_backend_t backend, struct ggml
 }
 
 static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_state_size") == 0) {
+        return (void *) ggml_backend_axera_state_size;
+    }
+    if (strcmp(name, "ggml_backend_state_write") == 0) {
+        return (void *) ggml_backend_axera_state_write;
+    }
+    if (strcmp(name, "ggml_backend_state_read") == 0) {
+        return (void *) ggml_backend_axera_state_read;
+    }
     if (strcmp(name, "ggml_backend_pin_host_weights") == 0) {
         return (void *) ggml_backend_axera_pin_host_weights;
     }
