@@ -1,6 +1,7 @@
 // Axera NPU backend ops: the graph's tensors by name, the KV cache and KQ mask, RoPE, the output head, CPU nodes
 
 #include "ops.h"
+#include "../core/argmax_state.h"
 
 #include <algorithm>
 #include <cmath>
@@ -18,56 +19,173 @@ static std::string base_name(const char * name) {  // "<backend>#<name>#<copy>" 
 
 const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph * g) {
     axera_timer tm("graph name map");
-    // the graph's identity: its node pointers and their ops
-    std::vector<uintptr_t> k(2 * (size_t) g->n_nodes);
-    for (int i = 0; i < g->n_nodes; i++) {
-        k[2 * i]     = (uintptr_t) g->nodes[i];
-        k[2 * i + 1] = (uintptr_t) g->nodes[i]->op;
-    }
-    if (k == key) {
-        return t;
-    }
-    for (auto & r : recent) {
-        if (r.first == k) {
-            std::swap(r.first, key);
-            std::swap(r.second, t);
-            return t;
+    static const bool stats = getenv("GGML_AXERA_GRAPH_STATS") != nullptr;
+    enum { ST_UID, ST_RECENT, ST_KEY, ST_TOPO, ST_BUILD } st = ST_BUILD;
+    // ggml_cgraph.uid is the exact identity llama.cpp assigns to a graph and reuses while the graph is unchanged. Fall
+    // back to its node pointers and ops only when the caller supplied no uid (the uid is then 0 by contract).
+    auto is_key = [&](const std::vector<uintptr_t> & k) {
+        if (k.size() != 2 * (size_t) g->n_nodes) {
+            return false;
         }
-    }
-    if (!key.empty()) {
-        if (recent.size() >= 4) {
-            recent.erase(recent.begin());
-        }
-        recent.emplace_back(std::move(key), std::move(t));
-    }
-    // each tensor once (in the order met: the first of a name wins), sorted by name into the map
-    std::unordered_set<const ggml_tensor *>             seen;
-    std::vector<std::pair<std::string, ggml_tensor *>> named;
-    seen.reserve(4 * (size_t) g->n_nodes);
-    named.reserve(4 * (size_t) g->n_nodes);
-    auto add = [&](ggml_tensor * x) {
-        if (seen.insert(x).second) {
-            named.emplace_back(base_name(x->name), x);
-        }
-    };
-    for (int i = 0; i < g->n_nodes; i++) {
-        ggml_tensor * node = g->nodes[i];
-        add(node);
-        for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
-            add(node->src[s]);
-            for (ggml_tensor * v = node->src[s]->view_src; v; v = v->view_src) {  // the cache tensors behind views
-                add(v);
+        for (int i = 0; i < g->n_nodes; ++i) {
+            if (k[2 * i] != (uintptr_t) g->nodes[i] || k[2 * i + 1] != (uintptr_t) g->nodes[i]->op) {
+                return false;
             }
         }
-    }
-    std::stable_sort(named.begin(), named.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
-    t.clear();
-    for (auto & n : named) {
-        if (t.empty() || std::prev(t.end())->first != n.first) {
-            t.emplace_hint(t.end(), std::move(n.first), n.second);
+        return true;
+    };
+    auto build_key = [&]() {
+        if (key.size() != 2 * (size_t) g->n_nodes) {
+            key.resize(2 * (size_t) g->n_nodes);
+        }
+        for (int i = 0; i < g->n_nodes; i++) {
+            key[2 * i]     = (uintptr_t) g->nodes[i];
+            key[2 * i + 1] = (uintptr_t) g->nodes[i]->op;
+        }
+    };
+    // The map's exact identity: every tensor it holds and the base name it holds it under, in the order the map is
+    // built. A rebuild with the same sequence maps every name the same way; tensor shapes may differ.
+    auto build_sig = [&](std::vector<std::pair<const ggml_tensor *, uint64_t>> & s) {
+        s.clear();
+        s.reserve(5 * (size_t) g->n_nodes);  // (no set or string: this runs once per rebuilt prompt graph)
+        auto add = [&](ggml_tensor * x) {
+            const char * name = x->name;
+            const char * a    = strchr(name, '#');
+            const char * b    = a ? strrchr(name, '#') : nullptr;
+            const char * p    = a && b > a ? a + 1 : name;
+            const char * e    = a && b > a ? b : name + strlen(name);
+            uint64_t     h    = 1469598103934665603ull;
+            for (; p < e; ++p) {
+                h = (h ^ (unsigned char) *p) * 1099511628211ull;
+            }
+            h = (h ^ (uint64_t) x->op) * 1099511628211ull;
+            h = (h ^ (uint64_t) (e - (a && b > a ? a + 1 : name))) * 1099511628211ull;
+            s.emplace_back(x, h);
+        };
+        for (int i = 0; i < g->n_nodes; i++) {
+            ggml_tensor * node = g->nodes[i];
+            add(node);
+            for (int src = 0; src < GGML_MAX_SRC && node->src[src]; ++src) {
+                add(node->src[src]);
+                for (ggml_tensor * v = node->src[src]->view_src; v; v = v->view_src) {
+                    add(v);
+                }
+            }
+        }
+    };
+    // stable_uid survives the scheduler's per-call split of a reused graph; uid does not
+    const uint64_t gid = g->stable_uid ? g->stable_uid : g->uid;
+    bool hit = false;
+    if (gid) {
+        if (uid == gid) {
+            hit = true;
+            st  = ST_UID;
+        } else {
+            for (auto & r : recent_uid) {
+                if (r.first == gid) {
+                    std::swap(r.second, t);
+                    sig.clear();  // the recent maps do not carry a signature
+                    uid = gid;
+                    hit = true;
+                    st  = ST_RECENT;
+                    break;
+                }
+            }
+        }
+        if (!hit) {
+            std::vector<std::pair<const ggml_tensor *, uint64_t>> nsig;
+            build_sig(nsig);
+            if (!sig.empty() && nsig == sig) {  // a rebuild of the mapped graph: same tensors, same names
+                hit = true;
+                st  = ST_TOPO;
+                uid = gid;
+                key.clear();
+            }
+        }
+        if (!hit) {
+            if (uid) {  // keep the current map for an alternation back to this graph
+                if (recent_uid.size() >= 4) {
+                    recent_uid.erase(recent_uid.begin());
+                }
+                recent_uid.emplace_back(uid, std::move(t));
+                t.clear();
+                sig.clear();
+            }
+            uid = gid;
+            key.clear();
+        }
+    } else {
+        hit = is_key(key);
+        if (hit) {
+            st = ST_KEY;
+        } else {
+            for (auto & r : recent) {
+                if (is_key(r.first)) {
+                    std::swap(r.first, key);
+                    std::swap(r.second, t);
+                    hit = true;
+                    st  = ST_KEY;
+                    break;
+                }
+            }
+        }
+        if (!hit) {
+            if (!key.empty()) {
+                if (recent.size() >= 4) {
+                    recent.erase(recent.begin());
+                }
+                recent.emplace_back(std::move(key), std::move(t));
+                t.clear();
+                sig.clear();
+            }
+            uid = 0;
         }
     }
-    key = std::move(k);
+    if (!hit) {
+        // each tensor once (in the order met: the first of a name wins), sorted by name into the map
+        std::unordered_set<const ggml_tensor *>             seen;
+        std::vector<std::pair<std::string, ggml_tensor *>> named;
+        seen.reserve(4 * (size_t) g->n_nodes);
+        named.reserve(4 * (size_t) g->n_nodes);
+        auto add = [&](ggml_tensor * x) {
+            if (seen.insert(x).second) {
+                named.emplace_back(base_name(x->name), x);
+            }
+        };
+        for (int i = 0; i < g->n_nodes; i++) {
+            ggml_tensor * node = g->nodes[i];
+            add(node);
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+                add(node->src[s]);
+                for (ggml_tensor * v = node->src[s]->view_src; v; v = v->view_src) {  // the cache tensors behind views
+                    add(v);
+                }
+            }
+        }
+        std::stable_sort(named.begin(), named.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+        t.clear();
+        for (auto & n : named) {
+            if (t.empty() || std::prev(t.end())->first != n.first) {
+                t.emplace_hint(t.end(), std::move(n.first), n.second);
+            }
+        }
+        build_sig(sig);
+        if (!gid) {
+            build_key();
+        }
+    }
+    if (stats) {
+        static uint64_t n = 0, cnt[5] = {0, 0, 0, 0, 0};
+        ++n; ++cnt[st];
+        if (n % 8 == 0) {
+            fprintf(stderr, "graph names: %llu calls, uid %llu/recent %llu/key %llu/topo %llu/build %llu "
+                    "(uid %llu stable %llu)\n",
+                    (unsigned long long) n, (unsigned long long) cnt[ST_UID], (unsigned long long) cnt[ST_RECENT],
+                    (unsigned long long) cnt[ST_KEY], (unsigned long long) cnt[ST_TOPO],
+                    (unsigned long long) cnt[ST_BUILD], (unsigned long long) g->uid,
+                    (unsigned long long) g->stable_uid);
+        }
+    }
     return t;
 }
 
@@ -305,6 +423,303 @@ void output_head::bind(const kernel & lm, const ggml_tensor * output_weight) {
     x = axera_cmm_alloc(R * K * sizeof(ggml_bf16_t));
 }
 
+bool output_head::bind_fused(const kernel & lm, const ggml_tensor * output_weight) {
+    if (!k || w != output_weight || !mx4) {
+        return false;
+    }
+    const int64_t N = w->ne[1], K = w->ne[0];
+    if (lm.find_input("a") < 0 || lm.find_input("norm_weight") < 0 || lm.find_input("b_t") < 0 ||
+        lm.find_input("b_scale") < 0 || lm.find_output("output") < 0) {
+        return false;
+    }
+    if (lm.in_bytes("a") != (uint32_t) (K * sizeof(ggml_bf16_t)) || lm.in_bytes("norm_weight") != (uint32_t) (K * sizeof(float)) ||
+        lm.in_bytes("b_t") != (uint32_t) (N * K / 2) || lm.in_bytes("b_scale") != (uint32_t) (N * K / AXERA_MX_GROUP) ||
+        lm.out_bytes("output") != (uint32_t) (N * sizeof(float))) {
+        return false;
+    }
+    fk = &lm;
+    if (!fkw) {
+        fkw = axera_cmm_alloc((size_t) K * sizeof(float));
+    }
+    fin.assign(fk->info->nInputSize, AX_ENGINE_IO_BUFFER_T{});
+    fout.assign(fk->info->nOutputSize, AX_ENGINE_IO_BUFFER_T{});
+    fin[fk->input("norm_weight")] = axera_io(fkw, (size_t) K * sizeof(float));
+    fin[fk->input("b_t")]         = axera_io(q, mx4 ? (size_t) N * K / 2 : (size_t) N * K);
+    fin[fk->input("b_scale")]     = axera_io(s, (size_t) N * K / AXERA_MX_GROUP);
+    fgw                           = nullptr;
+    return true;
+}
+
+bool output_head::bind_combined(const kernel & lm, const ggml_tensor * output_weight) {
+    if (!k || w != output_weight) {
+        return false;
+    }
+    const int64_t N = w->ne[1], K = w->ne[0];
+    if (lm.find_input("x") < 0 || lm.find_input("norm_w") < 0 || lm.find_input("w") < 0 || lm.find_input("s") < 0 ||
+        lm.find_output("out") < 0 || lm.find_output("ids") < 0 || lm.find_output("top_logits") < 0) {
+        return false;
+    }
+    const int R = (int) (lm.in_bytes("x") / (K * sizeof(ggml_bf16_t)));
+    if (R != 1 ||
+        lm.in_bytes("norm_w") != (uint32_t) (K * sizeof(float)) ||
+        lm.in_bytes("w") != (uint32_t) (mx4 ? N * K / 2 : N * K) ||
+        lm.in_bytes("s") != (uint32_t) (N * K / AXERA_MX_GROUP) ||
+        lm.in_bytes("x") != (uint32_t) (K * sizeof(ggml_bf16_t)) ||
+        lm.out_bytes("out") != (uint32_t) (N * sizeof(float)) || lm.out_bytes("ids") != sizeof(int32_t) ||
+        lm.out_bytes("top_logits") != sizeof(float)) {
+        return false;
+    }
+    if (ck == &lm) {
+        return true;
+    }
+    ck = &lm;
+    cR = R;
+    cnorm = axera_cmm_alloc((size_t) K * sizeof(float));
+    cx    = axera_cmm_alloc((size_t) K * sizeof(ggml_bf16_t));
+    cids  = axera_cmm_alloc(sizeof(int32_t));
+    ctop  = axera_cmm_alloc(sizeof(float));
+    cin.assign(ck->info->nInputSize, AX_ENGINE_IO_BUFFER_T{});
+    cout.assign(ck->info->nOutputSize, AX_ENGINE_IO_BUFFER_T{});
+    cin[ck->input("norm_w")] = axera_io(cnorm, (size_t) K * sizeof(float));
+    cin[ck->input("w")]      = axera_io(q, mx4 ? (size_t) N * K / 2 : (size_t) N * K);
+    cin[ck->input("s")]      = axera_io(s, (size_t) N * K / AXERA_MX_GROUP);
+    cout[ck->output("ids")]  = axera_io(cids, sizeof(int32_t));
+    cout[ck->output("top_logits")] = axera_io(ctop, sizeof(float));
+    cgw = nullptr;
+    return true;
+}
+
+bool output_head::combined_ready(ggml_cgraph * g, const graph_names & names) const {
+    GGML_UNUSED(g);
+    if (!ck) {
+        return false;
+    }
+    ggml_tensor * logits = graph_head(names);
+    if (!logits || logits->op != GGML_OP_MUL_MAT || logits->src[0] != w || logits->type != GGML_TYPE_F32 ||
+        logits->ne[1] < 1) {
+        return false;
+    }
+    ggml_tensor * hn = logits->src[1];
+    while (hn->op == GGML_OP_GET_ROWS || hn->op == GGML_OP_VIEW || hn->op == GGML_OP_RESHAPE) {
+        hn = hn->src[0];
+    }
+    float         eps;
+    const float * gw = final_norm(hn, (int) w->ne[0], &eps);
+    return gw != nullptr && eps == 1e-6f;
+}
+
+bool output_head::bind_combined4(const kernel & lm, const ggml_tensor * output_weight) {
+    if (!k || w != output_weight) {
+        return false;
+    }
+    const int64_t N = w->ne[1], K = w->ne[0];
+    if (lm.find_input("x") < 0 || lm.find_input("norm_w") < 0 || lm.find_input("w") < 0 ||
+        lm.find_input("s") < 0 || lm.find_input("m") < 0 || lm.find_output("out") < 0 ||
+        lm.find_output("ids") < 0 || lm.find_output("top_logits") < 0) {
+        return false;
+    }
+    if (lm.in_bytes("x") != (uint32_t) (4 * K * sizeof(ggml_bf16_t)) ||
+        lm.in_bytes("norm_w") != (uint32_t) (K * sizeof(float)) ||
+        lm.in_bytes("w") != (uint32_t) (mx4 ? N * K / 2 : N * K) ||
+        lm.in_bytes("s") != (uint32_t) (N * K / AXERA_MX_GROUP) || lm.in_bytes("m") != sizeof(int32_t) ||
+        lm.out_bytes("out") != (uint32_t) (4 * N * sizeof(float)) || lm.out_bytes("ids") != 4 * sizeof(int32_t) ||
+        lm.out_bytes("top_logits") != 4 * sizeof(float)) {
+        return false;
+    }
+    if (c4k == &lm) {
+        return true;
+    }
+    c4k   = &lm;
+    c4norm = axera_cmm_alloc((size_t) K * sizeof(float));
+    c4x    = axera_cmm_alloc((size_t) 4 * K * sizeof(ggml_bf16_t));
+    c4m    = axera_cmm_alloc(sizeof(int32_t));
+    c4ids  = axera_cmm_alloc(4 * sizeof(int32_t));
+    c4top  = axera_cmm_alloc(4 * sizeof(float));
+    c4in.assign(c4k->info->nInputSize, AX_ENGINE_IO_BUFFER_T{});
+    c4out.assign(c4k->info->nOutputSize, AX_ENGINE_IO_BUFFER_T{});
+    c4in[c4k->input("norm_w")] = axera_io(c4norm, (size_t) K * sizeof(float));
+    c4in[c4k->input("w")]      = axera_io(q, mx4 ? (size_t) N * K / 2 : (size_t) N * K);
+    c4in[c4k->input("s")]      = axera_io(s, (size_t) N * K / AXERA_MX_GROUP);
+    c4in[c4k->input("m")]      = axera_io(c4m, sizeof(int32_t));
+    c4out[c4k->output("ids")]  = axera_io(c4ids, 4 * sizeof(int32_t));
+    c4out[c4k->output("top_logits")] = axera_io(c4top, 4 * sizeof(float));
+    c4gw = nullptr;
+    return true;
+}
+
+void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
+                               const std::vector<int> * compact_rows, const axera_cmm * xb) {
+    ggml_tensor * logits = graph_head(names);
+    GGML_ASSERT(logits && logits->op == GGML_OP_MUL_MAT && logits->src[0] == w && logits->type == GGML_TYPE_F32 &&
+                ggml_backend_buffer_is_axera(logits->buffer));
+    const int64_t N = w->ne[1], K = w->ne[0];
+    const int     n_out = (int) logits->ne[1];
+    if (c4k && n_out == 4 && T == 4 && logits->nb[1] == N * sizeof(float)) {
+        run_combined4(g, names, h, T);
+        return;
+    }
+    ggml_tensor * hn = logits->src[1];
+    while (hn->op == GGML_OP_GET_ROWS || hn->op == GGML_OP_VIEW || hn->op == GGML_OP_RESHAPE) {
+        hn = hn->src[0];
+    }
+    float         eps;
+    const float * gw = final_norm(hn, (int) K, &eps);
+    GGML_ASSERT(gw && eps == 1e-6f);
+    if (gw != cgw) {
+        memcpy(cnorm->vir, gw, (size_t) K * sizeof(float));
+        cnorm->flush(cnorm->vir, (size_t) K * sizeof(float));
+        cgw = gw;
+    }
+    ggml_tensor * out_ids = n_out < T ? names.find("out_ids") : nullptr;
+    if (out_ids && (out_ids->type != GGML_TYPE_I32 || out_ids->ne[0] != n_out)) {
+        out_ids = nullptr;
+    }
+    if (n_out < T && !out_ids) {
+        for (int i = 0; i < g->n_nodes; i++) {
+            ggml_tensor * node = g->nodes[i];
+            if (node->op == GGML_OP_GET_ROWS && node->src[1] && node->src[1]->type == GGML_TYPE_I32 &&
+                node->src[1]->ne[0] == n_out && node->src[0]->ne[1] == T) {
+                out_ids = node->src[1];
+            }
+        }
+    }
+    GGML_ASSERT(n_out == T || out_ids);
+    auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+    std::vector<int32_t> pids((size_t) n_out);
+    std::vector<float>   pvals((size_t) n_out);
+    bool                 single = xb && T == 1 && n_out == 1 && (!compact_rows || (*compact_rows)[0] == 0);
+    for (int r = 0; r < n_out; ++r) {
+        const int     row = out_ids ? ((const int32_t *) out_ids->data)[r] : r;
+        const float * xr  = h.data() + (size_t) (compact_rows ? r : row) * K;
+        if (single) {
+            cin[ck->input("x")] = axera_io(*xb, (size_t) K * sizeof(ggml_bf16_t));
+        } else {
+            ggml_fp32_to_bf16_row(xr, (ggml_bf16_t *) cx->vir, K);
+            cx->flush(cx->vir, (size_t) K * sizeof(ggml_bf16_t));
+            cin[ck->input("x")] = axera_io(cx, (size_t) K * sizeof(ggml_bf16_t));
+        }
+        float * o = (float *) ((char *) logits->data + (size_t) r * logits->nb[1]);
+        cout[ck->output("out")] = axera_io(dctx, o, (size_t) N * sizeof(float));
+        axera_timer tk("lm_head (combined)");
+        ck->run(cin, cout, "output head (combined)");
+        tk.stop();
+        cids->invalidate(cids->vir, sizeof(int32_t));
+        ctop->invalidate(ctop->vir, sizeof(float));
+        memcpy(&pids[(size_t) r], cids->vir, sizeof(int32_t));
+        memcpy(&pvals[(size_t) r], ctop->vir, sizeof(float));
+    }
+    const bool published = axera::argmax_publish(pids.data(), pvals.data(), n_out);
+    if (!published) {
+        for (int r = 0; r < n_out; ++r) {
+            float * o = (float *) ((char *) logits->data + (size_t) r * logits->nb[1]);
+            dctx->invalidate(o, (size_t) N * sizeof(float));
+        }
+        dctx->clean_p     = (float *) logits->data;
+        dctx->clean_n     = (size_t) n_out * N * sizeof(float);
+        dctx->clean_epoch = axera_graph_epoch;
+    }
+    after(g, names);
+}
+
+void output_head::run_combined4(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T) {
+    ggml_tensor * logits = graph_head(names);
+    GGML_ASSERT(logits && logits->op == GGML_OP_MUL_MAT && logits->src[0] == w && logits->type == GGML_TYPE_F32 &&
+                logits->ne[1] == 4 && T == 4 && ggml_backend_buffer_is_axera(logits->buffer));
+    const int64_t N = w->ne[1], K = w->ne[0];
+    ggml_tensor * hn = logits->src[1];
+    while (hn->op == GGML_OP_GET_ROWS || hn->op == GGML_OP_VIEW || hn->op == GGML_OP_RESHAPE) {
+        hn = hn->src[0];
+    }
+    float         eps;
+    const float * gw = final_norm(hn, (int) K, &eps);
+    GGML_ASSERT(gw && eps == 1e-6f && h.size() >= (size_t) 4 * K);
+    if (gw != c4gw) {
+        memcpy(c4norm->vir, gw, (size_t) K * sizeof(float));
+        c4norm->flush(c4norm->vir, (size_t) K * sizeof(float));
+        c4gw = gw;
+    }
+    ggml_fp32_to_bf16_row(h.data(), (ggml_bf16_t *) c4x->vir, (int) (4 * K));
+    c4x->flush(c4x->vir, (size_t) 4 * K * sizeof(ggml_bf16_t));
+    *(int32_t *) c4m->vir = 4;
+    c4m->flush(c4m->vir, sizeof(int32_t));
+    c4in[c4k->input("x")] = axera_io(c4x, (size_t) 4 * K * sizeof(ggml_bf16_t));
+    GGML_ASSERT(logits->nb[1] == N * sizeof(float));
+    auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+    c4out[c4k->output("out")] = axera_io(dctx, logits->data, (size_t) 4 * N * sizeof(float));
+    {
+        axera_timer tk("lm_head (combined m4)");
+        c4k->run(c4in, c4out, "output head (combined m4)");
+        tk.stop();
+    }
+    c4ids->invalidate(c4ids->vir, 4 * sizeof(int32_t));
+    c4top->invalidate(c4top->vir, 4 * sizeof(float));
+    std::vector<int32_t> pids(4);
+    std::vector<float>   pvals(4);
+    memcpy(pids.data(), c4ids->vir, 4 * sizeof(int32_t));
+    memcpy(pvals.data(), c4top->vir, 4 * sizeof(float));
+    if (!axera::argmax_publish(pids.data(), pvals.data(), 4)) {
+        dctx->invalidate(logits->data, (size_t) 4 * N * sizeof(float));
+        dctx->clean_p     = (float *) logits->data;
+        dctx->clean_n     = (size_t) 4 * N * sizeof(float);
+        dctx->clean_epoch = axera_graph_epoch;
+    }
+    after(g, names);
+}
+
+bool output_head::fused_ready(ggml_cgraph * g, const graph_names & names) const {
+    GGML_UNUSED(g);
+    if (!fk) {
+        return false;
+    }
+    ggml_tensor * logits = graph_head(names);
+    if (!logits || logits->op != GGML_OP_MUL_MAT || logits->src[0] != w || logits->type != GGML_TYPE_F32 ||
+        logits->ne[1] != 1) {
+        return false;
+    }
+    ggml_tensor * hn = logits->src[1];
+    while (hn->op == GGML_OP_GET_ROWS || hn->op == GGML_OP_VIEW || hn->op == GGML_OP_RESHAPE) {
+        hn = hn->src[0];
+    }
+    float         eps;
+    const float * gw = final_norm(hn, (int) w->ne[0], &eps);
+    // the kernel was built with the model's 1e-6; another context's eps keeps the host path
+    return gw != nullptr && eps == 1e-6f;
+}
+
+void output_head::run_fused(ggml_cgraph * g, const graph_names & names, const axera_cmm & xb) {
+    axera_timer ts("lm_head (fused): setup");
+    ggml_tensor * logits = graph_head(names);
+    const int64_t N = w->ne[1], K = w->ne[0];
+    ggml_tensor * hn = logits->src[1];
+    while (hn->op == GGML_OP_GET_ROWS || hn->op == GGML_OP_VIEW || hn->op == GGML_OP_RESHAPE) {
+        hn = hn->src[0];
+    }
+    float         eps;
+    const float * gw = final_norm(hn, (int) K, &eps);
+    if (gw != fgw) {
+        memcpy(fkw->vir, gw, (size_t) K * sizeof(float));
+        fkw->flush();
+        fgw = gw;
+    }
+    auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+    float * o   = (float *) logits->data;
+    fin[fk->input("a")]         = axera_io(xb, (size_t) K * sizeof(ggml_bf16_t));
+    fout[fk->output("output")] = axera_io(dctx, o, (size_t) N * sizeof(float));
+    ts.stop();
+    axera_timer tl("lm_head (fused)");
+    fk->run(fin, fout, "output head (fused)");
+    tl.stop();
+    axera_timer ti("lm_head (fused): invalidate");
+    dctx->invalidate(o, (size_t) N * sizeof(float));
+    ti.stop();
+    dctx->clean_p     = o;
+    dctx->clean_n     = (size_t) N * sizeof(float);
+    dctx->clean_epoch = axera_graph_epoch;
+    axera_timer ta("lm_head (fused): after");
+    after(g, names);
+    ta.stop();
+}
+
 void output_head::bind_draft(const kernel & dlm, const std::vector<int32_t> & ids) {
     GGML_ASSERT(k && mx4);
     const int64_t N = w->ne[1], K = w->ne[0], NS = (int64_t) ids.size();
@@ -364,7 +779,7 @@ static void head_f32(const ggml_tensor * w, std::vector<float> & wf) {
 }
 
 void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
-                      const std::vector<char> * normed, const float * last) {
+                      const std::vector<char> * normed, const float * last, const std::vector<int> * compact_rows) {
     ggml_tensor * logits = graph_head(names);
     GGML_ASSERT(logits && logits->op == GGML_OP_MUL_MAT && logits->src[0] == w && logits->type == GGML_TYPE_F32 &&
                 ggml_backend_buffer_is_axera(logits->buffer));
@@ -379,11 +794,17 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
     const int     n_out = (int) logits->ne[1];
     // the output rows: the GET_ROWS index that crops the last layer or the final norm to the outputs
     ggml_tensor * out_ids = nullptr;
-    for (int i = 0; i < g->n_nodes && n_out < T; i++) {
-        ggml_tensor * node = g->nodes[i];
-        if (node->op == GGML_OP_GET_ROWS && node->src[1] && node->src[1]->type == GGML_TYPE_I32 &&
-            node->src[1]->ne[0] == n_out && node->src[0]->ne[1] == T) {
-            out_ids = node->src[1];
+    if (n_out < T) {
+        out_ids = names.find("out_ids");
+        if (!out_ids || out_ids->type != GGML_TYPE_I32 || out_ids->ne[0] != n_out) {
+            out_ids = nullptr;
+            for (int i = 0; i < g->n_nodes; i++) {
+                ggml_tensor * node = g->nodes[i];
+                if (node->op == GGML_OP_GET_ROWS && node->src[1] && node->src[1]->type == GGML_TYPE_I32 &&
+                    node->src[1]->ne[0] == n_out && node->src[0]->ne[1] == T) {
+                    out_ids = node->src[1];
+                }
+            }
         }
     }
     if (n_out < T && !out_ids) {
@@ -392,13 +813,15 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
     ggml_tensor *      rn = normed_rows(names);  // the normed rows, when the graph keeps them (embeddings: the
                                                  // TTS talker's hidden state for the code predictor)
     rn                    = rn && rn->type == GGML_TYPE_F32 && rn->ne[0] == K && rn->ne[1] == n_out ? rn : nullptr;
-    std::vector<float> y((size_t) n_out * K);
-    std::vector<int>   rows(n_out);
+    std::vector<float> & y = yn;
+    y.resize((size_t) n_out * K);
+    rows.resize(n_out);
+    axera_timer thn("head: rows + norm");
     for (int r = 0; r < n_out; ++r) {
         const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : r;
         GGML_ASSERT(row >= 0 && row < T);
         rows[r]          = row;
-        const float * xr = h.data() + (size_t) row * K;
+        const float * xr = h.data() + (size_t) (compact_rows ? r : row) * K;
         float *       yr = y.data() + (size_t) r * K;
         if (normed && (*normed)[row]) {  // the kernel's final norm
             memcpy(yr, xr, K * sizeof(float));
@@ -419,6 +842,7 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
             memcpy((char *) rn->data + r * rn->nb[1], yr, K * sizeof(float));
         }
     }
+    thn.stop();
     if (rn && ggml_backend_buffer_is_axera(rn->buffer)) {
         ((ggml_backend_axera_buffer_context *) rn->buffer->context)->flush(rn->data, ggml_nbytes(rn));
     }
@@ -463,7 +887,8 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
     }
     draft = false;
     axera_timer tl(k ? "lm_head" : "lm_head (cpu)");
-    std::vector<AX_ENGINE_IO_BUFFER_T> in(k ? k->info->nInputSize : 0), out(k ? k->info->nOutputSize : 0);
+    in.resize(k ? k->info->nInputSize : 0);
+    out.resize(k ? k->info->nOutputSize : 0);
     if (k) {
         in[k->input("x")] = axera_io(x);
         in[k->input("w")] = axera_io(q, mx4 ? N * K / 2 : N * K);
@@ -494,15 +919,23 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
             kr.push_back(r);
             continue;
         }
-        ggml_fp32_to_bf16_row(y.data() + (size_t) r * K, (ggml_bf16_t *) x->vir, K);
-        x->flush(x->vir, K * sizeof(ggml_bf16_t));
-        dctx->flush(o, N * sizeof(float));
+        {
+            axera_timer tx("head: input");
+            ggml_fp32_to_bf16_row(y.data() + (size_t) r * K, (ggml_bf16_t *) x->vir, K);
+            x->flush(x->vir, K * sizeof(ggml_bf16_t));
+        }
         out[k->output("out")] = axera_io(dctx, o, (uint32_t) (N * sizeof(float)));
-        k->run(in, out, "output head");
-        dctx->invalidate(o, N * sizeof(float));
-        dctx->clean_p     = o;  // the host reads these logits back without more cache maintenance this graph
-        dctx->clean_n     = N * sizeof(float);
-        dctx->clean_epoch = axera_graph_epoch;
+        {
+            axera_timer tr("head: run");
+            k->run(in, out, "output head");
+        }
+        {
+            axera_timer ti("head: output");
+            dctx->invalidate(o, N * sizeof(float));
+            dctx->clean_p     = o;  // the host reads these logits back without more cache maintenance this graph
+            dctx->clean_n     = N * sizeof(float);
+            dctx->clean_epoch = axera_graph_epoch;
+        }
     }
     for (size_t i0 = 0; i0 < kr.size(); i0 += R) {  // the kernel's rows R at a time, the weights read once per call
         const int nr = (int) std::min<size_t>(R, kr.size() - i0);
@@ -517,7 +950,6 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         const bool direct = nr == R && kr[i0 + R - 1] == kr[i0] + R - 1 && logits->nb[1] == N * sizeof(float);
         if (direct) {
             float * o = (float *) ((char *) logits->data + kr[i0] * logits->nb[1]);
-            dctx->flush(o, (size_t) R * N * sizeof(float));
             out[k->output("out")] = axera_io(dctx, o, (uint32_t) (R * N * sizeof(float)));
             k->run(in, out, "output head");
             dctx->invalidate(o, (size_t) R * N * sizeof(float));
@@ -554,6 +986,9 @@ void output_head::after(ggml_cgraph * g, const graph_names & names) {
     // head's logits: their padded copy is written above)
     const ggml_tensor * head   = graph_head(names);
     const ggml_tensor * padded = names.find("result_output");
+    if (g->n_nodes > 0 && g->nodes[g->n_nodes - 1] == head) {
+        return;  // the graph ends at the logits: no backend sampler follows
+    }
     int                 il     = -1;
     for (int i = 0; i < g->n_nodes; i++) {
         il = g->nodes[i] == head ? i : il;

@@ -308,6 +308,10 @@ extern "C" {
 
     typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
+    // Set an identity for the graph that survives the scheduler's per-call split. A backend that caches per-graph
+    // state can use it to recognize a reused graph; the scheduler copies it into every split graph.
+    GGML_API void ggml_graph_set_stable_uid(struct ggml_cgraph * graph, uint64_t uid);
+
     // Evaluation callback for each node in the graph (set with ggml_backend_sched_set_eval_callback)
     // when ask == true, the scheduler wants to know if the user wants to observe this node
     // this allows the scheduler to batch nodes together in order to evaluate them in a single call

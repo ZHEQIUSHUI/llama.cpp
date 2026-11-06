@@ -1066,6 +1066,10 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #endif
 
 // returns the backend that should be used for the node based on the current locations
+void ggml_graph_set_stable_uid(struct ggml_cgraph * graph, uint64_t uid) {
+    graph->stable_uid = uid;
+}
+
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
@@ -1749,6 +1753,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // set ids for all splits
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
+        // the parent graph's identity when it was supplied, and the split's position within it: unique per split and
+        // stable while the parent builder reuses the graph
+        sched->splits[i].graph.stable_uid =
+            graph->stable_uid ? (graph->stable_uid << 8) | (uint64_t) (i + 1) : 0;
     }
 }
 
@@ -1866,6 +1874,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    // GGML_AXERA_SCHED_PROF=1: split input copies vs the backend's graph call. The Axera adapter's own timers cover
+    // only the latter; this accounts for the per-token work between the scheduler entry and that timer.
+    static const bool prof = getenv("GGML_AXERA_SCHED_PROF") != nullptr;
+    static int64_t    prof_calls = 0;
+    static int64_t    prof_win_copy = 0, prof_win_compute = 0;
+    static bool       prof_printed = false;
+    int64_t           prof_copy = 0, prof_compute = 0;
+
     int prev_backend_id = -1;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -1885,6 +1901,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+        const int64_t prof_t0 = prof ? ggml_time_us() : 0;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
@@ -1895,6 +1912,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+        const int64_t prof_t1 = prof ? ggml_time_us() : 0;
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -1934,6 +1952,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 j0 = j1;
             }
         }
+        if (prof) {
+            prof_copy    += prof_t1 - prof_t0;
+            prof_compute += ggml_time_us() - prof_t1;
+            if (!prof_printed) {
+                prof_printed = true;
+                fprintf(stderr, "sched prof: %d splits, first split %d nodes, %d inputs:", sched->n_splits,
+                        split->graph.n_nodes, split->n_inputs);
+                for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
+                    fprintf(stderr, " [%s %zu]", split->inputs[input_id]->name,
+                            ggml_nbytes(split->inputs[input_id]));
+                }
+                fprintf(stderr, "\n");
+            }
+        }
 
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1941,6 +1973,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    prof_win_copy   += prof_copy;
+    prof_win_compute += prof_compute;
+    if (prof && ++prof_calls % 32 == 0) {
+        fprintf(stderr, "sched prof win: copies %.3f ms, backend %.3f ms per graph (%lld)\n",
+                prof_win_copy / 1e3 / 32, prof_win_compute / 1e3 / 32, (long long) prof_calls);
+        prof_win_copy = prof_win_compute = 0;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -2098,10 +2138,17 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    static const bool prof = getenv("LLAMA_GRAPH_PROF") != nullptr;
+    const int64_t     t0   = prof ? ggml_time_us() : 0;
     ggml_backend_sched_split_graph(sched, graph);
+    const int64_t     t1   = prof ? ggml_time_us() : 0;
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
+    }
+    if (prof) {
+        fprintf(stderr, "sched alloc: split %.3f ms, plan %.3f ms (%d nodes, %d splits)\n", (t1 - t0) / 1e3,
+                (ggml_time_us() - t1) / 1e3, graph->n_nodes, sched->n_splits);
     }
 
     sched->is_alloc = true;
@@ -2117,17 +2164,32 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    static const bool gsp = getenv("LLAMA_GRAPH_PROF") != nullptr;
+    static int64_t gsp_n = 0, gsp_reset = 0, gsp_alloc = 0, gsp_cs = 0;
+    const int64_t  gsp_t0 = gsp ? ggml_time_us() : 0;
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
+    const int64_t gsp_t1 = gsp ? ggml_time_us() : 0;
 
     if (!sched->is_alloc) {
         if (!ggml_backend_sched_alloc_graph(sched, graph)) {
             return GGML_STATUS_ALLOC_FAILED;
         }
     }
+    const int64_t gsp_t2 = gsp ? ggml_time_us() : 0;
 
-    return ggml_backend_sched_compute_splits(sched);
+    const enum ggml_status r = ggml_backend_sched_compute_splits(sched);
+    if (gsp) {
+        gsp_reset += gsp_t1 - gsp_t0;
+        gsp_alloc += gsp_t2 - gsp_t1;
+        gsp_cs    += ggml_time_us() - gsp_t2;
+        if (++gsp_n % 32 == 0) {
+            fprintf(stderr, "sched async: reset %.3f, alloc %.3f, splits %.3f ms/token (%lld)\n",
+                    gsp_reset / 1e3 / gsp_n, gsp_alloc / 1e3 / gsp_n, gsp_cs / 1e3 / gsp_n, (long long) gsp_n);
+        }
+    }
+    return r;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

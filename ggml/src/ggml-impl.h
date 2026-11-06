@@ -356,6 +356,9 @@ struct ggml_cgraph {
     // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
     // a value of 0 means it is not set and should be ignored
     uint64_t uid;
+    // an identity that survives the scheduler's per-call split: assigned by the graph's builder when its contents are
+    // (re)built, then copied into every split. Unlike uid it does not change while a builder reuses a graph.
+    uint64_t stable_uid;
 };
 
 // returns a slice of cgraph with nodes [i0, i1)
