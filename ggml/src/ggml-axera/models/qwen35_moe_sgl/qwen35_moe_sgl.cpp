@@ -612,8 +612,10 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     }
     const char * short16_env = getenv("GGML_AXERA_SHORT16");
     const int64_t cells_hint = axera_kv_cells();
+    // decode16's shared KV has 64 pages, while decode.verify is built for the 1024-page split KV. A package that
+    // carries the four-row verifier must keep the released 256k pair even when -c fits 16k.
     short16 = (!short16_env || atoi(short16_env) != 0) && cells_hint > 0 && cells_hint <= 16384 &&
-              man.has("decode16") && man.has("prefill.attn16");
+              !man.has("decode.verify") && man.has("decode16") && man.has("prefill.attn16");
     const kernel & dk = man.get(short16 ? "decode16" : "decode");
     const kernel & gk = man.get("prefill.gdn");
     const kernel & ak = man.get(short16 ? "prefill.attn16" : "prefill.attn");
