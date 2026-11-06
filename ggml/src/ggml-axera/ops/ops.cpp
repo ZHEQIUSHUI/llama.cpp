@@ -859,6 +859,9 @@ int output_head::full_row(int32_t idx, float * out, int32_t n) {
     if (n < N) {
         return 0;
     }
+    if (idx < 0) {  // llama.cpp's -1 is the last logits row
+        idx = fn_out + idx;
+    }
     int r = -1;
     for (int i = 0; i < fn_out; ++i) {
         if (frows[i] == idx) {
