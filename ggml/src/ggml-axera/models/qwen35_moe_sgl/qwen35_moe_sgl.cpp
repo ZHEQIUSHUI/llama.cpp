@@ -122,8 +122,11 @@ class qwen35_moe_sgl final : public model {
     std::array<int, 4>               dec_state = { -1, -1, -1, -1 };
     bool                             dec_state_dirty = false;  // the decode calls' state entries follow the prefill's swaps
     std::vector<call>                pre_attn[2], pre_moe;  // per layer and recurrent-state parity
+    std::vector<call>                pre_moev;              // optional routing-masked MoE for a short last chunk
+    std::vector<call>                pre_tail[2];            // optional 128-row last-page variants
+    std::vector<call>                pre_big3840[2], pre_big4096[2];  // optional all-full-page GDN / attention variants
     int                              state_parity = 0;
-    axera_cmm DX, DA, DOUT, DPOS, INDICES, PX, PA, XB, POS, META;
+    axera_cmm DX, DA, DOUT, DPOS, INDICES, PX, PA, XB, POS, GPT, PBIG, META;
     // the token embedding as an NPU gather (the GGUF table converted to bf16 once), for the whole-prefill chunk
     // and a decode token; when absent compute() falls back to the graph's CPU GET_ROWS
     bool      emb = false;
@@ -638,6 +641,8 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     POS     = axera_cmm_alloc((size_t) WN * ak.in_bytes("position_ids") / PG);
     META    = axera_cmm_alloc_nc(32);  // host-written scalars: the NPU sees each write without a cache flush
     AX      = (int) (ak.in_bytes("position_ids") / (PG * sizeof(int32_t)));
+    GPT     = axera_cmm_alloc((size_t) AX * 128 * sizeof(int32_t));
+    PBIG    = axera_cmm_alloc((size_t) AX * WN * sizeof(int32_t));
     GGML_ASSERT((AX == 1 || AX == 3) && (int64_t) NP * PG == man.context && dk.in_bytes("indices") == INDICES->size);
     for (int i = 0; i < NP; ++i) {
         ((int32_t *) INDICES->vir)[i] = i;
@@ -757,6 +762,12 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     // bound once: a page only swaps the four state pools and selects the other call, no IO scanning per layer.
     pre_attn[0].assign(L, {});
     pre_attn[1].assign(L, {});
+    pre_tail[0].assign(L, {});
+    pre_tail[1].assign(L, {});
+    pre_big3840[0].assign(L, {});
+    pre_big3840[1].assign(L, {});
+    pre_big4096[0].assign(L, {});
+    pre_big4096[1].assign(L, {});
     pre_moe.assign(L, {});
     auto meta = [&](size_t off, uint32_t bytes) {
         return axera_io(META.get(), (char *) META->vir + off, bytes);
@@ -815,23 +826,161 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
             }
         }
     }
-    for (int il = 0; il < L; ++il) {
-        const int         blk = il / 4;
-        const std::string pm = "b" + std::to_string(il % 4) + "_moe_";
-        call & m = pre_moe[il];
-        m.k      = &mk;
-        for (const auto & d : mk.desc->in) {
-            const std::string & n = d.name;
-            if (n == "x") {
-                m.in.push_back(axera_io(PA, d.bytes));
-            } else if (n == "w_scale2_route" || n.find("scale2_shared") != std::string::npos) {
-                m.in.push_back(part(pm + n, blk, d.bytes));
-            } else {  // w_up / w_scale_up / w_scale2_up: the fused gate | up tensor (rows 0:512 gate, 512:1024 up)
-                std::string b = n == "w_up" ? "w_gate" : n == "w_scale_up" ? "w_scale_gate" : n == "w_scale2_up" ? "w_scale2_gate" : n;
-                m.in.push_back(slice(pm + b, blk, d.bytes));
+    const bool gdn_tail = man.has("prefill.gdn128");
+    const bool attn_tail = man.has("prefill.attn128");
+    if (gdn_tail || attn_tail) {
+        const kernel & tgk = gdn_tail ? man.get("prefill.gdn128") : gk;
+        const kernel & tak = attn_tail ? man.get("prefill.attn128") : ak;
+        for (int par = 0; par < 2; ++par) {
+            for (int il = 0; il < L; ++il) {
+                const int         phase = il % 4, blk = il / 4;
+                const bool        gdn   = phase != 3;
+                if ((gdn && !gdn_tail) || (!gdn && !attn_tail)) {
+                    continue;
+                }
+                const std::string pa = "b" + std::to_string(phase) + "_attn_";
+                call &            c = pre_tail[par][il];
+                c.k                 = gdn ? &tgk : &tak;
+                for (const auto & d : c.k->desc->in) {
+                    const std::string & n = d.name;
+                    c.ix = n == "x" ? (int) c.in.size() : c.ix;
+                    if (n == "x") {
+                        c.in.push_back(axera_io(PX, d.bytes));
+                    } else if (n == "position_ids") {
+                        c.ipos = (int) c.in.size();
+                        c.in.push_back(axera_io(GPT, d.bytes));
+                    } else if (n == "valid_tokens") {
+                        c.in.push_back(meta(META_VALID, d.bytes));
+                    } else if (n == "indptr") {
+                        c.in.push_back(meta(META_INDPTR, d.bytes));
+                    } else if (n == "indices") {
+                        c.in.push_back(axera_io(INDICES, d.bytes));
+                    } else if (n == "cache_location") {
+                        c.in.push_back(meta(META_CLOC, d.bytes));
+                    } else if (n.find("scale2") != std::string::npos) {
+                        c.in.push_back(part(pa + n, blk, d.bytes));
+                    } else if (n.rfind("w_zeropoint_", 0) == 0) {
+                        c.in.push_back(axera_io(ZERO, d.bytes));
+                    } else if (n == "paged_kv_cache") {
+                        c.in.push_back(kv_io(ord[il], d.bytes));
+                    } else if (n == "cos_sin_cache") {
+                        c.in.push_back(axera_io(B("b3_attn_cos_sin_cache"), d.bytes));
+                    } else if (n == "state_in" || n == "q_conv_state_in" || n == "k_conv_state_in" ||
+                               n == "v_conv_state_in") {
+                        c.in.push_back(par == 0 ? slice("b0_attn_" + n, ord[il], d.bytes) : state_second(n, il, d.bytes));
+                    } else {
+                        static const std::map<std::string, std::string> A = {
+                            { "x_norm_w", "w_norm_attn" }, { "q_norm_w", "w_norm_q" }, { "k_norm_w", "w_norm_k" } };
+                        c.in.push_back(slice(pa + (A.count(n) ? A.at(n) : n), blk, d.bytes));
+                    }
+                }
+                for (const auto & d : c.k->desc->out) {
+                    const std::string & n = d.name;
+                    if (n == "output" || n == "residual_out") {
+                        (n == "output" ? c.iout : c.ires) = (int) c.out.size();
+                        c.out.push_back(axera_io(PA, d.bytes));
+                    } else {
+                        const std::string in = n.substr(0, n.size() - 4) + "_in";
+                        c.out.push_back(par == 0 ? state_second(in, il, d.bytes) : slice("b0_attn_" + in, ord[il], d.bytes));
+                    }
+                }
             }
         }
-        m.out.push_back(axera_io(PX, mk.desc->out[0].bytes));
+    }
+    auto bind_big = [&](std::vector<call> (&dst)[2], const kernel & k, bool gdn) {
+        for (int par = 0; par < 2; ++par) {
+            for (int il = 0; il < L; ++il) {
+                const int         phase = il % 4, blk = il / 4;
+                if ((phase == 3) == gdn) {
+                    continue;
+                }
+                const std::string pa = "b" + std::to_string(phase) + "_attn_";
+                call &            c = dst[par][il];
+                c.k                 = &k;
+                for (const auto & d : c.k->desc->in) {
+                    const std::string & n = d.name;
+                    c.ix = n == "x" ? (int) c.in.size() : c.ix;
+                    if (n == "x") {
+                        c.in.push_back(axera_io(PX, d.bytes));
+                    } else if (n == "position_ids") {
+                        c.ipos = (int) c.in.size();
+                        c.in.push_back(axera_io(PBIG, d.bytes));
+                    } else if (n == "valid_tokens") {
+                        c.in.push_back(meta(META_VALID, d.bytes));
+                    } else if (n == "indptr") {
+                        c.in.push_back(meta(META_INDPTR, d.bytes));
+                    } else if (n == "indices") {
+                        c.in.push_back(axera_io(INDICES, d.bytes));
+                    } else if (n == "cache_location") {
+                        c.in.push_back(meta(META_CLOC, d.bytes));
+                    } else if (n.find("scale2") != std::string::npos) {
+                        c.in.push_back(part(pa + n, blk, d.bytes));
+                    } else if (n.rfind("w_zeropoint_", 0) == 0) {
+                        c.in.push_back(axera_io(ZERO, d.bytes));
+                    } else if (n == "paged_kv_cache") {
+                        c.in.push_back(kv_io(ord[il], d.bytes));
+                    } else if (n == "cos_sin_cache") {
+                        c.in.push_back(axera_io(B("b3_attn_cos_sin_cache"), d.bytes));
+                    } else if (n == "state_in" || n == "q_conv_state_in" || n == "k_conv_state_in" ||
+                               n == "v_conv_state_in") {
+                        c.in.push_back(par == 0 ? slice("b0_attn_" + n, ord[il], d.bytes) : state_second(n, il, d.bytes));
+                    } else {
+                        static const std::map<std::string, std::string> A = {
+                            { "x_norm_w", "w_norm_attn" }, { "q_norm_w", "w_norm_q" }, { "k_norm_w", "w_norm_k" } };
+                        c.in.push_back(slice(pa + (A.count(n) ? A.at(n) : n), blk, d.bytes));
+                    }
+                }
+                for (const auto & d : c.k->desc->out) {
+                    const std::string & n = d.name;
+                    if (n == "output" || n == "residual_out") {
+                        (n == "output" ? c.iout : c.ires) = (int) c.out.size();
+                        c.out.push_back(axera_io(PA, d.bytes));
+                    } else {
+                        const std::string in = n.substr(0, n.size() - 4) + "_in";
+                        c.out.push_back(par == 0 ? state_second(in, il, d.bytes) : slice("b0_attn_" + in, ord[il], d.bytes));
+                    }
+                }
+            }
+        }
+    };
+    if (man.has("prefill.gdn3840")) {
+        bind_big(pre_big3840, man.get("prefill.gdn3840"), true);
+    }
+    if (man.has("prefill.gdn4096")) {
+        bind_big(pre_big4096, man.get("prefill.gdn4096"), true);
+    }
+    if (man.has("prefill.attn3840")) {
+        bind_big(pre_big3840, man.get("prefill.attn3840"), false);
+    }
+    if (man.has("prefill.attn4096")) {
+        bind_big(pre_big4096, man.get("prefill.attn4096"), false);
+    }
+    auto bind_moe = [&](std::vector<call> & v, const kernel & k) {
+        v.assign(L, {});
+        for (int il = 0; il < L; ++il) {
+            const int         blk = il / 4;
+            const std::string pm = "b" + std::to_string(il % 4) + "_moe_";
+            call & m = v[il];
+            m.k      = &k;
+            for (const auto & d : k.desc->in) {
+                const std::string & n = d.name;
+                if (n == "x") {
+                    m.in.push_back(axera_io(PA, d.bytes));
+                } else if (n == "valid_tokens") {
+                    m.in.push_back(meta(META_VALID, d.bytes));
+                } else if (n == "w_scale2_route" || n.find("scale2_shared") != std::string::npos) {
+                    m.in.push_back(part(pm + n, blk, d.bytes));
+                } else {  // w_up / w_scale_up / w_scale2_up: the fused gate | up tensor (rows 0:512 gate, 512:1024 up)
+                    std::string b = n == "w_up" ? "w_gate" : n == "w_scale_up" ? "w_scale_gate" : n == "w_scale2_up" ? "w_scale2_gate" : n;
+                    m.in.push_back(slice(pm + b, blk, d.bytes));
+                }
+            }
+            m.out.push_back(axera_io(PX, k.desc->out[0].bytes));
+        }
+    };
+    bind_moe(pre_moe, mk);
+    if (man.has("prefill.moev")) {
+        bind_moe(pre_moev, man.get("prefill.moev"));
     }
     pad   = {};
     pad.k = &man.get("prefill.padding");
@@ -1373,22 +1522,78 @@ void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const flo
                 }
             }
             POS->flush(POS->vir, (size_t) pages_live * page_ints * sizeof(int32_t));
+            const int full_rows = live - live % PG;
+            if (full_rows == 3840 || full_rows == 4096) {
+                auto * bp = (int32_t *) PBIG->vir;
+                for (int r = 0; r < full_rows; ++r) {
+                    for (int a = 0; a < AX; ++a) {
+                        bp[(size_t) a * full_rows + r] = p4[(size_t) r * 4 + a];
+                    }
+                }
+                PBIG->flush(PBIG->vir, (size_t) AX * full_rows * sizeof(int32_t));
+            }
+            const int tail_live = live % PG;
+            if (tail_live > 0 && tail_live <= 128 && man.has("prefill.attn128")) {
+                auto * tp = (int32_t *) GPT->vir;
+                for (int r = 0; r < 128; ++r) {
+                    for (int a = 0; a < AX; ++a) {
+                        tp[(size_t) a * 128 + r] = r < tail_live ? p4[(size_t) (r0 + live - tail_live + r) * 4 + a] : 0;
+                    }
+                }
+                GPT->flush();
+            }
         }
         axera_timer tl("prefill (chunk)");
         for (int il = 0; il < L; ++il) {
             const bool gdn = il % 4 != 3;
-            for (int s = 0; s < live; s += PG) {
+            const int  full = live - live % PG;
+            call *     big  = full == 4096 ? &pre_big4096[state_parity][il] :
+                              full == 3840 ? &pre_big3840[state_parity][il] : nullptr;
+            const bool big_run = big && big->k != nullptr;
+            int        s0      = 0;
+            int        page_parity = state_parity;
+            if (big_run) {
+                const axera_cmm & src = il == 0 ? XB : PX;
+                big->in[big->ix] = axera_io(src.get(), (char *) src->vir, big->k->in_bytes("x"));
+                if (big->ires >= 0) {
+                    big->out[big->ires] = axera_io(PA.get(), (char *) PA->vir, big->k->out_bytes("residual_out"));
+                }
+                if (big->iout >= 0) {
+                    big->out[big->iout] = axera_io(PA.get(), (char *) PA->vir, big->k->out_bytes("output"));
+                }
+                if (!gdn) {
+                    paging(cell, cell);
+                    META->flush(META->vir, META_BYTES);
+                }
+                axera_timer ta(gdn ? "prefill: gdn (big, layer)" : "prefill: attn (big, layer)");
+                big->k->run(big->in, big->out, gdn ? "prefill gdn big" : "prefill attn big");
+                s0 = full;
+                if (s0 == live) {
+                    states_swap();
+                } else {
+                    page_parity ^= 1;  // the big call's output set holds the page-start state
+                }
+            }
+            for (int s = s0; s < live; s += PG) {
                 const int     v    = std::min(PG, live - s);
                 const int64_t c    = cell + s;
-                call & pc = pre_attn[state_parity][il];
+                const bool  big_tail = big_run && s == full;
+                const int   par      = big_tail ? page_parity : state_parity;
+                call &      pcf  = pre_attn[par][il];
+                call &      pct  = pre_tail[par][il];
+                const bool  tail_call = pct.k != nullptr && v <= 128;
+                call &      pc   = tail_call ? pct : pcf;
                 const axera_cmm & src = il == 0 ? XB : PX;
-                pc.in[pc.ix] = axera_io(src.get(), (char *) src->vir + (size_t) s * xr, (uint32_t) (PG * xr));
+                pc.in[pc.ix] = axera_io(src.get(), (char *) src->vir + (size_t) s * xr, tail_call ? pc.k->in_bytes("x") : (uint32_t) (PG * xr));
                 if (gdn) {
-                    pc.out[pc.ires] = axera_io(PA.get(), (char *) PA->vir + (size_t) s * xr, (uint32_t) (PG * xr));
+                    pc.out[pc.ires] = axera_io(PA.get(), (char *) PA->vir + (size_t) s * xr,
+                                               tail_call ? pc.k->out_bytes("residual_out") : (uint32_t) (PG * xr));
                 } else {
-                    pc.out[pc.iout] = axera_io(PA.get(), (char *) PA->vir + (size_t) s * xr, (uint32_t) (PG * xr));
-                    pc.in[pc.ipos]  = axera_io(POS.get(), (char *) POS->vir + (size_t) (s / PG) * AX * PG * sizeof(int32_t),
-                                              pc.k->desc->in[pc.ipos].bytes);
+                    pc.out[pc.iout] = axera_io(PA.get(), (char *) PA->vir + (size_t) s * xr,
+                                               tail_call ? pc.k->out_bytes("output") : (uint32_t) (PG * xr));
+                    pc.in[pc.ipos]  = tail_call ? axera_io(GPT, pc.k->desc->in[pc.ipos].bytes) :
+                                                  axera_io(POS.get(), (char *) POS->vir + (size_t) (s / PG) * AX * PG * sizeof(int32_t),
+                                                           pc.k->desc->in[pc.ipos].bytes);
                 }
                 {
                     axera_timer tpg("prefill: paging");
@@ -1398,18 +1603,22 @@ void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const flo
                 }
                 axera_timer ta(gdn ? "prefill: gdn (chunk, layer)" : "prefill: attn (chunk, layer)");
                 pc.k->run(pc.in, pc.out, gdn ? "prefill gdn" : "prefill attn");
-                if (gdn) {
+                if (gdn && !big_tail) {
                     states_swap();
                 }
             }
+            const bool moev_run = !pre_moev.empty() && live < WN;
             if (live < WN) {
                 *(int32_t *) ((char *) META->vir + META_VALID) = live;
                 META->flush(META->vir, META_BYTES);
-                axera_timer tp("prefill: padding");
-                pad.k->run(pad.in, pad.out, "prefill padding");
+                if (!moev_run) {
+                    axera_timer tp("prefill: padding");
+                    pad.k->run(pad.in, pad.out, "prefill padding");
+                }
             }
             axera_timer tm("prefill: moe (chunk, layer)");
-            pre_moe[il].k->run(pre_moe[il].in, pre_moe[il].out, "prefill moe");
+            call & mo = moev_run ? pre_moev[il] : pre_moe[il];
+            mo.k->run(mo.in, mo.out, moev_run ? "prefill moev" : "prefill moe");
         }
         const bool     at_page = (cell + live) % PG == 0;
         if (at_page) {
@@ -1657,7 +1866,7 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     tpos.stop();
     axera_timer tout("compute pre: out rows");
     const int n_out = (int) logits->ne[1];
-    GGML_ASSERT(n_out >= 0 && n_out <= T);
+    GGML_ASSERT(n_out >= 0 && n_out <= T);  // a warmup or an image-only batch may request no output rows
     const ggml_tensor * out_ids = n_out > 0 && n_out < T ? names.find("out_ids") : nullptr;
     if (out_ids && (out_ids->type != GGML_TYPE_I32 || out_ids->ne[0] != n_out)) {
         out_ids = nullptr;

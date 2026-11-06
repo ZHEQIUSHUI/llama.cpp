@@ -5,6 +5,10 @@
 #include <map>
 #include <set>
 
+#include <sys/stat.h>
+#include <cstdint>
+#include <cstdio>
+
 #include <nlohmann/json.hpp>
 
 #include <fstream>
@@ -77,6 +81,26 @@ void kernel::run(std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_
         const char * e = getenv("GGML_AXERA_DUMP_ONLY");
         return e ? std::string(",") + e + "," : std::string();
     }();
+    static const char * dump_all_role = getenv("GGML_AXERA_DUMP_ALL_ROLE");
+    static const uint64_t dump_first = getenv("GGML_AXERA_DUMP_FIRST") ?
+        strtoull(getenv("GGML_AXERA_DUMP_FIRST"), nullptr, 10) : 0;
+    static const uint64_t dump_last = getenv("GGML_AXERA_DUMP_LAST") ?
+        strtoull(getenv("GGML_AXERA_DUMP_LAST"), nullptr, 10) : UINT64_MAX;
+    static const bool dump_full_first = getenv("GGML_AXERA_DUMP_FULL_FIRST") != nullptr;
+    auto write_inputs = [&](const std::string & dir, bool full = false) {
+        mkdir(dir.c_str(), 0777);
+        for (size_t i = 0; i < in.size(); ++i) {
+            const std::string name = info->pInputs[i].pName;
+            if (!full && !dump_only.empty() && dump_only.find("," + name + ",") == std::string::npos) {
+                continue;
+            }
+            const std::string p = dir + "/" + name + ".bin";
+            FILE *            f = fopen(p.c_str(), "wb");
+            GGML_ASSERT(f && in[i].pVirAddr);
+            fwrite(in[i].pVirAddr, 1, info->pInputs[i].nSize, f);
+            fclose(f);
+        }
+    };
     bool dump_role_at_match = false;
     if (!dump_roles.empty()) {
         const std::string a   = "," + dump_roles + ",";
@@ -88,21 +112,19 @@ void kernel::run(std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_
     }
     if ((dump_role && desc->role == dump_role && call_no == dump_at) || dump_role_at_match) {
         const char * dir = getenv("GGML_AXERA_DUMP_DIR");
-        for (size_t i = 0; i < in.size(); ++i) {
-            const std::string name = info->pInputs[i].pName;
-            if (!dump_only.empty() && dump_only.find("," + name + ",") == std::string::npos) {
-                continue;
-            }
-            const std::string p = std::string(dir ? dir : ".") + "/" + name + ".bin";
-            FILE *            f = fopen(p.c_str(), "wb");
-            GGML_ASSERT(f && in[i].pVirAddr);
-            fwrite(in[i].pVirAddr, 1, info->pInputs[i].nSize, f);
-            fclose(f);
-        }
+        write_inputs(dir ? dir : ".");
         fprintf(stderr, "axera: %s: %zu inputs of %s dumped to %s\n", what, in.size(), desc->role.c_str(), dir ? dir : ".");
         if (!getenv("GGML_AXERA_DUMP_NOEXIT")) {
             exit(0);
         }
+    }
+    if (dump_all_role && desc->role == dump_all_role && call_no >= dump_first && call_no <= dump_last) {
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/call_%05llu", getenv("GGML_AXERA_DUMP_DIR") ? getenv("GGML_AXERA_DUMP_DIR") : ".",
+                 (unsigned long long) call_no);
+        write_inputs(path, dump_full_first && call_no == dump_first);
+        fprintf(stderr, "axera: %s: %zu inputs of %s call %llu dumped to %s\n", what, in.size(), desc->role.c_str(),
+                (unsigned long long) call_no, path);
     }
     static const bool io_stats = getenv("GGML_AXERA_IO_STATS") != nullptr;
     if (io_stats) {
@@ -174,6 +196,19 @@ void kernel::run(std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_
             }
         }
         GGML_ABORT("axera: %s: kernel %s failed (0x%x)\n", what, desc->role.c_str(), ret);
+    }
+    if (dump_all_role && desc->role == dump_all_role && call_no >= dump_first && call_no <= dump_last &&
+        getenv("GGML_AXERA_DUMP_OUTPUTS")) {
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/call_%05llu", getenv("GGML_AXERA_DUMP_DIR") ? getenv("GGML_AXERA_DUMP_DIR") : ".",
+                 (unsigned long long) call_no);
+        for (size_t i = 0; i < out.size(); ++i) {
+            const std::string p = std::string(path) + "/out_" + info->pOutputs[i].pName + ".bin";
+            FILE *            f = fopen(p.c_str(), "wb");
+            GGML_ASSERT(f && out[i].pVirAddr);
+            fwrite(out[i].pVirAddr, 1, info->pOutputs[i].nSize, f);
+            fclose(f);
+        }
     }
 }
 
