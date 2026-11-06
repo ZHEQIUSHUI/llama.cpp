@@ -552,6 +552,26 @@ bool output_head::combined_ready(ggml_cgraph * g, const graph_names & names) con
     return gw != nullptr && eps == 1e-6f;
 }
 
+bool output_head::topk_ready(ggml_cgraph * g, const graph_names & names, int T) const {
+    GGML_UNUSED(g);
+    if (!tk || draft) {
+        return false;
+    }
+    ggml_tensor * logits = graph_head(names);
+    if (!logits) {
+        return false;
+    }
+    const int n_out = (int) logits->ne[1];
+    if (n_out < 1 || n_out > tR || T != n_out) {
+        return false;
+    }
+    if (names.find("result_output") && graph_head(names) != names.find("result_output")) {
+        return false;
+    }
+    const npu_opts opts = npu_get_options();
+    return opts.enabled && opts.K == tK;
+}
+
 bool output_head::bind_combined4(const kernel & lm, const ggml_tensor * output_weight) {
     if (!k || w != output_weight) {
         return false;
@@ -593,6 +613,10 @@ bool output_head::bind_combined4(const kernel & lm, const ggml_tensor * output_w
 
 void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
                                const std::vector<int> * compact_rows, const axera_cmm * xb) {
+    if (topk_ready(g, names, T)) {
+        run(g, names, h, T, nullptr, nullptr, compact_rows);
+        return;
+    }
     ggml_tensor * logits = graph_head(names);
     GGML_ASSERT(logits && logits->op == GGML_OP_MUL_MAT && logits->src[0] == w && logits->type == GGML_TYPE_F32 &&
                 ggml_backend_buffer_is_axera(logits->buffer));
@@ -848,6 +872,20 @@ int output_head::full_row(int32_t idx, float * out, int32_t n) {
     if (r < 0 || r >= fn_out || (size_t) (r + 1) * K > fy.size()) {
         return 0;
     }
+    if (ck) {  // the top-k path kept the pre-norm row, and the combined kernel writes the full fallback row
+        const float * xr = fy.data() + (size_t) r * K;
+        ggml_fp32_to_bf16_row(xr, (ggml_bf16_t *) cx->vir, K);
+        cx->flush(cx->vir, K * sizeof(ggml_bf16_t));
+        if (!ffull) {
+            ffull = axera_cmm_alloc(N * sizeof(float));
+        }
+        cin[ck->input("x")] = axera_io(cx, (size_t) K * sizeof(ggml_bf16_t));
+        cout[ck->output("out")] = axera_io(ffull, (size_t) N * sizeof(float));
+        ck->run(cin, cout, "output head (combined fallback row)");
+        ffull->invalidate(ffull->vir, (size_t) N * sizeof(float));
+        memcpy(out, (const float *) ffull->vir, (size_t) N * sizeof(float));
+        return 1;
+    }
     ggml_fp32_to_bf16_row(fy.data() + (size_t) r * K, (ggml_bf16_t *) x->vir, K);
     x->flush(x->vir, K * sizeof(ggml_bf16_t));
     std::vector<AX_ENGINE_IO_BUFFER_T> in(k->info->nInputSize), out_io(k->info->nOutputSize);
@@ -909,6 +947,11 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
     float         eps;
     const float * gw    = final_norm(hn, (int) K, &eps);
     const int     n_out = (int) logits->ne[1];
+    if (ck && gw != cgw) {
+        memcpy(cnorm->vir, gw, (size_t) K * sizeof(float));
+        cnorm->flush(cnorm->vir, (size_t) K * sizeof(float));
+        cgw = gw;
+    }
     // the output rows: the GET_ROWS index that crops the last layer or the final norm to the outputs
     ggml_tensor * out_ids = nullptr;
     if (n_out < T) {
@@ -1071,7 +1114,12 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
             // the sampler's per-row fallback: the rows of this run, their normed inputs and the graph's logits
             flogits = logits;
             fdctx   = dctx;
-            fy      = std::move(y);
+            fy.resize((size_t) n_out * K);  // the pre-norm rows, for the combined full-row fallback
+            for (int r = 0; r < n_out; ++r) {
+                const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : r;
+                memcpy(fy.data() + (size_t) r * K, h.data() + (size_t) (compact_rows ? r : row) * K,
+                       (size_t) K * sizeof(float));
+            }
             frows   = std::move(rows);
             fn_out  = n_out;
             npu_set_full_row(&output_head::full_row_cb, this);

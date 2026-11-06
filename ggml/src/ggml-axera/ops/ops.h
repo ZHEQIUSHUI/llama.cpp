@@ -148,6 +148,7 @@ struct output_head {
     bool bind_combined(const kernel & lm, const ggml_tensor * output_weight);
     bool bind_combined4(const kernel & lm, const ggml_tensor * output_weight);
     bool combined_ready(ggml_cgraph * g, const graph_names & names) const;
+    bool topk_ready(ggml_cgraph * g, const graph_names & names, int T) const;
     void run_combined(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
                       const std::vector<int> * compact_rows, const axera_cmm * xb);
     void run_combined4(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T);
