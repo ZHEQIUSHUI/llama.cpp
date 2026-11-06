@@ -427,7 +427,7 @@ void output_head::bind(const kernel & lm, const ggml_tensor * output_weight) {
 }
 
 void output_head::bind_topk(const kernel & lm) {
-    GGML_ASSERT(k && mx4 && w);
+    GGML_ASSERT(k && w);
     if (tk == &lm) {
         return;
     }
@@ -438,7 +438,8 @@ void output_head::bind_topk(const kernel & lm) {
     tK              = (int) (lm.out_bytes("values") / (sizeof(float) * tR));
     GGML_ASSERT(tK > 0 && (tR == 1 || lm.find_input("m") >= 0) && lm.find_input("bias") >= 0 && lm.find_input("mul_pos") >= 0 &&
                 lm.find_input("mul_neg") >= 0 && lm.find_input("temp") >= 0 &&
-                lm.in_bytes("x") == (uint32_t) (tR * K * sizeof(ggml_bf16_t)) && lm.in_bytes("w") == N * K / 2 &&
+                lm.in_bytes("x") == (uint32_t) (tR * K * sizeof(ggml_bf16_t)) &&
+                lm.in_bytes("w") == (uint32_t) (mx4 ? N * K / 2 : N * K) &&
                 lm.in_bytes("s") == N * K / AXERA_MX_GROUP && lm.in_bytes("bias") == N * sizeof(float) &&
                 lm.in_bytes("mul_pos") == N * sizeof(float) && lm.in_bytes("mul_neg") == N * sizeof(float) &&
                 lm.in_bytes("temp") == sizeof(float) && (tR == 1 || lm.in_bytes("m") == sizeof(int32_t)) &&
@@ -1057,7 +1058,7 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
             }
             std::vector<AX_ENGINE_IO_BUFFER_T> tin(tk->info->nInputSize), tout(tk->info->nOutputSize);
             tin[tk->input("x")]       = axera_io(tx, (size_t) tR * K * sizeof(ggml_bf16_t));
-            tin[tk->input("w")]       = axera_io(q, N * K / 2);
+            tin[tk->input("w")]       = axera_io(q, mx4 ? (size_t) N * K / 2 : (size_t) N * K);
             tin[tk->input("s")]       = axera_io(s, N * K / AXERA_MX_GROUP);
             tin[tk->input("bias")]    = axera_io(tbias, N * sizeof(float));
             tin[tk->input("mul_pos")] = axera_io(tmulp, N * sizeof(float));
