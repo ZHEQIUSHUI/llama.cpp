@@ -95,6 +95,8 @@ class qwen35_whole final : public model {
     std::vector<state_io>                 state_ios;
     std::vector<call>                     ver;  // per group (role decode.verify)
     std::vector<std::array<axera_cmm, 4>> snaps[2];
+    std::vector<float>                    h_buf;      // the target graph's hidden rows
+    std::vector<float>                    mtp_h_buf;  // the MTP graph's hidden rows
     axera_cmm                             VX, VCS, VPN, VMASK, VNT;
     int     cur_set = -1;              // the snapshot set holding the current state, -1: the pools
     int64_t ver_c0  = -1;              // the last verification's first cell, rows, snapshot set
@@ -1049,7 +1051,8 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
     }
     const rope         rp(rope_node, inp_pos, T);
     GGML_ASSERT(rp.ROT == ROT);
-    std::vector<float> h((size_t) T * H);
+    h_buf.resize((size_t) T * H);
+    std::vector<float> & h = h_buf;
     axera_timer        tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
     const int64_t      c0 = kv.cell_of(0);
     if (ver_c0 >= 0 && c0 > ver_c0 && c0 < ver_c0 + ver_T) {
@@ -1281,7 +1284,8 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
     auto row_bf16 = [&](const ggml_tensor * x, int r, ggml_bf16_t * d) {
         ggml_fp32_to_bf16_row((const float *) ((const char *) x->data + (size_t) r * x->nb[1]), d, H);
     };
-    std::vector<float> h((size_t) T * H);
+    mtp_h_buf.resize((size_t) T * H);
+    std::vector<float> & h = mtp_h_buf;
     const size_t       half = (ROT / 2) * sizeof(ggml_bf16_t);
     axera_timer        tm(T == 1 ? "mtp (draft)" : T <= 8 ? "mtp (catch-up rows)" : "mtp (prompt)");
     const int R8 = mtp8.k ? (int) (M8E->size / (H * sizeof(ggml_bf16_t))) : 0;
@@ -1339,14 +1343,14 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
         }
     } else {
         const int P = (int) (PE->size / (H * sizeof(ggml_bf16_t)));  // rows per call
-        std::vector<ggml_bf16_t> mrow(man.context);
         for (int it = 0; it < T; it += P) {
             const int n = std::min(P, T - it);
-            memset(PE->vir, 0, PE->size);
-            memset(PH->vir, 0, PH->size);
-            auto * pn   = (int32_t *) PPN->vir;
-            auto * mk   = (ggml_bf16_t *) PMASK->vir;  // [pages][P][256]
-            int    nmax = 0;
+            if (n < P) {  // (a full chunk overwrites every row)
+                memset((ggml_bf16_t *) PE->vir + (size_t) n * H, 0, (size_t) (P - n) * H * sizeof(ggml_bf16_t));
+                memset((ggml_bf16_t *) PH->vir + (size_t) n * H, 0, (size_t) (P - n) * H * sizeof(ggml_bf16_t));
+            }
+            auto * pn = (int32_t *) PPN->vir;
+            const int nmax = kv.chunk_mask((const int32_t *) pos->data, it, P, n, (ggml_bf16_t *) PMASK->vir);
             for (int r = 0; r < P; ++r) {
                 const int     rr = std::min(r, n - 1);  // padded rows: the last row's positions and mask, later cells
                 const int64_t c  = kv.cell_of(it + rr) + (r - rr);
@@ -1358,22 +1362,17 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
                 rp.rows(it + rr, 1, COS.get(), SIN.get());
                 memcpy((char *) PCS->vir + r * 2 * half, COS->vir, half);
                 memcpy((char *) PCS->vir + r * 2 * half + half, SIN->vir, half);
-                if (r < n) {  // (padded rows reuse the last real row's mask)
-                    std::fill(mrow.begin(), mrow.end(), ggml_fp32_to_bf16(-3e38f));
-                    nmax = std::max(nmax, kv.mask_row(it + rr, mrow.data()));
-                }
-                for (int b = 0; b < (int) (man.context / PG); ++b) {
-                    memcpy(mk + ((size_t) b * P + r) * PG, mrow.data() + (size_t) b * PG, PG * sizeof(ggml_bf16_t));
-                }
                 pn[3 * r]     = (int32_t) c;
                 pn[3 * r + 1] = (int32_t) (c / PG + 1);
                 pn[3 * r + 2] = (int32_t) ((c / PG) * 2 * PG + c % PG);
-                nmax          = std::max(nmax, (int) (c / PG + 1));
             }
             *(int32_t *) PNBLK->vir = nmax;
-            for (const axera_cmm * b : { &PE, &PH, &PCS, &PPN, &PMASK, &PNBLK }) {
-                (*b)->flush();
-            }
+            PE->flush(PE->vir, (size_t) n * H * sizeof(ggml_bf16_t));
+            PH->flush(PH->vir, (size_t) n * H * sizeof(ggml_bf16_t));
+            PCS->flush(PCS->vir, (size_t) n * 2 * half);
+            PPN->flush();
+            PNBLK->flush();
+            PMASK->flush(PMASK->vir, (size_t) nmax * P * PG * sizeof(ggml_bf16_t));
             mtpp.k->run(mtpp.in, mtpp.out, "mtp prompt");
             POUT2->invalidate();
             for (int r = 0; r < n; ++r) {
