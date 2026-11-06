@@ -1098,6 +1098,10 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
+int32_t llama_context::get_output_row(int32_t i) const {
+    return (int32_t) output_resolve_row(i);
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -4634,6 +4638,12 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     }
 
     return res;
+}
+
+int32_t llama_get_output_row_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_output_row(i);
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

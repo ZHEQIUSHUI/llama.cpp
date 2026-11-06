@@ -1149,6 +1149,9 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // The logits row for the ith token of the last batch. This is the index the output head used.
+    LLAMA_API int32_t llama_get_output_row_ith(struct llama_context * ctx, int32_t i);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
