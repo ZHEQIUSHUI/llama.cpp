@@ -172,6 +172,40 @@ struct axera_timer {
     }
 };
 
+// Task-ID async submission (SDK >= 0.6.0). A context has one execution slot:
+// a second in-flight submission returns TASK_BUSY, so a batch of dependent
+// calls uses one context per call. The SDK/driver serializes a handle's
+// submissions in submit order; verify(1) gates this before enabling it.
+//
+// Outputs default to SHARED_UNCACHED: the engine's SHARED_CACHED completion
+// path invalidates every output and cost ~6 ms for the 0.8B decode group's
+// 105 MiB of state. Buffers may still be cached CMM; the caller must manually
+// invalidate any output it reads on the CPU after wait().
+class axera_async_queue {
+  public:
+    axera_async_queue();
+    ~axera_async_queue();
+    axera_async_queue(const axera_async_queue &)            = delete;
+    axera_async_queue & operator=(const axera_async_queue &) = delete;
+
+    // GGML_AXERA_ASYNC=1, the runtime library's CAP_ASYNC, and the Task-ID ABI.
+    bool enabled() const;
+    // Create enough contexts for `n` in-flight calls. Safe to call repeatedly.
+    bool reserve(AX_ENGINE_HANDLE handle, size_t n);
+    // Queue one prepared call. The buffer descriptors are copied; the buffers
+    // themselves must stay alive until wait(). `cached_outputs` selects
+    // SHARED_CACHED instead of SHARED_UNCACHED for all outputs.
+    bool submit(AX_ENGINE_HANDLE handle, const std::vector<AX_ENGINE_IO_BUFFER_T> & in,
+                const std::vector<AX_ENGINE_IO_BUFFER_T> & out, bool cached_outputs = false);
+    // Wait for every queued task, then release the queued descriptors.
+    bool wait();
+    const std::string & error() const;
+
+  private:
+    struct impl;
+    std::unique_ptr<impl> p;
+};
+
 // persistent workers for the host loops: run(n, fn) calls fn(0 .. n - 1) on the workers and the caller, returning
 // when all are done
 class axera_pool {

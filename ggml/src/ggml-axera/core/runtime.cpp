@@ -10,10 +10,73 @@
 #include <fcntl.h>
 
 #include <fstream>
+#include <dlfcn.h>
 #include <iterator>
 
 #include <sys/mman.h>
 #include <unistd.h>
+
+namespace {
+
+using async_task_id_t         = uint64_t;
+using async_output_attr_t     = uint32_t;
+using async_context_t         = AX_ENGINE_CONTEXT_T;
+constexpr async_output_attr_t ASYNC_OUT_UNCACHED = 2;
+constexpr async_output_attr_t ASYNC_OUT_CACHED   = 3;
+constexpr uint32_t            ASYNC_CAP          = 1U << 0;
+constexpr int32_t             ASYNC_PARAM_INVALID = (int32_t) 0x80060084U;
+constexpr int32_t             ASYNC_NOT_SUPPORT  = (int32_t) 0x80060088U;
+constexpr int32_t             ASYNC_TASK_BUSY    = (int32_t) 0x80060089U;
+constexpr int32_t             ASYNC_NOT_SUPPORTED = (int32_t) 0x800600a2U;
+
+struct async_options {
+    uint32_t              nSize;
+    uint32_t              nOutputAttrCount;
+    const async_output_attr_t * pOutputAttrs;
+    uint64_t              u64Reserved[4];
+};
+
+using create_context_fn = int32_t (*)(AX_ENGINE_HANDLE, async_context_t *);
+using callback_fn = void (*)(AX_ENGINE_HANDLE, async_context_t, async_task_id_t, int32_t, void *);
+using run_fn = int32_t (*)(AX_ENGINE_HANDLE, async_context_t, const AX_ENGINE_IO_T *, const async_options *,
+                           callback_fn, void *, async_task_id_t *);
+using run_group_fn = int32_t (*)(AX_ENGINE_HANDLE, async_context_t, uint32_t, const AX_ENGINE_IO_T *,
+                                 const async_options *, callback_fn, void *, async_task_id_t *);
+using wait_fn      = int32_t (*)(AX_ENGINE_HANDLE, async_task_id_t, uint32_t, int32_t *);
+using capability_fn = int32_t (*)(uint32_t *);
+
+struct async_api {
+    create_context_fn create_context = nullptr;
+    run_fn            run            = nullptr;
+    run_group_fn      run_group      = nullptr;
+    wait_fn           wait           = nullptr;
+    capability_fn     capability     = nullptr;
+};
+
+static async_api load_async_api(std::string & why) {
+    async_api api;
+    void * lib = dlopen("libax_engine.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!lib) {
+        why = std::string("dlopen(libax_engine.so): ") + dlerror();
+        return api;
+    }
+    api.create_context = reinterpret_cast<create_context_fn>(dlsym(lib, "AX_ENGINE_CreateAsyncContext"));
+    api.run            = reinterpret_cast<run_fn>(dlsym(lib, "AX_ENGINE_RunAsync"));
+    api.run_group      = reinterpret_cast<run_group_fn>(dlsym(lib, "AX_ENGINE_RunGroupIOAsync"));
+    api.wait           = reinterpret_cast<wait_fn>(dlsym(lib, "AX_ENGINE_WaitAsync"));
+    api.capability     = reinterpret_cast<capability_fn>(dlsym(lib, "AX_ENGINE_GetCapability"));
+    if (!api.create_context || !api.run || !api.run_group || !api.wait || !api.capability) {
+        why = "libax_engine.so lacks the Task-ID async API";
+    }
+    return api;
+}
+
+// V0.6.0 rejects a NULL callback with PARAM_INVALID even though polling via
+// WaitAsync is documented. A no-op callback is still safe: WaitAsync owns the
+// task result and the callback does not need to release anything.
+static void async_noop(AX_ENGINE_HANDLE, async_context_t, async_task_id_t, int32_t, void *) {}
+
+}  // namespace
 
 std::atomic<uint64_t> axera_graph_epoch{ 0 };
 
@@ -354,4 +417,165 @@ axera_pool & axera_host_pool() {
         return n > 0 ? n : std::min(15, std::max(1, (int) std::thread::hardware_concurrency() - 1));
     }());
     return pool;
+}
+
+struct axera_async_queue::impl {
+    struct pending {
+        std::vector<AX_ENGINE_IO_BUFFER_T>          in;
+        std::vector<AX_ENGINE_IO_BUFFER_T>          out;
+        std::vector<async_output_attr_t>            attrs;
+        AX_ENGINE_IO_T                              io = {};
+        async_options                               options = {};
+        async_task_id_t                             id = 0;
+        async_context_t                             ctx = nullptr;
+    };
+
+    const bool requested = [] {
+        const char * e = std::getenv("GGML_AXERA_ASYNC");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+
+    bool             api_tried = false;
+    bool             api_ok    = false;
+    bool             failed    = false;
+    async_api        api;
+    AX_ENGINE_HANDLE handle    = nullptr;
+    uint32_t         groups    = 1;
+    std::vector<async_context_t> contexts;
+    std::vector<pending>         queued;
+    std::string                  why;
+
+    bool enabled() {
+        if (!requested) {
+            return false;
+        }
+        if (!api_tried) {
+            api_tried = true;
+            api       = load_async_api(why);
+            if (!why.empty()) {
+                GGML_LOG_WARN("%s: async disabled: %s\n", __func__, why.c_str());
+                return false;
+            }
+            uint32_t cap = 0;
+            const int32_t rc = api.capability(&cap);
+            if (rc != 0 || !(cap & ASYNC_CAP)) {
+                why = "runtime does not advertise AX_ENGINE_CAP_ASYNC";
+                GGML_LOG_WARN("%s: async disabled: %s (rc 0x%08x, cap 0x%08x)\n", __func__, why.c_str(),
+                              (unsigned) rc, cap);
+                return false;
+            }
+            api_ok = true;
+        }
+        return api_ok && !failed;
+    }
+
+    bool reserve(AX_ENGINE_HANDLE h, size_t n) {
+        if (!enabled()) {
+            return false;
+        }
+        if (n > 64) {
+            why = "more than 64 in-flight contexts requested";
+            return false;
+        }
+        if (!handle) {
+            handle = h;
+            if (AX_ENGINE_GetGroupIOInfoCount(handle, &groups) != 0) {
+                groups = 1;
+            }
+        } else if (handle != h) {
+            why = "one async queue cannot serve two model handles";
+            return false;
+        }
+        while (contexts.size() < n) {
+            async_context_t ctx = nullptr;
+            const int32_t rc = api.create_context(handle, &ctx);
+            if (rc != 0 || !ctx) {
+                why = "AX_ENGINE_CreateAsyncContext failed";
+                GGML_LOG_ERROR("%s: %s for context %zu (rc 0x%08x)\n", __func__, why.c_str(), contexts.size(),
+                               (unsigned) rc);
+                return false;
+            }
+            contexts.push_back(ctx);
+        }
+        return true;
+    }
+
+    bool submit(AX_ENGINE_HANDLE h, const std::vector<AX_ENGINE_IO_BUFFER_T> & in,
+                const std::vector<AX_ENGINE_IO_BUFFER_T> & out, bool cached_outputs) {
+        if (!reserve(h, queued.size() + 1)) {
+            return false;
+        }
+        pending q;
+        q.in  = in;
+        q.out = out;
+        q.attrs.assign(out.size(), cached_outputs ? ASYNC_OUT_CACHED : ASYNC_OUT_UNCACHED);
+        q.io.pInputs       = q.in.data();
+        q.io.nInputSize    = (uint32_t) q.in.size();
+        q.io.pOutputs      = q.out.data();
+        q.io.nOutputSize   = (uint32_t) q.out.size();
+        q.io.u64Reserved[0] = 1;  // AX_ENGINE_IO_FLAG_ALLOW_INPLACE
+        q.ctx              = contexts[queued.size()];
+
+        q.options.nSize            = sizeof(q.options);
+        q.options.nOutputAttrCount = (uint32_t) q.attrs.size();
+        q.options.pOutputAttrs     = q.attrs.empty() ? nullptr : q.attrs.data();
+
+        // The semantics probe showed that RunAsync accepts queued decode calls;
+        // RunGroupIOAsync can reject the second in-flight call with
+        // PARAM_INVALID even when the first accepted. Keep the probe's order and
+        // use the group entry point only for a runtime that asks for it.
+        int32_t rc = api.run(handle, q.ctx, &q.io, &q.options, async_noop, nullptr, &q.id);
+        if (rc == ASYNC_NOT_SUPPORT || rc == ASYNC_NOT_SUPPORTED || rc == ASYNC_PARAM_INVALID) {
+            rc = api.run_group(handle, q.ctx, 0, &q.io, &q.options, async_noop, nullptr, &q.id);
+        }
+        if (rc != 0 || !q.id) {
+            why = "async submission failed";
+            GGML_LOG_ERROR("%s: %s: ctx %zu rc 0x%08x id %llu (groups %u)\n", __func__, why.c_str(), queued.size(),
+                           (unsigned) rc, (unsigned long long) q.id, groups);
+            failed = true;
+            return false;
+        }
+        queued.push_back(std::move(q));
+        return true;
+    }
+
+    bool wait() {
+        bool ok = true;
+        for (pending & q : queued) {
+            int32_t result = 0;
+            const int32_t rc = api.wait(handle, q.id, 60000, &result);
+            if (rc != 0 || result != 0) {
+                why = "AX_ENGINE_WaitAsync failed";
+                GGML_LOG_ERROR("%s: %s: id %llu rc 0x%08x result 0x%08x\n", __func__, why.c_str(),
+                               (unsigned long long) q.id, (unsigned) rc, (unsigned) result);
+                ok = false;
+            }
+        }
+        queued.clear();
+        return ok;
+    }
+};
+
+axera_async_queue::axera_async_queue() : p(new impl) {}
+axera_async_queue::~axera_async_queue() = default;
+
+bool axera_async_queue::enabled() const {
+    return const_cast<impl *>(p.get())->enabled();
+}
+
+bool axera_async_queue::reserve(AX_ENGINE_HANDLE handle, size_t n) {
+    return p->reserve(handle, n);
+}
+
+bool axera_async_queue::submit(AX_ENGINE_HANDLE handle, const std::vector<AX_ENGINE_IO_BUFFER_T> & in,
+                               const std::vector<AX_ENGINE_IO_BUFFER_T> & out, bool cached_outputs) {
+    return p->submit(handle, in, out, cached_outputs);
+}
+
+bool axera_async_queue::wait() {
+    return p->wait();
+}
+
+const std::string & axera_async_queue::error() const {
+    return p->why;
 }
