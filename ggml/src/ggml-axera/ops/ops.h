@@ -116,12 +116,12 @@ struct output_head {
     // logits for the fallback path, plus one id/logit per row. The greedy sampler reads only the latter.
     const kernel *                     ck = nullptr;
     int                                cR = 0;
-    axera_cmm                          cnorm, cids, ctop, cx;
+    axera_cmm                          cnorm, cmeta, cids, ctop, cx;
     const float *                      cgw = nullptr;
     std::vector<AX_ENGINE_IO_BUFFER_T> cin, cout;
     // the same combined head for an MTP verify's four rows (role lm_head.verify; input m = the valid rows)
     const kernel *                     c4k = nullptr;
-    axera_cmm                          c4norm, c4x, c4m, c4ids, c4top;
+    axera_cmm                          c4norm, c4x, c4m, c4meta, c4ids, c4top;
     const float *                      c4gw = nullptr;
     std::vector<AX_ENGINE_IO_BUFFER_T> c4in, c4out;
 

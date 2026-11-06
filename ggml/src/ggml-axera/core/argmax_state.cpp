@@ -76,6 +76,8 @@ bool argmax_publish(const int32_t * ids, const float * logits, int32_t rows) {
     state & v = s();
     std::lock_guard<std::mutex> lk(v.mu);
     if (!v.enabled || !ids || !logits || rows <= 0 || rows > v.R) {
+        v.n = 0;
+        v.used.clear();
         return false;
     }
     for (int32_t r = 0; r < rows; ++r) {

@@ -476,8 +476,9 @@ bool output_head::bind_combined(const kernel & lm, const ggml_tensor * output_we
     cR = R;
     cnorm = axera_cmm_alloc((size_t) K * sizeof(float));
     cx    = axera_cmm_alloc((size_t) K * sizeof(ggml_bf16_t));
-    cids  = axera_cmm_alloc(sizeof(int32_t));
-    ctop  = axera_cmm_alloc(sizeof(float));
+    cmeta = axera_cmm_alloc(2 * 4096);  // both outputs keep the CMM allocation alignment
+    cids  = axera_cmm_view(cmeta.get(), 0, sizeof(int32_t));
+    ctop  = axera_cmm_view(cmeta.get(), 4096, sizeof(float));
     cin.assign(ck->info->nInputSize, AX_ENGINE_IO_BUFFER_T{});
     cout.assign(ck->info->nOutputSize, AX_ENGINE_IO_BUFFER_T{});
     cin[ck->input("norm_w")] = axera_io(cnorm, (size_t) K * sizeof(float));
@@ -533,8 +534,9 @@ bool output_head::bind_combined4(const kernel & lm, const ggml_tensor * output_w
     c4norm = axera_cmm_alloc((size_t) K * sizeof(float));
     c4x    = axera_cmm_alloc((size_t) 4 * K * sizeof(ggml_bf16_t));
     c4m    = axera_cmm_alloc(sizeof(int32_t));
-    c4ids  = axera_cmm_alloc(4 * sizeof(int32_t));
-    c4top  = axera_cmm_alloc(4 * sizeof(float));
+    c4meta = axera_cmm_alloc(2 * 4096);
+    c4ids  = axera_cmm_view(c4meta.get(), 0, 4 * sizeof(int32_t));
+    c4top  = axera_cmm_view(c4meta.get(), 4096, 4 * sizeof(float));
     c4in.assign(c4k->info->nInputSize, AX_ENGINE_IO_BUFFER_T{});
     c4out.assign(c4k->info->nOutputSize, AX_ENGINE_IO_BUFFER_T{});
     c4in[c4k->input("norm_w")] = axera_io(c4norm, (size_t) K * sizeof(float));
@@ -607,8 +609,7 @@ void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const
         if (debug_logits) {  // the diagnostic reads this row on the host; the greedy path itself never does
             dctx->invalidate(o, (size_t) N * sizeof(float));
         }
-        cids->invalidate(cids->vir, sizeof(int32_t));
-        ctop->invalidate(ctop->vir, sizeof(float));
+        cmeta->invalidate(cmeta->vir, cmeta->size);
         memcpy(&pids[(size_t) r], cids->vir, sizeof(int32_t));
         memcpy(&pvals[(size_t) r], ctop->vir, sizeof(float));
     }
@@ -659,8 +660,7 @@ void output_head::run_combined4(ggml_cgraph * g, const graph_names & names, cons
     if (debug_logits) {  // the diagnostic reads these rows on the host
         dctx->invalidate(logits->data, (size_t) 4 * N * sizeof(float));
     }
-    c4ids->invalidate(c4ids->vir, 4 * sizeof(int32_t));
-    c4top->invalidate(c4top->vir, 4 * sizeof(float));
+    c4meta->invalidate(c4meta->vir, c4meta->size);
     std::vector<int32_t> pids(4);
     std::vector<float>   pvals(4);
     memcpy(pids.data(), c4ids->vir, 4 * sizeof(int32_t));
