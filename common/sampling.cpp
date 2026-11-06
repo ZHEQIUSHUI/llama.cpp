@@ -141,8 +141,6 @@ struct common_sampler {
     bool greedy_fast = false;
     // pure greedy chain and the combined lm_head wrote an NPU argmax: take its (id, logit), not the full row
     bool npu_argmax = false;
-    // this sampler configured the backend's global argmax state; a clone only borrows it
-    bool npu_argmax_own = false;
     // (greedy_fast) the logit-bias sampler's biases, added in the argmax: one per token (the sum of its biases), in
     // token order, the tokens in the vocabulary
     std::vector<llama_logit_bias> fast_bias;
@@ -1002,7 +1000,6 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
         /* .greedy_fast = */ false,
         /* .npu_argmax  = */ false,
-        /* .npu_argmax_own = */ false,
         /* .fast_bias   = */ fast_bias,
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
@@ -1087,7 +1084,6 @@ struct common_sampler * common_sampler_init(
         }
         const int rows = api->configure(argmax_eligible, ids.empty() ? nullptr : ids.data(), (int32_t) ids.size());
         result->npu_argmax = rows > 0;
-        result->npu_argmax_own = result->npu_argmax;
         if (result->npu_argmax) {
             LOG_INF("%s: fused lm_head greedy sampling (R = %d)\n", __func__, rows);
         }
@@ -1109,12 +1105,6 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     if (gsmpl->npu && gsmpl->npu_saved) {
         gsmpl->npu->free_state(gsmpl->npu_saved);
         gsmpl->npu_saved = nullptr;
-    }
-
-    if (gsmpl->npu_argmax_own) {
-        if (const ggml_axera_argmax * api = argmax_api()) {
-            api->reset();
-        }
     }
 
     llama_sampler_free(gsmpl->grmr);
@@ -1200,7 +1190,6 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur_p   = */ gsmpl->cur_p,
         /* .greedy_fast = */ gsmpl->greedy_fast,
         /* .npu_argmax  = */ gsmpl->npu_argmax,
-        /* .npu_argmax_own = */ false,
         /* .fast_bias   = */ gsmpl->fast_bias,
         /* .rng     = */ gsmpl->rng,
         /* .npu     = */ gsmpl->npu,
