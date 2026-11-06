@@ -136,6 +136,8 @@ class qwen38_27b final : public model {
     void      swap_kept();
     bool      restart_point(int64_t s0, int k);
     void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0);
+    void      run_calls(std::vector<call> & calls, const char * what);
+    axera_async_queue async;
 };
 
 // rows of an [N, K] weight of the GGUF in the kernels' MXFP4 layout (codes [K / 2], scales [K / 32]): an MXFP4 tensor's
@@ -808,6 +810,37 @@ void qwen38_27b::load_state() {
     }
 }
 
+void qwen38_27b::run_calls(std::vector<call> & calls, const char * what) {
+    if (calls.empty()) {
+        return;
+    }
+    if (async.enabled() && async.reserve(calls.front().k->handle, calls.size())) {
+        axera_thermal_guard();
+        for (size_t i = 0; i < calls.size(); ++i) {
+            call & c = calls[i];
+            if (!async.submit(c.k->handle, c.in, c.out)) {
+                const std::string why = async.error();
+                if (!async.wait()) {
+                    GGML_ABORT("axera qwen38_27b: async %s: %s\n", what, async.error().c_str());
+                }
+                GGML_LOG_WARN("axera qwen38_27b: async %s: submission rejected (%s); running %zu remaining call(s) "
+                              "synchronously\n", what, why.c_str(), calls.size() - i);
+                for (size_t j = i; j < calls.size(); ++j) {
+                    calls[j].k->run(calls[j].in, calls[j].out, what);
+                }
+                return;
+            }
+        }
+        if (!async.wait()) {
+            GGML_ABORT("axera qwen38_27b: async %s: %s\n", what, async.error().c_str());
+        }
+        return;
+    }
+    for (auto & c : calls) {
+        c.k->run(c.in, c.out, what);
+    }
+}
+
 // prefill pages from cell c0 (a page's first): n rows x [n][H] bf16 and their M-RoPE positions p4 [n][4]; the hidden
 // states of the rows from out0 on into h
 void qwen38_27b::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0) {
@@ -899,8 +932,8 @@ ggml_status qwen38_27b::verify(const kv_view & kv, const rope & rp, const ggml_b
             for (int k = 0; k < 4; ++k) {
                 c.out[c.k->output(SN[k])] = axera_io(snaps[set][gi][k], snaps[set][gi][k]->size);
             }
-            c.k->run(c.in, c.out, "verify group");
         }
+        run_calls(ver, "verify group");
     }
     VX->invalidate(VX->vir, (size_t) T * H * sizeof(ggml_bf16_t));
     for (int r = 0; r < T; ++r) {
@@ -1068,9 +1101,7 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
         PN->flush();
         {
             axera_timer tl("layers (decode)");
-            for (auto & c : dec) {
-                c.k->run(c.in, c.out, "decode group");
-            }
+            run_calls(dec, "decode group");
         }
         A->invalidate(A->vir, H * sizeof(ggml_bf16_t));
         ggml_bf16_to_fp32_row((const ggml_bf16_t *) A->vir, h.data(), H);
