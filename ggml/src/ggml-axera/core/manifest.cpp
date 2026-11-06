@@ -292,6 +292,7 @@ static std::unique_ptr<manifest> load_manifest(const std::string & dir) {
         kernel_desc d;
         d.role = role;
         d.file = k.at("file").get<std::string>();
+        d.embedded = k.value("embedded", false);
         d.in   = read_io(k.at("in"));
         d.out  = read_io(k.at("out"));
         if (k.contains("packs")) {
@@ -329,11 +330,17 @@ static std::unique_ptr<manifest> load_manifest(const std::string & dir) {
         m->kernels[role] = std::move(d);
     }
     const int64_t t0 = ggml_time_us();
+    size_t n_embedded = 0;
     for (const auto & [role, d] : m->kernels) {
+        if (d.embedded) {
+            ++n_embedded;
+            continue;
+        }
         m->loaded[role] = load_kernel(dir, d);
     }
-    GGML_LOG_INFO("axera: %s: model %s, context %lld, %zu kernels loaded in %.1f s\n", dir.c_str(), m->model.c_str(),
-                  (long long) m->context, m->kernels.size(), (ggml_time_us() - t0) / 1e6);
+    GGML_LOG_INFO("axera: %s: model %s, context %lld, %zu kernels loaded, %zu embedded, in %.1f s\n", dir.c_str(),
+                  m->model.c_str(), (long long) m->context, m->kernels.size() - n_embedded, n_embedded,
+                  (ggml_time_us() - t0) / 1e6);
     return m;
 }
 

@@ -53,6 +53,10 @@ struct param_desc {
 
 struct kernel_desc {
     std::string                   role, file;
+    // The adapter owns this kernel's bytes and loads it with manifest::load_memory after it has resolved the GGUF
+    // tensors the kernel is built around (the token embedding and fused head). The package still describes it here,
+    // but the runtime must not create a second handle from the file.
+    bool                          embedded = false;
     std::vector<io_desc>          in, out;
     std::map<std::string, size_t> packs;  // pack input -> bytes
     std::vector<pack_member>      members;

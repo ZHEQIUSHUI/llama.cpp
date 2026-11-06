@@ -28,8 +28,6 @@ struct graph_names {
     std::vector<std::pair<std::vector<uintptr_t>, std::map<std::string, ggml_tensor *>>> recent;
 
     const std::map<std::string, ggml_tensor *> & of(const ggml_cgraph * g);
-    // the map of a graph with one split is the map of its first split: let the split's stable uid find it
-    void alias_first_split(uint64_t parent_uid);
     ggml_tensor * find(const std::string & name) const;
     ggml_tensor * at(const std::string & name) const;  // aborts if absent
 };
@@ -92,6 +90,7 @@ void output_norm(const graph_names & names, const std::vector<float> & h, int T)
 // the last row) as they are, the projection of any other row on the CPU (a small head: the TTS codec head's)
 struct output_head {
     const kernel * k = nullptr;
+    const kernel * kv = nullptr;  // optional multi-row verification head
     const ggml_tensor * w = nullptr;  // output.weight
     axera_cmm  q, s, x;               // the projection in the kernel's format, the bf16 input row(s)
     axera_cmm  yk, mk;                // a kernel of R rows per call (input m: the valid ones): its output, m
@@ -112,19 +111,34 @@ struct output_head {
     const kernel *                             fk = nullptr;
     axera_cmm                                  fkw;  // the final norm weight, f32
     const float *                              fgw = nullptr;
-    const ggml_backend_axera_buffer_context *  f_xb = nullptr;  // the prepared input / output of the decode graph
-    const ggml_tensor *                        f_logits = nullptr;
     std::vector<AX_ENGINE_IO_BUFFER_T>         fin, fout;
+    // The combined output head (role lm_head): final RMSNorm + projection + greedy argmax. It always writes the full
+    // logits for the fallback path, plus one id/logit per row. The greedy sampler reads only the latter.
+    const kernel *                     ck = nullptr;
+    int                                cR = 0;
+    axera_cmm                          cnorm, cmeta, cids, ctop, cx;
+    const float *                      cgw = nullptr;
+    std::vector<AX_ENGINE_IO_BUFFER_T> cin, cout;
+    // the same combined head for an MTP verify's four rows (role lm_head.verify; input m = the valid rows)
+    const kernel *                     c4k = nullptr;
+    axera_cmm                          c4norm, c4x, c4m, c4meta, c4ids, c4top;
+    const float *                      c4gw = nullptr;
+    std::vector<AX_ENGINE_IO_BUFFER_T> c4in, c4out;
 
     void bind(const kernel & lm, const ggml_tensor * output_weight);
     bool bind_fused(const kernel & lm, const ggml_tensor * output_weight);
+    bool bind_combined(const kernel & lm, const ggml_tensor * output_weight);
+    bool bind_combined4(const kernel & lm, const ggml_tensor * output_weight);
+    bool combined_ready(ggml_cgraph * g, const graph_names & names) const;
+    void run_combined(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
+                      const std::vector<int> * compact_rows, const axera_cmm * xb);
+    void run_combined4(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T);
     // ready for a one-row decode of this graph: the head's logits are the graph's and the graph's final-norm eps is
     // the one the kernel was built with
     bool fused_ready(ggml_cgraph * g, const graph_names & names) const;
-    // the fused head's constant inputs and its logits output for this graph: once per decode graph, not per token
-    void prepare_fused(ggml_cgraph * g, const graph_names & names, const axera_cmm & xb);
     // the fused head's one row, from the layer kernel's bf16 hidden row
     void run_fused(ggml_cgraph * g, const graph_names & names, const axera_cmm & xb);
+    void bind_verify(const kernel & lm);
     void bind_draft(const kernel & dlm, const std::vector<int32_t> & ids);  // after bind (MXFP4)
     void bind_cpu(const ggml_tensor * output_weight);
     // compact_rows: h holds only the output rows, in the same order as the graph's output row indices
