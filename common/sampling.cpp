@@ -907,7 +907,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (const ggml_axera_argmax * api = argmax_api()) {
             int32_t id_argmax = LLAMA_TOKEN_NULL;
             float   logit     = 0.0f;
-            if (api->take(idx, &id_argmax, &logit)) {
+            if (api->take(llama_get_output_row_ith(ctx, idx), &id_argmax, &logit)) {
                 debug_sample_row(gsmpl, ctx, idx, (llama_token) id_argmax, logit, true);
                 gsmpl->cur.resize(1);
                 gsmpl->cur[0] = llama_token_data{ (llama_token) id_argmax, logit, 1.0f };
