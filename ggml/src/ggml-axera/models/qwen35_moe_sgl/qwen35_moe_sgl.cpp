@@ -694,12 +694,14 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         auto it = t.find("token_embd.weight");
         if (it != t.end()) {
             const ggml_tensor * tw = it->second;
-            const auto & k4 = man.load_memory("vocab_embedding_4096", std::vector<char>(
-                (const char *) VOCAB_EMBEDDING_AXMODEL,
-                (const char *) VOCAB_EMBEDDING_AXMODEL + VOCAB_EMBEDDING_AXMODEL_SIZE));
-            const auto & k1 = man.load_memory("vocab_embedding_1", std::vector<char>(
-                (const char *) VOCAB_EMBEDDING_1_AXMODEL,
-                (const char *) VOCAB_EMBEDDING_1_AXMODEL + VOCAB_EMBEDDING_1_AXMODEL_SIZE));
+            const auto & k4 = man.has("vocab_embedding_4096") ? man.get("vocab_embedding_4096") :
+                man.load_memory("vocab_embedding_4096", std::vector<char>(
+                    (const char *) VOCAB_EMBEDDING_AXMODEL,
+                    (const char *) VOCAB_EMBEDDING_AXMODEL + VOCAB_EMBEDDING_AXMODEL_SIZE));
+            const auto & k1 = man.has("vocab_embedding_1") ? man.get("vocab_embedding_1") :
+                man.load_memory("vocab_embedding_1", std::vector<char>(
+                    (const char *) VOCAB_EMBEDDING_1_AXMODEL,
+                    (const char *) VOCAB_EMBEDDING_1_AXMODEL + VOCAB_EMBEDDING_1_AXMODEL_SIZE));
             const size_t wb = k4.in_bytes("weight");
             const size_t ob = k4.out_bytes("output_flat");
             GGML_ASSERT(tw->ne[0] == H && wb == (size_t) tw->ne[0] * tw->ne[1] * sizeof(ggml_bf16_t));
@@ -2011,8 +2013,9 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             fh_loaded = true;
             const char * e = getenv("GGML_AXERA_FUSED_HEAD");
             if (!e || atoi(e) != 0) {
-                const auto & fk = man.load_memory("lm_head_fused", std::vector<char>(
-                    (const char *) FUSED_HEAD_AXMODEL, (const char *) FUSED_HEAD_AXMODEL + FUSED_HEAD_AXMODEL_SIZE));
+                const auto & fk = man.has("lm_head_fused") ? man.get("lm_head_fused") :
+                    man.load_memory("lm_head_fused", std::vector<char>(
+                        (const char *) FUSED_HEAD_AXMODEL, (const char *) FUSED_HEAD_AXMODEL + FUSED_HEAD_AXMODEL_SIZE));
                 fh_ok = head.bind_fused(fk, logits->src[0]);
             }
         }
