@@ -125,6 +125,7 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
     void set_dummy_batch(bool value);
+    void set_prebuild_decode(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -440,6 +441,10 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+    // prebuild the next single-token decode graph after a multi-token batch (set off while speculative decoding owns
+    // the target context: its next batch is another verification, not a decode)
+    bool prebuild_decode = true;
+
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;
 

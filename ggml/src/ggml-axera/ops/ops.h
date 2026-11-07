@@ -150,8 +150,9 @@ struct output_head {
     bool combined_ready(ggml_cgraph * g, const graph_names & names) const;
     bool topk_ready(ggml_cgraph * g, const graph_names & names, int T) const;
     void run_combined(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
-                      const std::vector<int> * compact_rows, const axera_cmm * xb);
-    void run_combined4(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T);
+                      const std::vector<int> * compact_rows, const axera_cmm * xb, bool publish_argmax = true);
+    void run_combined4(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
+                       bool publish_argmax);
     // ready for a one-row decode of this graph: the head's logits are the graph's and the graph's final-norm eps is
     // the one the kernel was built with
     bool fused_ready(ggml_cgraph * g, const graph_names & names) const;

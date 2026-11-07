@@ -323,8 +323,8 @@ static void argmax_reset_c() {
     axera::argmax_reset();
 }
 
-static int argmax_take_c(int idx, int32_t * id, float * logit) {
-    return axera::argmax_take(idx, id, logit);
+static int argmax_take_c(int idx, const void * row_logits, int32_t * id, float * logit) {
+    return axera::argmax_take(idx, row_logits, id, logit);
 }
 
 static const ggml_axera_argmax g_axera_argmax = {
@@ -396,7 +396,7 @@ static bool ggml_backend_axera_offload_input_layer() {
 static bool ggml_backend_axera_host_visible_output() {
     // this adapter writes the logits in host-visible CMM: llama.cpp reads them in place instead of copying 1 MiB
     const axera::manifest * m = axera::kernels();
-    if (m && m->model == "qwen35_moe_sgl") {
+    if (m && (m->model == "qwen35_moe_sgl" || m->model == "qwen35_whole" || m->model == "qwen38_27b")) {
         return true;
     }
     // the combined head published every output row's argmax: the sampler takes those rows and never reads the logits

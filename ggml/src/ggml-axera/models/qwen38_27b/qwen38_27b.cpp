@@ -1846,7 +1846,9 @@ ggml_status qwen38_27b::compute_mtp(ggml_cgraph * g) {
             if (man.has("lm_head.verify")) {
                 head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
             }
-            head.run_combined(g, names, hr, T, nullptr, nullptr);
+            // the draft context's catch-up rows are not host-sampled; publishing them can replace the target verify
+            // rows when both graphs reuse the same host-visible logits buffer
+            head.run_combined(g, names, hr, T, nullptr, nullptr, false);
         }
     }
     return GGML_STATUS_SUCCESS;

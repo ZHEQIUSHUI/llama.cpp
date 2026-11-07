@@ -78,15 +78,55 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
     };
     // stable_uid survives the scheduler's per-call split of a reused graph; uid does not
     const uint64_t gid = g->stable_uid ? g->stable_uid : g->uid;
+    // Keep the current graph's map before handing its slot to another graph. Swapping the maps in place would leave
+    // the slot's key pointing at the other graph's map, so the next lookup of that key would return the wrong graph.
+    auto remember_uid = [&]() {
+        if (!uid || t.empty()) {
+            return;
+        }
+        for (auto & r : recent_uid) {
+            if (r.first == uid) {
+                r.second = std::move(t);
+                t.clear();
+                return;
+            }
+        }
+        if (recent_uid.size() >= 4) {
+            recent_uid.erase(recent_uid.begin());
+        }
+        recent_uid.emplace_back(uid, std::move(t));
+        t.clear();
+    };
+    auto remember_key = [&]() {
+        if (key.empty() || t.empty()) {
+            return;
+        }
+        for (auto & r : recent) {
+            if (r.first == key) {
+                r.second = std::move(t);
+                t.clear();
+                return;
+            }
+        }
+        if (recent.size() >= 4) {
+            recent.erase(recent.begin());
+        }
+        recent.emplace_back(std::move(key), std::move(t));
+        key.clear();
+        t.clear();
+    };
     bool hit = false;
     if (gid) {
         if (uid == gid) {
             hit = true;
             st  = ST_UID;
         } else {
-            for (auto & r : recent_uid) {
-                if (r.first == gid) {
-                    std::swap(r.second, t);
+            for (auto it = recent_uid.begin(); it != recent_uid.end(); ++it) {
+                if (it->first == gid) {
+                    auto found = std::move(it->second);
+                    recent_uid.erase(it);
+                    remember_uid();
+                    t = std::move(found);
                     sig.clear();  // the recent maps do not carry a signature
                     uid = gid;
                     hit = true;
@@ -107,11 +147,7 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
         }
         if (!hit) {
             if (uid) {  // keep the current map for an alternation back to this graph
-                if (recent_uid.size() >= 4) {
-                    recent_uid.erase(recent_uid.begin());
-                }
-                recent_uid.emplace_back(uid, std::move(t));
-                t.clear();
+                remember_uid();
                 sig.clear();
             }
             uid = gid;
@@ -122,10 +158,14 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
         if (hit) {
             st = ST_KEY;
         } else {
-            for (auto & r : recent) {
-                if (is_key(r.first)) {
-                    std::swap(r.first, key);
-                    std::swap(r.second, t);
+            for (auto it = recent.begin(); it != recent.end(); ++it) {
+                if (is_key(it->first)) {
+                    auto found_key = std::move(it->first);
+                    auto found     = std::move(it->second);
+                    recent.erase(it);
+                    remember_key();
+                    key = std::move(found_key);
+                    t   = std::move(found);
                     hit = true;
                     st  = ST_KEY;
                     break;
@@ -134,11 +174,7 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
         }
         if (!hit) {
             if (!key.empty()) {
-                if (recent.size() >= 4) {
-                    recent.erase(recent.begin());
-                }
-                recent.emplace_back(std::move(key), std::move(t));
-                t.clear();
+                remember_key();
                 sig.clear();
             }
             uid = 0;
@@ -613,7 +649,7 @@ bool output_head::bind_combined4(const kernel & lm, const ggml_tensor * output_w
 }
 
 void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
-                               const std::vector<int> * compact_rows, const axera_cmm * xb) {
+                               const std::vector<int> * compact_rows, const axera_cmm * xb, bool publish_argmax) {
     if (topk_ready(g, names, T)) {
         run(g, names, h, T, nullptr, nullptr, compact_rows);
         return;
@@ -624,7 +660,7 @@ void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const
     const int64_t N = w->ne[1], K = w->ne[0];
     const int     n_out = (int) logits->ne[1];
     if (c4k && n_out == 4 && T == 4 && logits->nb[1] == N * sizeof(float)) {
-        run_combined4(g, names, h, T);
+        run_combined4(g, names, h, T, publish_argmax);
         return;
     }
     ggml_tensor * hn = logits->src[1];
@@ -668,20 +704,19 @@ void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const
             cin[ck->input("x")] = axera_io(cx, (size_t) K * sizeof(ggml_bf16_t));
         }
         float * o = (float *) ((char *) logits->data + (size_t) r * logits->nb[1]);
+        // the output row is host-visible: flush a previous graph's CPU-dirty lines before the NPU writes it
+        dctx->flush(o, (size_t) N * sizeof(float));
         cout[ck->output("out")] = axera_io(dctx, o, (size_t) N * sizeof(float));
         axera_timer tk("lm_head (combined)");
         ck->run(cin, cout, "output head (combined)");
         tk.stop();
-        static const bool debug_logits = getenv("GGML_AXERA_SAMPLE_DEBUG") != nullptr;
-        if (debug_logits) {  // the diagnostic reads this row on the host; the greedy path itself never does
-            dctx->invalidate(o, (size_t) N * sizeof(float));
-        }
         cids->invalidate(cids->vir, sizeof(int32_t));
         ctop->invalidate(ctop->vir, sizeof(float));
         memcpy(&pids[(size_t) r], cids->vir, sizeof(int32_t));
         memcpy(&pvals[(size_t) r], ctop->vir, sizeof(float));
     }
-    const bool published = axera::argmax_publish(pids.data(), pvals.data(), n_out);
+    const bool published = publish_argmax && axera::argmax_publish(pids.data(), pvals.data(), n_out, logits->data,
+                                                                   (size_t) logits->nb[1]);
     if (!published) {
         for (int r = 0; r < n_out; ++r) {
             float * o = (float *) ((char *) logits->data + (size_t) r * logits->nb[1]);
@@ -694,7 +729,8 @@ void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const
     after(g, names);
 }
 
-void output_head::run_combined4(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T) {
+void output_head::run_combined4(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
+                                bool publish_argmax) {
     ggml_tensor * logits = graph_head(names);
     GGML_ASSERT(logits && logits->op == GGML_OP_MUL_MAT && logits->src[0] == w && logits->type == GGML_TYPE_F32 &&
                 logits->ne[1] == 4 && T == 4 && ggml_backend_buffer_is_axera(logits->buffer));
@@ -724,18 +760,17 @@ void output_head::run_combined4(ggml_cgraph * g, const graph_names & names, cons
         c4k->run(c4in, c4out, "output head (combined m4)");
         tk.stop();
     }
-    static const bool debug_logits = getenv("GGML_AXERA_SAMPLE_DEBUG") != nullptr;
-    if (debug_logits) {  // the diagnostic reads these rows on the host
-        dctx->invalidate(logits->data, (size_t) 4 * N * sizeof(float));
-    }
+    // the host samples the verification rows from these full logits, so invalidate them whether or not the fused
+    // rows were also published (a published run skips the copy, not the host's read)
+    dctx->invalidate(logits->data, (size_t) 4 * N * sizeof(float));
     c4ids->invalidate(c4ids->vir, 4 * sizeof(int32_t));
     c4top->invalidate(c4top->vir, 4 * sizeof(float));
     std::vector<int32_t> pids(4);
     std::vector<float>   pvals(4);
     memcpy(pids.data(), c4ids->vir, 4 * sizeof(int32_t));
     memcpy(pvals.data(), c4top->vir, 4 * sizeof(float));
-    if (!axera::argmax_publish(pids.data(), pvals.data(), 4)) {
-        dctx->invalidate(logits->data, (size_t) 4 * N * sizeof(float));
+    if (!publish_argmax || !axera::argmax_publish(pids.data(), pvals.data(), 4, logits->data,
+                                                  (size_t) logits->nb[1])) {
         dctx->clean_p     = (float *) logits->data;
         dctx->clean_n     = (size_t) 4 * N * sizeof(float);
         dctx->clean_epoch = axera_graph_epoch;
@@ -1011,14 +1046,6 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         ((ggml_backend_axera_buffer_context *) rn->buffer->context)->flush(rn->data, ggml_nbytes(rn));
     }
     auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
-    static const bool fuse_dbg = [] {
-        const char * e = getenv("LLAMA_NPU_SAMPLING_FUSE_DEBUG");
-        return e && e[0] && strcmp(e, "0") != 0;
-    }();
-    if (tk && fuse_dbg) {
-        fprintf(stderr, "npu fuse: T=%d n_out=%d tR=%d draft=%d last=%d\n", T, n_out, tR, (int) draft,
-                (int) (last != nullptr));
-    }
     // the fused head: the decode row(s) through lm_head.topk, which applies the host sampler's penalty state and keeps
     // the exact top-K, so common/sampling can run the chain on K candidates instead of the vocabulary. A verification
     // batch fills all of the kernel's rows in one call (m: the valid ones).
@@ -1127,46 +1154,6 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
             frows   = std::move(rows);
             fn_out  = n_out;
             npu_set_full_row(&output_head::full_row_cb, this);
-            // LLAMA_NPU_SAMPLING_CHECK_ROWS=1: project every row again through the regular head, apply the kernel's
-            // penalty transform on the host and compare the top of that row with the fused candidates. This checks the
-            // kernel and the row mapping independently of the sampler (it is the slow check for a short run).
-            static const bool check_rows = [] {
-                const char * e = getenv("LLAMA_NPU_SAMPLING_CHECK_ROWS");
-                return e && e[0] && strcmp(e, "0") != 0;
-            }();
-            if (check_rows) {
-                std::vector<float>   frow(N), pen(N);
-                std::vector<int32_t> order(N);
-                for (int r = 0; r < n_out; ++r) {
-                    if (!full_row(frows[r], frow.data(), (int32_t) N) ||
-                        !npu_base_penalized_row(frow.data(), (int32_t) N, pen.data())) {
-                        fprintf(stderr, "npu rows check: r=%d failed\n", r);
-                        continue;
-                    }
-                    for (int i = 0; i < N; ++i) {
-                        order[i] = i;
-                    }
-                    const int top = 16;
-                    std::partial_sort(order.begin(), order.begin() + top, order.end(),
-                                      [&](int32_t a, int32_t b) { return pen[a] > pen[b]; });
-                    const int32_t * kid = ti.data() + (size_t) r * tK;
-                    const float *   kv  = tv.data() + (size_t) r * tK;
-                    int             hit = 0;
-                    float           dv  = 0.0f;
-                    for (int j = 0; j < top; ++j) {
-                        for (int q = 0; q < top; ++q) {
-                            if ((int32_t) kid[j] == order[q]) {
-                                ++hit;
-                                dv = std::max(dv, fabsf(kv[j] - pen[order[q]]));
-                                break;
-                            }
-                        }
-                    }
-                    fprintf(stderr, "npu rows check: r=%d kernel_argmax=%d full_argmax=%d overlap16=%d maxdv=%.3g "
-                                    "vmax_diff=%.3g\n",
-                            r, (int) kid[0], (int) order[0], hit, dv, fabsf(((const float *) tmax->vir)[r] - pen[order[0]]));
-                }
-            }
             after(g, names);
             return;
         }

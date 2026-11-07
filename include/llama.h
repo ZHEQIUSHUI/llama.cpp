@@ -1127,6 +1127,10 @@ extern "C" {
     // Mark the next batch as a dummy warm-up batch: the model does not need the state it leaves behind.
     LLAMA_API void llama_set_dummy_batch(struct llama_context * ctx, bool dummy);
 
+    // Enable or disable building the next single-token decode graph at the end of a multi-token batch.
+    // Speculative decoding disables it because its next batch is another verification, not a decode.
+    LLAMA_API void llama_set_prebuild_decode(struct llama_context * ctx, bool enabled);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

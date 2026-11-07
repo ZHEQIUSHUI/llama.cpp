@@ -53,8 +53,10 @@ typedef struct ggml_axera_argmax {
     // 1: enable for this pure greedy chain (ids: the model's suppress tokens), returns the head's row count; 0: off
     int  (*configure)(int enabled, const int32_t * ids, int32_t n);
     void (*reset)(void);
-    // the published row for logits index idx (negative: from the end); 0: no fused row (read the full logits instead)
-    int  (*take)(int idx, int32_t * id, float * logit);
+    // the published row for logits index idx whose host row is row_logits (the buffer identifies the graph, so a
+    // draft/catch-up graph publishing between a target verify and host sampling cannot replace the target's row);
+    // 0: no fused row (read the full logits instead)
+    int  (*take)(int idx, const void * row_logits, int32_t * id, float * logit);
 } ggml_axera_argmax;
 
 #ifdef  __cplusplus

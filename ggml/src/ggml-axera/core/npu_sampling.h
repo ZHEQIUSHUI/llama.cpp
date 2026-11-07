@@ -98,7 +98,4 @@ int64_t  npu_config_id();
 void npu_take_updates(std::vector<npu_penalty_row> & rows, int64_t * generation);
 void npu_publish(const float * values, const int32_t * ids, int32_t n, int32_t rows,
                  const float * vmax, const float * sumexp, const uint8_t * usable);
-// the kernel's penalty transform on a raw full-logits row, using the state the kernel published with (a check)
-bool npu_base_penalized_row(const float * raw, int32_t n, float * out);
-
 }  // namespace axera

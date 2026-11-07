@@ -321,11 +321,8 @@ static npu_chain_plan npu_plan_chain(llama_sampler * chain, const common_params_
 // top-p over the K (or top-k) candidates. With a top-k above it llama.cpp normalises over that set; without one it
 // normalises over the whole vocabulary, whose sumexp the kernel returns.
 static double npu_sumexp_eps() {
-    static const double eps = [] {
-        const char * e = getenv("LLAMA_NPU_SAMPLING_SUMEXP_EPS");
-        return e && e[0] ? atof(e) : 2e-3;  // measured |hierarchical - sequential|/sequential: p50 5e-5, max 7.7e-4
-    }();
-    return eps;
+    // measured |hierarchical - sequential|/sequential: p50 5e-5, max 7.7e-4
+    return 2e-3;
 }
 
 // The kernel's sumexp is a hierarchical float sum; llama.cpp's top-p divides by a sequential sum over the full
@@ -408,242 +405,6 @@ static void npu_top_p_apply(llama_token_data_array * cur_p, float p, size_t min_
     }
     cur_p->size   = last_idx;
     cur_p->sorted = true;
-}
-
-// LLAMA_NPU_SAMPLING_DEBUG=<file>: one block per sampling step, the candidates the chain ran on and its choice.
-// fused=1 is the kernel's list (penalties already applied); fused=0 is the full-logit reference after the penalties
-// sampler, sorted by logit (the first 24 rows are enough to see a value difference that can move a sampled draw).
-static bool npu_dbg_on() {
-    static const char * p = getenv("LLAMA_NPU_SAMPLING_DEBUG");
-    return p && p[0];
-}
-
-static long long npu_dbg_step = 0;
-
-static void npu_dbg_mark(const char * what, int fused, int K, int top_k, float top_p, float min_p, float temp) {
-    if (!npu_dbg_on()) {
-        return;
-    }
-    FILE * f = fopen(getenv("LLAMA_NPU_SAMPLING_DEBUG"), "a");
-    if (!f) {
-        return;
-    }
-    fprintf(f, "MARK %s fused=%d K=%d top_k=%d top_p=%.9g min_p=%.9g temp=%.9g\n",
-            what, fused, K, top_k, top_p, min_p, temp);
-    fclose(f);
-}
-
-static void npu_dbg_dump(int fused, int n, float vmax, float sumexp, const float * val, const int32_t * ids,
-                         llama_token chosen, size_t size) {
-    if (!npu_dbg_on()) {
-        return;
-    }
-    FILE * f = fopen(getenv("LLAMA_NPU_SAMPLING_DEBUG"), "a");
-    if (!f) {
-        return;
-    }
-    fprintf(f, "STEP %lld fused=%d n=%d vmax=%.9g sumexp=%.9g chosen=%d size=%zu\n",
-            npu_dbg_step++, fused, n, vmax, sumexp, chosen, size);
-    const int m = n < 24 ? n : 24;
-    for (int i = 0; i < m; ++i) {
-        fprintf(f, " %d %.9g\n", ids[i], val[i]);
-    }
-    fclose(f);
-}
-
-static void npu_dbg_full(common_sampler * gsmpl, llama_token chosen) {
-    if (!npu_dbg_on()) {
-        return;
-    }
-    std::vector<llama_token_data> ref = gsmpl->cur;
-    llama_token_data_array       rp  = { ref.data(), ref.size(), -1, false };
-    const int                    nc  = llama_sampler_chain_n(gsmpl->chain);
-    for (int i = 0; i < nc; ++i) {
-        bool         empty = false;
-        const char * nm    = npu_strip(llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, i)), &empty);
-        if (empty) {
-            continue;
-        }
-        if (strcmp(nm, "penalties") == 0) {
-            llama_sampler_apply(llama_sampler_chain_get(gsmpl->chain, i), &rp);
-        }
-        break;  // penalties are first, or absent
-    }
-    const int m = std::min<int>(24, (int) rp.size);
-    std::partial_sort(rp.data, rp.data + m, rp.data + rp.size,
-                      [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; });
-    std::vector<float>   val(m);
-    std::vector<int32_t> ids(m);
-    for (int i = 0; i < m; ++i) {
-        val[i] = rp.data[i].logit;
-        ids[i] = rp.data[i].id;
-    }
-    npu_dbg_dump(0, m, rp.data[0].logit, 0.0f, val.data(), ids.data(), chosen, rp.size);
-}
-
-// LLAMA_NPU_SAMPLING_PROF=1: the verification's host sampling time, one line per accepted batch (samples = the rows
-// the batch sampled, i.e. the accepted drafts plus the target token)
-static void npu_prof_spec(const char * kind, size_t samples, std::chrono::steady_clock::time_point t0, int64_t host_us) {
-    static const bool on = [] {
-        const char * e = getenv("LLAMA_NPU_SAMPLING_PROF");
-        return e && e[0] && strcmp(e, "0") != 0;
-    }();
-    if (!on) {
-        return;
-    }
-    const double wall = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
-    fprintf(stderr, "npu spec sampling %s samples=%zu host_us=%lld wall_us=%.3f\n", kind, samples,
-            (long long) host_us, wall);
-}
-
-// LLAMA_NPU_SAMPLING_TRACE_SPEC=1: the verification round's draft and every row's decision (for the paired gate)
-static bool npu_trace_spec_on() {
-    static const bool on = [] {
-        const char * e = getenv("LLAMA_NPU_SAMPLING_TRACE_SPEC");
-        return e && e[0] && strcmp(e, "0") != 0;
-    }();
-    return on;
-}
-
-static void npu_trace_spec_round(const char * kind, const std::vector<int> & idxs, const llama_tokens & draft) {
-    if (!npu_trace_spec_on()) {
-        return;
-    }
-    fprintf(stderr, "spec trace %s round n_draft=%zu idxs=", kind, draft.size());
-    for (size_t i = 0; i < idxs.size(); ++i) {
-        fprintf(stderr, "%s%d", i ? "," : "", idxs[i]);
-    }
-    fprintf(stderr, " draft=");
-    for (size_t i = 0; i < draft.size(); ++i) {
-        fprintf(stderr, "%s%d", i ? "," : "", draft[i]);
-    }
-    fprintf(stderr, "\n");
-}
-
-static void npu_trace_spec_row(const char * kind, size_t i, int idx, llama_token draft, llama_token id, bool match) {
-    if (!npu_trace_spec_on()) {
-        return;
-    }
-    fprintf(stderr, "spec trace %s row i=%zu idx=%d draft=%d sampled=%d %s\n", kind, i, idx, (int) draft, (int) id,
-            match ? "accept" : "reject");
-}
-
-// LLAMA_NPU_SAMPLING_CHECK=1: on a fused row, also run llama.cpp's own chain over that row's raw (full) logits with a
-// clone of the chain (the same RNG state) and compare. The row comes from the adapter's regular head, so this is the
-// in-process exactness gate on real rows, and it exercises the full_row fallback path.
-static int64_t npu_fallback_rows = 0;
-static int64_t npu_fb_ok = 0, npu_fb_bad = 0;
-static int64_t npu_ok_k = 0, npu_bad_k = 0;    // top_k > 0: the candidates are the whole chain's support
-static int64_t npu_ok_0 = 0, npu_bad_0 = 0;    // top_k == 0: the top-p cut uses the kernel's full-vocabulary sum
-static int64_t npu_bad_0_cut = 0;              // ... and the mismatch was a different top-p cut (the fp32 sum order)
-
-static bool npu_check_on() {
-    static const bool on = [] {
-        const char * e = getenv("LLAMA_NPU_SAMPLING_CHECK");
-        return e && e[0] && strcmp(e, "0") != 0;
-    }();
-    static const bool reg = [] {
-        atexit([] {
-            fprintf(stderr, "npu chain check: %lld verification rows fell back to the full logits; "
-                            "fallback path %lld ok, %lld mismatches\n",
-                    (long long) npu_fallback_rows, (long long) npu_fb_ok, (long long) npu_fb_bad);
-            fprintf(stderr, "npu chain check: top-k rows %lld ok, %lld mismatches; "
-                            "top-k=0 rows %lld ok, %lld mismatches (%lld a different top-p cut)\n",
-                    (long long) npu_ok_k, (long long) npu_bad_k, (long long) npu_ok_0, (long long) npu_bad_0,
-                    (long long) npu_bad_0_cut);
-        });
-        return true;
-    }();
-    (void) reg;
-    return on;
-}
-
-// ref is a clone of the live chain taken BEFORE the live chain's draw, so the reference uses the same RNG state.
-static void npu_chain_check(common_sampler * gsmpl, struct llama_context * ctx, int idx, llama_token npu_id,
-                            llama_sampler * ref, float sumexp, bool local) {
-    static int64_t n_ok = 0, n_bad = 0;
-    static double max_p_diff = 0.0;
-    static int64_t n_dist = 0;
-    static const bool verbose = [] {
-        const char * e = getenv("LLAMA_NPU_SAMPLING_CHECK_VERBOSE");
-        return e && e[0] && strcmp(e, "0") != 0;
-    }();
-    static const bool reg = [] {
-        atexit([] {
-            fprintf(stderr, "npu chain check: %lld rows ok, %lld mismatches; distribution rows=%lld max|dp|=%.3g\n",
-                    (long long) n_ok, (long long) n_bad, (long long) n_dist, max_p_diff);
-        });
-        return true;
-    }();
-    (void) reg;
-    const int nv = (int) llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
-    gsmpl->npu_full.resize(nv);
-    if (!gsmpl->npu->full_row(idx, gsmpl->npu_full.data(), nv)) {
-        ++n_bad;
-        fprintf(stderr, "npu chain check: row %d: no full-logit fallback\n", idx);
-        return;
-    }
-    const float * lg = gsmpl->npu_full.data();
-    std::vector<llama_token_data> full(nv);
-    for (int i = 0; i < nv; ++i) {
-        full[i] = llama_token_data{ (llama_token) i, lg[i], 0.0f };
-    }
-    llama_token_data_array fp = { full.data(), full.size(), -1, false };
-    if (!ref) {
-        ++n_bad;
-        fprintf(stderr, "npu chain check: row %d: no chain clone\n", idx);
-        return;
-    }
-    llama_sampler_apply(ref, &fp);
-    const llama_token ref_id = fp.data[fp.selected].id;
-    // llama.cpp's top-p softmax accumulates the full-vocabulary sum in token order (before its sort); the kernel's
-    // sumexp uses a hierarchical order. Measure that difference when it matters (a top-k-less top-p boundary).
-    double rel = 0.0;
-    if (!local && (verbose || ref_id != npu_id)) {
-        float seq = 0.0f, mx = lg[0];
-        for (int i = 1; i < nv; ++i) {
-            mx = std::max(mx, lg[i]);
-        }
-        for (int i = 0; i < nv; ++i) {
-            seq += expf(lg[i] - mx);
-        }
-        rel = sumexp > 0.0f && seq > 0.0f ? fabs((double) sumexp - (double) seq) / (double) seq : 0.0;
-    }
-    // the target distribution the rejection variant reads: the same ids, and the same probabilities up to the float
-    // chain (the fused and the full head project the same row with different accumulations)
-    const llama_token_data_array & live = gsmpl->cur_p;
-    if (live.size == fp.size) {
-        bool same_ids = true;
-        double dp = 0.0;
-        for (size_t i = 0; i < fp.size; ++i) {
-            same_ids = same_ids && live.data[i].id == fp.data[i].id;
-            dp = std::max(dp, (double) fabsf(live.data[i].p - fp.data[i].p));
-        }
-        if (same_ids) {
-            ++n_dist;
-            max_p_diff = std::max(max_p_diff, dp);
-        }
-    }
-    if (ref_id == npu_id) {
-        ++n_ok;
-        (local ? npu_ok_k : npu_ok_0)++;
-        if (verbose) {
-            fprintf(stderr, "npu chain check: row %d ok id=%d sumexp_rel=%.3g live.size=%zu ref.size=%zu\n", idx,
-                    npu_id, rel, gsmpl->cur_p.size, fp.size);
-        }
-    } else {
-        ++n_bad;
-        if (local) {
-            ++npu_bad_k;
-        } else {
-            ++npu_bad_0;
-            if (gsmpl->cur_p.size != fp.size) {
-                ++npu_bad_0_cut;
-            }
-        }
-        fprintf(stderr, "npu chain check: row %d MISMATCH npu=%d full=%d sumexp_rel=%.3g live.size=%zu ref.size=%zu\n",
-                idx, npu_id, ref_id, rel, gsmpl->cur_p.size, fp.size);
-    }
 }
 
 // the host chain over the candidates: penalties were applied by the kernel; top-p without a top-k above it uses the
@@ -1051,7 +812,6 @@ struct common_sampler * common_sampler_init(
             result->npu_v.assign(K, 0.0f);
             result->npu_i.assign(K, 0);
             result->greedy_fast  = false;
-            npu_dbg_mark("sampler", 1, K, params.top_k, params.top_p, params.min_p, plan.temp_sumexp);
             LOG_INF("%s: fused lm_head.topk sampling (K = %d)\n", __func__, K);
         } else {
             if (K > 0) {
@@ -1059,7 +819,6 @@ struct common_sampler * common_sampler_init(
                 // on the full logits (top_k > K, min_keep > K)
                 api->configure(0, 0, 0.0f, 0.0f, 1.0f, 1.0f, 0, 1.0f, 0.0f, 0.0f);
             }
-            npu_dbg_mark("sampler", 0, 0, params.top_k, params.top_p, params.min_p, 1.0f);
         }
     }
 
@@ -1407,41 +1166,6 @@ struct argmax_pool {
     }
 };
 
-// GGML_AXERA_SAMPLE_DEBUG=1: the chosen id and the full row's two largest biased logits. The fused path reads the row
-// here only for the diagnostic (it invalidates logits that the greedy path otherwise never touches).
-static void debug_sample_row(const common_sampler * gsmpl, struct llama_context * ctx, int idx, llama_token id,
-                             float logit, bool fused) {
-    static const bool enabled = getenv("GGML_AXERA_SAMPLE_DEBUG") != nullptr;
-    static int64_t     call = 0;
-    if (!enabled) {
-        return;
-    }
-    const float * logits  = llama_get_logits_ith(ctx, idx);
-    const int     n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
-    if (!logits) {
-        return;
-    }
-    llama_token i1 = -1, i2 = -1;
-    float       v1 = -INFINITY, v2 = -INFINITY;
-    for (llama_token i = 0; i < n_vocab; ++i) {
-        float v = logits[i];
-        for (const auto & b : gsmpl->fast_bias) {
-            if (b.token == i) {
-                v += b.bias;
-                break;
-            }
-        }
-        if (v > v1) {
-            v2 = v1; i2 = i1;
-            v1 = v;  i1 = i;
-        } else if (v > v2 && i != i1) {
-            v2 = v;  i2 = i;
-        }
-    }
-    fprintf(stderr, "SAMPLE_DEBUG call=%lld fused=%d id=%d logit=%.9g row1=%d %.9g row2=%d %.9g margin=%.9g\n",
-            (long long) call++, fused ? 1 : 0, id, logit, i1, v1, i2, v2, v1 - v2);
-}
-
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -1457,26 +1181,15 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // the fused head's K candidates: penalties already applied on the NPU, sorted by logit
     bool have_full = false;
-    // LLAMA_NPU_SAMPLING_CHECK: a fallback row's chain reference (taken before the live chain's draw)
-    llama_sampler *    fb_ref    = nullptr;
-    std::vector<float> fb_logits;
     if (gsmpl->npu_sampling) {
-        const bool check = npu_check_on();
-        static const int prof2 = [] {
-            const char * e = getenv("LLAMA_NPU_SAMPLING_PROF2");
-            return e ? atoi(e) : 0;
-        }();
-        const auto p0 = std::chrono::steady_clock::now();
         int32_t n = 0;
         float   vmax = 0.0f, sumexp = 0.0f;
         // with a top-k above the chain only the first top_k candidates can be selected, so there is no need to copy
         // (or build) the rest of K
         const int32_t take_k = gsmpl->params.top_k > 0 ? std::min(gsmpl->npu_K, gsmpl->params.top_k) : gsmpl->npu_K;
         const int take = gsmpl->npu->take(gsmpl->npu_v.data(), gsmpl->npu_i.data(), take_k, &n, &vmax, &sumexp);
-        const auto p1 = std::chrono::steady_clock::now();
         bool need_full = false;  // the ambiguity trials found two different draws: take the full-logit row
         if (take == 1) {
-            llama_sampler * ref = check ? llama_sampler_clone(gsmpl->chain) : nullptr;
             gsmpl->cur.resize(n);
             for (int32_t i = 0; i < n; ++i) {
                 gsmpl->cur[i] = llama_token_data{ gsmpl->npu_i[i], gsmpl->npu_v[i], 0.0f };
@@ -1506,45 +1219,16 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
                         llama_sampler_free(c);
                     }
                     need_full = ids[0] != ids[1];
-                    if (prof2 || need_full) {
-                        fprintf(stderr, "npu row prof idx=%d ambiguous lo=%d hi=%d ids=%d/%d %s\n", idx, lo, hi,
-                                (int) ids[0], (int) ids[1], need_full ? "fallback" : "same");
-                    }
-                }
-            }
-            const auto p2 = std::chrono::steady_clock::now();
-            if (ref) {
-                if (need_full) {
-                    llama_sampler_free(ref);
-                    ref = nullptr;
                 }
             }
             if (!need_full) {
                 npu_apply_chain(gsmpl, &cur_p, sumexp);
-                const auto p3 = std::chrono::steady_clock::now();
-                if (prof2) {
-                    fprintf(stderr, "npu row prof idx=%d take=%.1f build=%.1f chain=%.1f us n=%d size=%zu\n", idx,
-                            std::chrono::duration<double, std::micro>(p1 - p0).count(),
-                            std::chrono::duration<double, std::micro>(p2 - p1).count(),
-                            std::chrono::duration<double, std::micro>(p3 - p2).count(), n, cur_p.size);
-                }
                 GGML_ASSERT(cur_p.selected >= 0 && (size_t) cur_p.selected < cur_p.size);
                 const llama_token npu_id = cur_p.data[cur_p.selected].id;
-                npu_dbg_dump(1, n, vmax, sumexp, gsmpl->npu_v.data(), gsmpl->npu_i.data(), npu_id, cur_p.size);
-                if (ref) {
-                    const bool local = gsmpl->params.top_k > 0;
-                    npu_chain_check(gsmpl, ctx, idx, npu_id, ref, sumexp, local);
-                    llama_sampler_free(ref);
-                }
                 return npu_id;
             }
         }
         if (take < 0 || need_full) {
-            ++npu_fallback_rows;
-            if (prof2) {
-                fprintf(stderr, "npu row prof idx=%d fallback take=%.1f us\n", idx,
-                        std::chrono::duration<double, std::micro>(p1 - p0).count());
-            }
             // this verification row cannot be proved from the K candidates: project its full logits through the
             // adapter's regular head and run the ordinary chain below over them
             const int nv = (int) llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
@@ -1557,12 +1241,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             }
             cur_p    = llama_token_data_array{ gsmpl->cur.data(), (size_t) nv, -1, false };
             have_full = true;
-            if (check) {
-                fb_ref    = llama_sampler_clone(gsmpl->chain);
-                fb_logits = gsmpl->npu_full;
-            }
-            npu_dbg_mark("row-full", 0, 0, gsmpl->params.top_k, gsmpl->params.top_p, gsmpl->params.min_p,
-                         gsmpl->params.temp);
         }
     }
 
@@ -1573,8 +1251,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (const ggml_axera_argmax * api = argmax_api()) {
             int32_t id_argmax = LLAMA_TOKEN_NULL;
             float   logit     = 0.0f;
-            if (api->take(llama_get_output_row_ith(ctx, idx), &id_argmax, &logit)) {
-                debug_sample_row(gsmpl, ctx, idx, (llama_token) id_argmax, logit, true);
+            const float * row_logits = llama_get_logits_ith(ctx, idx);
+            if (api->take(llama_get_output_row_ith(ctx, idx), row_logits, &id_argmax, &logit)) {
                 gsmpl->cur.resize(1);
                 gsmpl->cur[0] = llama_token_data{ (llama_token) id_argmax, logit, 1.0f };
                 cur_p         = { gsmpl->cur.data(), 1, 0, true };
@@ -1627,7 +1305,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (best < 0) {  // every logit -inf: the first token, as the greedy sampler over the array
             best = 0;
         }
-        debug_sample_row(gsmpl, ctx, idx, best, bv, false);
         gsmpl->cur.resize(1);
         gsmpl->cur[0] = llama_token_data{ best, bv, 1.0f };
         cur_p         = { gsmpl->cur.data(), 1, 0, true };
@@ -1637,8 +1314,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     if (!have_full) {
         gsmpl->set_logits(ctx, idx);
     }
-    npu_dbg_full(gsmpl, LLAMA_TOKEN_NULL);  // the full-logit reference, before the chain mutates it
-
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
@@ -1671,26 +1346,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
-
-    if (fb_ref) {
-        // the fallback row ran the ordinary chain over the regular head's logits; a clone with the same RNG state must
-        // pick the same token from the same raw row
-        std::vector<llama_token_data> full(fb_logits.size());
-        for (size_t i = 0; i < fb_logits.size(); ++i) {
-            full[i] = llama_token_data{ (llama_token) i, fb_logits[i], 0.0f };
-        }
-        llama_token_data_array fp = { full.data(), full.size(), -1, false };
-        llama_sampler_apply(fb_ref, &fp);
-        if (fp.data[fp.selected].id == id) {
-            ++npu_fb_ok;
-        } else {
-            ++npu_fb_bad;
-            fprintf(stderr, "npu chain check: fallback row %d MISMATCH live=%d chain=%d\n", idx, (int) id,
-                    (int) fp.data[fp.selected].id);
-        }
-        llama_sampler_free(fb_ref);
-        fb_ref = nullptr;
-    }
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
         return id;
@@ -1729,10 +1384,16 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
-    const auto npa_t0 = std::chrono::steady_clock::now();
-    const int64_t npa_us0 = gsmpl->t_total_us;
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
-    npu_trace_spec_round("match", idxs, draft);
+
+    // A multi-row verification head is not bit-identical to the one-row decode head, so a near-tied argmax can
+    // differ.  Speculative verification therefore takes the full-logit argmax; plain decode keeps the fused row.
+    struct argmax_off {
+        bool & value;
+        bool   saved;
+        explicit argmax_off(bool & v) : value(v), saved(v) { value = false; }
+        ~argmax_off() { value = saved; }
+    } argmax_off_guard(gsmpl->npu_argmax);
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
@@ -1742,8 +1403,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
-
-        npu_trace_spec_row("match", i, idxs[i], draft[i], id, draft[i] == id);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -1759,14 +1418,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        npu_trace_spec_row("match", i, idxs[i], -1, id, true);
-
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
     }
 
-    npu_prof_spec("match", result.size(), npa_t0, gsmpl->t_total_us - npa_us0);
     return result;
 }
 
@@ -1783,12 +1439,17 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
 // Preserves the target distribution exactly, and accepts more often than matching does when the
 // draft samples instead of taking its argmax.
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
-    const auto npa_t0 = std::chrono::steady_clock::now();
-    const int64_t npa_us0 = gsmpl->t_total_us;
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
-    npu_trace_spec_round("rejection", idxs, draft);
     gsmpl->npu_exact_set = true;
+
+    // see common_sampler_sample_and_accept_n: use the full target rows for speculative verification
+    struct argmax_off {
+        bool & value;
+        bool   saved;
+        explicit argmax_off(bool & v) : value(v), saved(v) { value = false; }
+        ~argmax_off() { value = saved; }
+    } argmax_off_guard(gsmpl->npu_argmax);
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
@@ -1848,7 +1509,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
-            npu_trace_spec_row("rejection", i, idxs[i], draft[i], draft[i], true);
             continue;
         }
 
@@ -1878,7 +1538,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
-        npu_trace_spec_row("rejection", i, idxs[i], draft[i], id, false);
 
         break;
     }
@@ -1886,15 +1545,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        npu_trace_spec_row("rejection", i, idxs[i], -1, id, true);
-
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
     }
 
     gsmpl->npu_exact_set = false;
-    npu_prof_spec("rejection", result.size(), npa_t0, gsmpl->t_total_us - npa_us0);
     return result;
 }
 

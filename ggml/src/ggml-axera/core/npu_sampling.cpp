@@ -338,23 +338,4 @@ void npu_publish(const float * values, const int32_t * ids, int32_t n, int32_t r
     s.valid = true;
 }
 
-bool npu_base_penalized_row(const float * raw, int32_t n, float * out) {
-    npu_sampling & s = npu_state();
-    std::lock_guard<std::mutex> lk(s.mu);
-    if (!s.enabled || !s.base_valid || !raw || !out || n < 0) {
-        return false;
-    }
-    memcpy(out, raw, (size_t) n * sizeof(float));
-    for (const auto & kv : s.base_counts) {
-        if (kv.first < 0 || kv.first >= n) {
-            continue;
-        }
-        float mul_pos, mul_neg, bias;
-        penalty_params(s, kv.second, &mul_pos, &mul_neg, &bias);
-        float & v = out[kv.first];
-        v = v * (v > 0.0f ? mul_pos : mul_neg) + bias;
-    }
-    return true;
-}
-
 }  // namespace axera
