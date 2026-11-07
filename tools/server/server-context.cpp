@@ -1424,6 +1424,9 @@ private:
         }
         // every target batch is followed by another verify/draft round, so a single-token decode graph is never used
         llama_set_prebuild_decode(ctx_tgt, spec == nullptr);
+        if (ctx_dft) {
+            llama_set_prebuild_decode(ctx_dft, false);
+        }
 
         if (!spec && params_base.speculative.has_synth()) {
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
