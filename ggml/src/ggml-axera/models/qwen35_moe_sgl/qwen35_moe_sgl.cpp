@@ -165,7 +165,7 @@ class qwen35_moe_sgl final : public model {
     std::vector<dec_more_t>          dec_more;  // optional smaller-context decode kernels, ascending pages
     call                             ver;  // role decode.verify: four rows, one rank-1 delta per row
     call                             app;  // role gdn.apply: advance the recurrent state by accepted deltas
-    axera_cmm                        VX, VOUT, VPOSN, VPIDS, VINDPTR, VLOC, VNT, VNPREV, VST0;
+    axera_cmm                        VX, VOUT, VPOSN, VPIDS, VINDPTR, VLOC, VNT, VNPREV, VST0, VROUTE;
     axera_cmm                        VDELTA[2][3];  // u / k / g per verification set
     axera_cmm                        VSNAP[2][3];   // q / k / v Conv history per verification set
     std::vector<uint8_t>             conv_entry;    // Conv state before the latest verify (j = 0)
@@ -1110,8 +1110,9 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
                 GGML_ABORT("axera qwen35_moe_sgl: decode.verify's KV dtype does not match the decode kernel\n");
             }
         }
-        GGML_ASSERT(vk.in_bytes("x") == 4 * H * sizeof(ggml_bf16_t) &&
-                    vk.out_bytes("output") == 4 * H * sizeof(ggml_bf16_t) && vk.in_bytes("ntok") == sizeof(int32_t));
+        const int vrows = (int) (vk.in_bytes("positions") / sizeof(int32_t));
+        GGML_ASSERT(vrows >= 2 && vrows <= 4 && vk.in_bytes("x") == vrows * H * sizeof(ggml_bf16_t) &&
+                    vk.out_bytes("output") == vrows * H * sizeof(ggml_bf16_t) && vk.in_bytes("ntok") == sizeof(int32_t));
         VX      = axera_cmm_alloc(vk.in_bytes("x"));
         VOUT    = axera_cmm_alloc(vk.out_bytes("output"));
         VPOSN   = axera_cmm_alloc(vk.in_bytes("positions"));
@@ -1129,7 +1130,7 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         for (auto & set : VSNAP) {
             for (int k = 0; k < 3; ++k) {
                 set[k] = axera_cmm_alloc(vk.in_bytes(SN[k]));
-                GGML_ASSERT(vk.in_bytes(SN[k]) == 4 * logical(STATE_BANK[k + 1]));
+                GGML_ASSERT(vk.in_bytes(SN[k]) == vrows * logical(STATE_BANK[k + 1]));
             }
         }
         for (auto & set : VDELTA) {
@@ -1154,6 +1155,11 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
                 ver.in.push_back(axera_io(VSNAP[0][k], d.bytes));
             } else if (n.rfind("b3_kv", 0) == 0) {
                 ver.in.push_back(kv_io(std::stoi(n.substr(5)), d.bytes));
+            } else if (n == "route_debug") {
+                if (!VROUTE) {
+                    VROUTE = axera_cmm_alloc(d.bytes);
+                }
+                ver.in.push_back(axera_io(VROUTE, d.bytes));
             } else if (banks.count(n) && bank_n.at(n) == d.bytes) {
                 ver.in.push_back(axera_io(B(n), d.bytes));
             } else {
@@ -1162,8 +1168,16 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         }
         for (const auto & d : vk.desc->out) {
             const std::string & n = d.name;
-            GGML_ASSERT(n == "output");
-            ver.out.push_back(axera_io(VOUT, d.bytes));
+            if (n == "output") {
+                ver.out.push_back(axera_io(VOUT, d.bytes));
+            } else if (n == "route_debug") {
+                if (!VROUTE) {
+                    VROUTE = axera_cmm_alloc(d.bytes);
+                }
+                ver.out.push_back(axera_io(VROUTE, d.bytes));
+            } else {
+                GGML_ABORT("axera qwen35_moe_sgl: decode.verify: unexpected output %s\n", n.c_str());
+            }
         }
 
         app = {};
@@ -1644,7 +1658,7 @@ size_t qwen35_moe_sgl::state_read(const void * src, size_t size) {
 // stays in its pool at the entry cell; the accepted prefix is folded in by the next call.
 ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h,
                                    const std::vector<int> * out_rows) {
-    GGML_ASSERT(ver.k && T >= 1 && T <= 4);
+    GGML_ASSERT(ver.k);
     const int64_t c0 = kv.cell_of(0);
     if (c0 % PG == 0) {
         materialize_deltas();
@@ -1670,8 +1684,8 @@ ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, c
     auto * loc = (int32_t *) VLOC->vir;
     const int rows = (int) (ver.k->in_bytes("positions") / sizeof(int32_t));
     const int axes = (int) (ver.k->in_bytes("position_ids") / (rows * sizeof(int32_t)));
-    GGML_ASSERT(rows == 4 && axes >= 1 && axes <= 4);
-    for (int r = 0; r < 4; ++r) {
+    GGML_ASSERT(rows >= 2 && rows <= 4 && T >= 1 && T <= rows && axes >= 1 && axes <= 4);
+    for (int r = 0; r < rows; ++r) {
         const int     rr = std::min(r, T - 1);
         const int64_t c  = c0 + rr;
         pos[r]           = (int32_t) c;
@@ -1705,6 +1719,32 @@ ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, c
         ver.k->run(ver.in, ver.out, "verify");
     }
     VOUT->invalidate(VOUT->vir, (size_t) T * H * sizeof(ggml_bf16_t));
+    if (VROUTE && getenv("GGML_AXERA_ROUTE_DUMP")) {
+        VROUTE->invalidate(VROUTE->vir, VROUTE->size);
+        const char * path = getenv("GGML_AXERA_ROUTE_DUMP");
+        FILE *       f    = fopen(path, "ab");
+        if (f) {
+            const int stages = (int) (VROUTE->size / ((size_t) rows * 8 * sizeof(int32_t)));
+            const int32_t * ids = (const int32_t *) VROUTE->vir;
+            fprintf(f, "R %ld %d", (long) c0, T);
+            for (int l = 0; l < stages; ++l) {
+                bool seen[256] = {};
+                int  n         = 0;
+                for (int r = 0; r < rows; ++r) {
+                    for (int k = 0; k < 8; ++k) {
+                        const int e = ids[((size_t) l * rows + r) * 8 + k];
+                        if (e >= 0 && e < 256 && !seen[e]) {
+                            seen[e] = true;
+                            ++n;
+                        }
+                    }
+                    fprintf(f, " %d", n);
+                }
+            }
+            fprintf(f, "\n");
+            fclose(f);
+        }
+    }
     for (size_t r = 0; r < (out_rows ? out_rows->size() : (size_t) T); ++r) {
         const int row = out_rows ? out_rows->at(r) : (int) r;
         GGML_ASSERT(row >= 0 && row < T);
