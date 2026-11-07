@@ -206,6 +206,7 @@ class qwen35_moe_sgl final : public model {
     std::vector<ggml_bf16_t> page_x;
     std::vector<int32_t>     page_p;  // [cells][4]
     std::vector<float>       hb;
+    std::vector<float>       hnext;  // every row's final hidden, for h_nextn (h holds only the logits rows)
     std::vector<int>         orows;
     std::vector<int32_t>     p4b;
     output_head              head;
@@ -2529,6 +2530,20 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     }
     hb.resize((size_t) n_out * H);
     std::vector<float> & h = hb;
+    // h_nextn needs the final hidden of every row: a prompt asks for only its last logits row, so h cannot be its
+    // source. Keep all T rows in hnext and copy the requested ones into h for the head.
+    ggml_tensor * hn = names.find("h_nextn");
+    const bool need_hn = hn && (hn->flags & GGML_TENSOR_FLAG_COMPUTE);
+    std::vector<int> hrows;
+    if (need_hn) {
+        hnext.resize((size_t) T * H);
+        hrows.resize((size_t) T);
+        for (int r = 0; r < T; ++r) {
+            hrows[(size_t) r] = r;
+        }
+    }
+    std::vector<float> &     hf    = need_hn ? hnext : h;
+    const std::vector<int> & hfrow = need_hn ? hrows : out_rows;
     tout.stop();
     t_pre2.stop();
     const int64_t ct_pre = ct_on ? ggml_time_us() : 0;
@@ -2616,7 +2631,7 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
                                       vxb.data() + (size_t) r * H, H);
             });
         }
-        const ggml_status st = verify(kv, vxb.data(), pb.data(), T, h.data(), &out_rows);
+        const ggml_status st = verify(kv, vxb.data(), pb.data(), T, hf.data(), &hfrow);
         if (st != GGML_STATUS_SUCCESS) {
             return st;
         }
@@ -2625,11 +2640,11 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
         if (c0 == state_cell && c0 % PG == 0) {  // sequential batch from a page start: the state is exactly here
             axera_timer tp(T > 256 ? "prefill (prompt)" : "prefill (all pages)");
             if (token_ids) {
-                prefill(c0, T, nullptr, nullptr, 0, token_ids, pb.data(), h, out_rows);
+                prefill(c0, T, nullptr, nullptr, 0, token_ids, pb.data(), hf, hfrow);
             } else if (direct_embed) {
-                prefill(c0, T, xb1.data(), nullptr, 0, nullptr, pb.data(), h, out_rows);
+                prefill(c0, T, xb1.data(), nullptr, 0, nullptr, pb.data(), hf, hfrow);
             } else {
-                prefill(c0, T, nullptr, (const float *) x0->data, x0->nb[1], nullptr, pb.data(), h, out_rows);
+                prefill(c0, T, nullptr, (const float *) x0->data, x0->nb[1], nullptr, pb.data(), hf, hfrow);
             }
             snap_prompt = true;  // (its page's restart point outlives the decode's next pages)
         } else {
@@ -2667,12 +2682,12 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             }
             xs.insert(xs.end(), xb.begin(), xb.end());
             ps.insert(ps.end(), pb.begin(), pb.end());
-            std::vector<int> shifted(out_rows.size());
-            for (size_t i = 0; i < out_rows.size(); ++i) {
-                shifted[i] = out_rows[i] + k;
+            std::vector<int> shifted(hfrow.size());
+            for (size_t i = 0; i < hfrow.size(); ++i) {
+                shifted[i] = hfrow[i] + k;
             }
             axera_timer tp(T > 256 ? "prefill (prompt)" : "prefill (all pages)");
-            prefill(s0, k + T, xs.data(), nullptr, 0, nullptr, ps.data(), h, shifted);
+            prefill(s0, k + T, xs.data(), nullptr, 0, nullptr, ps.data(), hf, shifted);
             snap_prompt = true;  // (its page's restart point outlives the decode's next pages)
         }
     } else {
@@ -2683,7 +2698,7 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
         }
         materialize_deltas();
         const bool direct_x = combined_dec && T == 1 && n_out == 1;
-        float * hd = (fused_dec || direct_x) ? nullptr : h.data();
+        float * hd = need_hn ? hnext.data() : ((fused_dec || direct_x) ? nullptr : h.data());
         if (direct_embed) {
             decode(c0, xb1.data(), pb.data(), hd);
         } else if (token_ids) {
@@ -2698,6 +2713,11 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             std::vector<ggml_bf16_t> xb((size_t) H);
             ggml_fp32_to_bf16_row((const float *) x0->data, xb.data(), H);
             decode(c0, xb.data(), pb.data(), hd);
+        }
+    }
+    if (need_hn) {
+        for (size_t i = 0; i < out_rows.size(); ++i) {
+            memcpy(h.data() + i * H, hnext.data() + (size_t) out_rows[i] * H, (size_t) H * sizeof(float));
         }
     }
     if (n_out > 0) {
@@ -2730,14 +2750,14 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
                     ct_all_us / 1e3 / cn, (long long) cn);
         }
     }
-    ggml_tensor * hn = names.find("h_nextn");  // the MTP block's input: every row's final norm
-    if (hn && (hn->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+    // the MTP block's input: every row's final norm
+    if (need_hn) {
         axera_timer tn("h_nextn");
         GGML_ASSERT(hn->type == GGML_TYPE_F32 && hn->ne[0] == H && hn->ne[1] == T);
         float         eps;
         const float * w = final_norm(hn, H, &eps);
         axera_host_pool().run(T, [&](int64_t r) {
-            const float * x = h.data() + (size_t) r * H;
+            const float * x = hf.data() + (size_t) r * H;
             float *       y = (float *) ((char *) hn->data + r * hn->nb[1]);
             double        ss = 0;
             for (int i = 0; i < H; ++i) {
