@@ -1185,7 +1185,8 @@ void qwen35_moe_sgl::states_swap() {
         axera_cmm & cur = B(n);
         auto *      a = cur.get(), *b = s2->get();
         std::swap(cur, *s2);
-        // every IO bound to either pool now points to the other one
+        // The prefill calls are bound to both parities and select the right pool through state_parity.
+        // Only the decode/verify/apply calls bind the current pools directly and need the swap.
         auto rebind = [&](std::vector<AX_ENGINE_IO_BUFFER_T> & v) {
             for (auto & io : v) {
                 const char * p = (const char *) io.pVirAddr;
@@ -1201,18 +1202,6 @@ void qwen35_moe_sgl::states_swap() {
             rebind(ver.in);
             rebind(app.in);
             rebind(app.out);
-        }
-        for (auto & par : pre_attn) {
-            for (auto & c : par) {
-                rebind(c.in);
-                rebind(c.out);
-            }
-        }
-        for (auto & v : pre_f) {
-            for (auto & c : v) {
-                rebind(c.in);
-                rebind(c.out);
-            }
         }
     }
     dec_state_dirty = true;
