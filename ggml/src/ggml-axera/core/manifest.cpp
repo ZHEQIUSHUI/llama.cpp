@@ -221,7 +221,11 @@ kernel & manifest::get(const std::string & role) const {
 }
 
 kernel & manifest::load_memory(const std::string & role, std::vector<char> model) const {
-    GGML_ASSERT(!loaded.count(role));
+    auto it = loaded.find(role);
+    if (it != loaded.end()) {
+        GGML_ASSERT(it->second->model == model);
+        return *it->second;
+    }
     auto d   = std::make_unique<kernel_desc>();
     d->role  = role;
     d->file  = "<memory>";
