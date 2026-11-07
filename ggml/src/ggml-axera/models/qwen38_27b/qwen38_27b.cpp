@@ -871,6 +871,14 @@ void qwen38_27b::zero_state() {
     snap_prompt = false;
     page_x.clear();
     page_p.clear();
+    if (MKV && mtp_page_b && mtp_cell > 0) {
+        const size_t pages = std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG));
+        if (pages) {
+            memset(MKV->vir, 0, pages * mtp_page_b);
+            MKV->flush(MKV->vir, pages * mtp_page_b);
+        }
+    }
+    mtp_cell = 0;
 }
 
 void qwen38_27b::swap_kept() {
