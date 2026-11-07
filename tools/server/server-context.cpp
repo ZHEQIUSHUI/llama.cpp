@@ -325,9 +325,14 @@ struct server_slot {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        GGML_ASSERT(cur->data);
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data->main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            llama_state_seq_get_data_ext(ctx_dft, cur->data->drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        if (prompt_cache.disk_enabled()) {
+            prompt_cache.store_disk(*cur);
         }
 
         return true;
@@ -1504,17 +1509,55 @@ private:
             params_base.cache_idle_slots = false;
         }
 
-        if (params_base.cache_ram_mib != 0) {
-            if (params_base.cache_ram_mib < 0) {
-                SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
+        const bool cache_disk = !params_base.slot_save_path.empty() && params_base.cache_disk_mib != 0;
+        if (params_base.cache_ram_mib != 0 || cache_disk) {
+            if (params_base.cache_ram_mib != 0) {
+                if (params_base.cache_ram_mib < 0) {
+                    SRV_TRC("prompt cache RAM tier is enabled, size limit: %s\n", "no limit");
+                } else {
+                    SRV_TRC("prompt cache RAM tier is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
+                }
             } else {
-                SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
+                SRV_TRC("%s", "prompt cache RAM tier is disabled\n");
             }
-            SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            server_prompt_cache_identity cache_identity;
+            cache_identity.model_path = params_base.model.path;
+            cache_identity.n_ctx      = n_ctx;
+            std::error_code ec;
+            const auto model_size = std::filesystem::file_size(std::filesystem::u8path(params_base.model.path), ec);
+            cache_identity.model_size = ec ? 0 : (uint64_t) model_size;
+            cache_identity.mmproj_path = params_base.mmproj.path;
+            if (!params_base.mmproj.path.empty()) {
+                const auto mmproj_size = std::filesystem::file_size(std::filesystem::u8path(params_base.mmproj.path), ec);
+                cache_identity.mmproj_size = ec ? 0 : (uint64_t) mmproj_size;
+            }
+            cache_identity.has_draft = ctx_dft != nullptr;
+
+            const char * kernel_dir = std::getenv("GGML_AXERA_KERNEL_DIR");
+            const std::string manifest_path = std::string(kernel_dir ? kernel_dir : "axera_kernels") + "/manifest.json";
+            cache_identity.kernel_manifest_md5 = server_file_md5(manifest_path);
+
+            std::string cache_path;
+            if (cache_disk) {
+                cache_path = params_base.slot_save_path + "prompt-cache";
+                if (params_base.cache_disk_mib < 0) {
+                    SRV_TRC("prompt cache disk tier is enabled, size limit: %s\n", "no limit");
+                } else {
+                    SRV_TRC("prompt cache disk tier is enabled, size limit: %d MiB, path: %s\n",
+                            params_base.cache_disk_mib, cache_path.c_str());
+                }
+            }
+
+            prompt_cache = std::make_unique<server_prompt_cache>(
+                    params_base.cache_ram_mib,
+                    n_ctx,
+                    cache_path,
+                    cache_disk ? params_base.cache_disk_mib : 0,
+                    mctx != nullptr,
+                    cache_identity);
         } else {
-            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` or `--slot-save-path DIR` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1574,8 +1617,8 @@ private:
         metrics.init();
 
         if (params_base.cache_idle_slots) {
-            if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
+            if (!prompt_cache) {
+                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram or --slot-save-path, disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
                 if (params_base.kv_unified) {

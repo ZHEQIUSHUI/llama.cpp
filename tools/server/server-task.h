@@ -7,6 +7,11 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <condition_variable>
+#include <memory>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -644,51 +649,133 @@ struct server_prompt {
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
+    std::list<common_prompt_checkpoint> checkpoints;
 
     size_t size() const {
-        return main.size() + drft.size();
-    }
-};
-
-struct server_prompt_cache_state {
-    server_prompt prompt;
-    server_prompt_data data;
-
-    size_t size() const {
-        size_t res = data.size();
-
-        for (const auto & ckpt : prompt.checkpoints) {
+        size_t res = main.size() + drft.size();
+        for (const auto & ckpt : checkpoints) {
             res += ckpt.size();
         }
-
         return res;
     }
 };
 
+struct server_prompt_cache_state {
+    uint64_t id = 0;
+    server_prompt prompt;
+    std::shared_ptr<server_prompt_data> data;
+
+    // disk tier: file name (inside the cache directory), current/estimated file size and write completion
+    std::string file;
+    size_t file_size = 0;
+    bool disk_ready = false;
+    bool keep_ram = false;
+
+    size_t size() const {
+        return data ? data->size() : 0;
+    }
+};
+
+struct server_prompt_cache_identity {
+    std::string model_path;
+    uint64_t    model_size     = 0;
+    std::string mmproj_path;
+    uint64_t    mmproj_size    = 0;
+    int32_t     n_ctx          = 0;
+    std::string kernel_manifest_md5;
+    bool        has_draft      = false;
+};
+
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(
+            int32_t limit_size_mib,
+            size_t limit_tokens,
+            const std::string & disk_path = "",
+            int32_t limit_disk_mib = 0,
+            bool has_mtmd = false,
+            const server_prompt_cache_identity & identity = {}) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->limit_disk   = 1024ull*1024ull*(limit_disk_mib < 0 ? 0 : limit_disk_mib);
+        this->ram_enabled  = limit_size_mib != 0;
+        this->has_mtmd     = has_mtmd;
+        this->identity     = identity;
+
+        if (!disk_path.empty() && limit_disk_mib != 0) {
+            init_disk(disk_path);
+        }
     }
 
-    std::list<server_prompt_cache_state> states;
+    ~server_prompt_cache();
+
+    std::list<std::shared_ptr<server_prompt_cache_state>> states;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 
+    // in bytes, 0 = no limit
+    size_t limit_disk = 0;
+
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // whether the RAM tier and disk tier are active
+    bool ram_enabled = false;
+
+    bool disk_enabled() const { return !disk_dir.empty(); }
+
     size_t size() const;
+
+    size_t disk_size() const;
 
     size_t n_tokens() const;
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
+    bool store_disk(const server_prompt_cache_state & state);
+
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+private:
+    struct job {
+        enum type {
+            SAVE,
+            REMOVE,
+        } type;
+
+        uint64_t id = 0;
+        std::string filepath;
+        std::shared_ptr<server_prompt_data> data;
+    };
+
+    void init_disk(const std::string & disk_path);
+    void load_index();
+    void write_index() const;
+    void remove_state(std::list<std::shared_ptr<server_prompt_cache_state>>::iterator it);
+    void enqueue(job && j);
+    void worker_loop();
+    bool save_file(const job & j) const;
+
+    size_t size_locked() const;
+    size_t disk_size_locked() const;
+    size_t n_tokens_locked() const;
+
+    std::string disk_dir;
+    std::string disk_index;
+    bool has_mtmd = false;
+    uint64_t next_id = 0;
+    server_prompt_cache_identity identity;
+
+    mutable std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<job> jobs;
+    std::thread worker;
+    bool stop = false;
 };
+
+std::string server_file_md5(const std::string & path);
 
 // used exclusively by router mode
 struct server_task_result_router : server_task_result {

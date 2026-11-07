@@ -10,6 +10,11 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 
 //
@@ -1688,33 +1693,649 @@ json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
 }
 
+namespace {
+
+// small self-contained MD5, used only to fingerprint the kernel manifest in the disk-cache index
+struct md5_ctx {
+    uint32_t state[4] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };
+    uint64_t count = 0;
+    uint8_t  buffer[64] = {};
+};
+
+uint32_t md5_rol(uint32_t v, uint32_t n) {
+    return (v << n) | (v >> (32 - n));
+}
+
+void md5_transform(md5_ctx & ctx, const uint8_t block[64]) {
+    static const uint32_t K[64] = {
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+    };
+    static const uint32_t S[64] = {
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    };
+
+    uint32_t M[16];
+    for (uint32_t i = 0; i < 16; ++i) {
+        M[i] = (uint32_t) block[i*4 + 0]
+             | (uint32_t) block[i*4 + 1] << 8
+             | (uint32_t) block[i*4 + 2] << 16
+             | (uint32_t) block[i*4 + 3] << 24;
+    }
+
+    uint32_t A = ctx.state[0];
+    uint32_t B = ctx.state[1];
+    uint32_t C = ctx.state[2];
+    uint32_t D = ctx.state[3];
+
+    for (uint32_t i = 0; i < 64; ++i) {
+        uint32_t F = 0;
+        uint32_t g = 0;
+        if (i < 16) {
+            F = (B & C) | (~B & D);
+            g = i;
+        } else if (i < 32) {
+            F = (D & B) | (~D & C);
+            g = (5*i + 1) % 16;
+        } else if (i < 48) {
+            F = B ^ C ^ D;
+            g = (3*i + 5) % 16;
+        } else {
+            F = C ^ (B | ~D);
+            g = (7*i) % 16;
+        }
+        const uint32_t tmp = D;
+        D = C;
+        C = B;
+        B = B + md5_rol(A + F + K[i] + M[g], S[i]);
+        A = tmp;
+    }
+
+    ctx.state[0] += A;
+    ctx.state[1] += B;
+    ctx.state[2] += C;
+    ctx.state[3] += D;
+}
+
+void md5_update(md5_ctx & ctx, const uint8_t * data, size_t size) {
+    while (size > 0) {
+        const size_t n = std::min<size_t>(size, sizeof(ctx.buffer) - (ctx.count % sizeof(ctx.buffer)));
+        std::memcpy(ctx.buffer + ctx.count % sizeof(ctx.buffer), data, n);
+        ctx.count += n;
+        data += n;
+        size -= n;
+        if (ctx.count % sizeof(ctx.buffer) == 0) {
+            md5_transform(ctx, ctx.buffer);
+        }
+    }
+}
+
+std::string md5_final(md5_ctx & ctx) {
+    const uint64_t bits = ctx.count * 8;
+    const uint8_t one = 0x80;
+    md5_update(ctx, &one, 1);
+    const uint8_t zero = 0;
+    while (ctx.count % sizeof(ctx.buffer) != 56) {
+        md5_update(ctx, &zero, 1);
+    }
+    uint8_t length[8];
+    for (int i = 0; i < 8; ++i) {
+        length[i] = (uint8_t) (bits >> (8*i));
+    }
+    md5_update(ctx, length, sizeof(length));
+
+    static const char hex[] = "0123456789abcdef";
+    std::string res(32, '0');
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t b = (uint8_t) (ctx.state[i] >> (8*j));
+            res[(i*4 + j)*2 + 0] = hex[b >> 4];
+            res[(i*4 + j)*2 + 1] = hex[b & 0xf];
+        }
+    }
+    return res;
+}
+
+static constexpr uint32_t PROMPT_CACHE_FILE_MAGIC   = 0x53445053; // "SPDS"
+static constexpr uint32_t PROMPT_CACHE_FILE_VERSION = 1;
+
+template <typename T>
+void pc_write(std::ostream & os, const T & v) {
+    os.write(reinterpret_cast<const char *>(&v), sizeof(v));
+}
+
+size_t pc_file_size(size_t size_main, size_t size_drft, const std::list<common_prompt_checkpoint> & checkpoints) {
+    size_t res = sizeof(uint32_t) * 2 + sizeof(uint64_t) * 2 + sizeof(uint32_t);
+    for (const auto & ckpt : checkpoints) {
+        res += sizeof(int64_t) + sizeof(int32_t) * 2;
+        res += sizeof(uint64_t) * 3 + ckpt.data_tgt.size() + ckpt.data_dft.size() + ckpt.data_spec.size();
+    }
+    return res + size_main + size_drft;
+}
+
+bool pc_write_file(const std::string & path, const server_prompt_data & data) {
+    const std::string tmp = path + ".tmp";
+    std::ofstream ofs(std::filesystem::u8path(tmp), std::ios::binary | std::ios::trunc);
+    if (!ofs) {
+        return false;
+    }
+
+    const uint32_t magic   = PROMPT_CACHE_FILE_MAGIC;
+    const uint32_t version = PROMPT_CACHE_FILE_VERSION;
+    const uint64_t size_main = data.main.size();
+    const uint64_t size_drft = data.drft.size();
+    const uint32_t n_ckpt    = (uint32_t) data.checkpoints.size();
+    pc_write(ofs, magic);
+    pc_write(ofs, version);
+    pc_write(ofs, size_main);
+    pc_write(ofs, size_drft);
+    pc_write(ofs, n_ckpt);
+    for (const auto & ckpt : data.checkpoints) {
+        const uint64_t n_tgt  = ckpt.data_tgt.size();
+        const uint64_t n_dft  = ckpt.data_dft.size();
+        const uint64_t n_spec = ckpt.data_spec.size();
+        pc_write(ofs, ckpt.n_tokens);
+        pc_write(ofs, ckpt.pos_min);
+        pc_write(ofs, ckpt.pos_max);
+        pc_write(ofs, n_tgt);
+        pc_write(ofs, n_dft);
+        pc_write(ofs, n_spec);
+        if (n_tgt)  { ofs.write((const char *) ckpt.data_tgt.data(),  n_tgt); }
+        if (n_dft)  { ofs.write((const char *) ckpt.data_dft.data(),  n_dft); }
+        if (n_spec) { ofs.write((const char *) ckpt.data_spec.data(), n_spec); }
+    }
+    if (size_main) { ofs.write((const char *) data.main.data(), size_main); }
+    if (size_drft) { ofs.write((const char *) data.drft.data(), size_drft); }
+    ofs.flush();
+    if (!ofs) {
+        ofs.close();
+        std::error_code ec;
+        std::filesystem::remove(std::filesystem::u8path(tmp), ec);
+        return false;
+    }
+    ofs.close();
+
+    std::error_code ec;
+    std::filesystem::rename(std::filesystem::u8path(tmp), std::filesystem::u8path(path), ec);
+    if (ec) {
+        std::filesystem::remove(std::filesystem::u8path(tmp), ec);
+        return false;
+    }
+    return true;
+}
+
+bool pc_read_file(const std::string & path, server_prompt_data & data, size_t expected_size) {
+    std::ifstream ifs(std::filesystem::u8path(path), std::ios::binary | std::ios::ate);
+    if (!ifs) {
+        return false;
+    }
+    const std::streamoff file_size = ifs.tellg();
+    if (file_size < 0 || (size_t) file_size != expected_size) {
+        return false;
+    }
+    ifs.seekg(0);
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint64_t size_main = 0;
+    uint64_t size_drft = 0;
+    uint32_t n_ckpt = 0;
+    ifs.read((char *) &magic, sizeof(magic));
+    ifs.read((char *) &version, sizeof(version));
+    ifs.read((char *) &size_main, sizeof(size_main));
+    ifs.read((char *) &size_drft, sizeof(size_drft));
+    ifs.read((char *) &n_ckpt, sizeof(n_ckpt));
+    if (!ifs || magic != PROMPT_CACHE_FILE_MAGIC || version != PROMPT_CACHE_FILE_VERSION) {
+        return false;
+    }
+
+    auto read_buf = [&](std::vector<uint8_t> & buf, uint64_t n) {
+        const std::streamoff pos = ifs.tellg();
+        if (pos < 0 || n > (uint64_t) (file_size - pos)) {
+            return false;
+        }
+        buf.resize((size_t) n);
+        if (n) {
+            ifs.read((char *) buf.data(), n);
+        }
+        return (bool) ifs;
+    };
+
+    data.checkpoints.clear();
+    for (uint32_t i = 0; i < n_ckpt; ++i) {
+        int64_t n_tokens = 0;
+        int32_t pos_min = 0;
+        int32_t pos_max = 0;
+        uint64_t n_tgt = 0;
+        uint64_t n_dft = 0;
+        uint64_t n_spec = 0;
+        ifs.read((char *) &n_tokens, sizeof(n_tokens));
+        ifs.read((char *) &pos_min, sizeof(pos_min));
+        ifs.read((char *) &pos_max, sizeof(pos_max));
+        ifs.read((char *) &n_tgt, sizeof(n_tgt));
+        ifs.read((char *) &n_dft, sizeof(n_dft));
+        ifs.read((char *) &n_spec, sizeof(n_spec));
+        if (!ifs) {
+            return false;
+        }
+        common_prompt_checkpoint ckpt;
+        ckpt.id_task  = -1;
+        ckpt.n_tokens = n_tokens;
+        ckpt.pos_min  = pos_min;
+        ckpt.pos_max  = pos_max;
+        if (!read_buf(ckpt.data_tgt, n_tgt) || !read_buf(ckpt.data_dft, n_dft) || !read_buf(ckpt.data_spec, n_spec)) {
+            return false;
+        }
+        if (ckpt.data_tgt.empty()) {
+            return false;
+        }
+        data.checkpoints.push_back(std::move(ckpt));
+    }
+    if (!read_buf(data.main, size_main) || !read_buf(data.drft, size_drft)) {
+        return false;
+    }
+    return ifs.tellg() == file_size;
+}
+
+} // namespace
+
+std::string server_file_md5(const std::string & path) {
+    std::ifstream ifs(std::filesystem::u8path(path), std::ios::binary);
+    if (!ifs) {
+        return std::string();
+    }
+    md5_ctx ctx;
+    char buf[64*1024];
+    while (ifs) {
+        ifs.read(buf, sizeof(buf));
+        const std::streamsize n = ifs.gcount();
+        if (n > 0) {
+            md5_update(ctx, (const uint8_t *) buf, (size_t) n);
+        }
+    }
+    return md5_final(ctx);
+}
+
 //
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return size_locked();
+}
+
+size_t server_prompt_cache::size_locked() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.size();
+        if (state->keep_ram) {
+            res += state->size();
+        }
+    }
+
+    return res;
+}
+
+size_t server_prompt_cache::disk_size() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return disk_size_locked();
+}
+
+size_t server_prompt_cache::disk_size_locked() const {
+    size_t res = 0;
+
+    for (const auto & state : states) {
+        if (!state->file.empty()) {
+            res += state->file_size;
+        }
     }
 
     return res;
 }
 
 size_t server_prompt_cache::n_tokens() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return n_tokens_locked();
+}
+
+size_t server_prompt_cache::n_tokens_locked() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.prompt.n_tokens();
+        res += state->prompt.n_tokens();
     }
 
     return res;
 }
 
+void server_prompt_cache::init_disk(const std::string & disk_path) {
+    disk_dir = disk_path;
+    if (disk_dir.empty() || disk_dir.back() != DIRECTORY_SEPARATOR) {
+        disk_dir += DIRECTORY_SEPARATOR;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::u8path(disk_dir), ec);
+    if (ec) {
+        SRV_WRN("failed to create prompt cache directory '%s': %s\n", disk_dir.c_str(), ec.message().c_str());
+        disk_dir.clear();
+        return;
+    }
+
+    disk_index = disk_dir + "index.json";
+    worker = std::thread([this]() { worker_loop(); });
+
+    load_index();
+    update();
+}
+
+void server_prompt_cache::load_index() {
+    auto remove_all = [this]() {
+        std::error_code ec;
+        for (const auto & entry : std::filesystem::directory_iterator(std::filesystem::u8path(disk_dir), ec)) {
+            if (entry.is_regular_file(ec)) {
+                std::filesystem::remove(entry.path(), ec);
+            }
+        }
+    };
+
+    std::ifstream ifs(std::filesystem::u8path(disk_index), std::ios::binary);
+    if (!ifs) {
+        remove_all();
+        return;
+    }
+    std::stringstream ss;
+    ss << ifs.rdbuf();
+
+    json index;
+    try {
+        index = json::parse(ss.str());
+    } catch (const std::exception & err) {
+        SRV_WRN("ignoring invalid prompt cache index '%s': %s\n", disk_index.c_str(), err.what());
+        remove_all();
+        return;
+    }
+    if (!index.is_object() || !index.contains("identity") || !index.at("identity").is_object() ||
+        !index.contains("states") || !index.at("states").is_array()) {
+        SRV_WRN("ignoring invalid prompt cache index '%s'\n", disk_index.c_str());
+        remove_all();
+        return;
+    }
+
+    bool identity_ok = false;
+    try {
+        identity_ok =
+            index.value("version", 0) == 1 &&
+            index.at("identity").value("model_path", std::string()) == identity.model_path &&
+            index.at("identity").value("model_size", uint64_t(0)) == identity.model_size &&
+            index.at("identity").value("mmproj_path", std::string()) == identity.mmproj_path &&
+            index.at("identity").value("mmproj_size", uint64_t(0)) == identity.mmproj_size &&
+            index.at("identity").value("n_ctx", int32_t(0)) == identity.n_ctx &&
+            index.at("identity").value("kernel_manifest_md5", std::string()) == identity.kernel_manifest_md5 &&
+            index.at("identity").value("has_draft", false) == identity.has_draft;
+    } catch (const std::exception & err) {
+        SRV_WRN("ignoring invalid prompt cache identity in '%s': %s\n", disk_index.c_str(), err.what());
+        remove_all();
+        return;
+    }
+
+    const json & entries = index.at("states");
+    if (!identity_ok) {
+        SRV_WRN("prompt cache identity changed, deleting old disk states in '%s'\n", disk_dir.c_str());
+        remove_all();
+        return;
+    }
+
+    std::set<std::string> keep_files;
+    for (const auto & entry : entries) {
+        if (!entry.is_object()) {
+            continue;
+        }
+        std::string file;
+        uint64_t file_size = 0;
+        try {
+            file      = entry.value("file", std::string());
+            file_size = entry.value("size", uint64_t(0));
+        } catch (const std::exception & err) {
+            SRV_WRN("ignoring invalid prompt cache index entry: %s\n", err.what());
+            continue;
+        }
+        if (file.empty() || file.find('/') != std::string::npos || file.find('\\') != std::string::npos) {
+            continue;
+        }
+
+        std::error_code ec;
+        const std::string filepath = disk_dir + file;
+        if (!std::filesystem::exists(std::filesystem::u8path(filepath), ec) ||
+            std::filesystem::file_size(std::filesystem::u8path(filepath), ec) != file_size) {
+            std::filesystem::remove(std::filesystem::u8path(filepath), ec);
+            continue;
+        }
+
+        try {
+            const std::vector<int> packed_int = entry.at("tokens").get<std::vector<int>>();
+            llama_tokens packed;
+            packed.reserve(packed_int.size());
+            for (const int token : packed_int) {
+                packed.push_back((llama_token) token);
+            }
+            server_tokens tokens = server_tokens::deserialize(packed, has_mtmd);
+            if (tokens.empty()) {
+                continue;
+            }
+
+            keep_files.insert(file);
+
+            auto state = std::make_shared<server_prompt_cache_state>();
+            state->id         = next_id++;
+            state->prompt.tokens = std::move(tokens);
+            state->file       = file;
+            state->file_size  = (size_t) file_size;
+            state->disk_ready = true;
+            state->keep_ram   = false;
+
+            if (entry.contains("checkpoints") && entry.at("checkpoints").is_array()) {
+                for (const auto & ckpt : entry.at("checkpoints")) {
+                    common_prompt_checkpoint c;
+                    c.id_task  = -1;
+                    c.n_tokens = ckpt.value("n_tokens", int64_t(0));
+                    c.pos_min  = ckpt.value("pos_min", int32_t(0));
+                    c.pos_max  = ckpt.value("pos_max", int32_t(0));
+                    state->prompt.checkpoints.push_back(std::move(c));
+                }
+            }
+            states.push_back(std::move(state));
+        } catch (const std::exception & err) {
+            SRV_WRN("ignoring prompt cache index entry '%s': %s\n", file.c_str(), err.what());
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::u8path(disk_dir + file), ec);
+        }
+    }
+
+    std::error_code ec;
+    for (const auto & entry : std::filesystem::directory_iterator(std::filesystem::u8path(disk_dir), ec)) {
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        if (name.compare(0, 6, "state-") == 0 && keep_files.count(name) == 0) {
+            std::filesystem::remove(entry.path(), ec);
+        }
+    }
+
+    SRV_TRC("prompt cache: loaded %zu disk state(s), %.3f MiB from '%s'\n",
+            states.size(), disk_size_locked() / (1024.0 * 1024.0), disk_dir.c_str());
+}
+
+void server_prompt_cache::write_index() const {
+    if (disk_dir.empty()) {
+        return;
+    }
+
+    json index = json::object();
+    index["version"] = 1;
+    index["identity"] = json::object();
+    index["identity"]["model_path"] = identity.model_path;
+    index["identity"]["model_size"] = identity.model_size;
+    index["identity"]["mmproj_path"] = identity.mmproj_path;
+    index["identity"]["mmproj_size"] = identity.mmproj_size;
+    index["identity"]["n_ctx"] = identity.n_ctx;
+    index["identity"]["kernel_manifest_md5"] = identity.kernel_manifest_md5;
+    index["identity"]["has_draft"] = identity.has_draft;
+
+    json entries = json::array();
+    for (const auto & state : states) {
+        if (state->file.empty()) {
+            continue;
+        }
+
+        json entry = json::object();
+        entry["file"] = state->file;
+        entry["size"] = (uint64_t) state->file_size;
+
+        json tokens = json::array();
+        try {
+            const std::vector<char> packed = state->prompt.tokens.serialize();
+            for (size_t i = 0; i + sizeof(uint32_t) <= packed.size(); i += sizeof(uint32_t)) {
+                uint32_t token = 0;
+                std::memcpy(&token, packed.data() + i, sizeof(token));
+                tokens.push_back((int) token);
+            }
+        } catch (const std::exception & err) {
+            SRV_WRN("failed to serialize prompt tokens for disk cache '%s': %s\n", state->file.c_str(), err.what());
+            continue;
+        }
+        entry["tokens"] = tokens;
+
+        json checkpoints = json::array();
+        for (const auto & ckpt : state->prompt.checkpoints) {
+            json c = json::object();
+            c["n_tokens"] = (int64_t) ckpt.n_tokens;
+            c["pos_min"]  = (int32_t) ckpt.pos_min;
+            c["pos_max"]  = (int32_t) ckpt.pos_max;
+            checkpoints.push_back(c);
+        }
+        entry["checkpoints"] = checkpoints;
+        entries.push_back(entry);
+    }
+    index["states"] = entries;
+
+    const std::string tmp = disk_index + ".tmp";
+    std::ofstream ofs(std::filesystem::u8path(tmp), std::ios::binary | std::ios::trunc);
+    if (!ofs) {
+        return;
+    }
+    const std::string body = index.dump();
+    ofs.write(body.data(), body.size());
+    ofs.flush();
+    if (!ofs) {
+        ofs.close();
+        std::error_code ec;
+        std::filesystem::remove(std::filesystem::u8path(tmp), ec);
+        return;
+    }
+    ofs.close();
+    std::error_code ec;
+    std::filesystem::rename(std::filesystem::u8path(tmp), std::filesystem::u8path(disk_index), ec);
+}
+
+void server_prompt_cache::remove_state(std::list<std::shared_ptr<server_prompt_cache_state>>::iterator it) {
+    const auto & state = *it;
+    if (disk_enabled() && !state->file.empty()) {
+        job j;
+        j.type     = job::REMOVE;
+        j.id       = state->id;
+        j.filepath = disk_dir + state->file;
+        enqueue(std::move(j));
+    }
+    states.erase(it);
+}
+
+void server_prompt_cache::enqueue(job && j) {
+    jobs.push_back(std::move(j));
+    cv.notify_one();
+}
+
+bool server_prompt_cache::save_file(const job & j) const {
+    return j.data && pc_write_file(j.filepath, *j.data);
+}
+
+void server_prompt_cache::worker_loop() {
+    while (true) {
+        job j;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait(lock, [this]() { return stop || !jobs.empty(); });
+            if (stop && jobs.empty()) {
+                break;
+            }
+            j = std::move(jobs.front());
+            jobs.pop_front();
+        }
+
+        if (j.type == job::SAVE) {
+            const bool ok = save_file(j);
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = std::find_if(states.begin(), states.end(), [&](const auto & state) { return state->id == j.id; });
+            if (ok) {
+                std::error_code ec;
+                const uint64_t file_size = std::filesystem::file_size(std::filesystem::u8path(j.filepath), ec);
+                if (it != states.end()) {
+                    (*it)->disk_ready = true;
+                    (*it)->file_size  = ec ? (*it)->file_size : (size_t) file_size;
+                    if (!(*it)->keep_ram) {
+                        (*it)->data.reset();
+                    }
+                } else {
+                    std::filesystem::remove(std::filesystem::u8path(j.filepath), ec);
+                }
+            } else {
+                SRV_WRN("failed to write prompt cache state '%s'\n", j.filepath.c_str());
+                if (it != states.end()) {
+                    if ((*it)->keep_ram) {
+                        (*it)->file.clear();
+                        (*it)->file_size = 0;
+                    } else {
+                        states.erase(it);
+                    }
+                }
+            }
+            write_index();
+        } else {
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::u8path(j.filepath), ec);
+            std::lock_guard<std::mutex> lock(mutex);
+            write_index();
+        }
+    }
+}
+
+server_prompt_cache::~server_prompt_cache() {
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        stop = true;
+    }
+    cv.notify_all();
+    if (worker.joinable()) {
+        worker.join();
+    }
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+    std::lock_guard<std::mutex> lock(mutex);
+
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        const int cur_lcp_len = (*it)->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
@@ -1729,71 +2350,147 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    const size_t file_size_new  = disk_enabled() ? pc_file_size(state_size_tgt, state_size_dft, prompt.checkpoints) : 0;
 
     // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
+    if (ram_enabled && limit_size > 0 && state_size_new > limit_size) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        return nullptr;
+    }
+    if (disk_enabled() && limit_disk > 0 && file_size_new > limit_disk) {
+        SRV_WRN(" - prompt state size %.3f MiB exceeds disk cache size limit %.3f MiB, skipping\n",
+                file_size_new / (1024.0 * 1024.0), limit_disk / (1024.0 * 1024.0));
         return nullptr;
     }
 
     // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        const int len = (*it)->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (len == (int) (*it)->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
-            it = states.erase(it);
+            remove_state(it++);
         } else {
             ++it;
         }
     }
 
-    if (limit_size > 0) {
+    if (ram_enabled && limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+        while (size_locked() + state_size_new > limit_size) {
+            auto it = std::find_if(states.begin(), states.end(), [](const auto & state) {
+                return state->keep_ram && state->data;
+            });
+            if (it == states.end()) {
+                break;
+            }
 
-            states.pop_front();
+            if (disk_enabled() && !(*it)->file.empty() && (*it)->disk_ready) {
+                SRV_WRN(" - making room for prompt cache entry, spilling oldest entry to disk (size = %.3f MiB)\n",
+                        (*it)->size() / (1024.0 * 1024.0));
+                (*it)->data.reset();
+            } else {
+                SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                        (*it)->size() / (1024.0 * 1024.0));
+                remove_state(it);
+            }
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    if (disk_enabled() && limit_disk > 0) {
+        while (disk_size_locked() + file_size_new > limit_disk) {
+            auto it = std::find_if(states.begin(), states.end(), [](const auto & state) {
+                return !state->file.empty();
+            });
+            if (it == states.end()) {
+                break;
+            }
 
-    // check if we can allocate enough memory for the new state
+            if ((*it)->keep_ram) {
+                SRV_WRN(" - disk cache limit reached, deleting oldest entry '%s'\n", (*it)->file.c_str());
+                job j;
+                j.type     = job::REMOVE;
+                j.id       = (*it)->id;
+                j.filepath = disk_dir + (*it)->file;
+                enqueue(std::move(j));
+                (*it)->file.clear();
+                (*it)->file_size  = 0;
+                (*it)->disk_ready = false;
+            } else {
+                SRV_WRN(" - disk cache limit reached, removing oldest entry '%s'\n", (*it)->file.c_str());
+                remove_state(it);
+            }
+        }
+    }
+
+    auto state = std::make_shared<server_prompt_cache_state>();
+    state->id         = next_id++;
+    state->keep_ram   = ram_enabled;
+    state->disk_ready = false;
+
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        state->data = std::make_shared<server_prompt_data>();
+        state->data->main.resize(state_size_tgt);
+        state->data->drft.resize(state_size_dft);
+        state->data->checkpoints = prompt.checkpoints;
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
-        limit_size = std::max<size_t>(1, 0.4*size());
+        if (!ram_enabled) {
+            return nullptr;
+        }
+
+        limit_size = std::max<size_t>(1, 0.4*size_locked());
 
         SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
 
-        update();
+        while (!states.empty() && size_locked() + state_size_new > limit_size) {
+            remove_state(states.begin());
+        }
 
         return nullptr;
     }
 
-    states.push_back({
-        /*.prompt =*/ {
-            /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
-        },
-        /*.data   =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
-        },
-    });
+    state->prompt.tokens      = prompt.tokens.clone();
+    state->prompt.checkpoints = prompt.checkpoints;
+    for (auto & ckpt : state->prompt.checkpoints) {
+        ckpt.data_tgt.clear();
+        ckpt.data_dft.clear();
+        ckpt.data_spec.clear();
+    }
 
-    return &states.back();
+    if (disk_enabled()) {
+        std::ostringstream ss;
+        ss << "state-" << std::chrono::steady_clock::now().time_since_epoch().count() << '-' << state->id << ".bin";
+        state->file      = ss.str();
+        state->file_size = file_size_new;
+    }
+
+    states.push_back(std::move(state));
+
+    return states.back().get();
+}
+
+bool server_prompt_cache::store_disk(const server_prompt_cache_state & state) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!disk_enabled() || state.file.empty() || !state.data) {
+        return false;
+    }
+
+    job j;
+    j.type     = job::SAVE;
+    j.id       = state.id;
+    j.filepath = disk_dir + state.file;
+    j.data     = state.data;
+    enqueue(std::move(j));
+    return true;
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    std::lock_guard<std::mutex> lock(mutex);
+
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1805,12 +2502,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        const int lcp_cur = (*it)->prompt.tokens.get_common_prefix(tokens_new);
 
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
+        const float f_keep_cur = float(lcp_cur) / (*it)->prompt.tokens.size();
         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", (*it)->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
@@ -1828,77 +2525,147 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-        {
-            auto & data = it_best->data.main;
-
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
+        std::shared_ptr<server_prompt_data> data = (*it_best)->data;
+        if (!data && (*it_best)->disk_ready) {
+            data = std::make_shared<server_prompt_data>();
+            if (!pc_read_file(disk_dir + (*it_best)->file, *data, (*it_best)->file_size)) {
+                SRV_WRN("failed to read prompt cache state '%s'\n", (*it_best)->file.c_str());
+                remove_state(it_best);
                 return false;
             }
+        }
 
-            data.clear();
-            data.shrink_to_fit();
+        if (!data) {
+            SRV_WRN("prompt cache state '%s' has no data\n", (*it_best)->file.c_str());
+            remove_state(it_best);
+            return false;
+        }
+
+        if ((ctx_dft != nullptr) != !data->drft.empty()) {
+            SRV_WRN("prompt cache state '%s' does not match the draft context\n", (*it_best)->file.c_str());
+            remove_state(it_best);
+            return false;
         }
 
         {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
+            const size_t size = data->main.size();
+            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data->main.data(), size, id_slot, 0);
+            if (n != size) {
+                SRV_ERR("failed to restore state with size %zu\n", size);
+                remove_state(it_best);
+                return false;
             }
         }
 
-        prompt = std::move(it_best->prompt);
+        if (!data->drft.empty()) {
+            const size_t size = data->drft.size();
+            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data->drft.data(), size, id_slot, 0);
+            if (n != size) {
+                SRV_WRN("failed to restore state with size %zu\n", size);
+                remove_state(it_best);
+                return false;
+            }
+        }
 
-        states.erase(it_best);
+        // a disk-only entry costs nothing in RAM; keep it so that another
+        // restart, slot or sequence can reuse the same file
+        const bool keep_disk = (*it_best)->disk_ready && !(*it_best)->keep_ram;
+        if (keep_disk) {
+            prompt.tokens = (*it_best)->prompt.tokens.clone();
+        } else {
+            prompt = std::move((*it_best)->prompt);
+        }
+        if (disk_enabled() && !(*it_best)->disk_ready) {
+            // the async writer still owns this state; copy the checkpoints
+            // instead of moving them out from under the writer
+            prompt.checkpoints = data->checkpoints;
+        } else {
+            prompt.checkpoints = std::move(data->checkpoints);
+        }
+
+        if (keep_disk) {
+            // most recently used entries go to the back of the LRU list
+            states.splice(states.end(), states, it_best);
+        } else {
+            remove_state(it_best);
+        }
     }
 
     return true;
 }
 
 void server_prompt_cache::update() {
-    if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+    std::lock_guard<std::mutex> lock(mutex);
 
-            states.pop_front();
+    if (ram_enabled && limit_size > 0) {
+        while (size_locked() > limit_size) {
+            auto it = std::find_if(states.begin(), states.end(), [](const auto & state) {
+                return state->keep_ram && state->data;
+            });
+            if (it == states.end()) {
+                break;
+            }
+
+            if (disk_enabled() && !(*it)->file.empty() && (*it)->disk_ready) {
+                SRV_WRN(" - cache size limit reached, spilling oldest entry to disk (size = %.3f MiB)\n",
+                        (*it)->size() / (1024.0 * 1024.0));
+                (*it)->data.reset();
+            } else {
+                SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n",
+                        (*it)->size() / (1024.0 * 1024.0));
+                remove_state(it);
+            }
+        }
+    }
+
+    if (disk_enabled() && limit_disk > 0) {
+        while (disk_size_locked() > limit_disk) {
+            auto it = std::find_if(states.begin(), states.end(), [](const auto & state) {
+                return !state->file.empty();
+            });
+            if (it == states.end()) {
+                break;
+            }
+
+            if ((*it)->keep_ram) {
+                SRV_WRN(" - disk cache size limit reached, deleting oldest file '%s'\n", (*it)->file.c_str());
+                job j;
+                j.type     = job::REMOVE;
+                j.id       = (*it)->id;
+                j.filepath = disk_dir + (*it)->file;
+                enqueue(std::move(j));
+                (*it)->file.clear();
+                (*it)->file_size  = 0;
+                (*it)->disk_ready = false;
+            } else {
+                SRV_WRN(" - disk cache size limit reached, removing oldest entry '%s'\n", (*it)->file.c_str());
+                remove_state(it);
+            }
         }
     }
 
     // average size per token
-    const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
+    const float size_per_token = std::max<float>(1.0f, float(size_locked() + disk_size_locked()) / (std::max<size_t>(1, n_tokens_locked())));
 
     // dynamically increase the token limit if it can fit in the memory limit
-    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
+    const size_t limit_tokens_cur = ram_enabled && limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (!states.empty() && n_tokens() > limit_tokens_cur) {
+        while (!states.empty() && n_tokens_locked() > limit_tokens_cur) {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+                    limit_tokens, limit_tokens_cur, states.front()->size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            remove_state(states.begin());
         }
     }
 
-    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
-            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+    SRV_TRC(" - cache state: %zu prompts, %.3f MiB RAM, %.3f MiB disk (limits: %.3f MiB RAM, %.3f MiB disk, %zu tokens, %zu est)\n",
+            states.size(), size_locked() / (1024.0 * 1024.0), disk_size_locked() / (1024.0 * 1024.0),
+            limit_size / (1024.0 * 1024.0), limit_disk / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
-        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB RAM, %9.3f MiB disk\n",
+                (const void *) state.get(), state->prompt.n_tokens(), state->prompt.checkpoints.size(),
+                state->size() / (1024.0 * 1024.0), state->file_size / (1024.0 * 1024.0));
     }
 }
