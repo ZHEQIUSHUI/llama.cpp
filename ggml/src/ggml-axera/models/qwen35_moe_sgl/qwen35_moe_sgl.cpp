@@ -2815,15 +2815,21 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
     axera_timer    tb("init: mtp");
     const kernel & k1 = man.get("mtp.t1");
     const kernel & kp = man.get("mtp.prompt");
-    if (kv_page_b != (size_t) 2 * PG * 2 * 256 * 2) {
-        GGML_ABORT("axera qwen35_moe_sgl: the MTP kernels are BF16-KV only; this package's KV cache is E4M3\n");
+    int mtp_kv_dtype = 0;
+    for (const auto & d : k1.desc->in) {
+        if (d.name == "paged_kv") {
+            mtp_kv_dtype = d.dtype;
+            break;
+        }
     }
+    GGML_ASSERT(mtp_kv_dtype == 9 || mtp_kv_dtype == 11);
+    const size_t mtp_elem_b = mtp_kv_dtype == 11 ? 1 : 2;
     GGML_ASSERT(k1.in_bytes("paged_kv") == kp.in_bytes("paged_kv"));
     if (man.has("mtp.m8")) {
         const kernel & k8 = man.get("mtp.m8");
         GGML_ASSERT(k8.in_bytes("paged_kv") == k1.in_bytes("paged_kv"));
     }
-    const size_t mtp_page_kv = (size_t) 2 * PG * 2 * 256 * 2;
+    const size_t mtp_page_kv = (size_t) 2 * PG * 2 * 256 * mtp_elem_b;
     GGML_ASSERT(k1.in_bytes("paged_kv") % mtp_page_kv == 0);
     const int mtp_np = (int) (k1.in_bytes("paged_kv") / mtp_page_kv);
     mtp_kv_pages     = mtp_np;
