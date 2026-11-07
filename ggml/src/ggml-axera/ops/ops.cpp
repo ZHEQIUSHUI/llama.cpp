@@ -717,11 +717,13 @@ void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const
     }
     const bool published = publish_argmax && axera::argmax_publish(pids.data(), pvals.data(), n_out, logits->data,
                                                                    (size_t) logits->nb[1]);
+    // The sampler's fused-row stale-value check still reads the host-visible full row. Retire the NPU-written lines
+    // even when the fused argmax was published, or that check can consume a previous graph's cached values.
+    for (int r = 0; r < n_out; ++r) {
+        float * o = (float *) ((char *) logits->data + (size_t) r * logits->nb[1]);
+        dctx->invalidate(o, (size_t) N * sizeof(float));
+    }
     if (!published) {
-        for (int r = 0; r < n_out; ++r) {
-            float * o = (float *) ((char *) logits->data + (size_t) r * logits->nb[1]);
-            dctx->invalidate(o, (size_t) N * sizeof(float));
-        }
         dctx->clean_p     = (float *) logits->data;
         dctx->clean_n     = (size_t) n_out * N * sizeof(float);
         dctx->clean_epoch = axera_graph_epoch;
