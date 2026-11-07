@@ -8,9 +8,9 @@
 //   prefill.padding zeros the workspace rows beyond the live token count.
 // Prefill is layer-outer over up to 4096 tokens: for each layer, run 256-row attention chunks, clear the padded rows,
 // then run the fixed 4096-row MoE. The decode and prefill kernels read the same NVFP4 weight banks.
-// The state is this adapter's (the decode kernel's banks): KV cache paged [10][64 pages][K, V][256][2 x 256] bf16 (a
-// long-context decode kernel instead takes one input b3_kv<j> [pages][K, V][256][2 x 256] per attention layer, its pools
-// holding only the pages of llama.cpp's -c),
+// The state is this adapter's (the decode kernel's banks): KV cache paged [10][64 pages][K, V][256][2 x 256] in the
+// manifest's dtype (BF16, or E4M3 for the fp8-KV release; a long-context decode kernel instead takes one input
+// b3_kv<j> [pages][K, V][256][2 x 256] per attention layer, its pools holding only the pages of llama.cpp's -c),
 // delta-net states [30][32][128][128] f32, conv states q / k [30][3][2048], v [30][3][4096] bf16 (value heads in HF
 // order). The prefill kernels write the recurrent states to a second set, the two swapped after each page. One
 // sequence. Weights only from the GGUF: every projection and expert row is quantized to NVFP4 (E2M1 pairs, an E4M3
@@ -699,7 +699,17 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     ONES->flush();
     ZERO = axera_cmm_alloc(4096);
     const bool   split   = logical("b3_kv0") > 0;  // one KV input per attention layer
-    const size_t page_kv = (size_t) 2 * PG * 2 * 256 * 2;
+    int          kv_dtype = 0;
+    for (const auto & d : dk.desc->in) {
+        if (d.name == "b3_kv0" || d.name == "b3_kv") {
+            kv_dtype = d.dtype;
+            break;
+        }
+    }
+    // AX_ENGINE_DATA_TYPE_T: 9 = BFLOAT16 (2 bytes), 11 = FLOAT8_E4M3 (1 byte).
+    GGML_ASSERT(kv_dtype == 9 || kv_dtype == 11);
+    const size_t kv_elem_b = kv_dtype == 11 ? 1 : 2;
+    const size_t page_kv  = (size_t) 2 * PG * 2 * 256 * kv_elem_b;
     const int    NP      = (int) (split ? logical("b3_kv0") / page_kv : logical("b3_kv") / (NB * page_kv));  // pages
     kv_pages             = NP;
     kv_total_pages       = NP;
@@ -1094,6 +1104,11 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     ver = {};
     if (man.has("decode.verify")) {
         const kernel & vk = man.get("decode.verify");
+        for (const auto & d : vk.desc->in) {
+            if (d.name.rfind("b3_kv", 0) == 0 && d.dtype != kv_dtype) {
+                GGML_ABORT("axera qwen35_moe_sgl: decode.verify's KV dtype does not match the decode kernel\n");
+            }
+        }
         GGML_ASSERT(vk.in_bytes("x") == 4 * H * sizeof(ggml_bf16_t) &&
                     vk.out_bytes("output") == 4 * H * sizeof(ggml_bf16_t) && vk.in_bytes("ntok") == sizeof(int32_t));
         VX      = axera_cmm_alloc(vk.in_bytes("x"));
@@ -2749,6 +2764,9 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
     axera_timer    tb("init: mtp");
     const kernel & k1 = man.get("mtp.t1");
     const kernel & kp = man.get("mtp.prompt");
+    if (kv_page_b != (size_t) 2 * PG * 2 * 256 * 2) {
+        GGML_ABORT("axera qwen35_moe_sgl: the MTP kernels are BF16-KV only; this package's KV cache is E4M3\n");
+    }
     GGML_ASSERT(k1.in_bytes("paged_kv") == kp.in_bytes("paged_kv"));
     if (man.has("mtp.m8")) {
         const kernel & k8 = man.get("mtp.m8");
