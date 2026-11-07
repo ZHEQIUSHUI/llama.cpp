@@ -2760,21 +2760,6 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
         zero_state();
     }
     tm_all.stop();
-    if (ct_on && T == 1) {
-        static int64_t cn = 0, ct_names_us = 0, ct_pre_us = 0, ct_bind_us = 0, ct_all_us = 0, ct_total_us = 0;
-        const int64_t ct_end = ggml_time_us();
-        ++cn;
-        ct_names_us += ct_names - ct_0;
-        ct_pre_us   += ct_pre - ct_names;
-        ct_bind_us  += ct_bind - ct_pre;
-        ct_all_us   += ct_end - ct_bind;
-        ct_total_us += ct_end - ct_0;
-        if (cn % 32 == 0) {
-            fprintf(stderr, "adapter compute: total %.3f = names %.3f + pre %.3f + bind %.3f + graph %.3f ms/token (%lld)\n",
-                    ct_total_us / 1e3 / cn, ct_names_us / 1e3 / cn, ct_pre_us / 1e3 / cn, ct_bind_us / 1e3 / cn,
-                    ct_all_us / 1e3 / cn, (long long) cn);
-        }
-    }
     // the MTP block's input: every row's final norm
     if (need_hn) {
         axera_timer tn("h_nextn");
@@ -2796,6 +2781,12 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
         if (ggml_backend_buffer_is_axera(hn->buffer)) {
             ((ggml_backend_axera_buffer_context *) hn->buffer->context)->flush(hn->data, ggml_nbytes(hn));
         }
+    }
+    if (ct_on) {
+        const int64_t ct_end = ggml_time_us();
+        fprintf(stderr, "adapter graph T=%d nodes=%d: names %.3f + pre %.3f + bind %.3f + graph %.3f = %.3f ms\n",
+                T, g->n_nodes, (ct_names - ct_0) / 1e3, (ct_pre - ct_names) / 1e3, (ct_bind - ct_pre) / 1e3,
+                (ct_end - ct_bind) / 1e3, (ct_end - ct_0) / 1e3);
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -3170,32 +3161,44 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
     };
 
     if (T >= 2 && T <= R8 && !std::getenv("GGML_AXERA_MTP_T1")) {  // the rows accepted by a verification, in one call
-        rows_in(mtp8.e, mtp8.h, R8, 0, T - 1);
-        fill_pids(mtp8.pids, paxes, R8, 0, T - 1);
-        fill_pos(mtp8.pos, R8, 0, T - 1, kv, cell_of);
-        fill_loc(mtp8.loc, R8, 0, T - 1, kv, cell_of);
-        set_ntok(mtp8.ntok, T);
-        set_indptr(mtp8.indptr, cell_of(T - 1));
+        {
+            axera_timer thost("mtp host: fills (multi)");
+            rows_in(mtp8.e, mtp8.h, R8, 0, T - 1);
+            fill_pids(mtp8.pids, paxes, R8, 0, T - 1);
+            fill_pos(mtp8.pos, R8, 0, T - 1, kv, cell_of);
+            fill_loc(mtp8.loc, R8, 0, T - 1, kv, cell_of);
+            set_ntok(mtp8.ntok, T);
+            set_indptr(mtp8.indptr, cell_of(T - 1));
+        }
         mtp8.c.k->run(mtp8.c.in, mtp8.c.out, mtp8.c.k->desc->role.c_str());
-        mtp8.hnext->invalidate(mtp8.hnext->vir, (size_t) T * H * sizeof(ggml_bf16_t));
-        mtp8.hraw->invalidate(mtp8.hraw->vir, (size_t) T * H * sizeof(ggml_bf16_t));
-        for (int r = 0; r < T; ++r) {
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp8.hnext->vir + (size_t) r * H, h.data() + (size_t) r * H, H);
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp8.hraw->vir + (size_t) r * H, hr.data() + (size_t) r * H, H);
+        {
+            axera_timer thost("mtp host: read h (multi)");
+            mtp8.hnext->invalidate(mtp8.hnext->vir, (size_t) T * H * sizeof(ggml_bf16_t));
+            mtp8.hraw->invalidate(mtp8.hraw->vir, (size_t) T * H * sizeof(ggml_bf16_t));
+            for (int r = 0; r < T; ++r) {
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp8.hnext->vir + (size_t) r * H, h.data() + (size_t) r * H, H);
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp8.hraw->vir + (size_t) r * H, hr.data() + (size_t) r * H, H);
+            }
         }
     } else if (T <= 8 || std::getenv("GGML_AXERA_MTP_T1")) {  // a draft step: row by row
         for (int r = 0; r < T; ++r) {
-            rows_in(mtp1.e, mtp1.h, 1, r, 0);
-            fill_pids(mtp1.pids, paxes, 1, r, 0);
-            fill_pos(mtp1.pos, 1, r, 0, kv, cell_of);
-            fill_loc(mtp1.loc, 1, r, 0, kv, cell_of);
-            set_ntok(mtp1.ntok, 1);
-            set_indptr(mtp1.indptr, cell_of(r));
+            {
+                axera_timer thost("mtp host: fills (t1)");
+                rows_in(mtp1.e, mtp1.h, 1, r, 0);
+                fill_pids(mtp1.pids, paxes, 1, r, 0);
+                fill_pos(mtp1.pos, 1, r, 0, kv, cell_of);
+                fill_loc(mtp1.loc, 1, r, 0, kv, cell_of);
+                set_ntok(mtp1.ntok, 1);
+                set_indptr(mtp1.indptr, cell_of(r));
+            }
             mtp1.c.k->run(mtp1.c.in, mtp1.c.out, "mtp t1");
-            mtp1.hnext->invalidate(mtp1.hnext->vir, H * sizeof(ggml_bf16_t));
-            mtp1.hraw->invalidate(mtp1.hraw->vir, H * sizeof(ggml_bf16_t));
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp1.hnext->vir, h.data() + (size_t) r * H, H);
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp1.hraw->vir, hr.data() + (size_t) r * H, H);
+            {
+                axera_timer thost("mtp host: read h (t1)");
+                mtp1.hnext->invalidate(mtp1.hnext->vir, H * sizeof(ggml_bf16_t));
+                mtp1.hraw->invalidate(mtp1.hraw->vir, H * sizeof(ggml_bf16_t));
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp1.hnext->vir, h.data() + (size_t) r * H, H);
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp1.hraw->vir, hr.data() + (size_t) r * H, H);
+            }
         }
     } else {
         const int P = (int) (mtpP.e->size / (H * sizeof(ggml_bf16_t)));
@@ -3243,6 +3246,7 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
             }
             head.draft = true;
             const std::vector<char> normed(T, 1);  // (the draft kernel projects the MTP shared-head norm)
+            axera_timer th("mtp head (draft)");
             head.run(g, names, h, T, &normed);
         } else {
             if (!head.bind_combined(man.get("lm_head"), logits->src[0])) {
@@ -3252,6 +3256,7 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
             if (man.has("lm_head.verify")) {
                 head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
             }
+            axera_timer th("mtp head (multi)");
             head.run_combined(g, names, hr, T, nullptr, nullptr);
         }
     }
