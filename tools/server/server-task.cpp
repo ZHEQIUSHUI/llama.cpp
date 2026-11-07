@@ -2453,12 +2453,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
-    state->prompt.tokens      = prompt.tokens.clone();
-    state->prompt.checkpoints = prompt.checkpoints;
-    for (auto & ckpt : state->prompt.checkpoints) {
-        ckpt.data_tgt.clear();
-        ckpt.data_dft.clear();
-        ckpt.data_spec.clear();
+    state->prompt.tokens = prompt.tokens.clone();
+    // Keep only checkpoint metadata in the prompt entry.  The payload is
+    // already stored in data->checkpoints and is moved back on load.
+    state->prompt.checkpoints.clear();
+    for (const auto & ckpt : prompt.checkpoints) {
+        common_prompt_checkpoint info;
+        info.id_task  = ckpt.id_task;
+        info.n_tokens = ckpt.n_tokens;
+        info.pos_min  = ckpt.pos_min;
+        info.pos_max  = ckpt.pos_max;
+        state->prompt.checkpoints.push_back(std::move(info));
     }
 
     if (disk_enabled()) {
