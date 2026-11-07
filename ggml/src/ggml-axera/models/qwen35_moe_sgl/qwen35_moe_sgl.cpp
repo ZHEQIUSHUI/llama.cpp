@@ -69,10 +69,13 @@ struct sgl_state_header {
     uint32_t kind;
     int64_t  state_cell;
     int64_t  snap_cell;
+    int64_t  ksnap_cell;
     uint32_t kv_split;
     uint32_t n_attn;
     uint32_t nkv_pages;
     uint32_t kv_total_pages;
+    uint32_t snap_prompt;
+    uint32_t reserved;
     uint64_t kv_page_b;
     uint64_t kv_n;
     uint64_t st_b;
@@ -80,8 +83,11 @@ struct sgl_state_header {
     uint64_t ck_b;
     uint64_t cv_b;
     uint64_t snap_n;
+    uint64_t ksnap_n;
     uint64_t page_x_n;
     uint64_t page_p_n;
+    uint64_t kpage_x_n;
+    uint64_t kpage_p_n;
 };
 
 // GGML_AXERA_SGL35_BANK_SUM=1: print one FNV-1a hash per bank after load. The loader must produce the same bytes
@@ -190,6 +196,11 @@ class qwen35_moe_sgl final : public model {
     std::vector<uint8_t>     snap;
     int64_t                  snap_cell = -1;
     int                      snap_parity = -1;  // 1: the second state set holds snap_cell's state (no copy was made)
+    bool                     snap_prompt = false;  // the current restart point is the last prompt's page
+    std::vector<uint8_t>     ksnap;
+    int64_t                  ksnap_cell = -1;
+    std::vector<ggml_bf16_t> kpage_x;
+    std::vector<int32_t>     kpage_p;
     int64_t                  state_cell = -1;  // tokens processed: the current recurrent state is before this cell
     bool                     state_dirty = false;  // a sequence has updated the recurrent-state pools
     std::vector<ggml_bf16_t> page_x;
@@ -277,6 +288,8 @@ class qwen35_moe_sgl final : public model {
     void         states_swap();
     void         sync_dec_states();
     void         zero_state();
+    void         swap_kept();
+    bool         restart_point(int64_t s0, int k);
     void         save_state(int64_t cell);
     void         load_state();
     void         state_home();
@@ -1336,15 +1349,45 @@ void qwen35_moe_sgl::zero_state() {
     state_dirty = false;
     snap_cell  = -1;
     snap_parity = -1;
+    snap_prompt = false;
+    ksnap_cell = -1;
+    ksnap.clear();
+    kpage_x.clear();
+    kpage_p.clear();
     state_cell = 0;
     page_x.clear();
     page_p.clear();
+}
+
+void qwen35_moe_sgl::swap_kept() {
+    std::swap(snap, ksnap);
+    std::swap(snap_cell, ksnap_cell);
+    std::swap(page_x, kpage_x);
+    std::swap(page_p, kpage_p);
+}
+
+// the restart point of the page from s0 with its first k inputs (the current one, or the kept one made current)
+bool qwen35_moe_sgl::restart_point(int64_t s0, int k) {
+    if (snap_cell == s0 && (int) (page_x.size() / H) >= k) {
+        return true;
+    }
+    if (ksnap_cell == s0 && (int) (kpage_x.size() / H) >= k) {
+        swap_kept();
+        snap_prompt = true;
+        return true;
+    }
+    return false;
 }
 
 void qwen35_moe_sgl::save_state(int64_t cell) {
     GGML_ASSERT(cell % PG == 0);
     materialize_deltas();
     axera_timer tl("state save");
+    if (snap_prompt && snap_cell >= 0) {  // the last prompt's page: kept
+        swap_kept();
+    }
+    snap_prompt = false;
+    snap.resize(ksnap.size() ? ksnap.size() : snap.size());
     if (cell == 0) {  // a fresh sequence's state is zero and load_state() restores it without a snapshot copy
         snap_cell = 0;
         snap_parity = -1;
@@ -1422,7 +1465,8 @@ size_t qwen35_moe_sgl::state_size() const {
     for (const char * nm : { "b0_attn_state_in", "b0_attn_q_conv_state_in", "b0_attn_k_conv_state_in", "b0_attn_v_conv_state_in" }) {
         n += banks.at(nm)->size;
     }
-    n += snap.size() + page_x.size() * sizeof(ggml_bf16_t) + page_p.size() * sizeof(int32_t);
+    n += snap.size() + ksnap.size() + page_x.size() * sizeof(ggml_bf16_t) + page_p.size() * sizeof(int32_t) +
+         kpage_x.size() * sizeof(ggml_bf16_t) + kpage_p.size() * sizeof(int32_t);
     return n;
 }
 
@@ -1438,14 +1482,16 @@ size_t qwen35_moe_sgl::state_write(void * dst, size_t size) {
     sgl_state_header h;
     memset(&h, 0, sizeof(h));
     memcpy(h.magic, "AXSGL1", sizeof(h.magic) - 1);
-    h.version        = 1;
+    h.version        = 2;
     h.kind           = 3;
     h.state_cell     = state_cell;
     h.snap_cell      = snap_cell;
+    h.ksnap_cell     = ksnap_cell;
     h.kv_split       = kv_split;
     h.n_attn         = NB;
     h.nkv_pages      = (uint32_t) nkv_pages;
     h.kv_total_pages = (uint32_t) kv_total_pages;
+    h.snap_prompt    = snap_prompt;
     h.kv_page_b      = kv_page_b;
     h.kv_n           = (uint64_t) NB * nkv_pages * kv_page_b;
     h.st_b           = B("b0_attn_state_in")->size;
@@ -1453,8 +1499,11 @@ size_t qwen35_moe_sgl::state_write(void * dst, size_t size) {
     h.ck_b           = B("b0_attn_k_conv_state_in")->size;
     h.cv_b           = B("b0_attn_v_conv_state_in")->size;
     h.snap_n         = snap.size();
+    h.ksnap_n        = ksnap.size();
     h.page_x_n       = page_x.size() * sizeof(ggml_bf16_t);
     h.page_p_n       = page_p.size() * sizeof(int32_t);
+    h.kpage_x_n      = kpage_x.size() * sizeof(ggml_bf16_t);
+    h.kpage_p_n      = kpage_p.size() * sizeof(int32_t);
 
     char * p = (char *) dst;
     memcpy(p, &h, sizeof(h));
@@ -1482,10 +1531,16 @@ size_t qwen35_moe_sgl::state_write(void * dst, size_t size) {
     }
     memcpy(p, snap.data(), h.snap_n);
     p += h.snap_n;
+    memcpy(p, ksnap.data(), h.ksnap_n);
+    p += h.ksnap_n;
     memcpy(p, page_x.data(), h.page_x_n);
     p += h.page_x_n;
     memcpy(p, page_p.data(), h.page_p_n);
     p += h.page_p_n;
+    memcpy(p, kpage_x.data(), h.kpage_x_n);
+    p += h.kpage_x_n;
+    memcpy(p, kpage_p.data(), h.kpage_p_n);
+    p += h.kpage_p_n;
     return (size_t) (p - (char *) dst);
 }
 
@@ -1496,16 +1551,18 @@ size_t qwen35_moe_sgl::state_read(const void * src, size_t size) {
     }
     sgl_state_header h;
     memcpy(&h, src, sizeof(h));
-    if (memcmp(h.magic, "AXSGL1", sizeof(h.magic) - 1) != 0 || h.version != 1 || h.kind != 3 || h.n_attn != NB ||
+    if (memcmp(h.magic, "AXSGL1", sizeof(h.magic) - 1) != 0 || h.version != 2 || h.kind != 3 || h.n_attn != NB ||
         h.kv_split != kv_split || h.kv_page_b != kv_page_b || h.kv_total_pages != (uint32_t) kv_total_pages ||
         h.nkv_pages > (uint32_t) kv_pages || h.state_cell < 0 || h.state_cell > kv_cells ||
         h.kv_n != (uint64_t) NB * h.nkv_pages * h.kv_page_b || h.st_b != B("b0_attn_state_in")->size ||
         h.cq_b != B("b0_attn_q_conv_state_in")->size || h.ck_b != B("b0_attn_k_conv_state_in")->size ||
         h.cv_b != B("b0_attn_v_conv_state_in")->size || h.page_x_n % (H * sizeof(ggml_bf16_t)) ||
-        h.page_p_n % (4 * sizeof(int32_t))) {
+        h.page_p_n % (4 * sizeof(int32_t)) || h.kpage_x_n % (H * sizeof(ggml_bf16_t)) ||
+        h.kpage_p_n % (4 * sizeof(int32_t))) {
         return 0;
     }
-    const size_t need = sizeof(h) + h.kv_n + h.st_b + h.cq_b + h.ck_b + h.cv_b + h.snap_n + h.page_x_n + h.page_p_n;
+    const size_t need = sizeof(h) + h.kv_n + h.st_b + h.cq_b + h.ck_b + h.cv_b + h.snap_n + h.ksnap_n + h.page_x_n +
+                        h.page_p_n + h.kpage_x_n + h.kpage_p_n;
     if (size < need) {
         return 0;
     }
@@ -1532,16 +1589,37 @@ size_t qwen35_moe_sgl::state_read(const void * src, size_t size) {
         p += B(n)->size;
     }
     snap.resize(h.snap_n);
+    ksnap.resize(h.ksnap_n);
     page_x.resize(h.page_x_n / sizeof(ggml_bf16_t));
     page_p.resize(h.page_p_n / sizeof(int32_t));
+    kpage_x.resize(h.kpage_x_n / sizeof(ggml_bf16_t));
+    kpage_p.resize(h.kpage_p_n / sizeof(int32_t));
     memcpy(snap.data(), p, h.snap_n);
     p += h.snap_n;
+    memcpy(ksnap.data(), p, h.ksnap_n);
+    p += h.ksnap_n;
     memcpy(page_x.data(), p, h.page_x_n);
     p += h.page_x_n;
     memcpy(page_p.data(), p, h.page_p_n);
     p += h.page_p_n;
+    memcpy(kpage_x.data(), p, h.kpage_x_n);
+    p += h.kpage_x_n;
+    memcpy(kpage_p.data(), p, h.kpage_p_n);
+    p += h.kpage_p_n;
     snap_cell   = h.snap_cell;
+    ksnap_cell  = h.ksnap_cell;
+    snap_prompt = h.snap_prompt;
     state_cell  = h.state_cell;
+    snap_parity      = -1;
+    delta_set        = -1;
+    delta_n          = 0;
+    delta_live       = false;
+    conv_entry_valid = false;
+    conv_set         = -1;
+    conv_n           = 0;
+    ver_c0           = -1;
+    ver_T            = 0;
+    state_dirty      = true;
     return (size_t) (p - (const char *) src);
 }
 
@@ -2487,6 +2565,10 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
         restore_conv(accepted);
         delta_n    = accepted;
         delta_live = accepted > 0;
+        if (snap_cell > c0 && ksnap_cell >= 0 && ksnap_cell <= c0 && c0 < ksnap_cell + PG) {
+            swap_kept();  // (a page start inside the rejected rows: the kept one, the page of c0)
+            snap_prompt = true;
+        }
         if (snap_cell > c0) {  // (no restart point of c0's page kept)
             snap_cell = -1;
             page_x.clear();
@@ -2534,11 +2616,12 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             } else {
                 prefill(c0, T, nullptr, (const float *) x0->data, x0->nb[1], nullptr, pb.data(), h, out_rows);
             }
+            snap_prompt = true;  // (its page's restart point outlives the decode's next pages)
         } else {
             // a rewind (e.g. the server's prompt cache): from c0's page start and the state saved there
             const int64_t s0 = c0 - c0 % PG;
             const int     k  = (int) (c0 - s0);
-            if (snap_cell != s0 || (k > 0 && (int) (page_x.size() / H) < k)) {
+            if (!restart_point(s0, k)) {
                 GGML_LOG_ERROR("axera qwen35_moe_sgl: a prompt from cell %lld, whose page-start state is not kept\n",
                                (long long) c0);
                 return GGML_STATUS_FAILED;
@@ -2575,6 +2658,7 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             }
             axera_timer tp(T > 256 ? "prefill (prompt)" : "prefill (all pages)");
             prefill(s0, k + T, xs.data(), nullptr, 0, nullptr, ps.data(), h, shifted);
+            snap_prompt = true;  // (its page's restart point outlives the decode's next pages)
         }
     } else {
         if (c0 != state_cell) {
