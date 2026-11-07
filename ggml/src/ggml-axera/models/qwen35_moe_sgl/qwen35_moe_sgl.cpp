@@ -1427,6 +1427,7 @@ size_t qwen35_moe_sgl::state_size() const {
 }
 
 size_t qwen35_moe_sgl::state_write(void * dst, size_t size) {
+    axera_timer tw("state write");
     const size_t total = state_size();
     if (!total || size < total) {
         return 0;
@@ -1489,6 +1490,7 @@ size_t qwen35_moe_sgl::state_write(void * dst, size_t size) {
 }
 
 size_t qwen35_moe_sgl::state_read(const void * src, size_t size) {
+    axera_timer tr("state read");
     if (size < sizeof(sgl_state_header)) {
         return 0;
     }

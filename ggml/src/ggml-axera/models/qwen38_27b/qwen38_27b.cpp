@@ -964,6 +964,7 @@ size_t qwen38_27b::state_size() const {
 }
 
 size_t qwen38_27b::state_write(void * dst, size_t size) {
+    axera_timer tw("state write");
     mtp_wait();  // an async MTP catch-up writes MKV; serialize after it finishes
     const size_t total = state_size();
     if (!total || size < total) {
@@ -1060,6 +1061,7 @@ size_t qwen38_27b::state_write(void * dst, size_t size) {
 }
 
 size_t qwen38_27b::state_read(const void * src, size_t size) {
+    axera_timer tr("state read");
     mtp_wait();
     if (size < sizeof(state_header_27b)) {
         return 0;
