@@ -89,6 +89,20 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
+// When the adaptive gate keeps MTP dormant, the per-round catch-up costs more than the drafts can win.  In observe
+// mode the target rows are queued instead of being decoded by the draft context; a single flush then catches the
+// draft KV up over the whole queue.  Only feed single-token decode batches in this mode.
+void common_speculative_set_observe(common_speculative * spec, bool observe);
+
+// run the batched catch-up queued by observe mode
+bool common_speculative_flush(common_speculative * spec);
+
+// draft n tokens from (id_last, pos0) after the catch-up, without the target-side verification the normal draft
+// path expects.  Used as a cheap acceptance probe: the caller compares the result with the tokens the target
+// generates plainly.
+bool common_speculative_probe(common_speculative * spec, llama_seq_id seq_id, llama_token id_last, llama_pos pos0,
+                              int n, llama_token * out);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

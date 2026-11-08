@@ -107,7 +107,11 @@ struct output_head {
     const kernel *       dk = nullptr;
     std::vector<int32_t> dids;
     axera_cmm            dq, ds, dy;
+    bool                 dargmax = false;  // the draft head returns one (local id, logit) instead of 65536 logits
+    axera_cmm            did, dtop;
     bool                 draft = false;  // the next run's single output row through the draft head
+    // one already-normalized row through an argmax draft head (the fused draft chain); the global id
+    int32_t draft_argmax_row(const ggml_bf16_t * row, float * logit);
     // the fused head + penalties + exact top-K (role lm_head.topk): the penalty arrays the host sampler maintains, the
     // candidates and the full-vocabulary max / sumexp it returns
     const kernel *       tk = nullptr;

@@ -745,6 +745,11 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
+#define SCHED_NEED_RESERVE() do { \
+    if (getenv("LLAMA_RESERVE_DEBUG")) { fprintf(stderr, "reserve need at line %d\n", __LINE__); } \
+    sched_need_reserve = true; \
+} while (0)
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -1362,7 +1367,7 @@ void llama_context::set_embeddings(bool value) {
 
     // a pooled context computes the logits only without embeddings, so the toggle changes the graph shape
     if (cparams.embeddings != value && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
-        sched_need_reserve = true;
+        SCHED_NEED_RESERVE();
     }
 
     cparams.embeddings = value;
@@ -1372,8 +1377,12 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
     if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
-        // these flags change the graph shape
-        sched_need_reserve = true;
+        // A model with nextn layers always builds t_h_nextn; the flag only changes the last layer's crop, and
+        // process_ubatch's can_reuse() already rejects the cached graph when that topology changes.  Re-reserving
+        // here costs a full worst-case build (>100 ms), which the adaptive gate would pay on every transition.
+        if (model.hparams.n_layer_nextn == 0) {
+            SCHED_NEED_RESERVE();
+        }
     }
 
     cparams.embeddings_nextn        = value;
@@ -1388,7 +1397,7 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     cparams.embeddings_layer_inp[lid] = enable;
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
-    sched_need_reserve = true;
+    SCHED_NEED_RESERVE();
 }
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
@@ -1405,7 +1414,7 @@ void llama_context::set_causal_attn(bool value) {
     cparams.causal_attn = value;
 
     // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph
-    //sched_need_reserve = true;
+    //SCHED_NEED_RESERVE();
 }
 
 bool llama_context::get_causal_attn() const {
@@ -1432,7 +1441,7 @@ void llama_context::set_warmup(bool value) {
     }
 
     // warmups are usually with small batches, so no need to reserve
-    //sched_need_reserve = true;
+    //SCHED_NEED_RESERVE();
 }
 
 void llama_context::set_dummy_batch(bool value) {
@@ -1440,7 +1449,16 @@ void llama_context::set_dummy_batch(bool value) {
 }
 
 void llama_context::set_prebuild_decode(bool value) {
-    prebuild_decode = value;
+    prebuild_decode         = value;
+    prebuild_decode_pending = value;
+}
+
+void llama_context::arm_prebuild_verify(uint32_t n_tokens) {
+    prebuild_verify_n = n_tokens;
+}
+
+void llama_context::set_process_meta_only(bool value) {
+    process_meta_only = value;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -1457,7 +1475,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            SCHED_NEED_RESERVE();
         }
         sampling.samplers.erase(seq_id);
         return false;
@@ -1476,7 +1494,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        SCHED_NEED_RESERVE();
 
         return true;
     }
@@ -1485,7 +1503,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            SCHED_NEED_RESERVE();
         }
 
         sampling.samplers.erase(seq_id);
@@ -1495,7 +1513,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    SCHED_NEED_RESERVE();
 
     return true;
 }
@@ -1515,7 +1533,7 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
         }
     }
 
-    sched_need_reserve = true;
+    SCHED_NEED_RESERVE();
 }
 
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -1554,7 +1572,7 @@ bool llama_context::set_adapter_cvec(
 
     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
 
-    sched_need_reserve = true;
+    SCHED_NEED_RESERVE();
 
     return res;
 }
@@ -1714,7 +1732,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
-bool llama_context::graph_prebuild_decode(const llama_memory_context_i * mctx) {
+bool llama_context::graph_prebuild_decode(const llama_memory_context_i * mctx, uint32_t n_tokens) {
     // llama.cpp measures a prompt's call and then each generated token's call separately. The decode graph's topology
     // does not depend on the prompt, so build and allocate it at the end of the prompt's call (where a few ms are
     // spare) and let the backend prewarm its per-graph host state there: the first decode then reuses it.
@@ -1728,17 +1746,20 @@ bool llama_context::graph_prebuild_decode(const llama_memory_context_i * mctx) {
     };
     // With speculative decoding, every target batch is followed by another verify/draft round, so the single-token
     // decode graph would never be used. The caller disables the prebuild while speculative decoding owns the context.
-    if (!enabled || !prebuild_decode || !mctx || cparams.warmup || cparams.embeddings) {
-        return no(!enabled ? "disabled" : !prebuild_decode ? "disabled by caller" : !mctx ? "no memory context" :
+    if (!enabled || (!prebuild_decode && n_tokens == 1) || !mctx || cparams.warmup || cparams.embeddings) {
+        return no(!enabled ? "disabled" : (!prebuild_decode && n_tokens == 1) ? "disabled by caller" : !mctx ? "no memory context" :
                   cparams.warmup ? "warmup" : "embeddings");
     }
 
     llama_batch_ext nb(this);
-    const int32_t  idx = nb.add_token(0);
     // the dummy batch must continue the sequence: the batch allocator rejects a position the memory does not expect
     llama_pos      pos = memory ? memory->seq_pos_max(0) + 1 : 0;
-    if (idx < 0 || !nb.set_token_id(idx, 0) || !nb.set_token_pos(idx, &pos) || !nb.set_output(idx, true)) {
-        return no("dummy batch");
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const int32_t idx = nb.add_token(0);
+        const llama_pos p = pos + (llama_pos) i;
+        if (idx < 0 || !nb.set_token_id(idx, 0) || !nb.set_token_pos(idx, &p) || !nb.set_output(idx, true)) {
+            return no("dummy batch");
+        }
     }
 
     llama_batch_allocr balloc_next(model.hparams.n_pos_per_embd());
@@ -1750,8 +1771,13 @@ bool llama_context::graph_prebuild_decode(const llama_memory_context_i * mctx) {
         return no("next memory context");
     }
     const llama_ubatch & ub = mctx_next->get_ubatch();
-    if (ub.n_tokens != 1 || !ub.output || !ub.output[0]) {
+    if (ub.n_tokens != n_tokens || !ub.output) {
         return no("split");
+    }
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        if (!ub.output[i]) {
+            return no("split output");
+        }
     }
 
     // Applying the dummy decode makes its KV cache length and recurrent cell placement available to the graph
@@ -1776,7 +1802,7 @@ bool llama_context::graph_prebuild_decode(const llama_memory_context_i * mctx) {
     }
 
     const int32_t save_n_outputs = n_outputs;
-    n_outputs = 1;  // the slot (and the graph's output row count) of the decode they will run next
+    n_outputs = n_tokens;  // the graph's output row count of the batch they will run next
 
     auto * res = get_gf_res_prev();
     bool   ok  = false;
@@ -1816,9 +1842,9 @@ bool llama_context::graph_prebuild_decode(const llama_memory_context_i * mctx) {
     // The recurrent rollback can reject a partial range, which would also stop the hybrid wrapper from clearing the
     // KV cell. The recurrent metadata is restored wholesale below, so only the attention cache needs the removal.
     if (mem_hybrid) {
-        mem_hybrid->get_mem_attn()->seq_rm(0, pos, pos + 1);
+        mem_hybrid->get_mem_attn()->seq_rm(0, pos, pos + n_tokens);
     } else {
-        memory->seq_rm(0, pos, pos + 1);
+        memory->seq_rm(0, pos, pos + n_tokens);
     }
     if (mem_recr) {
         mem_recr->cells  = std::move(recr_cells);
@@ -2168,6 +2194,37 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    if (process_meta_only) {
+        // The draft chain wrote the KV rows itself.  This path only applies the batch's cache metadata; the generic
+        // decode's output reservation, scheduler reserve and graph-input setup are not involved.
+        if (t_compute_start_us == 0) {
+            t_compute_start_us = ggml_time_us();
+        }
+        n_queued_tokens += n_tokens_all;
+        bool optimized = false;
+        while (true) {
+            llama_memory_context_ptr mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+            if (!mctx) {
+                return -2;
+            }
+            if (mctx->get_status() == LLAMA_MEMORY_STATUS_SUCCESS) {
+                if (!mctx->apply()) {
+                    LLAMA_LOG_ERROR("%s: failed to apply metadata-only memory context\n", __func__);
+                    return -2;
+                }
+                return 0;
+            }
+            if (mctx->get_status() == LLAMA_MEMORY_STATUS_FAILED_PREPARE && !optimized) {
+                optimized = true;
+                if (memory_update(true)) {
+                    continue;
+                }
+            }
+            LLAMA_LOG_ERROR("%s: metadata-only memory context status %d\n", __func__, mctx->get_status());
+            return -2;
+        }
+    }
+
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
     if (!embd_seq.empty()) {
@@ -2237,6 +2294,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         break;
     }
     const int64_t dp_t4 = dprof && dp_t0 ? ggml_time_us() : 0;
+
+    if (process_meta_only) {
+        // The draft chain wrote these KV rows itself.  Apply the batch's cache metadata, but do not build or run
+        // the MTP graph.
+        if (!mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+            return -2;
+        }
+        return 0;
+    }
 
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
@@ -2339,7 +2406,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_res));
                 auto fn = (bool (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_visible_output");
-                if (fn && fn() && n_outputs_prev == 0 && ubatch.n_tokens == n_outputs && t_logits->type == GGML_TYPE_F32 &&
+                // Alias the graph's output row(s) only when this ubatch is the whole logical batch. With -ub smaller
+                // than -b the first ubatch aliased its own (small) tensor and the following ubatches copied at
+                // n_outputs_prev*n_vocab past it: a heap overwrite (llama-perplexity -ub 4 segfaulted).
+                if (fn && fn() && n_outputs_prev == 0 && n_outputs_all == n_outputs && ubatch.n_tokens == n_outputs &&
+                    t_logits->type == GGML_TYPE_F32 &&
                     ggml_is_contiguous(t_logits) && t_logits->nb[1] == n_vocab*sizeof(float) &&
                     t_logits->ne[1] == n_outputs) {
                     logits.data = (float *) t_logits->data;
@@ -2505,7 +2576,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // a prompt's graph is done (its logits are in the host buffer above): hand the next decode graph over now
     if (n_ubatch_last > 1) {
-        graph_prebuild_decode(mctx.get());
+        if (prebuild_verify_n > 1) {
+            graph_prebuild_decode(mctx.get(), prebuild_verify_n);
+            prebuild_verify_n = 0;
+            prebuild_decode_pending = false;
+        } else if (prebuild_decode && prebuild_decode_pending) {
+            graph_prebuild_decode(mctx.get());
+            prebuild_decode_pending = false;
+        }
     }
 
     // wait for the computation to finish (automatically done when obtaining the model output)
@@ -4234,7 +4312,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     }
 
     // the training graph is different, need to reserve again
-    sched_need_reserve = true;
+    SCHED_NEED_RESERVE();
     sched_reserve();
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
@@ -4684,6 +4762,10 @@ void llama_set_prebuild_decode(llama_context * ctx, bool enabled) {
     ctx->set_prebuild_decode(enabled);
 }
 
+void llama_arm_prebuild_verify(llama_context * ctx, uint32_t n_tokens) {
+    ctx->arm_prebuild_verify(n_tokens);
+}
+
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
 }
@@ -4734,6 +4816,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_process_meta_only(llama_context * ctx, bool value) {
+    ctx->set_process_meta_only(value);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

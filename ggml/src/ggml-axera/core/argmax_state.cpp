@@ -32,13 +32,63 @@ state & s() {
     return v;
 }
 
+static thread_local bool t_draft = false;
+static thread_local int  t_chain = 0;
+static std::mutex        g_chain_mu;
+static bool              g_chain_available = false;
+static std::vector<int32_t> g_chain_ids;
+static std::vector<float>   g_chain_logits;
+
 }  // namespace
+
+void argmax_draft_scope(bool on) {
+    t_draft = on;
+}
+
+void argmax_chain_set_available(bool on) {
+    std::lock_guard<std::mutex> lk(g_chain_mu);
+    g_chain_available = on;
+}
+
+bool argmax_chain_available() {
+    std::lock_guard<std::mutex> lk(g_chain_mu);
+    return g_chain_available;
+}
+
+int argmax_chain_n() {
+    return t_chain;
+}
+
+void argmax_chain_set_n(int n) {
+    t_chain = n;
+}
+
+void argmax_chain_publish(const int32_t * ids, const float * logits, int n) {
+    std::lock_guard<std::mutex> lk(g_chain_mu);
+    g_chain_ids.assign(ids, ids + n);
+    g_chain_logits.assign(logits, logits + n);
+}
+
+int argmax_chain_take(int32_t * ids, float * logits, int max_n) {
+    std::lock_guard<std::mutex> lk(g_chain_mu);
+    const int n = std::min<int>(max_n, (int) g_chain_ids.size());
+    for (int i = 0; i < n; ++i) {
+        ids[i]    = g_chain_ids[(size_t) i];
+        logits[i] = g_chain_logits[(size_t) i];
+    }
+    g_chain_ids.clear();
+    g_chain_logits.clear();
+    return n;
+}
 
 int argmax_configure(bool enabled, const int32_t * ids, int32_t n) {
     state & v = s();
     std::lock_guard<std::mutex> lk(v.mu);
     v.enabled = false;
-    v.R = 0;
+    // a head may publish whether or not the sampler that owns this configuration asks for fused rows: the MTP draft
+    // head is always greedy while the request's target sampler may not be, and both share this process-wide state.
+    // A take still happens only from a sampler that configured npu_argmax (rows > 0 below).
+    v.R = 4;
     v.pubs.clear();
     v.suppress.clear();
     if (ids && n > 0) {
@@ -52,17 +102,18 @@ int argmax_configure(bool enabled, const int32_t * ids, int32_t n) {
     // A sampler is configured before the adapter loads the manifest. Request the fast path now; the combined head
     // publishes rows once it runs, and a manifest without one simply never publishes (the caller then falls back to
     // the full logits). Four is the largest head the model code binds, including MTP verify.
-    const int r = 4;
     v.enabled = true;
-    v.R = r;
-    return r;
+    return v.R;
 }
 
 void argmax_reset() {
     state & v = s();
     std::lock_guard<std::mutex> lk(v.mu);
     v.enabled = false;
-    v.R = 0;
+    // a head may publish whether or not the sampler that owns this configuration asks for fused rows: the MTP draft
+    // head is always greedy while the request's target sampler may not be, and both share this process-wide state.
+    // A take still happens only from a sampler that configured npu_argmax (rows > 0 below).
+    v.R = 4;
     v.pubs.clear();
     v.suppress.clear();
 }
@@ -76,7 +127,7 @@ bool argmax_wanted() {
 bool argmax_publish(const int32_t * ids, const float * logits, int32_t rows, const void * rows_base, size_t row_stride) {
     state & v = s();
     std::lock_guard<std::mutex> lk(v.mu);
-    if (!v.enabled || !ids || !logits || !rows_base || rows <= 0 || rows > v.R || row_stride < sizeof(float)) {
+    if (!ids || !logits || !rows_base || rows <= 0 || rows > v.R || row_stride < sizeof(float)) {
         return false;
     }
     auto same_rows = [&](const state::publication & p) {
@@ -124,10 +175,9 @@ int argmax_published() {
 }
 
 int argmax_take(int idx, const void * row_logits, int32_t * id, float * logit) {
-    (void) idx;
     state & v = s();
     std::lock_guard<std::mutex> lk(v.mu);
-    if (!v.enabled || !row_logits || !id || !logit) {
+    if (!row_logits || !id || !logit) {
         return 0;
     }
     // The buffer is the graph's identity. In particular the MTP draft/catch-up graph runs after a target verify and
@@ -135,7 +185,13 @@ int argmax_take(int idx, const void * row_logits, int32_t * id, float * logit) {
     const float * row_values = (const float *) row_logits;
     for (auto it = v.pubs.rbegin(); it != v.pubs.rend(); ++it) {
         for (int32_t row = 0; row < it->n; ++row) {
-            if ((const char *) row_logits != it->base + (size_t) row * it->stride || it->used[(size_t) row]) {
+            if (it->used[(size_t) row]) {
+                continue;
+            }
+            // a backend without a zero-copy host alias hands the sampler a copy of the graph row.  The row index the
+            // caller passes is the graph row; the copied value at the published id still matches bit-exactly.
+            const bool direct = (const char *) row_logits == it->base + (size_t) row * it->stride;
+            if (!direct && idx != row) {
                 continue;
             }
             // The same host buffer can be reused by a later graph while an older publication still names it.  Only
@@ -149,6 +205,18 @@ int argmax_take(int idx, const void * row_logits, int32_t * id, float * logit) {
             it->used[(size_t) row] = 1;
             *id                   = it->ids[(size_t) row];
             *logit                = it->logits[(size_t) row];
+            return 1;
+        }
+    }
+    // The MTP draft context's logits reach the sampler through a device-to-host copy of a row the argmax head does not
+    // write, so neither the pointer nor the value of that copy identifies the publication.  Its graph publishes one row
+    // and the sampler consumes it immediately, before any other graph runs: the newest publication is that row.
+    if (t_draft && !v.pubs.empty()) {
+        auto & p = v.pubs.back();
+        if (p.n == 1 && idx == 0 && !p.used[0]) {
+            p.used[0] = 1;
+            *id       = p.ids[0];
+            *logit    = p.logits[0];
             return 1;
         }
     }

@@ -1387,13 +1387,19 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     // A multi-row verification head is not bit-identical to the one-row decode head, so a near-tied argmax can
-    // differ.  Speculative verification therefore takes the full-logit argmax; plain decode keeps the fused row.
+    // differ.  The default takes the fused row left by the same kernel: it is the argmax the draft is matched
+    // against, and scanning four 248K rows on the A55 costs ~4 ms a round.  LLAMA_SPEC_ARGMAX=0 restores the
+    // full-logit argmax for an exact A/B.
+    static const bool spec_argmax = [] {
+        const char * e = getenv("LLAMA_SPEC_ARGMAX");
+        return e == nullptr || atoi(e) != 0;
+    }();
     struct argmax_off {
         bool & value;
         bool   saved;
-        explicit argmax_off(bool & v) : value(v), saved(v) { value = false; }
+        argmax_off(bool & v, bool off) : value(v), saved(v) { value = off ? false : value; }
         ~argmax_off() { value = saved; }
-    } argmax_off_guard(gsmpl->npu_argmax);
+    } argmax_off_guard(gsmpl->npu_argmax, !spec_argmax);
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
@@ -1443,7 +1449,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
     gsmpl->npu_exact_set = true;
 
-    // see common_sampler_sample_and_accept_n: use the full target rows for speculative verification
+    // rejection needs exact probabilities from the full target rows, so it always keeps the full-logit path
     struct argmax_off {
         bool & value;
         bool   saved;

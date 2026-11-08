@@ -126,6 +126,8 @@ struct llama_context {
     void set_warmup(bool value);
     void set_dummy_batch(bool value);
     void set_prebuild_decode(bool value);
+    void arm_prebuild_verify(uint32_t n_tokens);
+    void set_process_meta_only(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -265,7 +267,7 @@ public:
 
     // build and allocate the next single-token decode graph and let the backend prewarm it, after a prompt ubatch's
     // graph was computed and before its generated token: the graph's topology is fixed, so the first decode reuses it
-    bool graph_prebuild_decode(const llama_memory_context_i * mctx);
+    bool graph_prebuild_decode(const llama_memory_context_i * mctx, uint32_t n_tokens = 1);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -444,6 +446,9 @@ private:
     // prebuild the next single-token decode graph after a multi-token batch (set off while speculative decoding owns
     // the target context: its next batch is another verification, not a decode)
     bool prebuild_decode = true;
+    bool prebuild_decode_pending = true;
+    uint32_t prebuild_verify_n = 0;
+    bool process_meta_only = false;
 
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;

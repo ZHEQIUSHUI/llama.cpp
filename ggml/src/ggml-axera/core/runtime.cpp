@@ -237,6 +237,14 @@ void axera_flush_file_pages() {
     if (ranges.empty()) {
         return;
     }
+    static const bool flush_dbg = getenv("GGML_AXERA_FLUSH_DEBUG") != nullptr;
+    size_t flush_bytes = 0;
+    for (const auto & r : ranges) {
+        flush_bytes += (size_t) (r.end - r.off);
+    }
+    if (flush_dbg) {
+        fprintf(stderr, "file pages flush: %zu ranges, %.3f MB\n", ranges.size(), (double) flush_bytes / 1e6);
+    }
     std::sort(ranges.begin(), ranges.end(), [](const axera_file_range & a, const axera_file_range & b) {
         return a.fd != b.fd ? a.fd < b.fd : a.off < b.off;
     });
