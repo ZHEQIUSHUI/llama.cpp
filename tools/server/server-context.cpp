@@ -2454,15 +2454,29 @@ private:
                                          atoi(getenv("LLAMA_SPEC_ADAPTIVE")) != 0;
             static const bool window_mode = getenv("LLAMA_SPEC_GATE_WINDOW") == nullptr ||
                                             atoi(getenv("LLAMA_SPEC_GATE_WINDOW")) != 0;
+            bool cold_dormant = false;
             if (adaptive && window_mode && slot.spec_mtp) {
                 slot.spec_structured = !slot.use_spec_rejection() &&
                                        slot.prompt_is_structured(slot.task->tokens.get_tokens());
+                static const bool cold_start = getenv("LLAMA_SPEC_COLD_START") == nullptr ||
+                                               atoi(getenv("LLAMA_SPEC_COLD_START")) != 0;
+                if (cold_start && !slot.spec_structured) {
+                    slot.spec_gate_init   = true;
+                    slot.spec_gate_on     = false;
+                    slot.spec_gate_locked = true;
+                    slot.spec_nextn_on    = false;
+                    llama_set_embeddings_nextn(ctx_tgt, false, false);
+                    cold_dormant = true;
+                    SLT_INF(slot, "%s", "adaptive MTP off (non-structured prompt starts dormant)\n");
+                }
             }
-            // Every greedy MTP request starts with a short verified window.  Structured prompts use the patient
-            // threshold below; unknown prose closes after three rounds (nine drafts) below 0.60 acceptance.  This is
-            // deliberately independent of a keyword hit: a missed structured prompt still opens from its own
-            // acceptance, while prose pays only the short trial.
-            llama_arm_prebuild_verify(ctx_tgt, std::min<uint32_t>(8, params_base.speculative.draft.n_max + 1));
+            // Structured prompts start with a short verified window and keep drafting while it pays.  A verified
+            // window on prose commits four-row target KV entries and rolls them back; even after the gate closes that
+            // leaves decode ~5% slower on this board.  Non-structured prompts therefore start dormant and use the
+            // plain single-row path.  LLAMA_SPEC_COLD_START=0 restores the verified trial for experiments.
+            if (!cold_dormant) {
+                llama_arm_prebuild_verify(ctx_tgt, std::min<uint32_t>(8, params_base.speculative.draft.n_max + 1));
+            }
         }
 
         // reset server kill-switch counter
