@@ -2456,8 +2456,7 @@ private:
                                             atoi(getenv("LLAMA_SPEC_GATE_WINDOW")) != 0;
             bool cold_dormant = false;
             if (adaptive && window_mode && slot.spec_mtp) {
-                slot.spec_structured = !slot.use_spec_rejection() &&
-                                       slot.prompt_is_structured(slot.task->tokens.get_tokens());
+                slot.spec_structured = slot.prompt_is_structured(slot.task->tokens.get_tokens());
                 static const bool cold_start = getenv("LLAMA_SPEC_COLD_START") == nullptr ||
                                                atoi(getenv("LLAMA_SPEC_COLD_START")) != 0;
                 if (cold_start && !slot.spec_structured) {
