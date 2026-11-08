@@ -103,6 +103,13 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Build a multi-row verification graph at the end of a prompt. The arm is consumed once.
+LLAMA_API void llama_arm_prebuild_verify(struct llama_context * ctx, uint32_t n_tokens);
+
+// Apply a batch's KV-cache metadata without building or running its graph.  The speculative draft chain uses this
+// after it has already written the rows itself.
+LLAMA_API void llama_set_process_meta_only(struct llama_context * ctx, bool value);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

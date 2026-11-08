@@ -12,6 +12,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../src/llama-ext.h" // llama_set_embeddings_nextn (target h_nextn while drafting)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -375,24 +376,39 @@ struct server_slot {
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
-    // adaptive MTP: MTP is slower than plain decoding on this hardware at every measured acceptance rate, because
-    // the four-row verify and the per-round side work (draft chain, catch-up, four-row head) cost more than the
-    // extra tokens yield.  The gate therefore starts off: a dormant round skips drafting and the draft catch-up, so
-    // the request runs at plain speed.  LLAMA_SPEC_ADAPTIVE=0 forces drafting for benchmarking, and
-    // LLAMA_SPEC_ADAPTIVE_PROBE=1 enables a periodic one-token probe that can turn drafting back on when the
-    // acceptance window says it pays (see get_n_draft_max).
-    // recent per-round acceptance ratios; a window (not an exponential average) keeps one lucky probe from turning
-    // drafting back on for a whole prose request, and its few samples keep code's first round from disabling it
-    static constexpr int spec_accept_cap = 8;
-    float spec_accept_win[spec_accept_cap] = {};
-    int   spec_accept_n   = 0;
-    int   spec_accept_pos = 0;
-    int   spec_probe_n    = 0;  // consecutive 1-token probes that were accepted
-    int   spec_probe_tot  = 0;
-    int   spec_gate_probe = 0;
-    bool  spec_gate_on    = false;  // MTP is slower than plain below a high acceptance, so it starts off
-    bool  spec_probe_round = false; // this decode step is a dormant 1-token probe (catch-up must run)
-    bool  spec_mtp        = false;
+    // adaptive MTP: drafting starts off.  While off, the target rows are queued for the draft context (observe mode)
+    // and a probe at a few fixed token counts runs one batched catch-up plus the static draft chain.  The three ids
+    // the chain predicts there are compared with the three tokens the target generates plainly next, which measures
+    // exactly what verification would accept without building the four-row verify graph.  Prose never pays for that
+    // graph; predictable text opens MTP after one or two probes.
+    static constexpr int spec_probe_tokens = 4;
+    llama_token spec_probe_ids[spec_probe_tokens] = {};
+    int   spec_probe_left   = 0;    // predictions of the current probe still to compare
+    int   spec_probe_ck     = 0;    // predictions compared so far in this request
+    int   spec_probe_hits   = 0;    // predictions that matched
+    int   spec_probe_windows = 0;   // completed probes
+    int   spec_probe_win_hits = 0;  // cumulative hits when the last window ended
+    int   spec_probe_win_ck   = 0;  // cumulative comparisons when the last window ended
+    bool  spec_probe_arm    = false; // the next observed token is the probe's anchor, not a prediction
+    bool  spec_probe_round  = false; // this round runs a probe instead of a verified draft
+    int   spec_next_probe   = 0;    // probe once this many tokens have been generated
+    int   spec_probe_n      = 3;    // ids per probe
+    int64_t spec_round_t0   = 0;    // start of this round, for the diagnostic line
+    bool  spec_gate_init    = false;
+    bool  spec_gate_on      = false;
+    bool  spec_gate_locked  = false;
+    bool  spec_trial        = false; // a short verified trial decides whether MTP pays here
+    int   spec_trial_rounds = 0;
+    int   spec_trial_tokens = 0;
+    int   spec_trial_accept = 0;
+    int   spec_trial_draft  = 0;
+    int   spec_trial_retry  = 0;
+    int64_t spec_trial_us   = 0;
+    int64_t spec_plain_t0   = 0;
+    int64_t spec_plain_gen0 = 0;
+    float spec_plain_tps    = 0.0f;
+    bool  spec_nextn_on     = true;  // ctx_tgt currently computes h_nextn
+    bool  spec_mtp          = false;
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
@@ -429,16 +445,38 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
-        for (int i = 0; i < spec_accept_cap; ++i) {
-            spec_accept_win[i] = 0.0f;
+        for (int i = 0; i < spec_probe_tokens; ++i) {
+            spec_probe_ids[i] = LLAMA_TOKEN_NULL;
         }
-        spec_accept_n    = 0;
-        spec_accept_pos  = 0;
-        spec_probe_n     = 0;
-        spec_probe_tot   = 0;
-        spec_gate_probe  = 0;
-        spec_gate_on     = false;
-        spec_probe_round = false;
+        spec_round_t0     = 0;
+        spec_probe_left   = 0;
+        spec_probe_ck     = 0;
+        spec_probe_hits   = 0;
+        spec_probe_windows = 0;
+        spec_probe_win_hits = 0;
+        spec_probe_win_ck   = 0;
+        spec_probe_arm    = false;
+        spec_probe_round  = false;
+        spec_next_probe   = 0;
+        spec_gate_init    = false;
+        spec_gate_on      = false;
+        spec_gate_locked  = false;
+        spec_trial        = false;
+        spec_trial_rounds = 0;
+        spec_trial_tokens = 0;
+        spec_trial_accept = 0;
+        spec_trial_draft  = 0;
+        spec_trial_retry  = 0;
+        spec_trial_us     = 0;
+        spec_plain_t0     = 0;
+        spec_plain_gen0   = 0;
+        spec_plain_tps    = 0.0f;
+        spec_nextn_on     = true;
+        // the next request's prompt primes the draft KV, which needs the target's h_nextn rows; a dormant
+        // request turned them off to run the target at plain speed
+        if (spec_mtp && ctx_tgt) {
+            llama_set_embeddings_nextn(ctx_tgt, true, false);
+        }
 
         n_predict_max = -1;
 
@@ -560,25 +598,80 @@ struct server_slot {
         if (!can_speculate()) {
             return 0;
         }
+        spec_round_t0 = ggml_time_us();
 
         static const bool adaptive = getenv("LLAMA_SPEC_ADAPTIVE") == nullptr ||
                                      atoi(getenv("LLAMA_SPEC_ADAPTIVE")) != 0;
-        // MTP is currently slower than plain decoding on this hardware, so the gate starts (and by default stays)
-        // off.  Probing is opt-in: a dormant round skips the draft catch-up, which leaves the draft KV with a gap,
-        // so a probe can only be meaningful when a catch-up is run for it (handled below) and even then the gap
-        // makes it a rough estimate.  LLAMA_SPEC_ADAPTIVE_PROBE=1 enables it.
-        static const bool probe_enabled = getenv("LLAMA_SPEC_ADAPTIVE_PROBE") != nullptr &&
-                                          atoi(getenv("LLAMA_SPEC_ADAPTIVE_PROBE")) != 0;
-        bool probing = false;
-        spec_probe_round = false;
-        if (adaptive && spec_mtp && !spec_gate_on) {
-            llama_set_prebuild_decode(ctx_tgt, true);
-            if (!probe_enabled || ++spec_gate_probe < 64) {
-                return 0;
+        // probe schedule: the first at 8 generated tokens, then every 20.  A probe is 3 chain steps, each compared
+        // with the token the target generates plainly next; two windows already match the verified acceptance of the
+        // scenes we measured, and a third covers the slower starters.
+        static const int probe_at       = std::max(4, getenv("LLAMA_SPEC_PROBE_AT") ? atoi(getenv("LLAMA_SPEC_PROBE_AT")) : 8);
+        static const int probe_gap      = std::max(4, getenv("LLAMA_SPEC_PROBE") ? atoi(getenv("LLAMA_SPEC_PROBE")) : 20);
+        static const int probe_windows  = std::max(1, getenv("LLAMA_SPEC_PROBE_WINDOWS") ? atoi(getenv("LLAMA_SPEC_PROBE_WINDOWS")) : 3);
+        static const float probe_accept = getenv("LLAMA_SPEC_OPEN_ACC") ? (float) atof(getenv("LLAMA_SPEC_OPEN_ACC")) : 0.55f;
+        static const bool trial_mode = getenv("LLAMA_SPEC_TRIAL") == nullptr ||
+                                       atoi(getenv("LLAMA_SPEC_TRIAL")) != 0;
+        static const int trial_at = std::max(4, getenv("LLAMA_SPEC_TRIAL_AT") ? atoi(getenv("LLAMA_SPEC_TRIAL_AT")) : 12);
+        static const int trial_rounds = std::max(2, getenv("LLAMA_SPEC_TRIAL_ROUNDS") ? atoi(getenv("LLAMA_SPEC_TRIAL_ROUNDS")) : 4);
+        static const float trial_ratio = getenv("LLAMA_SPEC_TRIAL_RATIO") ? (float) atof(getenv("LLAMA_SPEC_TRIAL_RATIO")) : 1.00f;
+        // h_nextn is nearly free on this target (the decode graph does not change size), and the probe reads it to
+        // reconstruct the MTP input rows, so dormant rounds keep it on unless explicitly disabled.
+        static const bool toggle_nextn = getenv("LLAMA_SPEC_TARGET_NEXTN") == nullptr ||
+                                         atoi(getenv("LLAMA_SPEC_TARGET_NEXTN")) != 0;
+        auto target_nextn = [&](bool on) {
+            on = on || !toggle_nextn;
+            if (spec_nextn_on != on) {
+                llama_set_embeddings_nextn(ctx_tgt, on, false);
+                spec_nextn_on = on;
             }
-            spec_gate_probe = 0;
-            probing         = true;
-            spec_probe_round = true;
+        };
+        if (adaptive && spec_mtp) {
+            if (!spec_gate_init) {
+                spec_gate_init   = true;
+                spec_gate_on     = false;
+                spec_gate_locked = false;
+                spec_next_probe  = trial_mode ? trial_at : probe_at;
+            }
+            target_nextn(true);
+            if (trial_mode) {
+                if (spec_plain_t0 == 0 && stats.n_gen >= 1) {
+                    spec_plain_t0   = ggml_time_us();
+                    spec_plain_gen0 = (int64_t) stats.n_gen;
+                }
+                if (!spec_gate_on) {
+                    llama_set_prebuild_decode(ctx_tgt, true);
+                    if (!spec_gate_locked && (int) stats.n_gen >= spec_next_probe &&
+                        n_remaining() > trial_rounds * 7) {
+                        const int64_t now = ggml_time_us();
+                        const int64_t dg  = (int64_t) stats.n_gen - spec_plain_gen0;
+                        const int64_t dt  = now - spec_plain_t0;
+                        spec_plain_tps    = dg > 0 && dt > 0 ? (float)(dg * 1e6 / dt) : 78.0f;
+                        spec_trial        = true;
+                        spec_trial_rounds = 0;
+                        spec_trial_tokens = 0;
+                        spec_trial_accept = 0;
+                        spec_trial_draft  = 0;
+                        spec_trial_us     = 0;
+                        spec_gate_on      = true;
+                        SLT_INF(*this, "adaptive MTP trial (%d rounds, plain %.1f tok/s)\n",
+                                trial_rounds, (double) spec_plain_tps);
+                    } else {
+                        return 0;
+                    }
+                } else {
+                    llama_set_prebuild_decode(ctx_tgt, false);
+                }
+            } else if (!spec_gate_on) {
+                llama_set_prebuild_decode(ctx_tgt, true);
+                if (!spec_gate_locked && spec_probe_left == 0 && (int) stats.n_gen >= spec_next_probe &&
+                    n_remaining() > spec_probe_n + 1) {
+                    spec_probe_round = true;
+                } else {
+                    return 0;
+                }
+            } else {
+                llama_set_prebuild_decode(ctx_tgt, false);
+            }
         }
 
         // determine the max draft that fits the current slot state
@@ -590,11 +683,8 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
-        if (probing) {
-            n_draft_max = std::min(n_draft_max, 1);
-        }
-        if (adaptive && spec_mtp && spec_gate_on) {
-            llama_set_prebuild_decode(ctx_tgt, false);
+        if (adaptive && spec_mtp && spec_probe_round) {
+            n_draft_max = std::min(n_draft_max, spec_probe_n);
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -602,10 +692,108 @@ struct server_slot {
         return n_draft_max;
     }
 
+    void note_trial_round(int n_accepted, int n_draft) {
+        if (!spec_trial) {
+            return;
+        }
+        static const int trial_rounds = std::max(2, getenv("LLAMA_SPEC_TRIAL_ROUNDS") ? atoi(getenv("LLAMA_SPEC_TRIAL_ROUNDS")) : 4);
+        static const float trial_ratio = getenv("LLAMA_SPEC_TRIAL_RATIO") ? (float) atof(getenv("LLAMA_SPEC_TRIAL_RATIO")) : 1.00f;
+        const int64_t now = ggml_time_us();
+        const int round = spec_trial_rounds++;
+        spec_trial_accept += n_accepted;
+        spec_trial_draft  += n_draft;
+        // round zero also binds the draft head and chain buffers; compare steady-state rounds only
+        if (round > 0) {
+            spec_trial_us     += now - spec_round_t0;
+            spec_trial_tokens += n_accepted + 1;
+        }
+        if (spec_trial_rounds < trial_rounds || spec_trial_us <= 0 || spec_trial_tokens <= 0) {
+            return;
+        }
+
+        const float tps  = (float)(spec_trial_tokens * 1e6 / spec_trial_us);
+        const float acc  = spec_trial_draft > 0 ? (float) spec_trial_accept / (float) spec_trial_draft : 0.0f;
+        const bool  open = tps >= spec_plain_tps * trial_ratio;
+        spec_trial = false;
+        if (open) {
+            spec_gate_on     = true;
+            spec_gate_locked = false;
+            SLT_INF(*this, "adaptive MTP on (trial %.1f vs plain %.1f tok/s, acceptance %.3f)\n",
+                    (double) tps, (double) spec_plain_tps, (double) acc);
+            return;
+        }
+        // one retry when the acceptance was good but the first steady-state rounds were noisy
+        if (spec_trial_retry == 0 && acc >= 0.60f && n_remaining() > 24) {
+            spec_trial_retry = 1;
+            spec_gate_on     = false;
+            spec_gate_locked = false;
+            spec_next_probe  = (int) stats.n_gen + 24;
+            SLT_INF(*this, "adaptive MTP trial retry (%.1f vs plain %.1f tok/s, acceptance %.3f)\n",
+                    (double) tps, (double) spec_plain_tps, (double) acc);
+            return;
+        }
+        spec_gate_on     = false;
+        spec_gate_locked = true;
+        SLT_INF(*this, "adaptive MTP off (trial %.1f vs plain %.1f tok/s, acceptance %.3f)\n",
+                (double) tps, (double) spec_plain_tps, (double) acc);
+    }
+
+    // decide whether the probe window proved that drafting pays for this request
+    void finish_probe() {
+        static const float open_acc = getenv("LLAMA_SPEC_OPEN_ACC") ? (float) atof(getenv("LLAMA_SPEC_OPEN_ACC")) : 0.55f;
+        static const int   windows_max = std::max(1, getenv("LLAMA_SPEC_PROBE_WINDOWS") ? atoi(getenv("LLAMA_SPEC_PROBE_WINDOWS")) : 3);
+        static const int   probe_gap = std::max(4, getenv("LLAMA_SPEC_PROBE") ? atoi(getenv("LLAMA_SPEC_PROBE")) : 20);
+
+        const int win_hits = spec_probe_hits - spec_probe_win_hits;
+        const int win_ck   = spec_probe_ck - spec_probe_win_ck;
+        spec_probe_win_hits = spec_probe_hits;
+        spec_probe_win_ck   = spec_probe_ck;
+        spec_probe_windows++;
+        // 2/3 is too noisy: the first window always just schedules the second one, and opening needs >= 0.55 of the
+        // 6 then 9 samples
+        const bool enough = spec_probe_ck >= 6;
+        const int  need   = (int) std::ceil(open_acc * spec_probe_ck - 1e-6f);
+        if (getenv("LLAMA_SPEC_GATE_DEBUG")) {
+            SLT_INF(*this, "probe: window %d/%d, total %d/%d hits, %d windows (open needs %d at %.2f)\n",
+                    win_hits, win_ck, spec_probe_hits, spec_probe_ck, spec_probe_windows, need, (double) open_acc);
+        }
+        if (enough && spec_probe_hits >= need) {
+            spec_gate_on     = true;
+            spec_gate_locked = false;
+            SLT_INF(*this, "adaptive MTP on (probe %d/%d hits >= %.2f)\n", spec_probe_hits, spec_probe_ck,
+                    (double) open_acc);
+            return;
+        }
+        if (spec_probe_windows < windows_max && n_remaining() > spec_probe_n + 1) {
+            spec_next_probe = (int) stats.n_gen + probe_gap;
+            return;
+        }
+        spec_gate_locked = true;
+        SLT_INF(*this, "adaptive MTP off (probe %d/%d hits < %.2f)\n", spec_probe_hits, spec_probe_ck,
+                (double) open_acc);
+    }
+
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
         if (spec_draft.empty()) {
+            // adaptive probe: the chain predicted the next few tokens; compare them with what the target produces
+            if (spec_probe_arm) {
+                spec_probe_arm = false;
+            } else if (spec_probe_left > 0) {
+                const int i = spec_probe_n - spec_probe_left;
+                if (getenv("LLAMA_SPEC_GATE_DEBUG")) {
+                    SLT_INF(*this, "probe cmp %d: pred %d actual %d%s\n", i, spec_probe_ids[i], sampled,
+                            spec_probe_ids[i] == sampled ? " hit" : "");
+                }
+                if (sampled == spec_probe_ids[i]) {
+                    spec_probe_hits++;
+                }
+                spec_probe_ck++;
+                if (--spec_probe_left == 0) {
+                    finish_probe();
+                }
+            }
             // no speculative decoding
             i_batch = batch.size();
 
@@ -2072,6 +2260,10 @@ private:
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+
+        if (spec && ctx_dft && params_base.speculative.draft.n_max > 0) {
+            llama_arm_prebuild_verify(ctx_tgt, std::min<uint32_t>(8, params_base.speculative.draft.n_max + 1));
+        }
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -3618,10 +3810,38 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            // bring the draft KV and pending hidden up to the draft position in one batched call (no-op when the
+            // queue is empty), then let the chain draft from there
+            queue_tasks.yield_to_queue([&]() {
+                common_speculative_set_observe(spec.get(), false);
+                common_speculative_flush(spec.get());
+            });
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
         }
+
+        // a probe round's ids are a measurement, not a draft to verify: keep them out of the target batch and
+        // compare them with the tokens the target generates plainly next
+        iterate(drafting, [&](server_slot & slot) {
+            if (!slot.spec_probe_round) {
+                return;
+            }
+            const size_t n = std::min(slot.spec_draft.size(), (size_t) server_slot::spec_probe_tokens);
+            for (size_t i = 0; i < n; ++i) {
+                slot.spec_probe_ids[i] = slot.spec_draft[i];
+            }
+            slot.spec_probe_n     = (int) n;
+            slot.spec_probe_left  = (int) n;
+            slot.spec_probe_arm   = n > 0;
+            if (getenv("LLAMA_SPEC_GATE_DEBUG") && n > 0) {
+                SLT_INF(slot, "probe ids: %d %d %d\n", slot.spec_probe_ids[0], n > 1 ? slot.spec_probe_ids[1] : -1,
+                        n > 2 ? slot.spec_probe_ids[2] : -1);
+            }
+            slot.spec_draft.clear();
+            slot.spec_draft_q.clear();
+            slot.spec_probe_round = false;
+        });
 
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
@@ -4462,9 +4682,14 @@ private:
             // catch-up is the whole point of the dormant state.  A probe round must run it, otherwise the probe
             // drafts from a stale context.
             const bool dormant = adaptive && params_base.n_parallel == 1 && sb && sb->spec_mtp &&
-                                 !sb->spec_gate_on && !sb->spec_probe_round;
+                                 !sb->spec_gate_on;
             if (dormant) {
+                // single-token dormant rounds only queue the target row for the next probe; a prompt batch is still
+                // decoded by the draft context so the MTP KV covers the prompt before the first probe
+                common_speculative_set_observe(spec.get(), batch.view.size() == 1);
             } else {
+                common_speculative_set_observe(spec.get(), false);
+            }
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
@@ -4475,7 +4700,6 @@ private:
 
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
-            }
             }
         }
 
@@ -4722,45 +4946,11 @@ private:
 
             slot.stats.update_gen_last();
 
+            slot.note_trial_round((int) n_accepted, (int) n_draft);
+
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
-
-            {
-                static const bool adaptive = getenv("LLAMA_SPEC_ADAPTIVE") == nullptr ||
-                                             atoi(getenv("LLAMA_SPEC_ADAPTIVE")) != 0;
-                if (adaptive && slot.spec_mtp && !slot.spec_gate_on) {
-                    // a probe: three accepted probes in a row say the draft pays; otherwise stay dormant
-                    slot.spec_probe_tot++;
-                    slot.spec_probe_n = n_accepted == n_draft && n_draft > 0 ? slot.spec_probe_n + 1 : 0;
-                    if (slot.spec_probe_n >= 3) {
-                        slot.spec_gate_on = true;
-                        slot.spec_accept_n = 0;
-                        slot.spec_accept_pos = 0;
-                        SLT_INF(slot, "%s", "adaptive MTP on (three accepted probes)\n");
-                    }
-                } else if (adaptive && slot.spec_mtp) {
-                    const float acc = n_draft ? (float) n_accepted / (float) n_draft : 0.0f;
-                    slot.spec_accept_win[slot.spec_accept_pos] = acc;
-                    slot.spec_accept_pos = (slot.spec_accept_pos + 1) % server_slot::spec_accept_cap;
-                    slot.spec_accept_n = std::min(slot.spec_accept_n + 1, server_slot::spec_accept_cap);
-                    float sum = 0.0f;
-                    for (int i = 0; i < slot.spec_accept_n; ++i) {
-                        sum += slot.spec_accept_win[i];
-                    }
-                    const bool on = slot.spec_accept_n < 8 || sum / slot.spec_accept_n >= 0.5f;
-                    if (getenv("LLAMA_SPEC_GATE_DEBUG")) {
-                        SLT_INF(slot, "gate: acc %.3f window %.3f (%d) -> %s\n", (double) acc,
-                                (double) (sum / slot.spec_accept_n), slot.spec_accept_n, on ? "on" : "off");
-                    }
-                    if (on != slot.spec_gate_on) {
-                        SLT_INF(slot, "adaptive MTP %s (acceptance %.3f)\n", on ? "on" : "off",
-                               (double) (sum / slot.spec_accept_n));
-                    }
-                    slot.spec_gate_on    = on;
-                    slot.spec_gate_probe = 0;
-                }
-            }
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {

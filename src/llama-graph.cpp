@@ -1527,7 +1527,15 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
+    static const bool dbg_reuse = getenv("GGML_AXERA_REUSE_DEBUG") != nullptr;
     if (!this->params.allow_reuse(params)) {
+        if (dbg_reuse) {
+            fprintf(stderr, "reuse debug: allow_reuse = 0 (tokens %u/%u seqs %u/%u seqtok %u/%u mixed %d/%d)\n",
+                    this->params.ubatch.n_tokens, params.ubatch.n_tokens,
+                    this->params.ubatch.n_seqs, params.ubatch.n_seqs,
+                    this->params.ubatch.n_seq_tokens, params.ubatch.n_seq_tokens,
+                    (int) this->params.ubatch.is_mixed(), (int) params.ubatch.is_mixed());
+        }
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
@@ -1543,6 +1551,10 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
+        if (!cur && dbg_reuse) {
+            fprintf(stderr, "reuse debug: input %d/%d (%s) = 0\n", (int) (&input - inputs.data()), (int) inputs.size(),
+                    typeid(*input).name());
+        }
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
