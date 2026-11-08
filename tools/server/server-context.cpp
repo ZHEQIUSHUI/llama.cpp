@@ -614,6 +614,35 @@ struct server_slot {
             "数学", "计算", "方程", "多少", "小时", "解答", "步骤", "证明", "答案",
             "solve", "calculate", "equation", "integral",
         };
+        // Optional extra keywords, comma/space separated, matched after the built-in table.  This keeps the
+        // default classifier (and therefore the 35B gate) unchanged while a model-specific launcher can mark
+        // deterministic prompt families (for example translation or enumeration) as structured.
+        static const std::vector<std::string> extra_keys = [] {
+            std::vector<std::string> out;
+            const char * e = getenv("LLAMA_SPEC_STRUCT_EXTRA");
+            if (e == nullptr) {
+                return out;
+            }
+            std::string s = e;
+            size_t p = 0;
+            while (p < s.size()) {
+                size_t q = s.find_first_of(",; ", p);
+                if (q == std::string::npos) {
+                    q = s.size();
+                }
+                if (q > p) {
+                    std::string key = s.substr(p, q - p);
+                    for (auto & c : key) {
+                        if (c >= 'A' && c <= 'Z') {
+                            c = c - 'A' + 'a';
+                        }
+                    }
+                    out.push_back(std::move(key));
+                }
+                p = q + 1;
+            }
+            return out;
+        }();
         std::string text;
         const int n = (int) tokens.size();
         for (int i = std::max(0, n - 512); i < n; ++i) {
@@ -636,6 +665,11 @@ struct server_slot {
             return true;
         }
         for (const char * key : keys) {
+            if (text.find(key) != std::string::npos) {
+                return true;
+            }
+        }
+        for (const auto & key : extra_keys) {
             if (text.find(key) != std::string::npos) {
                 return true;
             }
