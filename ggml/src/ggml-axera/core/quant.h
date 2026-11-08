@@ -31,6 +31,11 @@ float axera_quantize_nvfp4_slice(const ggml_tensor * w, int64_t r0, int64_t nr, 
 float axera_quantize_nvfp4_slice_perm(const ggml_tensor * w, int64_t r0, int64_t nr, const std::vector<int64_t> * row_src,
                                       const std::vector<int64_t> * blk_src, uint8_t * q, int64_t q_row_bytes,
                                       uint8_t * s, int64_t s_row_bytes);
+
+// rows of an NVFP4 GGUF tensor -> the kernels' pair-major NVFP4 layout
+void axera_copy_nvfp4_slice(const ggml_tensor * w, int64_t r0, int64_t nr, uint8_t * q, int64_t q_row_bytes,
+                            uint8_t * s, int64_t s_row_bytes, const std::vector<int64_t> * row_src = nullptr,
+                            const std::vector<int64_t> * blk_src = nullptr);
 // [N, K] weight of another GGUF type (quantized, f16, f32) -> bf16 copy in a new CMM buffer
 axera_cmm axera_to_bf16(const ggml_tensor * w);
 // ggml block_mxfp4 rows -> the kernels' layout: codes [rows][K / 2] (FP4 pairs, low nibble first), scales [rows][K / 32]

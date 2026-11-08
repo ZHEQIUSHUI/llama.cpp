@@ -294,6 +294,40 @@ void axera_quantize_nvfp4_into(const ggml_tensor * w, int64_t r0, int64_t nr, fl
     });
 }
 
+static inline const uint8_t * axera_weight_row_port(const ggml_tensor * w, int64_t rr);
+
+// GGML NVFP4 stores a 64-value super-block as four E4M3 scales, then one byte per pair of values:
+// byte j is value j in the low nibble and value j + 8 in the high nibble. The kernels store a
+// 16-value block as eight bytes: byte t is value 2t in the low nibble and value 2t + 1 in the high
+// nibble. Copy the bytes and transpose the nibbles, without decoding the values.
+void axera_copy_nvfp4_slice(const ggml_tensor * w, int64_t r0, int64_t nr, uint8_t * q, int64_t q_row_bytes,
+                            uint8_t * s, int64_t s_row_bytes, const std::vector<int64_t> * row_src,
+                            const std::vector<int64_t> * blk_src) {
+    const int64_t K = w->ne[0];
+    GGML_ASSERT(w->type == GGML_TYPE_NVFP4 && K % 64 == 0 && r0 >= 0 && nr >= 0 && r0 + nr <= ggml_nrows(w));
+    GGML_ASSERT(q_row_bytes == K / 2 && s_row_bytes == K / 16);
+    GGML_ASSERT(w->nb[1] == (size_t) K / 64 * 36);
+    axera_host_pool().run(nr, [&](int64_t d) {
+        const int64_t src_row = row_src ? (*row_src)[d] : d;
+        GGML_ASSERT(src_row >= 0 && src_row < nr);
+        const uint8_t * src = axera_weight_row_port(w, r0 + src_row);
+        uint8_t *       dq  = q + (size_t) d * q_row_bytes;
+        uint8_t *       ds  = s + (size_t) d * s_row_bytes;
+        for (int64_t g = 0; g < K / 16; ++g) {
+            const int64_t sg  = blk_src ? (*blk_src)[g] : g;
+            GGML_ASSERT(sg >= 0 && sg < K / 16);
+            const uint8_t * blk = src + (size_t) (sg / 4) * 36;
+            ds[g]               = blk[sg % 4];
+            const uint8_t * b   = blk + 4 + (size_t) (sg % 4) * 8;
+            uint8_t *       o   = dq + g * 8;
+            for (int j = 0; j < 4; ++j) {
+                o[j]     = (uint8_t) ((b[2 * j] & 0x0f) | ((b[2 * j + 1] & 0x0f) << 4));
+                o[4 + j] = (uint8_t) ((b[2 * j] >> 4) | (b[2 * j + 1] & 0xf0));
+            }
+        }
+    });
+}
+
 static inline const uint8_t * axera_weight_row_port(const ggml_tensor * w, int64_t rr) {
     const int64_t d1 = rr % w->ne[1], d2 = rr / w->ne[1];
     return (const uint8_t *) w->data + (size_t) d2 * w->nb[2] + (size_t) d1 * w->nb[1];

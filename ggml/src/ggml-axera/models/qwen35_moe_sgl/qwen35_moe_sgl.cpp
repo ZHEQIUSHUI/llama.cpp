@@ -90,8 +90,81 @@ struct sgl_state_header {
     uint64_t kpage_p_n;
 };
 
-// GGML_AXERA_SGL35_BANK_SUM=1: print one FNV-1a hash per bank after load. The loader must produce the same bytes
-// before and after a conversion optimisation; this is the cheap check that it did (debug only).
+// debug-only MD5 of the bank bytes (the same hash as md5sum on a dump)
+namespace {
+struct axera_md5 {
+    uint32_t h[4];
+    uint64_t n;
+    uint8_t  b[64];
+};
+static inline uint32_t axera_md5_rotl(uint32_t x, int c) { return (x << c) | (x >> (32 - c)); }
+static void axera_md5_init(axera_md5 & m) {
+    m.h[0] = 0x67452301u; m.h[1] = 0xefcdab89u; m.h[2] = 0x98badcfeu; m.h[3] = 0x10325476u;
+    m.n = 0;
+}
+static void axera_md5_block(axera_md5 & m, const uint8_t * p) {
+    static const uint32_t K[64] = {
+        0xd76aa478u, 0xe8c7b756u, 0x242070dbu, 0xc1bdceeeu, 0xf57c0fafu, 0x4787c62au, 0xa8304613u, 0xfd469501u,
+        0x698098d8u, 0x8b44f7afu, 0xffff5bb1u, 0x895cd7beu, 0x6b901122u, 0xfd987193u, 0xa679438eu, 0x49b40821u,
+        0xf61e2562u, 0xc040b340u, 0x265e5a51u, 0xe9b6c7aau, 0xd62f105du, 0x02441453u, 0xd8a1e681u, 0xe7d3fbc8u,
+        0x21e1cde6u, 0xc33707d6u, 0xf4d50d87u, 0x455a14edu, 0xa9e3e905u, 0xfcefa3f8u, 0x676f02d9u, 0x8d2a4c8au,
+        0xfffa3942u, 0x8771f681u, 0x6d9d6122u, 0xfde5380cu, 0xa4beea44u, 0x4bdecfa9u, 0xf6bb4b60u, 0xbebfbc70u,
+        0x289b7ec6u, 0xeaa127fau, 0xd4ef3085u, 0x04881d05u, 0xd9d4d039u, 0xe6db99e5u, 0x1fa27cf8u, 0xc4ac5665u,
+        0xf4292244u, 0x432aff97u, 0xab9423a7u, 0xfc93a039u, 0x655b59c3u, 0x8f0ccc92u, 0xffeff47du, 0x85845dd1u,
+        0x6fa87e4fu, 0xfe2ce6e0u, 0xa3014314u, 0x4e0811a1u, 0xf7537e82u, 0xbd3af235u, 0x2ad7d2bbu, 0xeb86d391u };
+    static const uint8_t S[64] = {
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21 };
+    uint32_t w[16];
+    for (int i = 0; i < 16; ++i)
+        w[i] = (uint32_t) p[4*i] | ((uint32_t) p[4*i+1] << 8) | ((uint32_t) p[4*i+2] << 16) | ((uint32_t) p[4*i+3] << 24);
+    uint32_t a = m.h[0], b = m.h[1], c = m.h[2], d = m.h[3];
+    for (int i = 0; i < 64; ++i) {
+        uint32_t f; int g;
+        if (i < 16)      { f = (b & c) | (~b & d); g = i; }
+        else if (i < 32) { f = (d & b) | (~d & c); g = (5*i + 1) & 15; }
+        else if (i < 48) { f = b ^ c ^ d;          g = (3*i + 5) & 15; }
+        else             { f = c ^ (b | ~d);       g = (7*i) & 15; }
+        const uint32_t t = d; d = c; c = b; b = b + axera_md5_rotl(a + f + K[i] + w[g], S[i]); a = t;
+    }
+    m.h[0] += a; m.h[1] += b; m.h[2] += c; m.h[3] += d;
+}
+static void axera_md5_update(axera_md5 & m, const uint8_t * p, size_t n) {
+    size_t off = (size_t) (m.n & 63);
+    m.n += n;
+    if (off) {
+        size_t take = 64 - off;
+        if (take > n) take = n;
+        memcpy(m.b + off, p, take);
+        p += take; n -= take; off += take;
+        if (off < 64) return;
+        axera_md5_block(m, m.b);
+    }
+    while (n >= 64) { axera_md5_block(m, p); p += 64; n -= 64; }
+    if (n) memcpy(m.b, p, n);
+}
+static void axera_md5_final(axera_md5 & m, char out[33]) {
+    const uint64_t bits = m.n * 8;
+    const size_t   off  = (size_t) (m.n & 63);
+    const uint8_t  pad[64] = { 0x80 };
+    const size_t   padn = off < 56 ? 56 - off : 120 - off;
+    axera_md5_update(m, pad, padn);
+    uint8_t len[8];
+    for (int i = 0; i < 8; ++i) len[i] = (uint8_t) (bits >> (8*i));
+    axera_md5_update(m, len, 8);
+    static const char * hx = "0123456789abcdef";
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {
+        out[8*i + 2*j]     = hx[(m.h[i] >> (8*j + 4)) & 15];
+        out[8*i + 2*j + 1] = hx[(m.h[i] >> (8*j)) & 15];
+    }
+    out[32] = 0;
+}
+}  // namespace
+
+// GGML_AXERA_SGL35_BANK_SUM=1: print one FNV-1a and MD5 hash per bank after load. The loader must produce the same
+// bytes before and after a conversion optimisation; this is the check that it did (debug only).
 void axera_bank_checksums(const std::map<std::string, axera_cmm> & banks) {
     const char * e = std::getenv("GGML_AXERA_SGL35_BANK_SUM");
     if (!e || std::atoi(e) == 0) {
@@ -99,6 +172,8 @@ void axera_bank_checksums(const std::map<std::string, axera_cmm> & banks) {
     }
     uint64_t all = 1469598103934665603ULL;
     size_t   nb  = 0;
+    axera_md5 mall;
+    axera_md5_init(mall);
     for (const auto & [n, c] : banks) {
         uint64_t h = 1469598103934665603ULL;
         const uint8_t * p = (const uint8_t *) c->vir;
@@ -114,11 +189,19 @@ void axera_bank_checksums(const std::map<std::string, axera_cmm> & banks) {
             all = (all ^ p[i]) * 1099511628211ULL;
         }
         all ^= c->size;
-        fprintf(stderr, "GGML_AXERA_SGL35_BANK_SUM bank %-40s %10zu %016llx\n", n.c_str(), c->size,
-                (unsigned long long) h);
+        axera_md5 m;
+        axera_md5_init(m);
+        axera_md5_update(m, p, c->size);
+        char mh[33];
+        axera_md5_final(m, mh);
+        axera_md5_update(mall, p, c->size);
+        fprintf(stderr, "GGML_AXERA_SGL35_BANK_SUM bank %-40s %10zu %016llx md5 %s\n", n.c_str(), c->size,
+                (unsigned long long) h, mh);
         nb += c->size;
     }
-    fprintf(stderr, "GGML_AXERA_SGL35_BANK_SUM all %zu bytes %016llx\n", nb, (unsigned long long) all);
+    char mallh[33];
+    axera_md5_final(mall, mallh);
+    fprintf(stderr, "GGML_AXERA_SGL35_BANK_SUM all %zu bytes %016llx md5 %s\n", nb, (unsigned long long) all, mallh);
 }
 
 // GGUF's tiled value head of HF (grouped) head g
@@ -474,11 +557,27 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
             memcpy(d, tmp.data(), bb);
         }
     };
+    // an NVFP4 tensor's optional standard GGUF scale sidecar ("<tensor>.weight" -> "<tensor>.scale")
+    auto nv_scale = [&](const ggml_tensor * w, int64_t i) -> const ggml_tensor * {
+        std::string n = w->name;
+        const std::string suffix = ".weight";
+        if (n.size() >= suffix.size() && n.compare(n.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            n.resize(n.size() - suffix.size());
+        }
+        n += ".scale";
+        auto it = t.find(n);
+        if (it == t.end()) {
+            return nullptr;
+        }
+        GGML_ASSERT(it->second->type == GGML_TYPE_F32);
+        GGML_ASSERT(i >= 0 && i < ggml_nelements(it->second));
+        return it->second;
+    };
     // rows r0 .. r0 + nr of a GGUF tensor -> this block's NVFP4 code / scale banks, its global scale at scale2 index
     auto put_nv = [&](const std::string & pre, const std::string & base, const ggml_tensor * w, int64_t r0, int64_t nr,
                       int b, int64_t row0, int64_t s2i, const std::vector<int64_t> * row_src = nullptr,
                       const std::vector<int64_t> * blk_src = nullptr, const std::string & sname = "",
-                      const std::string & zname = "") -> float {
+                      const std::string & zname = "", int64_t s2src = 0) -> float {
         const std::string qn = pre + base;
         const std::string sn = sname.empty() ? qn + "_scale" : sname;
         const std::string zn = zname.empty() ? qn + "_scale2" : zname;
@@ -488,12 +587,23 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
         GGML_ASSERT((size_t) (row0 + nr) * (K / 2) <= bank_n.at(qn) / NB);
         GGML_ASSERT((size_t) (row0 + nr) * (K / 16) <= bank_n.at(sn) / NB);
         GGML_ASSERT((size_t) (s2i + 1) * sizeof(float) <= bank_n.at(zn) / NB);
-        const float scale2 = row_src || blk_src
-                                 ? axera_quantize_nvfp4_slice_perm(w, r0, nr, row_src, blk_src,
-                                                                   q + (size_t) row0 * (K / 2), K / 2,
-                                                                   s + (size_t) row0 * (K / 16), K / 16)
-                                 : axera_quantize_nvfp4_slice(w, r0, nr, q + (size_t) row0 * (K / 2), K / 2,
-                                                              s + (size_t) row0 * (K / 16), K / 16);
+        float scale2;
+        if (w->type == GGML_TYPE_NVFP4) {
+            axera_copy_nvfp4_slice(w, r0, nr, q + (size_t) row0 * (K / 2), K / 2, s + (size_t) row0 * (K / 16),
+                                   K / 16, row_src, blk_src);
+            const ggml_tensor * ws = nv_scale(w, s2src);
+            if (!ws) {
+                GGML_ABORT("axera qwen35_moe_sgl: NVFP4 tensor %s has no F32 .scale sidecar", w->name);
+            }
+            scale2 = ((const float *) ws->data)[ggml_nelements(ws) == 1 ? 0 : s2src];
+        } else {
+            scale2 = row_src || blk_src
+                         ? axera_quantize_nvfp4_slice_perm(w, r0, nr, row_src, blk_src,
+                                                           q + (size_t) row0 * (K / 2), K / 2,
+                                                           s + (size_t) row0 * (K / 16), K / 16)
+                         : axera_quantize_nvfp4_slice(w, r0, nr, q + (size_t) row0 * (K / 2), K / 2,
+                                                      s + (size_t) row0 * (K / 16), K / 16);
+        }
         ((float *) slot(zn, b))[s2i] = scale2;
         return scale2;
     };
@@ -535,9 +645,9 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
                 const ggml_tensor * qkv = T(il, "attn_qkv.weight");
                 GGML_ASSERT(qkv->ne[0] % 16 == 0 && qkv->ne[1] == 2048 + 2048 + 4096);
                 const std::vector<int64_t> vr = head_rows(4096);
-                put_nv(pa, "w_q", qkv, 0, 2048, b, 0, 0);
-                put_nv(pa, "w_k", qkv, 2048, 2048, b, 0, 0);
-                put_nv(pa, "w_v", qkv, 4096, 4096, b, 0, 0, &vr);
+                put_nv(pa, "w_q", qkv, 0, 2048, b, 0, 0, nullptr, nullptr, "", "", 0);
+                put_nv(pa, "w_k", qkv, 2048, 2048, b, 0, 0, nullptr, nullptr, "", "", 2048);
+                put_nv(pa, "w_v", qkv, 4096, 4096, b, 0, 0, &vr, nullptr, "", "", 4096);
                 if (!keep) {
                     axera_drop_mapped(qkv);
                 }
@@ -605,9 +715,9 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
                 const int64_t F = g->ne[1], E = g->ne[2];
                 for (int64_t e = 0; e < E; ++e) {
                     put_nv(pm, "w_gate", g, e * F, F, b, e * 2 * F, e * 2, nullptr, nullptr, pm + "w_scale_gate",
-                           pm + "w_scale2_gate");
+                           pm + "w_scale2_gate", e);
                     put_nv(pm, "w_gate", u, e * F, F, b, e * 2 * F + F, e * 2 + 1, nullptr, nullptr,
-                           pm + "w_scale_gate", pm + "w_scale2_gate");
+                           pm + "w_scale_gate", pm + "w_scale2_gate", e);
                 }
                 if (!keep) {
                     axera_drop_mapped(g);
@@ -616,7 +726,7 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
                 const int64_t Rd = d->ne[1], Ed = d->ne[2];
                 for (int64_t e = 0; e < Ed; ++e) {
                     put_nv(pm, "w_down", d, e * Rd, Rd, b, e * Rd, e, nullptr, nullptr, pm + "w_scale_down",
-                           pm + "w_scale2_down");
+                           pm + "w_scale2_down", e);
                 }
                 if (!keep) {
                     axera_drop_mapped(d);
@@ -2834,14 +2944,39 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
         GGML_ASSERT(W(n)->size >= v.size() * sizeof(float));
         memcpy(W(n)->vir, v.data(), v.size() * sizeof(float));
     };
+    auto nv_scale = [&](const ggml_tensor * w) -> const ggml_tensor * {
+        std::string n = w->name;
+        const std::string suffix = ".weight";
+        if (n.size() >= suffix.size() && n.compare(n.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            n.resize(n.size() - suffix.size());
+        }
+        n += ".scale";
+        auto it = t.find(n);
+        if (it == t.end()) {
+            return nullptr;
+        }
+        GGML_ASSERT(it->second->type == GGML_TYPE_F32 && ggml_nelements(it->second) >= 1);
+        return it->second;
+    };
     auto put_nv = [&](const char * base, const ggml_tensor * w) {
         const std::string qn = std::string("w_") + base;
         const std::string sn = std::string("w_scale_") + base;
         const std::string zn = std::string("w_scale2_") + base;
         const int64_t     K  = w->ne[0], N = ggml_nrows(w);
         GGML_ASSERT((size_t) N * (K / 2) <= Wn(qn.c_str())->size && (size_t) N * (K / 16) <= Wn(sn.c_str())->size);
-        const float s2 = axera_quantize_nvfp4_slice(w, 0, N, (uint8_t *) W(qn.c_str())->vir, K / 2,
-                                                    (uint8_t *) W(sn.c_str())->vir, K / 16);
+        float s2;
+        if (w->type == GGML_TYPE_NVFP4) {
+            axera_copy_nvfp4_slice(w, 0, N, (uint8_t *) W(qn.c_str())->vir, K / 2, (uint8_t *) W(sn.c_str())->vir,
+                                   K / 16);
+            const ggml_tensor * ws = nv_scale(w);
+            if (!ws) {
+                GGML_ABORT("axera qwen35_moe_sgl: NVFP4 tensor %s has no F32 .scale sidecar", w->name);
+            }
+            s2 = ((const float *) ws->data)[0];
+        } else {
+            s2 = axera_quantize_nvfp4_slice(w, 0, N, (uint8_t *) W(qn.c_str())->vir, K / 2,
+                                            (uint8_t *) W(sn.c_str())->vir, K / 16);
+        }
         GGML_ASSERT(Wn(zn.c_str())->size >= sizeof(float));
         memcpy(W(zn.c_str())->vir, &s2, sizeof(float));
     };

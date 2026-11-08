@@ -81,6 +81,9 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
             // Linear attention (gated delta net) specific tensors
             // Create tensors with calculated dimensions
             layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
+            if (layer.wqkv && layer.wqkv->type == GGML_TYPE_NVFP4) {
+                layer.wqkv_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "scale", il), { key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
+            }
             layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
             layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
             layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
@@ -128,6 +131,17 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, mtp_flags);
         layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, mtp_flags);
         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, mtp_flags);
+
+        // NVFP4 scale2 sidecars of this block. When MTP is skipped these are skipped too, but they still count as
+        // tensors of the file (the generic scale pass cannot see the skipped weights above).
+        layer.wq_s              = create_tensor(tn(LLM_TENSOR_ATTN_Q,              "scale", il), { 1 }, mtp_flags | TENSOR_NOT_REQUIRED);
+        layer.wk_s              = create_tensor(tn(LLM_TENSOR_ATTN_K,              "scale", il), { 1 }, mtp_flags | TENSOR_NOT_REQUIRED);
+        layer.wv_s              = create_tensor(tn(LLM_TENSOR_ATTN_V,              "scale", il), { 1 }, mtp_flags | TENSOR_NOT_REQUIRED);
+        layer.wo_s              = create_tensor(tn(LLM_TENSOR_ATTN_OUT,            "scale", il), { 1 }, mtp_flags | TENSOR_NOT_REQUIRED);
+        layer.ffn_gate_shexp_s  = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,      "scale", il), { 1 }, mtp_flags | TENSOR_NOT_REQUIRED);
+        layer.ffn_up_shexp_s    = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,        "scale", il), { 1 }, mtp_flags | TENSOR_NOT_REQUIRED);
+        layer.ffn_down_shexp_s  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,      "scale", il), { 1 }, mtp_flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.eh_proj_s   = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,       "scale", il), { 1 }, mtp_flags | TENSOR_NOT_REQUIRED);
 
         // NextN-specific tensors that define the MTP block.
         layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", il), { 2 * n_embd, n_embd }, mtp_flags);
