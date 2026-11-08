@@ -608,7 +608,7 @@ struct server_slot {
         return !!spec;
     }
 
-    bool prompt_is_structured(const llama_tokens & tokens) const {
+    bool prompt_is_structured(const server_tokens & tokens) const {
         static const char * keys[] = {
             "python", "def ", "class ", "```", "函数", "代码", "表格", "markdown",
             "数学", "计算", "方程", "多少", "小时", "解答", "步骤", "证明", "答案",
@@ -617,8 +617,9 @@ struct server_slot {
         std::string text;
         const int n = (int) tokens.size();
         for (int i = std::max(0, n - 512); i < n; ++i) {
-            if (tokens[i] != LLAMA_TOKEN_NULL) {
-                text += common_token_to_piece(ctx_tgt, tokens[i]);
+            const llama_token tok = tokens[i];
+            if (tok != LLAMA_TOKEN_NULL) {
+                text += common_token_to_piece(ctx_tgt, tok);
             }
         }
         for (auto & c : text) {
@@ -2456,7 +2457,7 @@ private:
                                             atoi(getenv("LLAMA_SPEC_GATE_WINDOW")) != 0;
             bool cold_dormant = false;
             if (adaptive && window_mode && slot.spec_mtp) {
-                slot.spec_structured = slot.prompt_is_structured(slot.task->tokens.get_tokens());
+                slot.spec_structured = slot.prompt_is_structured(slot.task->tokens);
                 static const bool cold_start = getenv("LLAMA_SPEC_COLD_START") == nullptr ||
                                                atoi(getenv("LLAMA_SPEC_COLD_START")) != 0;
                 if (cold_start && !slot.spec_structured) {
