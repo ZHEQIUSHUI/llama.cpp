@@ -30,15 +30,37 @@
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 
-// the fused draft head publishes its (id, logit) row for a sampler that cannot identify it by the host logits row
-static void spec_draft_scope(bool on) {
+static const ggml_axera_argmax * spec_axera_api() {
     static const ggml_axera_argmax * api = [] {
         ggml_backend_reg_t reg = ggml_backend_reg_by_name(GGML_AXERA_NAME);
         return reg ? (const ggml_axera_argmax *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_axera_argmax") : nullptr;
     }();
+    return api;
+}
+
+// the fused draft head publishes its (id, logit) row for a sampler that cannot identify it by the host logits row
+static void spec_draft_scope(bool on) {
+    const ggml_axera_argmax * api = spec_axera_api();
     if (api && api->draft_scope) {
         api->draft_scope(on ? 1 : 0);
     }
+}
+
+static bool spec_chain_available() {
+    const ggml_axera_argmax * api = spec_axera_api();
+    return api && api->chain_available && api->chain_available();
+}
+
+static void spec_chain_set_n(int n) {
+    const ggml_axera_argmax * api = spec_axera_api();
+    if (api && api->chain_set_n) {
+        api->chain_set_n(n);
+    }
+}
+
+static int spec_chain_take(int32_t * ids, float * logits, int max_n) {
+    const ggml_axera_argmax * api = spec_axera_api();
+    return api && api->chain_take ? api->chain_take(ids, logits, max_n) : 0;
 }
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
@@ -1762,6 +1784,47 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+            }
+        }
+
+        // A whole round of draft steps in one graph: llama.cpp allocates a cell for every step up front and the
+        // adapter runs the MTP block, argmax head and embedding gather for each of them.  Only the first row's
+        // embedding is real (the last accepted token); the chain replaces the other rows' placeholders with the
+        // ids its head picked, so no per-step graph or sampler is built.
+        if (n_seq == 1 && n_drafting == 1 && !chain_heads && !is_mem_shared && !params.probabilistic) {
+            llama_seq_id seq_id = -1;
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                if (drafting[s]) {
+                    seq_id = s;
+                }
+            }
+            if (seq_id >= 0) {
+                auto &    dp      = dparams[seq_id];
+                const int n_chain = dp.n_max > 0 ? std::min<int>(params.n_max, dp.n_max) : params.n_max;
+                if (n_chain >= 2 && n_chain <= 4 && dp.result->empty() && spec_chain_available()) {
+                    batch.clear();
+                    for (int t = 0; t < n_chain; ++t) {
+                        const int32_t ix = batch.add(dp.id_last, dp.pos0 + t, seq_id, t == n_chain - 1);
+                        batch.set_embd_state(ix, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+                    }
+                    spec_chain_set_n(n_chain);
+                    const int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                    spec_chain_set_n(0);
+                    int32_t   ids[4] = {};
+                    float     lv[4]  = {};
+                    const int n      = ret == 0 ? spec_chain_take(ids, lv, n_chain) : 0;
+                    if (n == n_chain) {
+                        auto * smpl = smpls[seq_id].get();
+                        for (int t = 0; t < n; ++t) {
+                            common_sampler_accept(smpl, ids[t], true);
+                            dp.result->push_back(ids[t]);
+                        }
+                    }
+                    if (dp.result->size() < (size_t) params.n_min) {
+                        dp.result->clear();
+                    }
+                    return;
+                }
             }
         }
 

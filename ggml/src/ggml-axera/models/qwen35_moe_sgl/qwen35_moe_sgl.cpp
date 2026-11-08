@@ -19,6 +19,7 @@
 
 #include "../model.h"
 #include "../../core/quant.h"
+#include "../../core/argmax_state.h"
 #include "../../ops/ops.h"
 #include "vocab_embedding_1_axmodel.h"
 #include "vocab_embedding_axmodel.h"
@@ -217,6 +218,7 @@ class qwen35_moe_sgl final : public model {
         axera_cmm e, h, pids, pos, indptr, loc, ntok, hnext, hraw;
     };
     mtp_call                         mtp1, mtp8, mtpP;
+    call                             emb_mtp;  // the token embedding gather straight into mtp1.e (draft chain)
     std::map<std::string, axera_cmm> mtp_w;
     axera_cmm                        MKV, MINDICES;
     int                              mtp_kv_pages = 0;
@@ -3033,6 +3035,22 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
         }
     };
     bind(mtp1, k1);
+    // the fused draft chain gathers the next draft token's embedding straight into the MTP row input
+    if (emb1.k && mtp1.e) {
+        emb_mtp = {};
+        emb_mtp.k = emb1.k;
+        emb_mtp.in.assign(emb1.k->info->nInputSize, {});
+        emb_mtp.out.assign(emb1.k->info->nOutputSize, {});
+        emb_mtp.in[emb1.k->input("input_flat")] = axera_io(EMBI, emb1.k->in_bytes("input_flat"));
+        emb_mtp.in[emb1.k->input("weight")]     = axera_io(EMBW, emb1.k->in_bytes("weight"));
+        emb_mtp.out[emb1.k->output("output_flat")] = axera_io(mtp1.e, (uint32_t) mtp1.e->size);
+    }
+    bool draft_argmax = false;
+    if (man.has("lm_head.draft")) {
+        const kernel & dk = man.get("lm_head.draft");
+        draft_argmax = dk.find_output("ids") >= 0 && dk.find_output("top_logits") >= 0;
+    }
+    axera::argmax_chain_set_available(draft_argmax && emb_mtp.k && mtp1.e);
     bind(mtpP, kp);
     if (man.has("mtp.m8")) {
         bind(mtp8, man.get("mtp.m8"));
@@ -3183,6 +3201,89 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         ce->flush();
         ch->flush();
     };
+
+    // The fused draft chain: one draft graph carries n_max placeholder tokens, so llama.cpp has already allocated
+    // every cell the round writes.  The adapter runs the steps back to back: MTP block at the step's cell, argmax
+    // draft head, token embedding gather for the next step.  The ids leave through the chain queue, so no sampler
+    // and no per-step graph are built.
+    const int     chain_n  = std::getenv("GGML_AXERA_MTP_CHAIN") && atoi(std::getenv("GGML_AXERA_MTP_CHAIN")) == 0
+                                 ? 0 : axera::argmax_chain_n();
+    ggml_tensor * rlogits  = names.find("result_output");
+    if (chain_n >= 2 && chain_n <= 4 && T == chain_n && rlogits && (rlogits->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+        man.has("lm_head.draft") && emb_mtp.k) {
+        head.bind(man.get("lm_head"), rlogits->src[0]);
+        if (!head.dk) {
+            const std::string f  = man.dir + "/draft_vocab.i32";
+            FILE *            fp = fopen(f.c_str(), "rb");
+            GGML_ASSERT(fp);
+            fseek(fp, 0, SEEK_END);
+            const long fsz = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            GGML_ASSERT(fsz > 0 && fsz % (long) sizeof(int32_t) == 0);
+            std::vector<int32_t> draft_ids((size_t) fsz / sizeof(int32_t));
+            GGML_ASSERT(fread(draft_ids.data(), sizeof(int32_t), draft_ids.size(), fp) == draft_ids.size());
+            fclose(fp);
+            axera_timer tb("init: draft head");
+            head.bind_draft(man.get("lm_head.draft"), draft_ids);
+        }
+        if (head.dk && head.dargmax) {
+            if (getenv("GGML_AXERA_MTP_CHAIN_DEBUG")) {
+                static bool chain_logged = false;
+                if (!chain_logged) {
+                    chain_logged = true;
+                    const int32_t * pd = (const int32_t *) pos->data;
+                    fprintf(stderr, "mtp chain: T=%d cells %lld %lld %lld pos %d %d %d (p4 %d %d %d)\n", T,
+                            (long long) cell_of(0), (long long) cell_of(1), T >= 3 ? (long long) cell_of(2) : -1LL,
+                            pd[0], T >= 2 ? pd[1] : -1, T >= 3 ? pd[2] : -1, pd[0], pd[1], pd[2]);
+                }
+            }
+            std::vector<int32_t> cid((size_t) chain_n);
+            std::vector<float>   clv((size_t) chain_n);
+            row_bf16(embd, 0, (ggml_bf16_t *) mtp1.e->vir);
+            row_bf16(hin, 0, (ggml_bf16_t *) mtp1.h->vir);
+            mtp1.e->flush();
+            mtp1.h->flush();
+            for (int r = 0; r < chain_n; ++r) {
+                {
+                    axera_timer thost("mtp chain: fills");
+                    fill_pids(mtp1.pids, paxes, 1, r, 0);
+                    fill_pos(mtp1.pos, 1, r, 0, kv, cell_of);
+                    fill_loc(mtp1.loc, 1, r, 0, kv, cell_of);
+                    set_ntok(mtp1.ntok, 1);
+                    set_indptr(mtp1.indptr, cell_of(r));
+                }
+                mtp1.c.k->run(mtp1.c.in, mtp1.c.out, "mtp chain");
+                mtp1.hnext->invalidate(mtp1.hnext->vir, H * sizeof(ggml_bf16_t));
+                {
+                    axera_timer th("mtp chain: head");
+                    cid[(size_t) r] = head.draft_argmax_row((const ggml_bf16_t *) mtp1.hnext->vir,
+                                                            &clv[(size_t) r]);
+                }
+                if (r + 1 < chain_n) {
+                    *(int32_t *) EMBI->vir = cid[(size_t) r];
+                    EMBI->flush(EMBI->vir, sizeof(int32_t));
+                    axera_timer te("mtp chain: embed");
+                    emb_mtp.k->run(emb_mtp.in, emb_mtp.out, "mtp chain embed");
+                    memcpy(mtp1.h->vir, mtp1.hnext->vir, H * sizeof(ggml_bf16_t));
+                    mtp1.h->flush();
+                }
+                if (hn->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                    ggml_bf16_to_fp32_row((const ggml_bf16_t *) mtp1.hnext->vir,
+                                          (float *) ((char *) hn->data + (size_t) r * hn->nb[1]), H);
+                }
+            }
+            if ((hn->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_backend_buffer_is_axera(hn->buffer)) {
+                ((ggml_backend_axera_buffer_context *) hn->buffer->context)->flush(hn->data, ggml_nbytes(hn));
+            }
+            axera::argmax_chain_publish(cid.data(), clv.data(), chain_n);
+            // the head's rows are replaced by the chain's argmax picks; the graph's logits are not written
+            auto * dctx = (ggml_backend_axera_buffer_context *) rlogits->buffer->context;
+            dctx->clean_p     = (float *) rlogits->data;
+            dctx->clean_n     = ggml_nbytes(rlogits);
+            dctx->clean_epoch = axera_graph_epoch;
+            return GGML_STATUS_SUCCESS;
+        }
+    }
 
     if (T >= 2 && T <= R8 && !std::getenv("GGML_AXERA_MTP_T1")) {  // the rows accepted by a verification, in one call
         {

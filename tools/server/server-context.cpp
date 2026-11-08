@@ -375,6 +375,25 @@ struct server_slot {
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
+    // adaptive MTP: MTP is slower than plain decoding on this hardware at every measured acceptance rate, because
+    // the four-row verify and the per-round side work (draft chain, catch-up, four-row head) cost more than the
+    // extra tokens yield.  The gate therefore starts off: a dormant round skips drafting and the draft catch-up, so
+    // the request runs at plain speed.  LLAMA_SPEC_ADAPTIVE=0 forces drafting for benchmarking, and
+    // LLAMA_SPEC_ADAPTIVE_PROBE=1 enables a periodic one-token probe that can turn drafting back on when the
+    // acceptance window says it pays (see get_n_draft_max).
+    // recent per-round acceptance ratios; a window (not an exponential average) keeps one lucky probe from turning
+    // drafting back on for a whole prose request, and its few samples keep code's first round from disabling it
+    static constexpr int spec_accept_cap = 8;
+    float spec_accept_win[spec_accept_cap] = {};
+    int   spec_accept_n   = 0;
+    int   spec_accept_pos = 0;
+    int   spec_probe_n    = 0;  // consecutive 1-token probes that were accepted
+    int   spec_probe_tot  = 0;
+    int   spec_gate_probe = 0;
+    bool  spec_gate_on    = false;  // MTP is slower than plain below a high acceptance, so it starts off
+    bool  spec_probe_round = false; // this decode step is a dormant 1-token probe (catch-up must run)
+    bool  spec_mtp        = false;
+
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
@@ -410,6 +429,16 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        for (int i = 0; i < spec_accept_cap; ++i) {
+            spec_accept_win[i] = 0.0f;
+        }
+        spec_accept_n    = 0;
+        spec_accept_pos  = 0;
+        spec_probe_n     = 0;
+        spec_probe_tot   = 0;
+        spec_gate_probe  = 0;
+        spec_gate_on     = false;
+        spec_probe_round = false;
 
         n_predict_max = -1;
 
@@ -525,11 +554,31 @@ struct server_slot {
         generated_token_probs.push_back(token);
     }
 
-    int get_n_draft_max() const {
+    int get_n_draft_max() {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
             return 0;
+        }
+
+        static const bool adaptive = getenv("LLAMA_SPEC_ADAPTIVE") == nullptr ||
+                                     atoi(getenv("LLAMA_SPEC_ADAPTIVE")) != 0;
+        // MTP is currently slower than plain decoding on this hardware, so the gate starts (and by default stays)
+        // off.  Probing is opt-in: a dormant round skips the draft catch-up, which leaves the draft KV with a gap,
+        // so a probe can only be meaningful when a catch-up is run for it (handled below) and even then the gap
+        // makes it a rough estimate.  LLAMA_SPEC_ADAPTIVE_PROBE=1 enables it.
+        static const bool probe_enabled = getenv("LLAMA_SPEC_ADAPTIVE_PROBE") != nullptr &&
+                                          atoi(getenv("LLAMA_SPEC_ADAPTIVE_PROBE")) != 0;
+        bool probing = false;
+        spec_probe_round = false;
+        if (adaptive && spec_mtp && !spec_gate_on) {
+            llama_set_prebuild_decode(ctx_tgt, true);
+            if (!probe_enabled || ++spec_gate_probe < 64) {
+                return 0;
+            }
+            spec_gate_probe = 0;
+            probing         = true;
+            spec_probe_round = true;
         }
 
         // determine the max draft that fits the current slot state
@@ -539,6 +588,13 @@ struct server_slot {
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+        }
+
+        if (probing) {
+            n_draft_max = std::min(n_draft_max, 1);
+        }
+        if (adaptive && spec_mtp && spec_gate_on) {
+            llama_set_prebuild_decode(ctx_tgt, false);
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -1446,6 +1502,7 @@ private:
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
+            slot.spec_mtp = spec_mtp;
             slot.n_ctx   = n_ctx_slot();
 
             slot.mctx                   = mctx;
@@ -4394,7 +4451,20 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+        // while the adaptive gate has drafting off, do not pay the draft-context catch-up after every target
+        // decode: the next draft (a sparse probe) is verified by the target anyway, so a stale draft KV can only
+        // cost acceptance, never output correctness
         if (spec) {
+            const server_slot * sb = batch.slot_batched;
+            static const bool adaptive = getenv("LLAMA_SPEC_ADAPTIVE") == nullptr ||
+                                         atoi(getenv("LLAMA_SPEC_ADAPTIVE")) != 0;
+            // with drafting permanently off there is nothing to catch the draft context up to, and skipping the
+            // catch-up is the whole point of the dormant state.  A probe round must run it, otherwise the probe
+            // drafts from a stale context.
+            const bool dormant = adaptive && params_base.n_parallel == 1 && sb && sb->spec_mtp &&
+                                 !sb->spec_gate_on && !sb->spec_probe_round;
+            if (dormant) {
+            } else {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
@@ -4405,6 +4475,7 @@ private:
 
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
+            }
             }
         }
 
@@ -4654,6 +4725,42 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+
+            {
+                static const bool adaptive = getenv("LLAMA_SPEC_ADAPTIVE") == nullptr ||
+                                             atoi(getenv("LLAMA_SPEC_ADAPTIVE")) != 0;
+                if (adaptive && slot.spec_mtp && !slot.spec_gate_on) {
+                    // a probe: three accepted probes in a row say the draft pays; otherwise stay dormant
+                    slot.spec_probe_tot++;
+                    slot.spec_probe_n = n_accepted == n_draft && n_draft > 0 ? slot.spec_probe_n + 1 : 0;
+                    if (slot.spec_probe_n >= 3) {
+                        slot.spec_gate_on = true;
+                        slot.spec_accept_n = 0;
+                        slot.spec_accept_pos = 0;
+                        SLT_INF(slot, "%s", "adaptive MTP on (three accepted probes)\n");
+                    }
+                } else if (adaptive && slot.spec_mtp) {
+                    const float acc = n_draft ? (float) n_accepted / (float) n_draft : 0.0f;
+                    slot.spec_accept_win[slot.spec_accept_pos] = acc;
+                    slot.spec_accept_pos = (slot.spec_accept_pos + 1) % server_slot::spec_accept_cap;
+                    slot.spec_accept_n = std::min(slot.spec_accept_n + 1, server_slot::spec_accept_cap);
+                    float sum = 0.0f;
+                    for (int i = 0; i < slot.spec_accept_n; ++i) {
+                        sum += slot.spec_accept_win[i];
+                    }
+                    const bool on = slot.spec_accept_n < 8 || sum / slot.spec_accept_n >= 0.5f;
+                    if (getenv("LLAMA_SPEC_GATE_DEBUG")) {
+                        SLT_INF(slot, "gate: acc %.3f window %.3f (%d) -> %s\n", (double) acc,
+                                (double) (sum / slot.spec_accept_n), slot.spec_accept_n, on ? "on" : "off");
+                    }
+                    if (on != slot.spec_gate_on) {
+                        SLT_INF(slot, "adaptive MTP %s (acceptance %.3f)\n", on ? "on" : "off",
+                               (double) (sum / slot.spec_accept_n));
+                    }
+                    slot.spec_gate_on    = on;
+                    slot.spec_gate_probe = 0;
+                }
+            }
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {

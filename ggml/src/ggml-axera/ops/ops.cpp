@@ -892,6 +892,28 @@ void output_head::bind_verify(const kernel & lm) {
     }
 }
 
+int32_t output_head::draft_argmax_row(const ggml_bf16_t * row, float * logit) {
+    GGML_ASSERT(dk && dargmax && did && dtop);
+    const size_t K = (size_t) w->ne[0];
+    memcpy(x->vir, row, K * sizeof(ggml_bf16_t));
+    x->flush(x->vir, K * sizeof(ggml_bf16_t));
+    std::vector<AX_ENGINE_IO_BUFFER_T> din(dk->info->nInputSize), dout(dk->info->nOutputSize);
+    din[dk->input("x")]            = axera_io(x, K * sizeof(ggml_bf16_t));
+    din[dk->input("w")]            = axera_io(dq);
+    din[dk->input("s")]            = axera_io(ds);
+    dout[dk->output("ids")]        = axera_io(did, sizeof(int32_t));
+    dout[dk->output("top_logits")] = axera_io(dtop, sizeof(float));
+    axera_timer tl("lm_head (draft chain)");
+    dk->run(din, dout, "draft head (argmax)");
+    did->invalidate(did->vir, sizeof(int32_t));
+    dtop->invalidate(dtop->vir, sizeof(float));
+    int32_t lid = 0;
+    memcpy(&lid, did->vir, sizeof(int32_t));
+    memcpy(logit, dtop->vir, sizeof(float));
+    GGML_ASSERT(lid >= 0 && lid < (int32_t) dids.size());
+    return dids[(size_t) lid];
+}
+
 // a TOP_K of the draft head's single row: over its vocabulary's logits only (the others are -inf)
 static const output_head * top_k_draft = nullptr;
 static bool                dargmax_pub = false;  // the draft head just published its row (set around after())

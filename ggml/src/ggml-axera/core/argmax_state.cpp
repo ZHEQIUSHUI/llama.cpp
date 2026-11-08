@@ -33,11 +33,52 @@ state & s() {
 }
 
 static thread_local bool t_draft = false;
+static thread_local int  t_chain = 0;
+static std::mutex        g_chain_mu;
+static bool              g_chain_available = false;
+static std::vector<int32_t> g_chain_ids;
+static std::vector<float>   g_chain_logits;
 
 }  // namespace
 
 void argmax_draft_scope(bool on) {
     t_draft = on;
+}
+
+void argmax_chain_set_available(bool on) {
+    std::lock_guard<std::mutex> lk(g_chain_mu);
+    g_chain_available = on;
+}
+
+bool argmax_chain_available() {
+    std::lock_guard<std::mutex> lk(g_chain_mu);
+    return g_chain_available;
+}
+
+int argmax_chain_n() {
+    return t_chain;
+}
+
+void argmax_chain_set_n(int n) {
+    t_chain = n;
+}
+
+void argmax_chain_publish(const int32_t * ids, const float * logits, int n) {
+    std::lock_guard<std::mutex> lk(g_chain_mu);
+    g_chain_ids.assign(ids, ids + n);
+    g_chain_logits.assign(logits, logits + n);
+}
+
+int argmax_chain_take(int32_t * ids, float * logits, int max_n) {
+    std::lock_guard<std::mutex> lk(g_chain_mu);
+    const int n = std::min<int>(max_n, (int) g_chain_ids.size());
+    for (int i = 0; i < n; ++i) {
+        ids[i]    = g_chain_ids[(size_t) i];
+        logits[i] = g_chain_logits[(size_t) i];
+    }
+    g_chain_ids.clear();
+    g_chain_logits.clear();
+    return n;
 }
 
 int argmax_configure(bool enabled, const int32_t * ids, int32_t n) {

@@ -331,11 +331,26 @@ static void argmax_draft_scope_c(int on) {
     axera::argmax_draft_scope(on != 0);
 }
 
+static void argmax_chain_set_n_c(int n) {
+    axera::argmax_chain_set_n(n);
+}
+
+static int argmax_chain_available_c() {
+    return axera::argmax_chain_available() ? 1 : 0;
+}
+
+static int argmax_chain_take_c(int32_t * ids, float * logits, int max_n) {
+    return axera::argmax_chain_take(ids, logits, max_n);
+}
+
 static const ggml_axera_argmax g_axera_argmax = {
     /* .configure = */ argmax_configure_c,
     /* .reset     = */ argmax_reset_c,
     /* .take      = */ argmax_take_c,
     /* .draft_scope = */ argmax_draft_scope_c,
+    /* .chain_set_n = */ argmax_chain_set_n_c,
+    /* .chain_available = */ argmax_chain_available_c,
+    /* .chain_take = */ argmax_chain_take_c,
 };
 
 uint32_t axera_n_seq_max() {
