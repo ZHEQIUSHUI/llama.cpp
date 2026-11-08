@@ -2671,9 +2671,22 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
         axera_timer tv("verify (all layers)");
         std::vector<ggml_bf16_t> vxb((size_t) T * H);
         if (token_ids) {
-            embed_tokens(token_ids, T);
-            XB->invalidate(XB->vir, (size_t) T * H * sizeof(ggml_bf16_t));
-            memcpy(vxb.data(), XB->vir, vxb.size() * sizeof(ggml_bf16_t));
+            // The 4096-row embedding kernel costs ~0.47 ms even for a four-row verify; four row copies out of the
+            // loader's host-visible bf16 table are a few microseconds.
+            bool gathered = true;
+            for (int r = 0; r < T && gathered; ++r) {
+                const int64_t id = token_ids[r];
+                gathered = id >= 0 && (size_t) id * H * sizeof(ggml_bf16_t) + H * sizeof(ggml_bf16_t) <= EMBW->size;
+                if (gathered) {
+                    memcpy(vxb.data() + (size_t) r * H, (const ggml_bf16_t *) EMBW->vir + (size_t) id * H,
+                           H * sizeof(ggml_bf16_t));
+                }
+            }
+            if (!gathered) {
+                embed_tokens(token_ids, T);
+                XB->invalidate(XB->vir, (size_t) T * H * sizeof(ggml_bf16_t));
+                memcpy(vxb.data(), XB->vir, vxb.size() * sizeof(ggml_bf16_t));
+            }
         } else {
             axera_host_pool().run(T, [&](int64_t r) {
                 ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]),
