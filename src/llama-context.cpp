@@ -1449,7 +1449,8 @@ void llama_context::set_dummy_batch(bool value) {
 }
 
 void llama_context::set_prebuild_decode(bool value) {
-    prebuild_decode = value;
+    prebuild_decode         = value;
+    prebuild_decode_pending = value;
 }
 
 void llama_context::arm_prebuild_verify(uint32_t n_tokens) {
@@ -2547,8 +2548,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (prebuild_verify_n > 1) {
             graph_prebuild_decode(mctx.get(), prebuild_verify_n);
             prebuild_verify_n = 0;
-        } else if (prebuild_decode) {
+            prebuild_decode_pending = false;
+        } else if (prebuild_decode && prebuild_decode_pending) {
             graph_prebuild_decode(mctx.get());
+            prebuild_decode_pending = false;
         }
     }
 

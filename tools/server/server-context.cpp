@@ -664,8 +664,14 @@ struct server_slot {
         }
         spec_round_t0 = ggml_time_us();
 
-        static const bool adaptive = getenv("LLAMA_SPEC_ADAPTIVE") == nullptr ||
-                                     atoi(getenv("LLAMA_SPEC_ADAPTIVE")) != 0;
+        static const bool adaptive = [] {
+            const char * e = getenv("LLAMA_SPEC_ADAPTIVE");
+            const bool   v = e == nullptr || atoi(e) != 0;
+            if (getenv("LLAMA_SPEC_GATE_DEBUG")) {
+                fprintf(stderr, "spec gate: LLAMA_SPEC_ADAPTIVE=%s -> %d\n", e ? e : "(unset)", (int) v);
+            }
+            return v;
+        }();
         // probe schedule: the first at 8 generated tokens, then every 20.  A probe is 3 chain steps, each compared
         // with the token the target generates plainly next; two windows already match the verified acceptance of the
         // scenes we measured, and a third covers the slower starters.
@@ -794,8 +800,13 @@ struct server_slot {
     }
 
     void note_trial_round(int n_accepted, int n_draft) {
+        static const bool adaptive = getenv("LLAMA_SPEC_ADAPTIVE") == nullptr ||
+                                     atoi(getenv("LLAMA_SPEC_ADAPTIVE")) != 0;
         static const bool window_mode = getenv("LLAMA_SPEC_GATE_WINDOW") == nullptr ||
                                         atoi(getenv("LLAMA_SPEC_GATE_WINDOW")) != 0;
+        if (!adaptive) {
+            return;
+        }
         if (window_mode && spec_mtp && spec_retry_one && n_draft > 0) {
             static const int retry_gap = std::max(16, getenv("LLAMA_SPEC_RETRY_GAP")
                 ? atoi(getenv("LLAMA_SPEC_RETRY_GAP")) : 64);
@@ -3723,40 +3734,38 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
-// #define DEBUG_TIMINGS
-#ifdef DEBUG_TIMINGS
+    static bool server_timings() {
+        static const bool on = getenv("LLAMA_SERVER_PROF") != nullptr;
+        return on;
+    }
     struct scoped_timer {
         int64_t & t;
         int64_t & n;
-        int64_t t_start;
+        int64_t t_start = 0;
         scoped_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_) {
-            t_start = ggml_time_us();
+            if (server_timings()) {
+                t_start = ggml_time_us();
+            }
         }
         ~scoped_timer() {
-            t += ggml_time_us() - t_start;
-            n++;
+            if (t_start) {
+                t += ggml_time_us() - t_start;
+                n++;
+            }
         }
     };
-#else
-    struct scoped_timer {
-        scoped_timer(int64_t &, int64_t &) {}
-        ~scoped_timer() {}
-    };
-#endif
 
     void update_slots() {
-#ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
-        if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
+        if (server_timings() && t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
             t_prev = t_start;
             SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
-            SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / n_pre_decode / 1000.0);
-            SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
-            SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
-            SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
+            SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / std::max<int64_t>(n_pre_decode, 1) / 1000.0);
+            SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / std::max<int64_t>(n_decode, 1) / 1000.0);
+            SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / std::max<int64_t>(n_post_decode, 1) / 1000.0);
+            SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / std::max<int64_t>(n_sampl, 1) / 1000.0);
         }
-#endif
 
         // check if all slots are idle
         {
@@ -5075,6 +5084,7 @@ private:
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
                 std::vector<llama_token> accepted;
+                scoped_timer timer(t_sampl, n_sampl);
                 if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
                     accepted = server_sample_and_accept_synth(

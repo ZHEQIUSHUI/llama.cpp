@@ -446,6 +446,7 @@ private:
     // prebuild the next single-token decode graph after a multi-token batch (set off while speculative decoding owns
     // the target context: its next batch is another verification, not a decode)
     bool prebuild_decode = true;
+    bool prebuild_decode_pending = true;
     uint32_t prebuild_verify_n = 0;
     bool process_meta_only = false;
 
