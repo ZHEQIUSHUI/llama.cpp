@@ -1756,6 +1756,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            if (h_tgt == nullptr) {
+                // A dormant MTP request turns the target's h_nextn output off.  Multimodal chunk callbacks bypass the
+                // server's dormant short-circuit, so there is no row to feed the draft context here.  Leave its KV
+                // stale: a later probe or draft verifies every candidate against the target.
+                SPC_DBG("%s", "skipping MTP prompt catch-up without target h_nextn\n");
+                return true;
+            }
 
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
