@@ -14,10 +14,10 @@
 
 namespace axera {
 
-static std::string base_name(const char * name) {  // "<backend>#<name>#<copy>" -> <name>
+static std::string_view base_name(const char * name) {  // "<backend>#<name>#<copy>" -> <name>
     const char * a = strchr(name, '#');
     const char * b = a ? strrchr(name, '#') : nullptr;
-    return a && b > a ? std::string(a + 1, b) : std::string(name);
+    return a && b > a ? std::string_view(a + 1, b - a - 1) : std::string_view(name);
 }
 
 const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph * g) {
@@ -116,6 +116,8 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
         t.clear();
     };
     bool hit = false;
+    std::vector<std::pair<const ggml_tensor *, uint64_t>> nsig;
+    bool nsig_built = false;
     if (gid) {
         if (uid == gid) {
             hit = true;
@@ -136,8 +138,8 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
             }
         }
         if (!hit) {
-            std::vector<std::pair<const ggml_tensor *, uint64_t>> nsig;
             build_sig(nsig);
+            nsig_built = true;
             if (!sig.empty() && nsig == sig) {  // a rebuild of the mapped graph: same tensors, same names
                 hit = true;
                 st  = ST_TOPO;
@@ -182,8 +184,8 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
     }
     if (!hit) {
         // each tensor once (in the order met: the first of a name wins), sorted by name into the map
-        std::unordered_set<const ggml_tensor *>             seen;
-        std::vector<std::pair<std::string, ggml_tensor *>> named;
+        std::unordered_set<const ggml_tensor *>                  seen;
+        std::vector<std::pair<std::string_view, ggml_tensor *>> named;
         seen.reserve(4 * (size_t) g->n_nodes);
         named.reserve(4 * (size_t) g->n_nodes);
         auto add = [&](ggml_tensor * x) {
@@ -204,11 +206,15 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
         std::stable_sort(named.begin(), named.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
         t.clear();
         for (auto & n : named) {
-            if (t.empty() || std::prev(t.end())->first != n.first) {
-                t.emplace_hint(t.end(), std::move(n.first), n.second);
+            if (t.empty() || t.rbegin()->first.compare(n.first) != 0) {
+                t.emplace_hint(t.end(), std::string(n.first), n.second);
             }
         }
-        build_sig(sig);
+        if (nsig_built && gid) {
+            sig = std::move(nsig);  // the walk above already hashed this graph
+        } else {
+            build_sig(sig);
+        }
         if (!gid) {
             build_key();
         }
@@ -837,16 +843,29 @@ void output_head::run_fused(ggml_cgraph * g, const graph_names & names, const ax
 void output_head::bind_draft(const kernel & dlm, const std::vector<int32_t> & ids) {
     GGML_ASSERT(k && mx4);
     const int64_t N = w->ne[1], K = w->ne[0], NS = (int64_t) ids.size();
+    const bool    argmax = dlm.find_output("ids") >= 0 || dlm.find_output("top_logits") >= 0;
+    if (argmax) {
+        GGML_ASSERT(dlm.find_output("ids") >= 0 && dlm.find_output("top_logits") >= 0 && dlm.find_output("out") < 0);
+        GGML_ASSERT(dlm.out_bytes("ids") == sizeof(int32_t) && dlm.out_bytes("top_logits") == sizeof(float));
+    } else {
+        GGML_ASSERT(dlm.find_output("out") >= 0 && dlm.out_bytes("out") == NS * sizeof(float));
+    }
     GGML_ASSERT(dlm.in_bytes("w") == NS * K / 2 && dlm.in_bytes("s") == NS * K / AXERA_MX_GROUP &&
-                dlm.in_bytes("x") == K * sizeof(ggml_bf16_t) && dlm.out_bytes("out") == NS * sizeof(float));
+                dlm.in_bytes("x") == K * sizeof(ggml_bf16_t));
     dk = &dlm;
-    if (dids == ids) {
+    if (dids == ids && dargmax == argmax) {
         return;
     }
-    dids = ids;
-    dq   = axera_cmm_alloc(NS * K / 2);
-    ds   = axera_cmm_alloc(NS * K / AXERA_MX_GROUP);
-    dy   = axera_cmm_alloc(NS * sizeof(float));
+    dids    = ids;
+    dargmax = argmax;
+    dq      = axera_cmm_alloc(NS * K / 2);
+    ds      = axera_cmm_alloc(NS * K / AXERA_MX_GROUP);
+    if (!dargmax) {
+        dy = axera_cmm_alloc(NS * sizeof(float));
+    } else {
+        did  = axera_cmm_alloc(sizeof(int32_t));
+        dtop = axera_cmm_alloc(sizeof(float));
+    }
     axera_host_pool().run(NS, [&](int64_t i) {
         const int64_t r = ids[i];
         GGML_ASSERT(r >= 0 && r < N && (i == 0 || ids[i - 1] < r));
@@ -875,6 +894,8 @@ void output_head::bind_verify(const kernel & lm) {
 
 // a TOP_K of the draft head's single row: over its vocabulary's logits only (the others are -inf)
 static const output_head * top_k_draft = nullptr;
+static bool                dargmax_pub = false;  // the draft head just published its row (set around after())
+static int32_t             dargmax_id  = -1;
 // with a TOP_K in its sampler, a draft head writes no logits: the TOP_K writes those of its rows (here and in the
 // padded copy, which is not made) and nothing reads the others
 static float * draft_logits = nullptr;
@@ -1169,6 +1190,39 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         din[dk->input("x")]   = axera_io(x, K * sizeof(ggml_bf16_t));
         din[dk->input("w")]   = axera_io(dq);
         din[dk->input("s")]   = axera_io(ds);
+        if (dargmax) {  // one (local id, logit): no 65536-float write and no host top-K
+            dout[dk->output("ids")]        = axera_io(did, sizeof(int32_t));
+            dout[dk->output("top_logits")] = axera_io(dtop, sizeof(float));
+            dk->run(din, dout, "draft head (argmax)");
+            did->invalidate(did->vir, sizeof(int32_t));
+            dtop->invalidate(dtop->vir, sizeof(float));
+            tl.stop();
+            int32_t lid = 0;
+            float   lv  = 0.0f;
+            memcpy(&lid, did->vir, sizeof(int32_t));
+            memcpy(&lv, dtop->vir, sizeof(float));
+            GGML_ASSERT(lid >= 0 && lid < (int32_t) dids.size());
+            const int32_t gid = dids[(size_t) lid];
+            float *       o   = (float *) logits->data;
+            // Nothing is written to the full logits row: filling it costs about 0.9 ms (uncached NPU memory), and the
+            // draft sampler takes the publication directly.  The row still reaches the sampler as a device copy; mark
+            // it clean so that copy skips cache maintenance, and after() fills the chain's top-k output instead.
+            if (!axera::argmax_wanted()) {  // no fused sampler (A/B): the full-row greedy scan needs the whole row
+                std::fill(o, o + N, -INFINITY);
+                o[gid] = lv;
+                dctx->flush(o, N * sizeof(float));
+            }
+            dargmax_id  = gid;
+            dargmax_pub = true;
+            // the sampler's fused row: keyed by this graph's logits row; only a greedy chain takes it
+            axera::argmax_publish(&gid, &lv, 1, logits->data, (size_t) logits->nb[1]);
+            dctx->clean_p     = o;
+            dctx->clean_n     = N * sizeof(float);
+            dctx->clean_epoch = axera_graph_epoch;
+            after(g, names);
+            dargmax_pub = false;
+            return;
+        }
         dout[dk->output("out")] = axera_io(dy);
         dk->run(din, dout, "draft head");
         dy->invalidate();
@@ -1307,13 +1361,25 @@ void output_head::after(ggml_cgraph * g, const graph_names & names) {
     int i0 = il + 1;
     for (int i = il + 1; i < g->n_nodes; i++) {
         ggml_tensor * n = g->nodes[i];
+        if (dargmax_pub && n->op == GGML_OP_TOP_K && n->type == GGML_TYPE_I32 && n->ne[0] <= 64 &&
+            (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            // the argmax draft head already picked the token: skip its pad and top-k scan over 248320 logits.  Every
+            // candidate slot is the same token, so the greedy chain's pick is that token whatever k the sampler asks.
+            int32_t * o = (int32_t *) n->data;
+            std::fill(o, o + n->ne[0], dargmax_id);
+            if (ggml_backend_buffer_is_axera(n->buffer)) {
+                ((ggml_backend_axera_buffer_context *) n->buffer->context)->flush(n->data, ggml_nbytes(n));
+            }
+            i0 = i + 1;
+            continue;
+        }
         if (n->op == GGML_OP_TOP_K && n->src[0]->type == GGML_TYPE_F32 && n->type == GGML_TYPE_I32 &&
             (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
             cpu_compute(g, g->nodes + i0, i - i0, "sampler (cpu)");
             axera_timer tk("sampler: top_k (host)");
             top_k_rows(n);
             i0 = i + 1;
-        } else if (n->op == GGML_OP_PAD && i == i0 && draft_logits) {  // (the TOP_K writes the rows it picks)
+        } else if (n->op == GGML_OP_PAD && i == i0 && (draft_logits || dargmax_pub)) {  // (the TOP_K writes its rows)
             i0 = i + 1;
         } else if (n->op == GGML_OP_PAD && i == i0 && pad_rows(n)) {  // (the sampler's padded logits: a copy)
             i0 = i + 1;

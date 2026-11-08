@@ -57,6 +57,8 @@ typedef struct ggml_axera_argmax {
     // draft/catch-up graph publishing between a target verify and host sampling cannot replace the target's row);
     // 0: no fused row (read the full logits instead)
     int  (*take)(int idx, const void * row_logits, int32_t * id, float * logit);
+    // sampling a speculative draft row: its own graph published the row just consumed (see argmax_take)
+    void (*draft_scope)(int on);
 } ggml_axera_argmax;
 
 #ifdef  __cplusplus

@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "ggml.h"
+#include "ggml-axera.h"
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "log.h"
@@ -28,6 +29,17 @@
 #define SPC_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
+
+// the fused draft head publishes its (id, logit) row for a sampler that cannot identify it by the host logits row
+static void spec_draft_scope(bool on) {
+    static const ggml_axera_argmax * api = [] {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name(GGML_AXERA_NAME);
+        return reg ? (const ggml_axera_argmax *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_axera_argmax") : nullptr;
+    }();
+    if (api && api->draft_scope) {
+        api->draft_scope(on ? 1 : 0);
+    }
+}
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
 // Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
@@ -577,7 +589,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            // A greedy draft only ever reads cur_p[0], and top_k == 1 makes the chain the greedy fast path, so the
+            // adapter can publish its fused draft-head argmax row instead of the head writing 65536 logits and the
+            // host scanning them.  Probabilistic drafting still needs the top-10 candidates for result_q.
+            sparams.top_k    = this->params.probabilistic ? 10 : 1;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             sparams.npu_sampling = false;
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
@@ -1499,7 +1514,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            // A greedy draft only ever reads cur_p[0], and top_k == 1 makes the chain the greedy fast path, so the
+            // adapter can publish its fused draft-head argmax row instead of the head writing 65536 logits and the
+            // host scanning them.  Probabilistic drafting still needs the top-10 candidates for result_q.
+            sparams.top_k    = this->params.probabilistic ? 10 : 1;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             sparams.npu_sampling = false;
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
@@ -1784,7 +1802,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                spec_draft_scope(true);
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                spec_draft_scope(false);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);

@@ -327,10 +327,15 @@ static int argmax_take_c(int idx, const void * row_logits, int32_t * id, float *
     return axera::argmax_take(idx, row_logits, id, logit);
 }
 
+static void argmax_draft_scope_c(int on) {
+    axera::argmax_draft_scope(on != 0);
+}
+
 static const ggml_axera_argmax g_axera_argmax = {
     /* .configure = */ argmax_configure_c,
     /* .reset     = */ argmax_reset_c,
     /* .take      = */ argmax_take_c,
+    /* .draft_scope = */ argmax_draft_scope_c,
 };
 
 uint32_t axera_n_seq_max() {

@@ -2339,7 +2339,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_res));
                 auto fn = (bool (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_visible_output");
-                if (fn && fn() && n_outputs_prev == 0 && ubatch.n_tokens == n_outputs && t_logits->type == GGML_TYPE_F32 &&
+                // Alias the graph's output row(s) only when this ubatch is the whole logical batch. With -ub smaller
+                // than -b the first ubatch aliased its own (small) tensor and the following ubatches copied at
+                // n_outputs_prev*n_vocab past it: a heap overwrite (llama-perplexity -ub 4 segfaulted).
+                if (fn && fn() && n_outputs_prev == 0 && n_outputs_all == n_outputs && ubatch.n_tokens == n_outputs &&
+                    t_logits->type == GGML_TYPE_F32 &&
                     ggml_is_contiguous(t_logits) && t_logits->nb[1] == n_vocab*sizeof(float) &&
                     t_logits->ne[1] == n_outputs) {
                     logits.data = (float *) t_logits->data;

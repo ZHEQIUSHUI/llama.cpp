@@ -1757,10 +1757,16 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
         }
         if (T == 1 && man.has("lm_head.draft")) {  // a draft step: the draft vocabulary's head (draft_vocab.i32)
             if (!head.dk) {
-                const std::string    f = man.dir + "/draft_vocab.i32";
-                FILE *               fp = fopen(f.c_str(), "rb");
-                std::vector<int32_t> ids(man.get("lm_head.draft").out_bytes("out") / sizeof(float));
-                GGML_ASSERT(fp && fread(ids.data(), sizeof(int32_t), ids.size(), fp) == ids.size());
+                const std::string f  = man.dir + "/draft_vocab.i32";
+                FILE *            fp = fopen(f.c_str(), "rb");
+                GGML_ASSERT(fp);
+                // the vocabulary is the file's, not the kernel's output shape: an argmax draft head has no full row
+                fseek(fp, 0, SEEK_END);
+                const long fsz = ftell(fp);
+                fseek(fp, 0, SEEK_SET);
+                GGML_ASSERT(fsz > 0 && fsz % (long) sizeof(int32_t) == 0);
+                std::vector<int32_t> ids((size_t) fsz / sizeof(int32_t));
+                GGML_ASSERT(fread(ids.data(), sizeof(int32_t), ids.size(), fp) == ids.size());
                 fclose(fp);
                 axera_timer tb("init: draft head");
                 head.bind_draft(man.get("lm_head.draft"), ids);

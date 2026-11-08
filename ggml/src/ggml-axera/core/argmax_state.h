@@ -19,5 +19,8 @@ bool argmax_wanted();
 bool argmax_publish(const int32_t * ids, const float * logits, int32_t rows, const void * rows_base, size_t row_stride);
 int  argmax_published();
 int  argmax_take(int idx, const void * row_logits, int32_t * id, float * logit);
+// the caller is sampling a speculative draft row: its graph publishes one row and consumes it immediately, but the
+// adapter hands the sampler a copy of a row the fused draft head does not write (so the row cannot identify it)
+void argmax_draft_scope(bool on);
 
 }  // namespace axera

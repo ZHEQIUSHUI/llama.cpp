@@ -107,6 +107,8 @@ struct output_head {
     const kernel *       dk = nullptr;
     std::vector<int32_t> dids;
     axera_cmm            dq, ds, dy;
+    bool                 dargmax = false;  // the draft head returns one (local id, logit) instead of 65536 logits
+    axera_cmm            did, dtop;
     bool                 draft = false;  // the next run's single output row through the draft head
     // the fused head + penalties + exact top-K (role lm_head.topk): the penalty arrays the host sampler maintains, the
     // candidates and the full-vocabulary max / sumexp it returns
