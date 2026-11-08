@@ -221,6 +221,11 @@ class qwen35_moe_sgl final : public model {
     call                             emb_mtp;  // the token embedding gather straight into mtp1.e (draft chain)
     std::map<std::string, axera_cmm> mtp_w;
     axera_cmm                        MKV, MINDICES;
+    // the static three-step draft chain (role mtp.chain): one call for MTP block + draft argmax + next embedding
+    call      mtp_chain;
+    bool      mtp_chain_bound = false;
+    axera_cmm chain_tok, chain_h, chain_e[3], chain_hn[3], chain_ids, chain_dids;
+    axera_cmm chain_pos, chain_pids, chain_indptr, chain_loc, chain_ntok;
     int                              mtp_kv_pages = 0;
     size_t                           mtp_kv_bytes = 0;
     const void *                     mtp_bound = nullptr;
@@ -304,6 +309,7 @@ class qwen35_moe_sgl final : public model {
     ggml_status  verify(const kv_view & kv, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h,
                         const std::vector<int> * out_rows);
     void         init_mtp(const std::map<std::string, ggml_tensor *> & t, int il, const rope & rq);
+    void         bind_mtp_chain(const kernel & ck);
     ggml_status  compute_mtp(ggml_cgraph * g);
     void         paging(int64_t hist, int64_t write_cell);
     void         embed_tokens(const int32_t * toks, int n);
@@ -3067,12 +3073,68 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
     MINDICES->flush();
 }
 
+// The static draft chain shares the MTP weights, the draft-head tables and the single MTP KV pool with the row-wise
+// kernels. Its three e buffers are outputs rather than internal DDR tensors: a DDR tensor produced and consumed in
+// the same graph was not visible to the following block in CRUN (the three blocks read a stale/zero row), while an
+// output buffer is bound through the kernel's IO table and is.
+void qwen35_moe_sgl::bind_mtp_chain(const kernel & ck) {
+    GGML_ASSERT(head.dq && head.ds && head.dids.size() == 65536);
+    auto need = [&](axera_cmm & c, uint32_t bytes) {
+        if (!c) {
+            c = axera_cmm_alloc(bytes);
+        }
+        GGML_ASSERT(c->size >= bytes);
+    };
+    mtp_chain = {};
+    mtp_chain.k = &ck;
+    mtp_chain.in.assign(ck.info->nInputSize, {});
+    mtp_chain.out.assign(ck.info->nOutputSize, {});
+    for (const auto & d : ck.desc->in) {
+        if (d.name.rfind("w_", 0) == 0) {
+            auto it = mtp_w.find(d.name);
+            if (it == mtp_w.end() || it->second->size < d.bytes) {
+                GGML_ABORT("axera qwen35_moe_sgl: mtp.chain: weight %s is %u bytes\n", d.name.c_str(), d.bytes);
+            }
+            mtp_chain.in[ck.input(d.name)] = axera_io(it->second, d.bytes);
+            continue;
+        }
+        axera_cmm * b = d.name == "token_id" ? &chain_tok : d.name == "h0" ? &chain_h :
+                        d.name == "positions" ? &chain_pos : d.name == "position_ids" ? &chain_pids :
+                        d.name == "indptr" ? &chain_indptr : d.name == "cache_location" ? &chain_loc :
+                        d.name == "ntok" ? &chain_ntok : d.name == "indices" ? &MINDICES :
+                        d.name == "paged_kv" ? &MKV : d.name == "emb_weight" ? &EMBW :
+                        d.name == "draft_ids" ? &chain_dids : d.name == "dhw" ? &head.dq :
+                        d.name == "dhs" ? &head.ds : nullptr;
+        if (!b) {
+            GGML_ABORT("axera qwen35_moe_sgl: mtp.chain: unexpected input %s\n", d.name.c_str());
+        }
+        // The MTP kernels describe the whole 1024-page pool in their IO table; the adapter may keep only the pages
+        // the context uses, as the row-wise kernels already do.
+        need(*b, b == &MKV ? mtp_kv_bytes : d.bytes);
+        mtp_chain.in[ck.input(d.name)] = axera_io(*b, d.bytes);
+    }
+    for (const auto & d : ck.desc->out) {
+        axera_cmm * b = d.name == "e0" ? &chain_e[0] : d.name == "e1" ? &chain_e[1] : d.name == "e2" ? &chain_e[2] :
+                        d.name == "out_ids" ? &chain_ids : d.name == "out_hnext0" ? &chain_hn[0] :
+                        d.name == "out_hnext1" ? &chain_hn[1] : d.name == "out_hnext2" ? &chain_hn[2] : nullptr;
+        if (!b) {
+            GGML_ABORT("axera qwen35_moe_sgl: mtp.chain: unexpected output %s\n", d.name.c_str());
+        }
+        need(*b, d.bytes);
+        mtp_chain.out[ck.output(d.name)] = axera_io(*b, d.bytes);
+    }
+    memcpy(chain_dids->vir, head.dids.data(), head.dids.size() * sizeof(int32_t));
+    chain_dids->flush();
+    mtp_chain_bound = true;
+}
+
 // A draft context's MTP graph: token embedding e (the token rows) with the target's final-norm hidden h of the
 // previous cell through blk.<il>, at the draft context's own cells. h_nextn / the logits of the output rows.
 ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
     ggml_tensor * hin  = names.find("mtp_h_input");
     ggml_tensor * hn   = names.find("h_nextn");
     ggml_tensor * pos  = names.find("inp_pos");
+    ggml_tensor * itok = names.find("inp_tokens");
     ggml_tensor * kidx = names.find("attn_inp_k_idxs");
     ggml_tensor * kqm  = names.find("attn_inp_kq_mask");
     const ggml_tensor * embd = nullptr;
@@ -3098,6 +3160,9 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
                        "(embd %d h_nextn %d inp_pos %d k_idxs %d kq_mask %d layer %d target %d)\n",
                        !!embd, !!hn, !!pos, !!kidx, !!kqm, il, !!bound);
         return GGML_STATUS_FAILED;
+    }
+    if (!itok && embd->op == GGML_OP_GET_ROWS && embd->src[1] && embd->src[1]->type == GGML_TYPE_I32) {
+        itok = embd->src[1];
     }
     const int T = (int) hin->ne[1];
     GGML_ASSERT(hin->type == GGML_TYPE_F32 && hin->ne[0] == H && embd->type == GGML_TYPE_F32 && embd->ne[0] == H &&
@@ -3208,8 +3273,11 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
     // and no per-step graph are built.
     const int     chain_n  = std::getenv("GGML_AXERA_MTP_CHAIN") && atoi(std::getenv("GGML_AXERA_MTP_CHAIN")) == 0
                                  ? 0 : axera::argmax_chain_n();
+    const char *  align_env = std::getenv("GGML_AXERA_MTP_ALIGN_BATCH");
+    const int     chain_pad = !align_env || atoi(align_env) != 0 ? 1 : 0;
     ggml_tensor * rlogits  = names.find("result_output");
-    if (chain_n >= 2 && chain_n <= 4 && T == chain_n && rlogits && (rlogits->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+    if (chain_n >= 2 && chain_n <= 4 && T == chain_n + chain_pad && rlogits &&
+        (rlogits->flags & GGML_TENSOR_FLAG_COMPUTE) &&
         man.has("lm_head.draft") && emb_mtp.k) {
         head.bind(man.get("lm_head"), rlogits->src[0]);
         if (!head.dk) {
@@ -3227,6 +3295,62 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
             head.bind_draft(man.get("lm_head.draft"), draft_ids);
         }
         if (head.dk && head.dargmax) {
+            const bool use_chain3 = chain_n == 3 && man.has("mtp.chain") &&
+                                    !(getenv("GGML_AXERA_MTP_CHAIN3") && atoi(getenv("GGML_AXERA_MTP_CHAIN3")) == 0);
+            if (use_chain3) {
+                const kernel & ck = man.get("mtp.chain");
+                if (!mtp_chain_bound) {
+                    bind_mtp_chain(ck);
+                }
+                GGML_ASSERT(itok && itok->type == GGML_TYPE_I32 && itok->data);
+                const int32_t first_id = ((const int32_t *) itok->data)[0];
+                *(int32_t *) chain_tok->vir = first_id;
+                chain_tok->flush();
+                row_bf16(hin, 0, (ggml_bf16_t *) chain_h->vir);
+                chain_h->flush();
+                const int32_t * pd = (const int32_t *) pos->data;
+                for (int r = 0; r < 3; ++r) {
+                    const int64_t c = cell_of(r);
+                    ((int32_t *) chain_pos->vir)[r] = (int32_t) c;
+                    ((int32_t *) chain_indptr->vir)[2 * r] = 0;
+                    ((int32_t *) chain_indptr->vir)[2 * r + 1] = (int32_t) (c / PG + 1);
+                    ((int32_t *) chain_loc->vir)[2 * r] = (int32_t) (c / PG);
+                    ((int32_t *) chain_loc->vir)[2 * r + 1] = (int32_t) (c % PG);
+                    ((int32_t *) chain_ntok->vir)[r] = 1;
+                    for (int s = 0; s < 3; ++s) {
+                        ((int32_t *) chain_pids->vir)[s * 3 + r] = mr_pos ? pd[std::min(s, 3) * T + r] : pd[r];
+                    }
+                }
+                chain_pos->flush();
+                chain_indptr->flush();
+                chain_loc->flush();
+                chain_ntok->flush();
+                chain_pids->flush();
+                {
+                    axera_timer tb("mtp chain3: one call");
+                    mtp_chain.k->run(mtp_chain.in, mtp_chain.out, "mtp chain3");
+                }
+                chain_ids->invalidate(chain_ids->vir, 3 * sizeof(int32_t));
+                int32_t cid[3] = {};
+                memcpy(cid, chain_ids->vir, sizeof(cid));
+                for (int r = 0; r < 3; ++r) {
+                    chain_hn[r]->invalidate(chain_hn[r]->vir, H * sizeof(ggml_bf16_t));
+                    if (hn->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                        ggml_bf16_to_fp32_row((const ggml_bf16_t *) chain_hn[r]->vir,
+                                              (float *) ((char *) hn->data + (size_t) r * hn->nb[1]), H);
+                    }
+                }
+                if ((hn->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_backend_buffer_is_axera(hn->buffer)) {
+                    ((ggml_backend_axera_buffer_context *) hn->buffer->context)->flush(hn->data, ggml_nbytes(hn));
+                }
+                float clv[3] = {};
+                axera::argmax_chain_publish(cid, clv, 3);
+                auto * dctx = (ggml_backend_axera_buffer_context *) rlogits->buffer->context;
+                dctx->clean_p     = (float *) rlogits->data;
+                dctx->clean_n     = ggml_nbytes(rlogits);
+                dctx->clean_epoch = axera_graph_epoch;
+                return GGML_STATUS_SUCCESS;
+            }
             if (getenv("GGML_AXERA_MTP_CHAIN_DEBUG")) {
                 static bool chain_logged = false;
                 if (!chain_logged) {
@@ -3252,7 +3376,10 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
                     set_ntok(mtp1.ntok, 1);
                     set_indptr(mtp1.indptr, cell_of(r));
                 }
-                mtp1.c.k->run(mtp1.c.in, mtp1.c.out, "mtp chain");
+                {
+                    axera_timer tb("mtp chain: block");
+                    mtp1.c.k->run(mtp1.c.in, mtp1.c.out, "mtp chain");
+                }
                 mtp1.hnext->invalidate(mtp1.hnext->vir, H * sizeof(ggml_bf16_t));
                 {
                     axera_timer th("mtp chain: head");
@@ -3285,7 +3412,15 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         }
     }
 
-    if (T >= 2 && T <= R8 && !std::getenv("GGML_AXERA_MTP_T1")) {  // the rows accepted by a verification, in one call
+    // The draft chain already wrote the accepted rows' KV when it produced them.  The catch-up block only recomputed
+    // those rows from the target hidden, and the eight scenes showed no acceptance gain.  GGML_AXERA_MTP_NO_CATCHUP=0
+    // restores the catch-up for an A/B.
+    const char * no_catchup_env = std::getenv("GGML_AXERA_MTP_NO_CATCHUP");
+    const bool   no_catchup     = !no_catchup_env || atoi(no_catchup_env) != 0;
+    const bool   mtp_catchup    = !(T >= 2 && T <= 8) || !no_catchup;
+    if (!mtp_catchup) {
+        // no catch-up: the draft chain's KV is already at these cells, and its h_nextn output is not read
+    } else if (T >= 2 && T <= R8 && !std::getenv("GGML_AXERA_MTP_T1")) {  // rows of a verification, one call
         {
             axera_timer thost("mtp host: fills (multi)");
             rows_in(mtp8.e, mtp8.h, R8, 0, T - 1);
@@ -3295,7 +3430,10 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
             set_ntok(mtp8.ntok, T);
             set_indptr(mtp8.indptr, cell_of(T - 1));
         }
-        mtp8.c.k->run(mtp8.c.in, mtp8.c.out, mtp8.c.k->desc->role.c_str());
+        {
+            axera_timer tb("mtp catch-up: block");
+            mtp8.c.k->run(mtp8.c.in, mtp8.c.out, mtp8.c.k->desc->role.c_str());
+        }
         {
             axera_timer thost("mtp host: read h (multi)");
             mtp8.hnext->invalidate(mtp8.hnext->vir, (size_t) T * H * sizeof(ggml_bf16_t));
@@ -3348,7 +3486,7 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         }
     }
 
-    if (hn->flags & GGML_TENSOR_FLAG_COMPUTE) {
+    if ((hn->flags & GGML_TENSOR_FLAG_COMPUTE) && mtp_catchup) {
         for (int r = 0; r < T; ++r) {
             memcpy((char *) hn->data + (size_t) r * hn->nb[1], h.data() + (size_t) r * H, H * sizeof(float));
         }
@@ -3357,7 +3495,10 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         }
     }
     ggml_tensor * logits = names.find("result_output");
-    if (logits && logits->ne[1] > 0 && (logits->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+    // an aligned catch-up batch asks for its last row's logits only to keep the draft graph's shape; its head is not
+    // run, and the draft chain publishes the ids it needs through the argmax queue
+    const bool catchup_no_head = T >= 2 && T <= 8 && axera::argmax_chain_n() == 0;
+    if (logits && logits->ne[1] > 0 && (logits->flags & GGML_TENSOR_FLAG_COMPUTE) && !catchup_no_head) {
         head.bind(man.get("lm_head"), logits->src[0]);
         if (T == 1 && man.has("lm_head.draft")) {
             if (!head.dk) {
