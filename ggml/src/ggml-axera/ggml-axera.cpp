@@ -7,6 +7,8 @@
 #include "core/argmax_state.h"
 
 #include <atomic>
+#include <map>
+#include <mutex>
 #include <unordered_map>
 
 static const char * ggml_backend_axera_get_name(ggml_backend_t backend) {
@@ -21,8 +23,27 @@ namespace axera {
 bool warmup_active() { return axera_warmup; }
 }
 
+// every llama.cpp context of a model (the target and a speculative draft context) shares one adapter, and therefore
+// one private state. A PARTIAL_ONLY checkpoint writes that state once: the first context to query it owns the blob,
+// the other contexts report no backend state. Restores follow the blob's own count, so they do not consult this map.
+static std::mutex                                     axera_state_owner_mu;
+static std::map<const axera::model *, ggml_backend_t> axera_state_owner;
+
+static bool ggml_backend_axera_state_owner(ggml_backend_t backend, const axera::model * model) {
+    std::lock_guard<std::mutex> lock(axera_state_owner_mu);
+    auto [it, inserted] = axera_state_owner.emplace(model, backend);
+    return inserted || it->second == backend;
+}
+
 static void ggml_backend_axera_free(ggml_backend_t backend) {
-    delete (ggml_backend_axera_context *) backend->context;
+    auto * ctx = (ggml_backend_axera_context *) backend->context;
+    if (ctx && ctx->model) {
+        std::lock_guard<std::mutex> lock(axera_state_owner_mu);
+        for (auto it = axera_state_owner.begin(); it != axera_state_owner.end();) {
+            it = it->second == backend ? axera_state_owner.erase(it) : std::next(it);
+        }
+    }
+    delete ctx;
     delete backend;
 }
 
@@ -291,19 +312,28 @@ static bool ggml_backend_axera_pin_host_weights(void) {
 
 // llama.cpp's state API: an adapter with private CMM caches appends this opaque blob to a sequence state, so a
 // checkpoint / prompt-cache restore restores what the kernels read (KV pages, recurrent state, page restart point).
-static size_t ggml_backend_axera_state_size(ggml_backend_t backend) {
+static size_t ggml_backend_axera_state_size(ggml_backend_t backend, uint32_t flags) {
     auto * ctx = (ggml_backend_axera_context *) backend->context;
-    return ctx && ctx->model ? ctx->model->state_size() : 0;
+    size_t size = 0;
+    if (ctx && ctx->model && (!(flags & axera::state_flags_partial_only) ||
+                              ggml_backend_axera_state_owner(backend, ctx->model.get()))) {
+        size = ctx->model->state_size(flags);
+    }
+    return size;
 }
 
-static size_t ggml_backend_axera_state_write(ggml_backend_t backend, void * dst, size_t size) {
+static size_t ggml_backend_axera_state_write(ggml_backend_t backend, void * dst, size_t size, uint32_t flags) {
     auto * ctx = (ggml_backend_axera_context *) backend->context;
-    return ctx && ctx->model ? ctx->model->state_write(dst, size) : 0;
+    if (!ctx || !ctx->model || ((flags & axera::state_flags_partial_only) &&
+                                !ggml_backend_axera_state_owner(backend, ctx->model.get()))) {
+        return 0;
+    }
+    return ctx->model->state_write(dst, size, flags);
 }
 
-static size_t ggml_backend_axera_state_read(ggml_backend_t backend, const void * src, size_t size) {
+static size_t ggml_backend_axera_state_read(ggml_backend_t backend, const void * src, size_t size, uint32_t flags) {
     auto * ctx = (ggml_backend_axera_context *) backend->context;
-    return ctx && ctx->model ? ctx->model->state_read(src, size) : 0;
+    return ctx && ctx->model ? ctx->model->state_read(src, size, flags) : 0;
 }
 
 // llama.cpp tells each context's sequence count: the largest is kept (a padded prefill chunk needs one sequence)

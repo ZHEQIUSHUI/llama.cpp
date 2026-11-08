@@ -75,7 +75,7 @@ struct sgl_state_header {
     uint32_t nkv_pages;
     uint32_t kv_total_pages;
     uint32_t snap_prompt;
-    uint32_t reserved;
+    uint32_t partial;
     uint64_t kv_page_b;
     uint64_t kv_n;
     uint64_t st_b;
@@ -141,9 +141,9 @@ class qwen35_moe_sgl final : public model {
   public:
     explicit qwen35_moe_sgl(const manifest & m) : man(m) {}
     ggml_status compute(ggml_cgraph * g) override;
-    size_t       state_size() const override;
-    size_t       state_write(void * dst, size_t size) override;
-    size_t       state_read(const void * src, size_t size) override;
+    size_t       state_size(uint32_t flags) const override;
+    size_t       state_write(void * dst, size_t size, uint32_t flags) override;
+    size_t       state_read(const void * src, size_t size, uint32_t flags) override;
 
   private:
     const manifest & man;
@@ -1466,17 +1466,20 @@ void qwen35_moe_sgl::load_state() {
 // llama.cpp's sequence state (prompt cache / context checkpoint). The KV pools and recurrent states live in CMM, not
 // in the llama.cpp cache tensors, so this blob carries the KV pages before the current cell, the current recurrent
 // state, and the restart point of the current page (the state at its first cell plus the page's inputs).
-size_t qwen35_moe_sgl::state_size() const {
+size_t qwen35_moe_sgl::state_size(uint32_t flags) const {
     if (!kv_page_b || !banks.count("b0_attn_state_in")) {
         return 0;
     }
+    const bool   partial    = flags & state_flags_partial_only;
     const bool   has_target = state_cell > 0 || snap_cell >= 0 || !page_x.empty();
     const size_t nkv_pages  = has_target ? std::min<size_t>((size_t) kv_pages, (size_t) ((state_cell + PG - 1) / PG)) : 0;
     if (!has_target) {
         return 0;
     }
     size_t n = sizeof(sgl_state_header);
-    n += (size_t) NB * nkv_pages * kv_page_b;
+    if (!partial) {
+        n += (size_t) NB * nkv_pages * kv_page_b;
+    }
     for (const char * nm : { "b0_attn_state_in", "b0_attn_q_conv_state_in", "b0_attn_k_conv_state_in", "b0_attn_v_conv_state_in" }) {
         n += banks.at(nm)->size;
     }
@@ -1485,30 +1488,31 @@ size_t qwen35_moe_sgl::state_size() const {
     return n;
 }
 
-size_t qwen35_moe_sgl::state_write(void * dst, size_t size) {
+size_t qwen35_moe_sgl::state_write(void * dst, size_t size, uint32_t flags) {
     axera_timer tw("state write");
-    const size_t total = state_size();
+    const size_t total = state_size(flags);
     if (!total || size < total) {
         return 0;
     }
+    const bool   partial    = flags & state_flags_partial_only;
     const bool   has_target = state_cell > 0 || snap_cell >= 0 || !page_x.empty();
     const size_t nkv_pages  = has_target ? std::min<size_t>((size_t) kv_pages, (size_t) ((state_cell + PG - 1) / PG)) : 0;
 
     sgl_state_header h;
     memset(&h, 0, sizeof(h));
     memcpy(h.magic, "AXSGL1", sizeof(h.magic) - 1);
-    h.version        = 2;
+    h.version        = 3;
     h.kind           = 3;
     h.state_cell     = state_cell;
     h.snap_cell      = snap_cell;
     h.ksnap_cell     = ksnap_cell;
     h.kv_split       = kv_split;
     h.n_attn         = NB;
-    h.nkv_pages      = (uint32_t) nkv_pages;
+    h.nkv_pages      = partial ? 0 : (uint32_t) nkv_pages;
     h.kv_total_pages = (uint32_t) kv_total_pages;
     h.snap_prompt    = snap_prompt;
     h.kv_page_b      = kv_page_b;
-    h.kv_n           = (uint64_t) NB * nkv_pages * kv_page_b;
+    h.kv_n           = partial ? 0 : (uint64_t) NB * nkv_pages * kv_page_b;
     h.st_b           = B("b0_attn_state_in")->size;
     h.cq_b           = B("b0_attn_q_conv_state_in")->size;
     h.ck_b           = B("b0_attn_k_conv_state_in")->size;
@@ -1519,24 +1523,27 @@ size_t qwen35_moe_sgl::state_write(void * dst, size_t size) {
     h.page_p_n       = page_p.size() * sizeof(int32_t);
     h.kpage_x_n      = kpage_x.size() * sizeof(ggml_bf16_t);
     h.kpage_p_n      = kpage_p.size() * sizeof(int32_t);
+    h.partial        = partial;
 
     char * p = (char *) dst;
     memcpy(p, &h, sizeof(h));
     p += sizeof(h);
-    const size_t page_n = nkv_pages * kv_page_b;
-    if (kv_split) {
-        for (const axera_cmm & c : KVL) {
-            c->invalidate(c->vir, page_n);
-            memcpy(p, c->vir, page_n);
-            p += page_n;
-        }
-    } else {
-        const axera_cmm & c = B("b3_kv");
-        for (int j = 0; j < NB; ++j) {
-            char * src = (char *) c->vir + (size_t) j * kv_total_pages * kv_page_b;
-            c->invalidate(src, page_n);
-            memcpy(p, src, page_n);
-            p += page_n;
+    if (!partial) {
+        const size_t page_n = nkv_pages * kv_page_b;
+        if (kv_split) {
+            for (const axera_cmm & c : KVL) {
+                c->invalidate(c->vir, page_n);
+                memcpy(p, c->vir, page_n);
+                p += page_n;
+            }
+        } else {
+            const axera_cmm & c = B("b3_kv");
+            for (int j = 0; j < NB; ++j) {
+                char * src = (char *) c->vir + (size_t) j * kv_total_pages * kv_page_b;
+                c->invalidate(src, page_n);
+                memcpy(p, src, page_n);
+                p += page_n;
+            }
         }
     }
     for (const char * n : { "b0_attn_state_in", "b0_attn_q_conv_state_in", "b0_attn_k_conv_state_in", "b0_attn_v_conv_state_in" }) {
@@ -1559,17 +1566,20 @@ size_t qwen35_moe_sgl::state_write(void * dst, size_t size) {
     return (size_t) (p - (char *) dst);
 }
 
-size_t qwen35_moe_sgl::state_read(const void * src, size_t size) {
+size_t qwen35_moe_sgl::state_read(const void * src, size_t size, uint32_t flags) {
     axera_timer tr("state read");
     if (size < sizeof(sgl_state_header)) {
         return 0;
     }
+    const bool partial = flags & state_flags_partial_only;
     sgl_state_header h;
     memcpy(&h, src, sizeof(h));
-    if (memcmp(h.magic, "AXSGL1", sizeof(h.magic) - 1) != 0 || h.version != 2 || h.kind != 3 || h.n_attn != NB ||
+    if (memcmp(h.magic, "AXSGL1", sizeof(h.magic) - 1) != 0 || h.version != 3 || h.kind != 3 || h.n_attn != NB ||
+        h.partial != partial ||
         h.kv_split != kv_split || h.kv_page_b != kv_page_b || h.kv_total_pages != (uint32_t) kv_total_pages ||
-        h.nkv_pages > (uint32_t) kv_pages || h.state_cell < 0 || h.state_cell > kv_cells ||
-        h.kv_n != (uint64_t) NB * h.nkv_pages * h.kv_page_b || h.st_b != B("b0_attn_state_in")->size ||
+        (partial ? h.nkv_pages != 0 || h.kv_n != 0 :
+         h.nkv_pages > (uint32_t) kv_pages || h.kv_n != (uint64_t) NB * h.nkv_pages * h.kv_page_b) ||
+        h.state_cell < 0 || h.state_cell > kv_cells || h.st_b != B("b0_attn_state_in")->size ||
         h.cq_b != B("b0_attn_q_conv_state_in")->size || h.ck_b != B("b0_attn_k_conv_state_in")->size ||
         h.cv_b != B("b0_attn_v_conv_state_in")->size || h.page_x_n % (H * sizeof(ggml_bf16_t)) ||
         h.page_p_n % (4 * sizeof(int32_t)) || h.kpage_x_n % (H * sizeof(ggml_bf16_t)) ||
@@ -1582,20 +1592,22 @@ size_t qwen35_moe_sgl::state_read(const void * src, size_t size) {
         return 0;
     }
     const char * p = (const char *) src + sizeof(h);
-    const size_t page_n = h.nkv_pages * h.kv_page_b;
-    if (kv_split) {
-        for (const axera_cmm & c : KVL) {
-            memcpy(c->vir, p, page_n);
-            c->flush(c->vir, page_n);
-            p += page_n;
-        }
-    } else {
-        const axera_cmm & c = B("b3_kv");
-        for (int j = 0; j < NB; ++j) {
-            char * d = (char *) c->vir + (size_t) j * kv_total_pages * kv_page_b;
-            memcpy(d, p, page_n);
-            c->flush(d, page_n);
-            p += page_n;
+    if (!h.partial) {
+        const size_t page_n = h.nkv_pages * h.kv_page_b;
+        if (kv_split) {
+            for (const axera_cmm & c : KVL) {
+                memcpy(c->vir, p, page_n);
+                c->flush(c->vir, page_n);
+                p += page_n;
+            }
+        } else {
+            const axera_cmm & c = B("b3_kv");
+            for (int j = 0; j < NB; ++j) {
+                char * d = (char *) c->vir + (size_t) j * kv_total_pages * kv_page_b;
+                memcpy(d, p, page_n);
+                c->flush(d, page_n);
+                p += page_n;
+            }
         }
     }
     for (const char * n : { "b0_attn_state_in", "b0_attn_q_conv_state_in", "b0_attn_k_conv_state_in", "b0_attn_v_conv_state_in" }) {

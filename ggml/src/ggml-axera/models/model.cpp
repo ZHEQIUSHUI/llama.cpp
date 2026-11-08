@@ -58,16 +58,16 @@ struct composite final : model {
         return cur->compute(g);
     }
 
-    size_t state_size() const override {
-        return llm ? llm->state_size() : 0;
+    size_t state_size(uint32_t flags) const override {
+        return llm ? llm->state_size(flags) : 0;
     }
 
-    size_t state_write(void * dst, size_t size) override {
-        return llm ? llm->state_write(dst, size) : 0;
+    size_t state_write(void * dst, size_t size, uint32_t flags) override {
+        return llm ? llm->state_write(dst, size, flags) : 0;
     }
 
-    size_t state_read(const void * src, size_t size) override {
-        return llm ? llm->state_read(src, size) : 0;
+    size_t state_read(const void * src, size_t size, uint32_t flags) override {
+        return llm ? llm->state_read(src, size, flags) : 0;
     }
 };
 

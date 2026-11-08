@@ -730,7 +730,7 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool store_disk(const server_prompt_cache_state & state);
 

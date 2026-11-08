@@ -307,7 +307,7 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    bool prompt_save(server_prompt_cache & prompt_cache) {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -2651,9 +2651,11 @@ private:
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, tgt = %.3f MiB, dft = %.3f MiB, spec = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
+                (float) cur.data_tgt.size() / 1024 / 1024, (float) cur.data_dft.size() / 1024 / 1024,
+                (float) cur.data_spec.size() / 1024 / 1024);
     }
 
     // checkpoints are appended to the slot save file, after the llama state payload

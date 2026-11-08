@@ -302,8 +302,8 @@ private:
 
     // opaque per-backend state (a backend whose adapter keeps its caches outside the llama.cpp tensors), appended to
     // the memory-module state so checkpoints restore it too
-    void state_write_backends(llama_io_write_i & io);
-    void state_read_backends (llama_io_read_i  & io);
+    void state_write_backends(llama_io_write_i & io, llama_state_seq_flags flags);
+    void state_read_backends (llama_io_read_i  & io, llama_state_seq_flags flags);
 
     //
     // members

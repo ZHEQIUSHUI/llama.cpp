@@ -3272,6 +3272,17 @@ public:
         return size_written;
     }
 
+    uint8_t * reserve(size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        uint8_t * res = ptr;
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+        return res;
+    }
+
 private:
     uint8_t * ptr;
     size_t buf_size = 0;
@@ -3326,6 +3337,17 @@ public:
 
     size_t n_bytes() override {
         return size_read;
+    }
+
+    const uint8_t * peek(size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        const uint8_t * res = ptr;
+        ptr += size;
+        size_read += size;
+        buf_size -= size;
+        return res;
     }
 
 private:
@@ -3508,6 +3530,17 @@ public:
         return size_written;
     }
 
+    uint8_t * reserve(size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        uint8_t * res = ptr;
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+        return res;
+    }
+
 private:
     uint8_t * ptr;
     size_t buf_size = 0;
@@ -3681,6 +3714,17 @@ public:
 
     size_t n_bytes() override {
         return size_read;
+    }
+
+    const uint8_t * peek(size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        const uint8_t * res = ptr;
+        ptr += size;
+        size_read += size;
+        buf_size -= size;
+        return res;
     }
 
 private:
@@ -3955,7 +3999,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
         memory->state_write(io);
     }
 
-    state_write_backends(io);
+    state_write_backends(io, 0);
 
     return io.n_bytes();
 }
@@ -3983,7 +4027,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
         memory->state_read(io);
     }
 
-    state_read_backends(io);
+    state_read_backends(io, 0);
 
     return io.n_bytes();
 }
@@ -3993,7 +4037,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
         memory->state_write(io, seq_id, flags);
     }
 
-    state_write_backends(io);
+    state_write_backends(io, flags);
 
     return io.n_bytes();
 }
@@ -4003,7 +4047,7 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
         memory->state_read(io, seq_id, flags);
     }
 
-    state_read_backends(io);
+    state_read_backends(io, flags);
 
     return io.n_bytes();
 }
@@ -4016,22 +4060,22 @@ static void * llama_backend_state_proc(ggml_backend_t backend, const char * name
     return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
 }
 
-void llama_context::state_write_backends(llama_io_write_i & io) {
+void llama_context::state_write_backends(llama_io_write_i & io, llama_state_seq_flags flags) {
     uint32_t count = 0;
     for (auto & backend : backends) {
-        auto * size_fn = (size_t (*)(ggml_backend_t)) llama_backend_state_proc(backend.get(), "ggml_backend_state_size");
-        if (size_fn && size_fn(backend.get()) > 0) {
+        auto * size_fn = (size_t (*)(ggml_backend_t, uint32_t)) llama_backend_state_proc(backend.get(), "ggml_backend_state_size");
+        if (size_fn && size_fn(backend.get(), flags) > 0) {
             ++count;
         }
     }
     io.write(&count, sizeof(count));
     for (uint32_t i = 0; i < backends.size(); ++i) {
         ggml_backend_t backend = backends[i].get();
-        auto * size_fn = (size_t (*)(ggml_backend_t)) llama_backend_state_proc(backend, "ggml_backend_state_size");
+        auto * size_fn = (size_t (*)(ggml_backend_t, uint32_t)) llama_backend_state_proc(backend, "ggml_backend_state_size");
         if (!size_fn) {
             continue;
         }
-        const size_t size = size_fn(backend);
+        const size_t size = size_fn(backend, flags);
         if (size == 0) {
             continue;
         }
@@ -4042,17 +4086,24 @@ void llama_context::state_write_backends(llama_io_write_i & io) {
             io.write(nullptr, size);  // (the dummy writer only counts)
             continue;
         }
-        std::vector<uint8_t> data(size);
-        auto * write_fn = (size_t (*)(ggml_backend_t, void *, size_t)) llama_backend_state_proc(backend, "ggml_backend_state_write");
-        const size_t written = write_fn ? write_fn(backend, data.data(), data.size()) : 0;
+        auto * write_fn = (size_t (*)(ggml_backend_t, void *, size_t, uint32_t)) llama_backend_state_proc(backend, "ggml_backend_state_write");
+        std::vector<uint8_t> data;
+        uint8_t * dst = io.reserve(size);
+        if (!dst) {
+            data.resize(size);
+            dst = data.data();
+        }
+        const size_t written = write_fn ? write_fn(backend, dst, size, flags) : 0;
         if (written != size) {
             throw std::runtime_error(format("backend %u wrote %zu of %zu state bytes", i, written, size));
         }
-        io.write(data.data(), data.size());
+        if (!data.empty()) {
+            io.write(data.data(), data.size());
+        }
     }
 }
 
-void llama_context::state_read_backends(llama_io_read_i & io) {
+void llama_context::state_read_backends(llama_io_read_i & io, llama_state_seq_flags flags) {
     uint32_t count = 0;
     io.read(&count, sizeof(count));
     for (uint32_t n = 0; n < count; ++n) {
@@ -4064,13 +4115,18 @@ void llama_context::state_read_backends(llama_io_read_i & io) {
             throw std::runtime_error(format("invalid backend state entry %u/%" PRIu64, i, size));
         }
         ggml_backend_t backend = backends[i].get();
-        auto * read_fn = (size_t (*)(ggml_backend_t, const void *, size_t)) llama_backend_state_proc(backend, "ggml_backend_state_read");
+        auto * read_fn = (size_t (*)(ggml_backend_t, const void *, size_t, uint32_t)) llama_backend_state_proc(backend, "ggml_backend_state_read");
         if (!read_fn) {
             throw std::runtime_error(format("backend %u has state data but no state reader", i));
         }
-        std::vector<uint8_t> data((size_t) size);
-        io.read(data.data(), data.size());
-        if (read_fn(backend, data.data(), data.size()) != data.size()) {
+        const uint8_t * src = io.peek((size_t) size);
+        std::vector<uint8_t> data;
+        if (!src) {
+            data.resize((size_t) size);
+            io.read(data.data(), data.size());
+            src = data.data();
+        }
+        if (read_fn(backend, src, (size_t) size, flags) != size) {
             throw std::runtime_error(format("backend %u failed to restore its state", i));
         }
     }

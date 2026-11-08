@@ -12,14 +12,17 @@
 
 namespace axera {
 
+// llama.cpp's LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY. ggml does not include llama.h, so the value is repeated here.
+constexpr uint32_t state_flags_partial_only = 1;
+
 struct model {
     virtual ~model() = default;
     // llama.cpp's sequence state (context checkpoints / prompt cache). An adapter whose caches are private CMM pools
     // overrides these: the backend appends the blob to the state stream, so a checkpoint restore puts the state the
     // kernels actually read back. The default is no state, which is also the CPU-backend behaviour.
-    virtual size_t state_size() const { return 0; }
-    virtual size_t state_write(void * dst, size_t size) { (void) dst; (void) size; return 0; }
-    virtual size_t state_read(const void * src, size_t size) { (void) src; (void) size; return 0; }
+    virtual size_t state_size(uint32_t flags) const { (void) flags; return 0; }
+    virtual size_t state_write(void * dst, size_t size, uint32_t flags) { (void) dst; (void) size; (void) flags; return 0; }
+    virtual size_t state_read(const void * src, size_t size, uint32_t flags) { (void) src; (void) size; (void) flags; return 0; }
     // the whole graph (llama.cpp's model graph: up to the logits); a graph the model does not run fails
     virtual ggml_status compute(ggml_cgraph * g) = 0;
     // one-time host work for a graph that a later compute will run (llama.cpp can hand the next graph over before

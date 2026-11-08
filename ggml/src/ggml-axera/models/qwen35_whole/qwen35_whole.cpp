@@ -64,18 +64,21 @@ struct whole_state_header {
     uint64_t page_p_n;
     uint64_t kpage_x_n;
     uint64_t kpage_p_n;
+    uint64_t mtp_page0;
     uint64_t mtp_pages;
     uint64_t mtp_page_b;
     uint64_t mtp_n;
+    uint32_t partial;
+    uint32_t reserved;
 };
 
 class qwen35_whole final : public model {
   public:
     explicit qwen35_whole(const manifest & m) : man(m), prm(m) {}
     ggml_status compute(ggml_cgraph * g) override;
-    size_t       state_size() const override;
-    size_t       state_write(void * dst, size_t size) override;
-    size_t       state_read(const void * src, size_t size) override;
+    size_t       state_size(uint32_t flags) const override;
+    size_t       state_write(void * dst, size_t size, uint32_t flags) override;
+    size_t       state_read(const void * src, size_t size, uint32_t flags) override;
 
   private:
     const manifest & man;
@@ -912,22 +915,32 @@ void qwen35_whole::load_state() {
 // recurrent state, and the current page's restart point (the recurrent state at the page start plus its inputs).
 // Only the pages up to the current cell are copied, plus the current page: a later prompt can overwrite the pages
 // after the checkpoint, and a restore rewrites the checkpoint's page from its restart point.
-size_t qwen35_whole::state_size() const {
+size_t qwen35_whole::state_size(uint32_t flags) const {
     if (KVC.empty() || !ST) {
         return 0;
     }
+    const bool   partial     = flags & state_flags_partial_only;
     const int    pna         = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
     const int64_t cur_cell   = state_cell();
     const bool   has_target  = cur_cell > 0 || snap_cell >= 0 || !page_x.empty();
     const size_t nkv_pages   = has_target ? std::min<size_t>((size_t) kv_pages, (size_t) ((cur_cell + PG - 1) / PG)) : 0;
-    const size_t mtp_pages   = MKV && mtp_page_b ? std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG)) : 0;
+    size_t       mtp_pages   = 0;
+    if (MKV && mtp_page_b && mtp_cell > 0) {
+        if (partial) {
+            mtp_pages = 1;
+        } else {
+            mtp_pages = std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG));
+        }
+    }
     const bool   has_mtp     = mtp_pages > 0;
     if (!has_target && !has_mtp) {
         return 0;
     }
     size_t n = sizeof(whole_state_header);
     if (has_target) {
-        n += (size_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
+        if (!partial) {
+            n += (size_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
+        }
         n += ST->size + CQ->size + CK->size + CV->size;
         n += snap.size() + ksnap.size() + page_x.size() * sizeof(ggml_bf16_t) + page_p.size() * sizeof(int32_t) +
              kpage_x.size() * sizeof(ggml_bf16_t) + kpage_p.size() * sizeof(int32_t);
@@ -936,17 +949,27 @@ size_t qwen35_whole::state_size() const {
     return n;
 }
 
-size_t qwen35_whole::state_write(void * dst, size_t size) {
+size_t qwen35_whole::state_write(void * dst, size_t size, uint32_t flags) {
     axera_timer tw("state write");
-    const size_t total = state_size();
+    const size_t total = state_size(flags);
     if (!total || size < total) {
         return 0;
     }
+    const bool   partial   = flags & state_flags_partial_only;
     const int    pna       = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
     const int64_t cur_cell = state_cell();
     const bool   has_target = cur_cell > 0 || snap_cell >= 0 || !page_x.empty();
     const size_t nkv_pages = has_target ? std::min<size_t>((size_t) kv_pages, (size_t) ((cur_cell + PG - 1) / PG)) : 0;
-    const size_t mtp_pages = MKV && mtp_page_b ? std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG)) : 0;
+    size_t       mtp_pages = 0;
+    size_t       mtp_page0 = 0;
+    if (MKV && mtp_page_b && mtp_cell > 0) {
+        if (partial) {
+            mtp_pages = 1;
+            mtp_page0 = (size_t) ((mtp_cell - 1) / PG);
+        } else {
+            mtp_pages = std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG));
+        }
+    }
     if (has_target) {
         state_home();  // a verification leaves the current state in a snapshot row
     }
@@ -954,7 +977,7 @@ size_t qwen35_whole::state_write(void * dst, size_t size) {
     whole_state_header h;
     memset(&h, 0, sizeof(h));
     memcpy(h.magic, "AXW35S1", sizeof(h.magic) - 1);
-    h.version     = 1;
+    h.version     = 2;
     h.kind        = 1;
     h.has_target  = has_target;
     h.has_mtp     = mtp_pages > 0;
@@ -965,9 +988,9 @@ size_t qwen35_whole::state_write(void * dst, size_t size) {
     h.snap_prompt = snap_prompt;
     h.ncall       = (uint32_t) KVC.size();
     h.pna         = (uint32_t) pna;
-    h.nkv_pages   = (uint32_t) nkv_pages;
+    h.nkv_pages   = partial ? 0 : (uint32_t) nkv_pages;
     h.kv_page_b   = kv_b / NBLK;
-    h.kv_n        = (uint64_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
+    h.kv_n        = partial ? 0 : (uint64_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
     h.st_b        = ST->size;
     h.cq_b        = CQ->size;
     h.ck_b        = CK->size;
@@ -978,21 +1001,25 @@ size_t qwen35_whole::state_write(void * dst, size_t size) {
     h.page_p_n    = page_p.size() * sizeof(int32_t);
     h.kpage_x_n   = kpage_x.size() * sizeof(ggml_bf16_t);
     h.kpage_p_n   = kpage_p.size() * sizeof(int32_t);
+    h.mtp_page0   = mtp_page0;
     h.mtp_pages   = mtp_pages;
     h.mtp_page_b  = mtp_page_b;
     h.mtp_n       = mtp_pages * mtp_page_b;
+    h.partial     = partial;
 
     char * p = (char *) dst;
     memcpy(p, &h, sizeof(h));
     p += sizeof(h);
     if (has_target) {
-        const size_t page_n = nkv_pages * (kv_b / NBLK);
-        for (const axera_cmm & c : KVC) {
-            for (int j = 0; j < pna; ++j) {
-                char * src = (char *) c->vir + (size_t) j * kv_alloc;
-                c->invalidate(src, page_n);
-                memcpy(p, src, page_n);
-                p += page_n;
+        if (!partial) {
+            const size_t page_n = nkv_pages * (kv_b / NBLK);
+            for (const axera_cmm & c : KVC) {
+                for (int j = 0; j < pna; ++j) {
+                    char * src = (char *) c->vir + (size_t) j * kv_alloc;
+                    c->invalidate(src, page_n);
+                    memcpy(p, src, page_n);
+                    p += page_n;
+                }
             }
         }
         for (const axera_cmm * b : { &ST, &CQ, &CK, &CV }) {
@@ -1014,27 +1041,33 @@ size_t qwen35_whole::state_write(void * dst, size_t size) {
         put(kpage_p.data(), h.kpage_p_n);
     }
     if (h.mtp_n) {
-        MKV->invalidate(MKV->vir, h.mtp_n);
-        memcpy(p, MKV->vir, h.mtp_n);
+        char * src = (char *) MKV->vir + mtp_page0 * mtp_page_b;
+        MKV->invalidate(src, h.mtp_n);
+        memcpy(p, src, h.mtp_n);
         p += h.mtp_n;
     }
     return (size_t) (p - (char *) dst);
 }
 
-size_t qwen35_whole::state_read(const void * src, size_t size) {
+size_t qwen35_whole::state_read(const void * src, size_t size, uint32_t flags) {
     axera_timer tr("state read");
     if (size < sizeof(whole_state_header)) {
         return 0;
     }
+    const bool partial = flags & state_flags_partial_only;
     whole_state_header h;
     memcpy(&h, src, sizeof(h));
-    if (memcmp(h.magic, "AXW35S1", sizeof(h.magic) - 1) != 0 || h.version != 1 || h.kind != 1) {
+    if (memcmp(h.magic, "AXW35S1", sizeof(h.magic) - 1) != 0 || h.version != 2 || h.kind != 1 ||
+        h.partial != partial) {
         return 0;
     }
     const int pna = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
     if (h.has_target && (KVC.size() != h.ncall || pna != (int) h.pna || h.kv_page_b != kv_b / NBLK ||
-                         h.nkv_pages > (uint32_t) kv_pages || h.st_b != ST->size || h.cq_b != CQ->size ||
-                         h.ck_b != CK->size || h.cv_b != CV->size || h.kv_n != (uint64_t) h.ncall * h.pna * h.nkv_pages * h.kv_page_b ||
+                         (partial ? h.nkv_pages != 0 || h.kv_n != 0 :
+                          h.nkv_pages > (uint32_t) kv_pages ||
+                              h.kv_n != (uint64_t) h.ncall * h.pna * h.nkv_pages * h.kv_page_b) ||
+                         h.st_b != ST->size || h.cq_b != CQ->size ||
+                         h.ck_b != CK->size || h.cv_b != CV->size ||
                          h.page_x_n % (H * sizeof(ggml_bf16_t)) || h.page_p_n % (4 * sizeof(int32_t)) ||
                          h.kpage_x_n % (H * sizeof(ggml_bf16_t)) || h.kpage_p_n % (4 * sizeof(int32_t)) ||
                          h.state_cell < 0 || h.state_cell > kv_cells)) {
@@ -1042,15 +1075,17 @@ size_t qwen35_whole::state_read(const void * src, size_t size) {
     }
     const bool mtp_valid = h.mtp_n == 0 ? h.mtp_pages == 0 && !h.has_mtp :
                            h.has_mtp && MKV && mtp_page_b && h.mtp_page_b == mtp_page_b &&
-                               h.mtp_pages <= MKV->size / mtp_page_b && h.mtp_pages * mtp_page_b == h.mtp_n &&
+                               h.mtp_pages > 0 && h.mtp_pages <= MKV->size / mtp_page_b &&
+                               h.mtp_page0 <= MKV->size / mtp_page_b - h.mtp_pages &&
+                               h.mtp_pages * mtp_page_b == h.mtp_n && (!partial || h.mtp_pages == 1) &&
                                h.mtp_cell >= 0 && h.mtp_cell <= kv_cells;
     if (!mtp_valid) {
         return 0;
     }
     size_t need = sizeof(h);
     if (h.has_target) {
-        need += h.kv_n + h.st_b + h.cq_b + h.ck_b + h.cv_b + h.snap_n + h.ksnap_n + h.page_x_n + h.page_p_n + h.kpage_x_n +
-                h.kpage_p_n;
+        need += h.kv_n + h.st_b + h.cq_b + h.ck_b + h.cv_b + h.snap_n + h.ksnap_n + h.page_x_n + h.page_p_n +
+                h.kpage_x_n + h.kpage_p_n;
     }
     need += h.mtp_n;
     if (size < need) {
@@ -1059,13 +1094,15 @@ size_t qwen35_whole::state_read(const void * src, size_t size) {
 
     const char * p = (const char *) src + sizeof(h);
     if (h.has_target) {
-        const size_t page_n = h.nkv_pages * h.kv_page_b;
-        for (const axera_cmm & c : KVC) {
-            for (int j = 0; j < (int) h.pna; ++j) {
-                char * d = (char *) c->vir + (size_t) j * kv_alloc;
-                memcpy(d, p, page_n);
-                c->flush(d, page_n);
-                p += page_n;
+        if (!h.partial) {
+            const size_t page_n = h.nkv_pages * h.kv_page_b;
+            for (const axera_cmm & c : KVC) {
+                for (int j = 0; j < (int) h.pna; ++j) {
+                    char * d = (char *) c->vir + (size_t) j * kv_alloc;
+                    memcpy(d, p, page_n);
+                    c->flush(d, page_n);
+                    p += page_n;
+                }
             }
         }
         for (const axera_cmm * b : { &ST, &CQ, &CK, &CV }) {
@@ -1106,8 +1143,9 @@ size_t qwen35_whole::state_read(const void * src, size_t size) {
         bind_state();
     }
     if (h.mtp_n) {
-        memcpy(MKV->vir, p, h.mtp_n);
-        MKV->flush(MKV->vir, h.mtp_n);
+        char * dst = (char *) MKV->vir + (size_t) h.mtp_page0 * mtp_page_b;
+        memcpy(dst, p, h.mtp_n);
+        MKV->flush(dst, h.mtp_n);
         p += h.mtp_n;
     }
     mtp_cell = h.mtp_cell;

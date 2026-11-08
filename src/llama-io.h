@@ -20,6 +20,9 @@ public:
     // bytes written so far
     virtual size_t n_bytes() = 0;
 
+    // a contiguous span for a backend to fill directly; a stream without a host buffer returns nullptr
+    virtual uint8_t * reserve(size_t size) { (void) size; return nullptr; }
+
     void write_string(const std::string & str);
 };
 
@@ -36,6 +39,9 @@ public:
 
     // bytes read so far
     virtual size_t n_bytes() = 0;
+
+    // a contiguous span for a backend to read directly; a stream without a host buffer returns nullptr
+    virtual const uint8_t * peek(size_t size) { (void) size; return nullptr; }
 
     void read_string(std::string & str);
 };

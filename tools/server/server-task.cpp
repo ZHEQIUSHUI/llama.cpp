@@ -2330,7 +2330,7 @@ server_prompt_cache::~server_prompt_cache() {
     }
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     std::lock_guard<std::mutex> lock(mutex);
 
     // first check if the current state is contained fully in the cache
@@ -2434,7 +2434,6 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         state->data = std::make_shared<server_prompt_data>();
         state->data->main.resize(state_size_tgt);
         state->data->drft.resize(state_size_dft);
-        state->data->checkpoints = prompt.checkpoints;
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -2465,6 +2464,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         info.pos_max  = ckpt.pos_max;
         state->prompt.checkpoints.push_back(std::move(info));
     }
+
+    // take over the payloads instead of copying them: the slot still owns its
+    // copy until prompt_load() replaces its prompt, so a copy would briefly
+    // double the checkpoint memory outside the cache budget
+    state->data->checkpoints = std::move(prompt.checkpoints);
 
     if (disk_enabled()) {
         std::ostringstream ss;
