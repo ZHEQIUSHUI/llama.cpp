@@ -1999,6 +1999,10 @@ int llama_perplexity(int argc, char ** argv) {
         return 1;
     }
 
+    // Perplexity reads the full logits rows. The fused lm_head.topk head is meant for a sampler chain and only
+    // publishes its candidates, so keep the backend on the full-row head even though common_init creates a sampler.
+    params.sampling.npu_sampling = false;
+
     const int32_t n_ctx = params.n_ctx;
     if (n_ctx <= 0) {
         LOG_ERR("%s: perplexity tool requires '--ctx-size' > 0\n", __func__);
