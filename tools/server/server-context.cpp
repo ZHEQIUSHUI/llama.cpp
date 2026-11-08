@@ -3758,7 +3758,7 @@ private:
     void update_slots() {
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
-        if (server_timings() && t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
+        if (server_timings() && t_start - t_prev > 100 * 1000) { // every 0.1 seconds
             t_prev = t_start;
             SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
             SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / std::max<int64_t>(n_pre_decode, 1) / 1000.0);

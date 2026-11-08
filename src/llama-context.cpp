@@ -2194,6 +2194,37 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    if (process_meta_only) {
+        // The draft chain wrote the KV rows itself.  This path only applies the batch's cache metadata; the generic
+        // decode's output reservation, scheduler reserve and graph-input setup are not involved.
+        if (t_compute_start_us == 0) {
+            t_compute_start_us = ggml_time_us();
+        }
+        n_queued_tokens += n_tokens_all;
+        bool optimized = false;
+        while (true) {
+            llama_memory_context_ptr mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+            if (!mctx) {
+                return -2;
+            }
+            if (mctx->get_status() == LLAMA_MEMORY_STATUS_SUCCESS) {
+                if (!mctx->apply()) {
+                    LLAMA_LOG_ERROR("%s: failed to apply metadata-only memory context\n", __func__);
+                    return -2;
+                }
+                return 0;
+            }
+            if (mctx->get_status() == LLAMA_MEMORY_STATUS_FAILED_PREPARE && !optimized) {
+                optimized = true;
+                if (memory_update(true)) {
+                    continue;
+                }
+            }
+            LLAMA_LOG_ERROR("%s: metadata-only memory context status %d\n", __func__, mctx->get_status());
+            return -2;
+        }
+    }
+
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
     if (!embd_seq.empty()) {
