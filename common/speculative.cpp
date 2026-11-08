@@ -2019,7 +2019,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (n_chain >= 2 && n_chain <= 4 && dp.result->empty() && spec_chain_available()) {
                     // Fold the catch-up into the chain: the chain rewrites every draft cell from the first one.
                     // Dropping the stale tail is optional because a step only attends to its own prefix.
-                    static const bool chain_rm = getenv("GGML_AXERA_MTP_CHAIN_RM") != nullptr;
+                    static const bool chain_rm = getenv("GGML_AXERA_MTP_CHAIN_RM") == nullptr ||
+                                                 atoi(getenv("GGML_AXERA_MTP_CHAIN_RM")) != 0;
                     if (chain_rm) {
                         llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, dp.pos0, -1);
                     }

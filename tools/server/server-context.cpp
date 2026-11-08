@@ -725,7 +725,10 @@ struct server_slot {
                         llama_set_prebuild_decode(ctx_tgt, false);
                         SLT_INF(*this, "adaptive MTP retry at %d generated tokens\n", (int) stats.n_gen);
                     } else {
-                        llama_set_prebuild_decode(ctx_tgt, true);
+                        // With no scheduled retry there is no future MTP round for this request.  Building the
+                        // four-row verify graph here would only pay the worst-case build for a graph that is never
+                        // used (and the target graph may have h_nextn disabled in this state).
+                        llama_set_prebuild_decode(ctx_tgt, retry_gap > 0);
                         return 0;
                     }
                 } else {
@@ -834,11 +837,12 @@ struct server_slot {
         if (window_mode && spec_mtp && !spec_gate_locked && n_draft > 0) {
             const bool patient = spec_structured && !use_spec_rejection();
             const float close_acc = getenv("LLAMA_SPEC_CLOSE_ACC")
-                ? (float) atof(getenv("LLAMA_SPEC_CLOSE_ACC")) : (patient ? 0.45f : 0.64f);
-            static const int min_rounds = std::max(2, getenv("LLAMA_SPEC_WINDOW_MIN")
-                ? atoi(getenv("LLAMA_SPEC_WINDOW_MIN")) : 4);
+                ? (float) atof(getenv("LLAMA_SPEC_CLOSE_ACC")) : (patient ? 0.45f : 0.60f);
+            static const int min_rounds_cfg = getenv("LLAMA_SPEC_WINDOW_MIN")
+                ? std::max(2, atoi(getenv("LLAMA_SPEC_WINDOW_MIN"))) : 0;
+            const int min_rounds = min_rounds_cfg ? min_rounds_cfg : (patient ? 4 : 3);
             const int min_draft = std::max(4, getenv("LLAMA_SPEC_WINDOW_DRAFTS")
-                ? atoi(getenv("LLAMA_SPEC_WINDOW_DRAFTS")) : (patient ? 60 : 10));
+                ? atoi(getenv("LLAMA_SPEC_WINDOW_DRAFTS")) : (patient ? 60 : 9));
             const int retry_gap = getenv("LLAMA_SPEC_RETRY_GAP")
                 ? std::max(16, atoi(getenv("LLAMA_SPEC_RETRY_GAP"))) : 0;
 
@@ -2453,19 +2457,12 @@ private:
             if (adaptive && window_mode && slot.spec_mtp) {
                 slot.spec_structured = !slot.use_spec_rejection() &&
                                        slot.prompt_is_structured(slot.task->tokens.get_tokens());
-                if (!slot.spec_structured) {
-                    // Free prose and non-greedy requests start fully plain: no verify prebuild, no h_nextn and no
-                    // speculative hook, so the default path never pays the first-draft graph cost on those scenes.
-                    slot.spec_gate_init   = true;
-                    slot.spec_gate_on     = false;
-                    slot.spec_gate_locked = true;
-                    slot.spec_nextn_on    = false;
-                    llama_set_embeddings_nextn(ctx_tgt, false, false);
-                }
             }
-            if (slot.spec_structured || !adaptive || !window_mode) {
-                llama_arm_prebuild_verify(ctx_tgt, std::min<uint32_t>(8, params_base.speculative.draft.n_max + 1));
-            }
+            // Every greedy MTP request starts with a short verified window.  Structured prompts use the patient
+            // threshold below; unknown prose closes after three rounds (nine drafts) below 0.60 acceptance.  This is
+            // deliberately independent of a keyword hit: a missed structured prompt still opens from its own
+            // acceptance, while prose pays only the short trial.
+            llama_arm_prebuild_verify(ctx_tgt, std::min<uint32_t>(8, params_base.speculative.draft.n_max + 1));
         }
 
         // reset server kill-switch counter
@@ -4887,7 +4884,10 @@ private:
             // Once the acceptance window has closed the gate for this request there is no future probe, so the draft
             // context is intentionally left stale.  Skipping the speculative hook entirely also avoids copying every
             // target hidden row into an observe queue that will never be consumed.
-            const bool dormant_skip = dormant && sb->spec_gate_locked && batch.view.size() == 1;
+            // A locked dormant request has no future probe or retry (unless a retry explicitly unlocked it), so its
+            // prompt prefill must not call the speculative hook either: process_task may have disabled the target's
+            // h_nextn rows, and the draft context's KV will never be consumed.
+            const bool dormant_skip = dormant && sb->spec_gate_locked;
             if (dormant_skip) {
                 // plain target decode: no draft work while the gate is closed
             } else if (dormant) {
