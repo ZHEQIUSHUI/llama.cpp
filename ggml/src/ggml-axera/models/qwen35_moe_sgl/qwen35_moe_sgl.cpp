@@ -254,6 +254,14 @@ class qwen35_moe_sgl final : public model {
     call                             ver;  // role decode.verify: four rows, one rank-1 delta per row
     call                             app;  // role gdn.apply: advance the recurrent state by accepted deltas
     axera_cmm                        VX, VOUT, VPOSN, VPIDS, VINDPTR, VLOC, VNT, VNPREV, VST0, VROUTE;
+    // the four-row output head merged into role decode.verify: its final-norm weight, live-row count, argmax rows,
+    // and (when the graph's logits are not four contiguous rows) a staging row set
+    axera_cmm                        VHNORM, VHM, VHIDS, VHTOP, VHLOG;
+    int                              vi_norm = -1, vi_m = -1;
+    int                              vo_logits = -1, vo_ids = -1, vo_top = -1;
+    int                              vh_nout = 0;
+    bool                             ver_head = false;
+    bool                             ver_head_ran = false;
     axera_cmm                        VDELTA[2][3];  // u / k / g per verification set
     axera_cmm                        VSNAP[2][3];   // q / k / v Conv history per verification set
     std::vector<uint8_t>             conv_entry;    // Conv state before the latest verify (j = 0)
@@ -397,7 +405,7 @@ class qwen35_moe_sgl final : public model {
     void         bind_state();
     AX_ENGINE_IO_BUFFER_T state_io(const std::string & name);
     ggml_status  verify(const kv_view & kv, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h,
-                        const std::vector<int> * out_rows);
+                        const std::vector<int> * out_rows, ggml_tensor * logits);
     void         init_mtp(const std::map<std::string, ggml_tensor *> & t, int il, const rope & rq);
     void         bind_mtp_chain(const kernel & ck);
     ggml_status  compute_mtp(ggml_cgraph * g);
@@ -1267,6 +1275,24 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
                 GGML_ABORT("axera qwen35_moe_sgl: decode.verify's KV dtype does not match the decode kernel\n");
             }
         }
+        ver_head = vk.find_output("logits") >= 0;
+        if (ver_head) {
+            GGML_ASSERT(vk.find_input("norm_w") >= 0 && vk.find_input("w_lm") >= 0 && vk.find_input("s_lm") >= 0 &&
+                        vk.find_input("m") >= 0 && vk.find_output("ids") >= 0 && vk.find_output("top_logits") >= 0);
+            GGML_ASSERT(head.w && head.q && head.s && "decode.verify's merged head needs the decode head weights");
+            const int64_t N = head.w->ne[1], K = head.w->ne[0];
+            GGML_ASSERT(vk.in_bytes("norm_w") == (uint32_t) (K * sizeof(float)) &&
+                        vk.in_bytes("w_lm") == head.q->size && vk.in_bytes("s_lm") == head.s->size &&
+                        vk.in_bytes("m") == (uint32_t) sizeof(int32_t) &&
+                        vk.out_bytes("ids") == 4 * sizeof(int32_t) &&
+                        vk.out_bytes("top_logits") == 4 * sizeof(float) &&
+                        vk.out_bytes("logits") == (uint32_t) (4 * N * sizeof(float)));
+            VHNORM = axera_cmm_alloc((size_t) K * sizeof(float));
+            VHM    = axera_cmm_alloc(sizeof(int32_t));
+            VHIDS  = axera_cmm_alloc(4 * sizeof(int32_t));
+            VHTOP  = axera_cmm_alloc(4 * sizeof(float));
+            vh_nout = (int) N;
+        }
         const int vrows = (int) (vk.in_bytes("positions") / sizeof(int32_t));
         GGML_ASSERT(vrows >= 2 && vrows <= 4 && vk.in_bytes("x") == vrows * H * sizeof(ggml_bf16_t) &&
                     vk.out_bytes("output") == vrows * H * sizeof(ggml_bf16_t) && vk.in_bytes("ntok") == sizeof(int32_t));
@@ -1298,6 +1324,20 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         ver.k = &vk;
         for (const auto & d : vk.desc->in) {
             const std::string & n = d.name;
+            if (n == "norm_w" || n == "w_lm" || n == "s_lm" || n == "m") {
+                if (n == "norm_w") {
+                    vi_norm = (int) ver.in.size();
+                    ver.in.push_back(axera_io(VHNORM, d.bytes));
+                } else if (n == "w_lm") {
+                    ver.in.push_back(axera_io(head.q, d.bytes));
+                } else if (n == "s_lm") {
+                    ver.in.push_back(axera_io(head.s, d.bytes));
+                } else {
+                    vi_m = (int) ver.in.size();
+                    ver.in.push_back(axera_io(VHM, d.bytes));
+                }
+                continue;
+            }
             const axera_cmm *   b = n == "x" ? &VX : n == "output" ? &VOUT : n == "positions" ? &VPOSN :
                                     n == "position_ids" ? &VPIDS : n == "indptr" ? &VINDPTR : n == "ntok" ? &VNT :
                                     n == "cache_location" ? &VLOC : n == "indices" ? &INDICES : n == "nprev" ? &VNPREV : nullptr;
@@ -1327,6 +1367,15 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
             const std::string & n = d.name;
             if (n == "output") {
                 ver.out.push_back(axera_io(VOUT, d.bytes));
+            } else if (n == "ids") {
+                vo_ids = (int) ver.out.size();
+                ver.out.push_back(axera_io(VHIDS, d.bytes));
+            } else if (n == "top_logits") {
+                vo_top = (int) ver.out.size();
+                ver.out.push_back(axera_io(VHTOP, d.bytes));
+            } else if (n == "logits") {
+                vo_logits = (int) ver.out.size();
+                ver.out.push_back(AX_ENGINE_IO_BUFFER_T{});
             } else if (n == "route_debug") {
                 if (!VROUTE) {
                     VROUTE = axera_cmm_alloc(d.bytes);
@@ -1826,7 +1875,7 @@ size_t qwen35_moe_sgl::state_read(const void * src, size_t size, uint32_t flags)
 // states into h, one rank-1 state delta per row, and the small Conv snapshots.  The recurrent state
 // stays in its pool at the entry cell; the accepted prefix is folded in by the next call.
 ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h,
-                                   const std::vector<int> * out_rows) {
+                                   const std::vector<int> * out_rows, ggml_tensor * logits) {
     GGML_ASSERT(ver.k);
     const int64_t c0 = kv.cell_of(0);
     if (c0 % PG == 0) {
@@ -1846,6 +1895,41 @@ ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, c
         conv_entry_valid = true;
     }
     const int rows = (int) (ver.k->in_bytes("positions") / sizeof(int32_t));
+    ver_head_ran       = false;
+    bool   head_direct = false;
+    int    lrows       = 0;
+    auto * ldctx       = logits && ggml_backend_buffer_is_axera(logits->buffer) ?
+                             (ggml_backend_axera_buffer_context *) logits->buffer->context : nullptr;
+    if (ver_head) {
+        if (logits) {
+            ggml_tensor * hn = logits->src[1];
+            while (hn->op == GGML_OP_GET_ROWS || hn->op == GGML_OP_VIEW || hn->op == GGML_OP_RESHAPE) {
+                hn = hn->src[0];
+            }
+            float         eps;
+            const float * gw = final_norm(hn, H, &eps);
+            GGML_ASSERT(gw && eps == 1e-6f && logits->type == GGML_TYPE_F32 && logits->ne[0] == vh_nout);
+            memcpy(VHNORM->vir, gw, (size_t) H * sizeof(float));
+            VHNORM->flush(VHNORM->vir, (size_t) H * sizeof(float));
+            lrows = (int) logits->ne[1];
+        }
+        *(int32_t *) VHM->vir = T;
+        VHM->flush(VHM->vir, sizeof(int32_t));
+        bool identity = !out_rows || (int) out_rows->size() == lrows;
+        for (int r = 0; out_rows && identity && r < lrows; ++r) {
+            identity = (*out_rows)[(size_t) r] == r;
+        }
+        head_direct = lrows == 4 && identity && ldctx && logits->nb[1] == (size_t) vh_nout * sizeof(float);
+        if (head_direct) {
+            ver.out[vo_logits] = axera_io(ldctx, logits->data, (size_t) 4 * vh_nout * sizeof(float));
+        } else {
+            if (!VHLOG) {
+                VHLOG = axera_cmm_alloc((size_t) 4 * vh_nout * sizeof(float));
+            }
+            ver.out[vo_logits] = axera_io(VHLOG, ver.k->out_bytes("logits"));
+        }
+        ver_head_ran = true;
+    }
     memset(VX->vir, 0, VX->size);
     memcpy(VX->vir, xb, (size_t) T * H * sizeof(ggml_bf16_t));
     if (!getenv("GGML_AXERA_VERIFY_ZERO_PAD")) {
@@ -1895,6 +1979,40 @@ ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, c
         ver.k->run(ver.in, ver.out, "verify");
     }
     VOUT->invalidate(VOUT->vir, (size_t) T * H * sizeof(ggml_bf16_t));
+    if (ver_head_ran) {
+        VHIDS->invalidate(VHIDS->vir, 4 * sizeof(int32_t));
+        VHTOP->invalidate(VHTOP->vir, 4 * sizeof(float));
+        const size_t rowb = (size_t) vh_nout * sizeof(float);
+        if (lrows > 0 && logits) {
+            if (head_direct) {
+                ldctx->invalidate(logits->data, (size_t) lrows * rowb);
+            } else {
+                VHLOG->invalidate(VHLOG->vir, (size_t) 4 * rowb);
+                GGML_ASSERT(logits->nb[1] == rowb);
+                for (int r = 0; r < lrows; ++r) {
+                    const int vr = out_rows ? out_rows->at((size_t) r) : r;
+                    GGML_ASSERT(vr >= 0 && vr < T);
+                    memcpy((char *) logits->data + (size_t) r * rowb, (char *) VHLOG->vir + (size_t) vr * rowb, rowb);
+                }
+                if (ldctx) {
+                    ldctx->flush(logits->data, (size_t) lrows * rowb);
+                }
+            }
+            std::vector<int32_t> pids((size_t) lrows);
+            std::vector<float>   pvals((size_t) lrows);
+            for (int r = 0; r < lrows; ++r) {
+                const int vr = out_rows ? out_rows->at((size_t) r) : r;
+                pids[(size_t) r]  = ((const int32_t *) VHIDS->vir)[vr];
+                pvals[(size_t) r] = ((const float *) VHTOP->vir)[vr];
+            }
+            const bool published = axera::argmax_publish(pids.data(), pvals.data(), lrows, logits->data, logits->nb[1]);
+            if (!published && ldctx) {
+                ldctx->clean_p     = (float *) logits->data;
+                ldctx->clean_n     = (size_t) lrows * rowb;
+                ldctx->clean_epoch = axera_graph_epoch;
+            }
+        }
+    }
     if (VROUTE && getenv("GGML_AXERA_ROUTE_DUMP")) {
         VROUTE->invalidate(VROUTE->vir, VROUTE->size);
         const char * path = getenv("GGML_AXERA_ROUTE_DUMP");
@@ -2644,6 +2762,7 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     ggml_tensor * norm0   = names.find("attn_norm-0");
     ggml_tensor * logits  = names.find("result_output");
     ggml_tensor * inp_pos = names.find("inp_pos");
+    ver_head_ran = false;
     if (!norm0 || !logits || !inp_pos) {
         GGML_LOG_ERROR("axera qwen35_35b_a3b: a graph of %d nodes that is not the whole model (-ngl 99)\n", g->n_nodes);
         return GGML_STATUS_FAILED;
@@ -2796,8 +2915,17 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     bool merged_dec   = false;
     const char * fused_head_env = getenv("GGML_AXERA_FUSED_HEAD");
     const bool   npu_heads      = !fused_head_env || atoi(fused_head_env) != 0;
+    static const bool merged_verify_on = [] {
+        const char * e = getenv("GGML_AXERA_MERGED_VERIFY");
+        return !e || atoi(e) != 0;
+    }();
+    const int64_t c0 = kv.cell_of(0);
+    const bool use_ver_head = ver_head && merged_verify_on && npu_heads && T > 1 && T <= 4 && c0 > 0 &&
+                              c0 + 4 <= man.context;
     if (n_out > 0) {
-        if (npu_heads && dec_head_ok && T == 1 && n_out == 1) {
+        if (use_ver_head) {
+            // the verify call itself writes the graph's logits, ids and top_logits
+        } else if (npu_heads && dec_head_ok && T == 1 && n_out == 1) {
             merged_dec = head.prepare_merged_decode(g, names);
         }
         if (!merged_dec && npu_heads && man.has("lm_head")) {
@@ -2834,7 +2962,6 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     }
     const int64_t ct_bind = ct_on ? ggml_time_us() : 0;
     axera_timer        tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
-    const int64_t      c0 = kv.cell_of(0);
     if (ver_c0 >= 0 && c0 != 0) {
         if (c0 < ver_c0 || c0 > ver_c0 + ver_T) {
             GGML_LOG_ERROR("axera qwen35_moe_sgl: cell %lld is outside the last verify's %lld..%lld window\n",
@@ -2897,7 +3024,7 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
                                       vxb.data() + (size_t) r * H, H);
             });
         }
-        const ggml_status st = verify(kv, vxb.data(), pb.data(), T, hf.data(), &hfrow);
+        const ggml_status st = verify(kv, vxb.data(), pb.data(), T, hf.data(), &hfrow, logits);
         if (st != GGML_STATUS_SUCCESS) {
             return st;
         }
@@ -2989,7 +3116,9 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     }
     if (n_out > 0) {
         axera_timer th(T > 256 ? "output head (prompt)" : T > 1 ? "output head (warmup)" : "output head (decode)");
-        if (merged_dec) {
+        if (ver_head_ran) {
+            head.after(g, names);
+        } else if (merged_dec) {
             head.finish_merged_decode(g, names, logits, true);
         } else if (combined_dec) {
             const bool direct_x = T == 1 && n_out == 1;
