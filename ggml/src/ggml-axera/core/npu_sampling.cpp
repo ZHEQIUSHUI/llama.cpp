@@ -90,19 +90,35 @@ int npu_configure(bool enabled, int32_t top_k, float top_p, float min_p, float t
 
     if (enabled) {
         const manifest * m = kernels();
+        int32_t          K = 0, R = 0;
         if (m && m->has("lm_head.topk")) {
             const kernel & k = m->get("lm_head.topk");
-            int32_t K = 0, R = 0;
             if (k.find_input("bias") >= 0 && k.find_input("mul_pos") >= 0 && k.find_input("mul_neg") >= 0 &&
                 k.find_input("temp") >= 0 && kernel_rows_and_k(k, &K, &R) &&
-                (R == 1 || k.find_input("m") >= 0)) {
-                s.K = K;
-                s.R = R;
-                s.rows.assign(R, npu_candidates{});
-                for (auto & row : s.rows) {
-                    row.values.assign(K, 0.0f);
-                    row.ids.assign(K, 0);
-                }
+                !(R == 1 || k.find_input("m") >= 0)) {
+                K = R = 0;
+            }
+        } else if (m && m->has("decode.group")) {
+            // the merged decode group carries the fused head: no separate lm_head.topk role, one output row, and the
+            // top-K candidates are named values/kids instead of values/ids
+            const kernel & g = m->get("decode.group");
+            if (g.find_input("bias") >= 0 && g.find_input("mul_pos") >= 0 && g.find_input("mul_neg") >= 0 &&
+                g.find_input("temp") >= 0 && g.find_output("values") >= 0 && g.find_output("kids") >= 0 &&
+                g.find_output("vmax") >= 0 && g.find_output("sumexp") >= 0 &&
+                g.out_bytes("values") >= sizeof(float) && g.out_bytes("values") % sizeof(float) == 0 &&
+                g.out_bytes("kids") == g.out_bytes("values") * sizeof(int32_t) / sizeof(float) &&
+                g.out_bytes("vmax") == sizeof(float) && g.out_bytes("sumexp") == sizeof(float)) {
+                K = (int32_t) (g.out_bytes("values") / sizeof(float));
+                R = 1;
+            }
+        }
+        if (K > 0 && R > 0) {
+            s.K = K;
+            s.R = R;
+            s.rows.assign(R, npu_candidates{});
+            for (auto & row : s.rows) {
+                row.values.assign(K, 0.0f);
+                row.ids.assign(K, 0);
             }
         }
     }
