@@ -1845,13 +1845,20 @@ ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, c
         }
         conv_entry_valid = true;
     }
+    const int rows = (int) (ver.k->in_bytes("positions") / sizeof(int32_t));
     memset(VX->vir, 0, VX->size);
     memcpy(VX->vir, xb, (size_t) T * H * sizeof(ggml_bf16_t));
+    if (!getenv("GGML_AXERA_VERIFY_ZERO_PAD")) {
+        // Padding rows only feed discarded logits.  Repeating the last live token keeps their router
+        // selection inside the live rows' expert set; zero rows otherwise add a fixed extra union.
+        for (int r = T; r < rows; ++r) {
+            memcpy((ggml_bf16_t *) VX->vir + (size_t) r * H, xb + (size_t) (T - 1) * H, H * sizeof(ggml_bf16_t));
+        }
+    }
     VX->flush();
     auto * pos = (int32_t *) VPOSN->vir;
     auto * pid = (int32_t *) VPIDS->vir;
     auto * loc = (int32_t *) VLOC->vir;
-    const int rows = (int) (ver.k->in_bytes("positions") / sizeof(int32_t));
     const int axes = (int) (ver.k->in_bytes("position_ids") / (rows * sizeof(int32_t)));
     GGML_ASSERT(rows >= 2 && rows <= 4 && T >= 1 && T <= rows && axes >= 1 && axes <= 4);
     for (int r = 0; r < rows; ++r) {
