@@ -165,10 +165,12 @@ class qwen35_whole final : public model {
     bool                           pre_head = false;  // the prefill kernel computes the selected rows' logits
     bool                           mtp_head = false;  // the MTP t1 kernel computes the draft / full logits
     const ggml_tensor *            ow       = nullptr;  // the tied output projection (the merged heads' weight)
+    std::vector<int32_t>           draft_ids;           // draft_vocab.i32, loaded once per model
 
     void init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_,
               const ggml_tensor * output_weight);
     void init_verify();
+    void load_draft_ids();
     bool legacy_plain_verify() const {
         // Manifests written before optional MTP roles made every role unconditional.  The released 4B package is
         // one of them and its published -ub 4 PPL uses the four-row verify path for an ordinary batch.  Keep that
@@ -1387,8 +1389,10 @@ ggml_status qwen35_whole::verify(const kv_view & kv, const rope & rp, const ggml
     }
     const int set = cur_set == 0 ? 1 : 0;
     static const char * SN[4] = { "ssnap", "cqsnap", "cksnap", "cvsnap" };
-    const bool direct = logits && logits->ne[1] == 4 && logits->nb[1] == (int64_t) head.w->ne[1] * sizeof(float);
-    if (ver_head && direct) {
+    const bool use_head = ver_head && T == 4;  // the merged four-row head is only valid for a complete batch
+    const bool direct = use_head && logits && logits->ne[1] == 4 &&
+                        logits->nb[1] == (int64_t) head.w->ne[1] * sizeof(float);
+    if (direct) {
         call & c = ver.back();
         c.out[c.k->output("logits")] = axera_io(((ggml_backend_axera_buffer_context *) logits->buffer->context),
                                                  logits->data, (size_t) 4 * head.w->ne[1] * sizeof(float));
@@ -1399,7 +1403,7 @@ ggml_status qwen35_whole::verify(const kv_view & kv, const rope & rp, const ggml
             call & c = ver[gi];
             if (ver_head) {
                 const bool last = gi + 1 == ver.size();
-                *(int32_t *) head.mgh->vir = last ? 1 : 0;
+                *(int32_t *) head.mgh->vir = use_head && last ? 1 : 0;
                 head.mgh->flush(head.mgh->vir, sizeof(int32_t));
             }
             for (int k = 0; k < 4; ++k) {
@@ -1548,7 +1552,7 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
         if (st != GGML_STATUS_SUCCESS) {
             return st;
         }
-        if (ver_head) {
+        if (ver_head && T == 4) {
             const bool direct = T == 4 && logits->ne[1] == 4 &&
                                 logits->nb[1] == (int64_t) logits->ne[0] * sizeof(float);
             head.finish_merged_verify(g, names, T, logits, direct);
@@ -1846,19 +1850,10 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
     if (logits && logits->op == GGML_OP_MUL_MAT && man.has("decode.group") &&
         man.get("decode.group").find_input("head") >= 0 && !man.has("mtp.m8")) {
         GGML_ASSERT(head.bind_merged(man.get("decode.group"), logits->src[0]));
-        if (!head.dk) {
-            const std::string f  = man.dir + "/draft_vocab.i32";
-            FILE *            fp = fopen(f.c_str(), "rb");
-            GGML_ASSERT(fp);
-            fseek(fp, 0, SEEK_END);
-            const long fsz = ftell(fp);
-            fseek(fp, 0, SEEK_SET);
-            GGML_ASSERT(fsz > 0 && fsz % (long) sizeof(int32_t) == 0);
-            std::vector<int32_t> ids((size_t) fsz / sizeof(int32_t));
-            GGML_ASSERT(fread(ids.data(), sizeof(int32_t), ids.size(), fp) == ids.size());
-            fclose(fp);
+        if (!head.dk && head.dids.empty()) {
+            load_draft_ids();
             axera_timer tb("init: draft head");
-            head.bind_draft_rows(ids);
+            head.bind_draft_rows(draft_ids);
         }
         mtp_head = head.bind_merged_draft(man.get("mtp.t1"));
     }
@@ -2098,20 +2093,10 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
             head.bind_topk(man.get("lm_head.topk"));
         }
         if (T == 1 && man.has("lm_head.draft")) {  // a draft step: the draft vocabulary's head (draft_vocab.i32)
-            if (!head.dk) {
-                const std::string f  = man.dir + "/draft_vocab.i32";
-                FILE *            fp = fopen(f.c_str(), "rb");
-                GGML_ASSERT(fp);
-                // the vocabulary is the file's, not the kernel's output shape: an argmax draft head has no full row
-                fseek(fp, 0, SEEK_END);
-                const long fsz = ftell(fp);
-                fseek(fp, 0, SEEK_SET);
-                GGML_ASSERT(fsz > 0 && fsz % (long) sizeof(int32_t) == 0);
-                std::vector<int32_t> ids((size_t) fsz / sizeof(int32_t));
-                GGML_ASSERT(fread(ids.data(), sizeof(int32_t), ids.size(), fp) == ids.size());
-                fclose(fp);
+            if (!head.dk && head.dids.empty()) {
+                load_draft_ids();
                 axera_timer tb("init: draft head");
-                head.bind_draft(man.get("lm_head.draft"), ids);
+                head.bind_draft(man.get("lm_head.draft"), draft_ids);
             }
             head.draft = true;
             const std::vector<char> normed(T, 1);  // (the draft kernel projects the MTP shared-head norm)
@@ -2130,6 +2115,22 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
         }
     }
     return GGML_STATUS_SUCCESS;
+}
+
+void qwen35_whole::load_draft_ids() {
+    if (!draft_ids.empty()) {
+        return;
+    }
+    const std::string f  = man.dir + "/draft_vocab.i32";
+    FILE *            fp = fopen(f.c_str(), "rb");
+    GGML_ASSERT(fp);
+    fseek(fp, 0, SEEK_END);
+    const long fsz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    GGML_ASSERT(fsz > 0 && fsz % (long) sizeof(int32_t) == 0);
+    draft_ids.resize((size_t) fsz / sizeof(int32_t));
+    GGML_ASSERT(fread(draft_ids.data(), sizeof(int32_t), draft_ids.size(), fp) == draft_ids.size());
+    fclose(fp);
 }
 
 }  // namespace
