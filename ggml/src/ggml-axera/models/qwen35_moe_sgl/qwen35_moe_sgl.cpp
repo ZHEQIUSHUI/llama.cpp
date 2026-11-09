@@ -20,6 +20,7 @@
 #include "../model.h"
 #include "../../core/quant.h"
 #include "../../core/argmax_state.h"
+#include "../../core/npu_sampling.h"
 #include "../../ops/ops.h"
 #include "vocab_embedding_1_axmodel.h"
 #include "vocab_embedding_axmodel.h"
@@ -947,6 +948,14 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         dec_head_ok = ow && head.bind_merged_decode(dk, ow);
         if (!dec_head_ok) {
             GGML_LOG_ERROR("axera qwen35_moe_sgl: the merged decode head's ABI does not match output.weight\n");
+        } else if (ow && man.has("lm_head.topk")) {
+            // The sampler's exact top-K tail is a standalone kernel: the merged decode head does not carry it.
+            // Bind the regular projection first (bind_topk uses its q/s and its full-row fallback), then the tail.
+            if (man.has("lm_head.gemm")) {
+                head.bind(man.get("lm_head.gemm"), ow);
+            }
+            head.bind_topk(man.get("lm_head.topk"));
+            GGML_LOG_INFO("axera qwen35_moe_sgl: fused lm_head.topk bound (K = %d)\n", head.tK);
         }
     }
     // decode: the banks, its own rows and paging. Optional smaller-context kernels share every pointer except the
@@ -2926,7 +2935,11 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
         if (use_ver_head) {
             // the verify call itself writes the graph's logits, ids and top_logits
         } else if (npu_heads && dec_head_ok && T == 1 && n_out == 1) {
-            merged_dec = head.prepare_merged_decode(g, names);
+            // Sampling requests need the sampler's exact top-K. Running the merged head would duplicate the
+            // projection the standalone lm_head.topk kernel already does, so let the decode keep its hidden row
+            // (head_on = 0) and run the fused tail from output_head::run below. Greedy keeps the merged head.
+            merged_dec = head.prepare_merged_decode(g, names) &&
+                         !(head.tk && npu_get_options().enabled);
         }
         if (!merged_dec && npu_heads && man.has("lm_head")) {
             head.bind(man.get("lm_head"), logits->src[0]);
@@ -2947,7 +2960,9 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
         }
     }
     bool fused_dec = false;
-    if (!merged_dec && !combined_dec && npu_heads && T == 1 && n_out == 1) {
+    // The embedded fused head also skips output_head::run, where the sampler's standalone top-K tail runs.
+    const bool run_topk = head.tk && npu_get_options().enabled;
+    if (!merged_dec && !combined_dec && npu_heads && T == 1 && n_out == 1 && !run_topk) {
         if (!fh_loaded) {
             fh_loaded = true;
             const char * e = getenv("GGML_AXERA_FUSED_HEAD");
