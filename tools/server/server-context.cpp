@@ -310,6 +310,10 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // this request continues the prompt already in the slot: the reused prefix reaches (almost) the end of the slot's
+    // tokens, so every token in the new prompt after it is a plain append
+    bool prompt_continuation = false;
+
     bool prompt_save(server_prompt_cache & prompt_cache) {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -1447,6 +1451,7 @@ public:
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
+            save_prompt_cache_on_shutdown();
             destroy();
         }
     }
@@ -1522,6 +1527,27 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // The disk tier is the persistence tier: a single rolling slot stays processing for the whole session, so the
+    // idle-slot save in process_tasks() never sees it. Save it before the model and its CMM state go away, otherwise
+    // the next start can only find states left behind by an earlier slot eviction (or none at all).
+    void save_prompt_cache_on_shutdown() {
+        if (!prompt_cache || !ctx_tgt || !prompt_cache->disk_enabled()) {
+            return;
+        }
+
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
+                continue;
+            }
+
+            const int64_t t_start = ggml_time_us();
+            const bool saved = slot.prompt_save(*prompt_cache);
+            prompt_cache->update();
+            SRV_TRC("prompt cache shutdown save: slot %d, %d tokens, saved = %d, %.1f ms\n",
+                    slot.id, slot.prompt.n_tokens(), saved ? 1 : 0, (ggml_time_us() - t_start) / 1000.0);
+        }
+    }
+
     void destroy() {
         spec.reset();
         spec_init.reset();
@@ -1546,6 +1572,7 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            save_prompt_cache_on_shutdown();
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -3099,6 +3126,7 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        const int64_t t_ckpt_us = ggml_time_us();
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -3158,11 +3186,11 @@ private:
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, tgt = %.3f MiB, dft = %.3f MiB, spec = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, tgt = %.3f MiB, dft = %.3f MiB, spec = %.3f MiB, took %.1f ms)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
                 (float) cur.data_tgt.size() / 1024 / 1024, (float) cur.data_dft.size() / 1024 / 1024,
-                (float) cur.data_spec.size() / 1024 / 1024);
+                (float) cur.data_spec.size() / 1024 / 1024, (ggml_time_us() - t_ckpt_us) / 1000.0);
     }
 
     // checkpoints are appended to the slot save file, after the llama state payload
@@ -4216,6 +4244,7 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        slot.prompt_continuation = false;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -4376,6 +4405,20 @@ private:
                             // a state or a checkpoint is useful when its pos_min is below this threshold
                             const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
 
+                            // a pure append reuses the live state at the end of the cached prompt: the recurrent state
+                            // is already at the right position, so rewinding through a checkpoint and replaying the tail
+                            // would only copy the checkpoint payload (hundreds of MiB on Axera) for an identical result.
+                            const bool state_at_prompt_tip = n_swa == 0 && n_past == (int) slot.prompt.n_tokens();
+
+                            // a continuation can still be short of the live tip: the generated tokens of the previous
+                            // request are in the slot state but the client may encode the same text differently (or
+                            // omit the sampled stop token). A normal assistant turn can be a few hundred tokens, so
+                            // keep that distinction from a prompt that rewrites a large part of the context.
+                            slot.prompt_continuation = n_past > 0 && (int) slot.prompt.n_tokens() - n_past <= 256;
+                            if (slot.prompt_continuation) {
+                                SLT_TRC(slot, "prompt continuation: reused %d of %d tokens\n", n_past, (int) slot.prompt.n_tokens());
+                            }
+
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
@@ -4426,7 +4469,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                if (!state_at_prompt_tip && pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -4443,6 +4486,7 @@ private:
                                     );
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+                                    const int64_t t_restore_us = ggml_time_us();
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
@@ -4463,7 +4507,7 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB, took %.1f ms)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024, (ggml_time_us() - t_restore_us) / 1000.0);
                                     }
 
                                     if (do_reset) {
@@ -4756,6 +4800,17 @@ private:
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+
+                    // A continuation already has a checkpoint at or just before the old tip, and the checkpoint data
+                    // lives on the host. Creating the usual cluster of near-end checkpoints copies hundreds of MiB per
+                    // turn from the NPU for a state that the next request can restore just as well from the older
+                    // checkpoint. Create a fresh anchor only once the prompt has moved a full min-step past it.
+                    if (do_checkpoint && slot.prompt_continuation && !slot.prompt.checkpoints.empty() &&
+                            slot.task->n_tokens() - slot.prompt.checkpoints.back().n_tokens <= params_base.checkpoint_min_step) {
+                        SLT_DBG(slot, "skipping checkpoint creation for a continuation (last checkpoint at %" PRId64 ", task has %d tokens)\n",
+                                slot.prompt.checkpoints.back().n_tokens, slot.task->n_tokens());
+                        do_checkpoint = false;
+                    }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
