@@ -420,11 +420,23 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);
     // a backend that wants the context's sequence count (its registry's "ggml_backend_set_n_seq_max"; ggml-axera: a
     // single sequence lets it pad a prompt's tail into the cache cells after the batch)
+    uint32_t n_seq_max_limit = std::numeric_limits<uint32_t>::max();
     for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
-        auto * fn = (void (*)(uint32_t)) ggml_backend_reg_get_proc_address(ggml_backend_reg_get(i), "ggml_backend_set_n_seq_max");
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        auto * fn = (void (*)(uint32_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_seq_max");
         if (fn) {
             fn(cparams.n_seq_max);
         }
+
+        auto * limit_fn = (uint32_t (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_n_seq_max_limit");
+        if (limit_fn) {
+            n_seq_max_limit = std::min(n_seq_max_limit, limit_fn());
+        }
+    }
+    if (cparams.n_seq_max > n_seq_max_limit) {
+        throw std::runtime_error(format(
+                "the backend supports at most %u sequence(s), but n_seq_max = %u; run the Axera server with -np %u",
+                n_seq_max_limit, cparams.n_seq_max, n_seq_max_limit));
     }
     LLAMA_LOG_INFO("%s: n_ctx                 = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);

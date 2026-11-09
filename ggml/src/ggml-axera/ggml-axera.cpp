@@ -345,6 +345,12 @@ static void ggml_backend_axera_set_n_seq_max(uint32_t n) {
     }
 }
 
+// the adapter owns one private KV sequence and one recurrent-state bank: a context with several llama.cpp sequences
+// would make every graph fail in the model adapter. Report the limit so llama.cpp can reject it before the first token.
+static uint32_t ggml_backend_axera_get_n_seq_max_limit() {
+    return 1;
+}
+
 static int argmax_configure_c(int enabled, const int32_t * ids, int32_t n) {
     return axera::argmax_configure(enabled != 0, ids, n);
 }
@@ -487,6 +493,9 @@ static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_set_n_seq_max") == 0) {
         return (void *) ggml_backend_axera_set_n_seq_max;
+    }
+    if (strcmp(name, "ggml_backend_get_n_seq_max_limit") == 0) {
+        return (void *) ggml_backend_axera_get_n_seq_max_limit;
     }
     if (strcmp(name, "ggml_backend_axera_argmax") == 0) {
         return (void *) &g_axera_argmax;
