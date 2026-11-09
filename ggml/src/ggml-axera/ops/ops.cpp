@@ -841,7 +841,7 @@ void output_head::run_fused(ggml_cgraph * g, const graph_names & names, const ax
 }
 
 void output_head::bind_draft(const kernel & dlm, const std::vector<int32_t> & ids) {
-    GGML_ASSERT(k && mx4);
+    GGML_ASSERT(k);
     const int64_t N = w->ne[1], K = w->ne[0], NS = (int64_t) ids.size();
     const bool    argmax = dlm.find_output("ids") >= 0 || dlm.find_output("top_logits") >= 0;
     if (argmax) {
@@ -850,15 +850,20 @@ void output_head::bind_draft(const kernel & dlm, const std::vector<int32_t> & id
     } else {
         GGML_ASSERT(dlm.find_output("out") >= 0 && dlm.out_bytes("out") == NS * sizeof(float));
     }
-    GGML_ASSERT(dlm.in_bytes("w") == NS * K / 2 && dlm.in_bytes("s") == NS * K / AXERA_MX_GROUP &&
-                dlm.in_bytes("x") == K * sizeof(ggml_bf16_t));
+    // the draft head's weight rows are the already-quantized output head's, in the same format: MXFP4
+    // (K / 2 bytes a row) or MXFP8 (K bytes a row)
+    const bool    dmx4 = dlm.in_bytes("w") == NS * K / 2;
+    GGML_ASSERT(dmx4 == mx4 && (dmx4 || dlm.in_bytes("w") == NS * K) &&
+                dlm.in_bytes("s") == NS * K / AXERA_MX_GROUP && dlm.in_bytes("x") == K * sizeof(ggml_bf16_t));
     dk = &dlm;
-    if (dids == ids && dargmax == argmax) {
+    if (dids == ids && dargmax == argmax && dqm4 == dmx4) {
         return;
     }
     dids    = ids;
     dargmax = argmax;
-    dq      = axera_cmm_alloc(NS * K / 2);
+    dqm4    = dmx4;
+    const int64_t rowb = dmx4 ? K / 2 : K;
+    dq      = axera_cmm_alloc(NS * rowb);
     ds      = axera_cmm_alloc(NS * K / AXERA_MX_GROUP);
     if (!dargmax) {
         dy = axera_cmm_alloc(NS * sizeof(float));
@@ -869,7 +874,7 @@ void output_head::bind_draft(const kernel & dlm, const std::vector<int32_t> & id
     axera_host_pool().run(NS, [&](int64_t i) {
         const int64_t r = ids[i];
         GGML_ASSERT(r >= 0 && r < N && (i == 0 || ids[i - 1] < r));
-        memcpy((uint8_t *) dq->vir + i * (K / 2), (const uint8_t *) q->vir + r * (K / 2), K / 2);
+        memcpy((uint8_t *) dq->vir + i * rowb, (const uint8_t *) q->vir + r * rowb, rowb);
         memcpy((uint8_t *) ds->vir + i * (K / AXERA_MX_GROUP), (const uint8_t *) s->vir + r * (K / AXERA_MX_GROUP), K / AXERA_MX_GROUP);
     });
     dq->flush();
