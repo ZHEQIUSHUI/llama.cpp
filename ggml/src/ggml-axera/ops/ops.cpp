@@ -699,6 +699,9 @@ bool output_head::bind_merged_decode(const kernel & dk, const ggml_tensor * outp
     if (!cnorm) {
         cnorm = axera_cmm_alloc((size_t) K * sizeof(float));
     }
+    if (!x) {  // the MTP draft-head path reuses this row buffer
+        x = axera_cmm_alloc((size_t) K * sizeof(ggml_bf16_t));
+    }
     if (!cids) {
         cids = axera_cmm_alloc(sizeof(int32_t));
     }
@@ -953,7 +956,7 @@ void output_head::run_fused(ggml_cgraph * g, const graph_names & names, const ax
 }
 
 void output_head::bind_draft(const kernel & dlm, const std::vector<int32_t> & ids) {
-    GGML_ASSERT(k && mx4);
+    GGML_ASSERT((k || md) && x && mx4);
     const int64_t N = w->ne[1], K = w->ne[0], NS = (int64_t) ids.size();
     const bool    argmax = dlm.find_output("ids") >= 0 || dlm.find_output("top_logits") >= 0;
     if (argmax) {

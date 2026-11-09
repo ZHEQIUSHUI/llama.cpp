@@ -3529,7 +3529,10 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         (rlogits->flags & GGML_TENSOR_FLAG_COMPUTE) &&
         man.has("lm_head.draft") && emb_mtp.k) {
         axera_timer thb("mtp chain: head bind");
-        head.bind(man.get("lm_head"), rlogits->src[0]);
+        if (man.has("lm_head")) {
+            head.bind(man.get("lm_head"), rlogits->src[0]);
+        }
+        GGML_ASSERT(head.w && head.q && head.s);  // the merged decode head's weights
         if (!head.dk) {
             const std::string f  = man.dir + "/draft_vocab.i32";
             FILE *            fp = fopen(f.c_str(), "rb");
@@ -3763,7 +3766,9 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
     // run, and the draft chain publishes the ids it needs through the argmax queue
     const bool catchup_no_head = T >= 2 && T <= 8 && axera::argmax_chain_n() == 0;
     if (logits && logits->ne[1] > 0 && (logits->flags & GGML_TENSOR_FLAG_COMPUTE) && !catchup_no_head) {
-        head.bind(man.get("lm_head"), logits->src[0]);
+        if (man.has("lm_head")) {
+            head.bind(man.get("lm_head"), logits->src[0]);
+        }
         if (T == 1 && man.has("lm_head.draft")) {
             if (!head.dk) {
                 const std::string f  = man.dir + "/draft_vocab.i32";
@@ -3784,7 +3789,7 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
             const std::vector<char> normed(T, 1);  // (the draft kernel projects the MTP shared-head norm)
             axera_timer th("mtp head (draft)");
             head.run(g, names, h, T, &normed);
-        } else {
+        } else if (man.has("lm_head")) {
             if (!head.bind_combined(man.get("lm_head"), logits->src[0])) {
                 GGML_LOG_ERROR("axera qwen35_moe_sgl: the MTP head is not a combined lm_head\n");
                 return GGML_STATUS_FAILED;
@@ -3794,6 +3799,21 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
             }
             axera_timer th("mtp head (multi)");
             head.run_combined(g, names, hr, T, nullptr, nullptr);
+        } else if (T == 4 && man.has("lm_head.verify")) {
+            const kernel & vk = man.get("lm_head.verify");
+            if (!head.k || head.w != logits->src[0]) {
+                head.bind(vk, logits->src[0]);
+            }
+            if (!head.bind_combined4(vk, logits->src[0])) {
+                GGML_LOG_ERROR("axera qwen35_moe_sgl: the MTP verify head ABI does not match output.weight\n");
+                return GGML_STATUS_FAILED;
+            }
+            axera_timer th("mtp head (verify)");
+            head.run_combined4(g, names, hr, T, true);
+        } else {
+            head.bind(man.get("lm_head.gemm"), logits->src[0]);
+            axera_timer th("mtp head (gemm)");
+            head.run(g, names, hr, T, nullptr, nullptr);
         }
     }
     return GGML_STATUS_SUCCESS;
