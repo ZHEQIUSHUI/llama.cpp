@@ -2803,6 +2803,10 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             if (man.has("lm_head.verify")) {
                 head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
             }
+        } else if (!merged_dec && npu_heads && n_out == 4 && man.has("lm_head.verify")) {
+            const kernel & vk = man.get("lm_head.verify");
+            head.bind(vk, logits->src[0]);
+            combined_dec = head.bind_combined4(vk, logits->src[0]);
         } else if (!merged_dec) {
             head.bind(man.get("lm_head.gemm"), logits->src[0]);
         }
