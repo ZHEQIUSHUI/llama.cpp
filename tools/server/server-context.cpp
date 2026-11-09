@@ -2565,14 +2565,21 @@ private:
                 slot.spec_structured = slot.prompt_is_structured(slot.task->tokens);
                 static const bool cold_start = getenv("LLAMA_SPEC_COLD_START") == nullptr ||
                                                atoi(getenv("LLAMA_SPEC_COLD_START")) != 0;
-                if (cold_start && !slot.spec_structured) {
+                // Sampled requests can look structured but have low draft acceptance and pay the verified-window
+                // rollback cost for little gain.  Opt-in launchers can start them dormant like prose.
+                static const bool sample_dormant = getenv("LLAMA_SPEC_SAMPLE_DORMANT") != nullptr &&
+                                                   atoi(getenv("LLAMA_SPEC_SAMPLE_DORMANT")) != 0;
+                const bool dormant = !slot.spec_structured || (sample_dormant && slot.use_spec_rejection());
+                if (cold_start && dormant) {
                     slot.spec_gate_init   = true;
                     slot.spec_gate_on     = false;
                     slot.spec_gate_locked = true;
                     slot.spec_nextn_on    = false;
                     llama_set_embeddings_nextn(ctx_tgt, false, false);
                     cold_dormant = true;
-                    SLT_INF(slot, "%s", "adaptive MTP off (non-structured prompt starts dormant)\n");
+                    SLT_INF(slot, "%s", slot.spec_structured
+                        ? "adaptive MTP off (sampled prompt starts dormant)\n"
+                        : "adaptive MTP off (non-structured prompt starts dormant)\n");
                 }
             }
             // Structured prompts start with a short verified window and keep drafting while it pays.  A verified
