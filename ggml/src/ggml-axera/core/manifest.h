@@ -7,8 +7,9 @@
 //             (within blk.<i>.), the conversion from it and its kernel form; kernel inputs and pack members name
 //             theirs (param, kind)
 //   kernels   by role, the kernels of the model's path: file, IO table, packs and their members (packed kernels)
-// Every kernel listed is loaded at the runtime's start; nothing else in the directory is read. A missing file, an IO
-// table that differs from the manifest's or a role the adapter asks for and the manifest lacks stops the process.
+// Every kernel listed is loaded at the runtime's start, except the optional roles (MTP/draft/verify: loaded on the
+// first get()); nothing else in the directory is read. A missing file, an IO table that differs from the manifest's
+// or a role the adapter asks for and the manifest lacks stops the process.
 #pragma once
 
 #include "runtime.h"
@@ -53,6 +54,7 @@ struct param_desc {
 
 struct kernel_desc {
     std::string                   role, file;
+    bool                          optional = false;  // loaded on first get(), not at the runtime's start
     std::vector<io_desc>          in, out;
     std::map<std::string, size_t> packs;  // pack input -> bytes
     std::vector<pack_member>      members;
@@ -82,7 +84,7 @@ struct manifest {
     std::map<std::string, std::map<std::string, param_desc>> params;  // layer kind -> parameter -> description
     std::map<std::string, kernel_desc>                       kernels;  // role -> description
 
-    // the role's kernel (loaded at the runtime's start); aborts if the manifest has no such role
+    // the role's kernel (an optional role on its first get()); aborts if the manifest has no such role
     kernel & get(const std::string & role) const;
     bool     has(const std::string & role) const { return kernels.count(role) > 0; }
     const param_desc & param(const std::string & kind, const std::string & name) const;

@@ -161,6 +161,7 @@ struct server_batch {
 
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
+    bool   spec_verify       = false;  // this batch verifies speculative drafts (the target's multi-row verify path)
 
     void init(llama_context * ctx, int32_t n_tokens_alloc, int32_t n_embd) {
         this->n_tokens_alloc = n_tokens_alloc;
@@ -199,6 +200,7 @@ struct server_batch {
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
+        spec_verify       = false;
     }
 
     int32_t size() const {
@@ -1042,6 +1044,7 @@ struct server_slot {
             for (size_t i = 0; i < spec_draft.size(); i++) {
                 spec_i_batch.push_back(batch.size() + i + 1);
             }
+            batch.spec_verify = true;
 
             auto pos0 = prompt.tokens.pos_next();
 
@@ -4863,8 +4866,16 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // A mixed batch (a prompt's rows next to a draft verification) stays on the plain path: the verify marker
+        // is a per-call property, and the plain path handles any row count correctly.
+        bool spec_verify = batch.spec_verify;
+        for (int i = off; i < off + batch.view.size(); ++i) {
+            spec_verify = spec_verify && !batch.tokens[i].is_prompt;
+        }
         queue_tasks.yield_to_queue([&]() {
+            llama_set_spec_verify(ctx_tgt, spec_verify);
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            llama_set_spec_verify(ctx_tgt, false);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }

@@ -76,6 +76,7 @@ class qwen35_whole final : public model {
   public:
     explicit qwen35_whole(const manifest & m) : man(m), prm(m) {}
     ggml_status compute(ggml_cgraph * g) override;
+    void         prewarm(ggml_cgraph * g) override;
     size_t       state_size(uint32_t flags) const override;
     size_t       state_write(void * dst, size_t size, uint32_t flags) override;
     size_t       state_read(const void * src, size_t size, uint32_t flags) override;
@@ -86,6 +87,7 @@ class qwen35_whole final : public model {
     graph_names      names;
     const void *     bound = nullptr;
     int              L = 0, H = 0, G = 0, ROT = 0, NBLK = 0;
+    int              pna_ = 1;  // the prefill kernel's layers per call (the pool IO's layer stride)
     bool             fp8 = false;  // the prefill banks' projections: MXFP8 (else MXFP4), from the kernel IO shapes
     int              KH = 16, VH = 0, REP = 1;  // delta-net key / value heads (from the prefill kernels' IO)
     std::vector<int> ord;  // layer -> its index among the delta-net layers / the attention layers
@@ -137,6 +139,7 @@ class qwen35_whole final : public model {
     std::vector<float>                    h_buf;      // the target graph's hidden rows
     std::vector<float>                    mtp_h_buf;  // the MTP graph's hidden rows
     axera_cmm                             VX, VCS, VPN, VMASK, VNT;
+    bool    verify_ready = false;      // the verify kernels/buffers are initialized (only when a verify graph runs)
     int     cur_set = -1;              // the snapshot set holding the current state, -1: the pools
     int64_t ver_c0  = -1;              // the last verification's first cell, rows, snapshot set
     int     ver_T = 0, ver_set = -1;
@@ -161,9 +164,19 @@ class qwen35_whole final : public model {
     bool                           ver_head = false;  // the verification group computes its own output head
     bool                           pre_head = false;  // the prefill kernel computes the selected rows' logits
     bool                           mtp_head = false;  // the MTP t1 kernel computes the draft / full logits
+    const ggml_tensor *            ow       = nullptr;  // the tied output projection (the merged heads' weight)
 
     void init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_,
               const ggml_tensor * output_weight);
+    void init_verify();
+    bool legacy_plain_verify() const {
+        // Manifests written before optional MTP roles made every role unconditional.  The released 4B package is
+        // one of them and its published -ub 4 PPL uses the four-row verify path for an ordinary batch.  Keep that
+        // path for legacy manifests; a unified manifest marks the MTP roles optional and is strictly marker-gated.
+        auto it = man.kernels.find("decode.verify");
+        return it != man.kernels.end() && !it->second.optional;
+    }
+    void bind_state_outs(call & c, int l0);
     void init_mtp(const std::map<std::string, ggml_tensor *> & t, int il);
     size_t part(int kind) const { return kind == 0 ? st_b : kind == 3 ? cv_b : cq_b; }
     const axera_cmm & pool(int kind) const { return kind == 0 ? ST : kind == 1 ? CQ : kind == 2 ? CK : CV; }
@@ -431,6 +444,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
                         const ggml_tensor * output_weight) {
     L = L_;
     H = H_;
+    ow = output_weight;
     GGML_ASSERT(L % 4 == 0);
     ord.assign(L, 0);
     int ng = 0, na = 0;
@@ -474,6 +488,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     const int pna = (int) pkv.shape[0], png = 3 * pna;  // the prefill kernel's layers per call
     GGML_ASSERT(pna > 0 && na % pna == 0);
     ncall = na / pna;
+    pna_  = pna;
     GGML_ASSERT((pst.shape[0] == png || pst.shape[0] == ng || pst.shape[0] == L / 4 || pst.shape[0] == pna) &&
                 pcq.shape[0] == pst.shape[0] && pcv.shape[0] == pst.shape[0]);
     // The common state bank (b0 [3 * pna]) is phase-major inside one call; calls follow one another. A call's
@@ -674,95 +689,13 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     }
     cur_set = -1;
     ver_c0  = -1;
-    // a call's state outputs st<j> / cq<j> / ck<j> / cv<j> (layer j of the group from layer l0): bound to where[]
-    auto state_outs = [&](call & c, int l0) {
-        for (size_t i = 0; i < c.k->desc->out.size(); ++i) {
-            const std::string & n = c.k->desc->out[i].name;
-            const int kind = n.rfind("st", 0) == 0 ? 0 : n.rfind("cq", 0) == 0 ? 1 : n.rfind("ck", 0) == 0 ? 2 :
-                             n.rfind("cv", 0) == 0 ? 3 : -1;
-            if (kind >= 0 && isdigit((unsigned char) n[2])) {
-                state_ios.push_back({ &c, i, kind, ord[l0 + atoi(n.c_str() + 2)] });
-            }
-        }
-    };
     state_ios.clear();
     for (int gi = 0; gi < L / G; ++gi) {
-        state_outs(dec[gi], gi * G);
+        bind_state_outs(dec[gi], gi * G);
     }
-    // verification: the decode groups' packs, x / out in place, 4 rows' cs / pn / mask, the snapshots
-    ver.clear();
-    if (man.has("decode.verify")) {
-        const kernel & vk = man.get("decode.verify");
-        ver_head = output_weight && vk.find_input("head") >= 0 && head.bind_merged_verify(vk, output_weight);
-        GGML_ASSERT(vk.in_bytes("x") == 4 * H * sizeof(ggml_bf16_t) && vk.in_bytes("cs") == 4 * csb &&
-                    vk.in_bytes("pn") == 4 * 3 * sizeof(int32_t) && vk.in_bytes("mask") == 4 * dk.in_bytes("mask"));
-        VX    = axera_cmm_alloc(vk.in_bytes("x"));
-        VCS   = axera_cmm_alloc(vk.in_bytes("cs"));
-        VPN   = axera_cmm_alloc(vk.in_bytes("pn"));
-        VMASK = axera_cmm_alloc(vk.in_bytes("mask"));
-        VNT   = axera_cmm_alloc(sizeof(int32_t));
-        static const char * SN[4] = { "ssnap", "cqsnap", "cksnap", "cvsnap" };
-        for (auto & set : snaps) {
-            set.clear();
-            set.resize(L / G);
-            for (auto & a : set) {
-                for (int k = 0; k < 4; ++k) {
-                    a[k] = axera_cmm_alloc(vk.out_bytes(SN[k]));
-                    GGML_ASSERT(a[k]->size == 4 * (size_t) (G / 4 * 3) * part(k));
-                }
-            }
-        }
-        ver.assign(L / G, {});
-        for (int gi = 0; gi < L / G; ++gi) {
-            call & c = ver[gi];
-            c.k      = &vk;
-            for (const auto & d : vk.desc->in) {
-                if (vk.desc->packs.count(d.name)) {  // the decode group's (the same layout)
-                    GGML_ASSERT(dk.desc->packs.count(d.name) && dk.desc->packs.at(d.name) == vk.desc->packs.at(d.name));
-                    size_t j = 0;
-                    while (dk.desc->in[j].name != d.name) {
-                        ++j;
-                    }
-                    c.in.push_back(dec[gi].in[j]);
-                    continue;
-                }
-                if (d.name.rfind("k_", 0) == 0) {
-                    c.in.push_back(bank_io(vk, d, gi));
-                    continue;
-                }
-                if (ver_head) {
-                    const axera_cmm * hb = d.name == "head" ? &head.mgh : d.name == "norm_w" ? &head.c4norm :
-                                           d.name == "w_lm" ? &head.q : d.name == "s_lm" ? &head.s : nullptr;
-                    if (hb) {
-                        c.in.push_back(axera_io(*hb, d.bytes));
-                        continue;
-                    }
-                }
-                const axera_cmm * b = d.name == "x" ? &VX : d.name == "cs" ? &VCS : d.name == "pn" ? &VPN :
-                                      d.name == "mask" ? &VMASK : d.name == "ntok" ? &VNT : nullptr;
-                if (!b) {
-                    GGML_ABORT("axera qwen35_whole: decode.verify: unexpected input %s\n", d.name.c_str());
-                }
-                c.in.push_back(axera_io(*b, d.bytes));
-            }
-            for (const auto & d : vk.desc->out) {
-                if (ver_head && (d.name == "ids" || d.name == "top_logits" || d.name == "logits")) {
-                    const axera_cmm * hb = d.name == "ids" ? &head.c4ids : d.name == "top_logits" ? &head.c4top :
-                                           &head.mvl;
-                    c.out.push_back(axera_io(*hb, d.bytes));
-                    continue;
-                }
-                int k = -1;
-                for (int j = 0; j < 4; ++j) {
-                    k = d.name == SN[j] ? j : k;
-                }
-                c.out.push_back(d.name == "out" ? axera_io(VX, d.bytes) : k >= 0 ? axera_io(snaps[0][gi][k], d.bytes) :
-                                                   pool_io(d.name, gi * G + atoi(d.name.c_str() + 2)));
-            }
-            state_outs(c, gi * G);
-        }
+    if (legacy_plain_verify()) {
+        init_verify();  // the released 4B's CMM layout and four-row PPL path
     }
-
     // prefill: the weight banks (above), the pools, one page's inputs
     PX      = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
     POUT[0] = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
@@ -861,6 +794,123 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
 }
 
 // the calls' state outputs to where the state is
+// a call's state outputs st<j> / cq<j> / ck<j> / cv<j> (layer j of the group from layer l0): bound to where[]
+void qwen35_whole::bind_state_outs(call & c, int l0) {
+    for (size_t i = 0; i < c.k->desc->out.size(); ++i) {
+        const std::string & n = c.k->desc->out[i].name;
+        const int kind = n.rfind("st", 0) == 0 ? 0 : n.rfind("cq", 0) == 0 ? 1 : n.rfind("ck", 0) == 0 ? 2 :
+                         n.rfind("cv", 0) == 0 ? 3 : -1;
+        if (kind >= 0 && isdigit((unsigned char) n[2])) {
+            state_ios.push_back({ &c, i, kind, ord[l0 + atoi(n.c_str() + 2)] });
+        }
+    }
+}
+
+// The verification buffers and kernels are only needed by a speculative-decoding verify graph.  A plain manifest
+// (MTP off) must keep the released CMM layout, so a unified manifest's optional verify roles are loaded and these
+// allocations made on the first verify graph instead of in init().
+void qwen35_whole::init_verify() {
+    if (verify_ready) {
+        return;
+    }
+    axera_timer    tv("init: verify");
+    const kernel & dk  = man.get("decode.group");
+    const uint32_t csb = dk.in_bytes("cs");
+    auto pool_io = [&](const std::string & n, int il) {
+        if (n.rfind("kv", 0) == 0) {
+            const int a = ord[il];
+            return axera_io(KVC[a / pna_].get(), (char *) KVC[a / pna_]->vir + (size_t) (a % pna_) * kv_b, (uint32_t) kv_b);
+        }
+        const axera_cmm & p = n[0] == 's' ? ST : n[1] == 'q' ? CQ : n[1] == 'k' ? CK : CV;
+        const size_t      b = n[0] == 's' ? st_b : n[1] == 'v' ? cv_b : cq_b;
+        return axera_io(p.get(), (char *) p->vir + ord[il] * b, (uint32_t) b);
+    };
+    auto bank_io = [&](const kernel & k, const io_desc & d, int gi) -> AX_ENGINE_IO_BUFFER_T {
+        auto it = banks.find(d.name.substr(2));
+        if (d.name.rfind("k_", 0) != 0 || it == banks.end()) {
+            GGML_ABORT("axera qwen35_whole: %s: unexpected input %s\n", k.desc->role.c_str(), d.name.c_str());
+        }
+        const size_t bb = it->second->size / (L / 4);  // a block's bytes
+        GGML_ASSERT(d.bytes == (size_t) (G / 4) * bb);
+        return axera_io(it->second.get(), (char *) it->second->vir + (size_t) gi * d.bytes, d.bytes);
+    };
+    // verification: the decode groups' packs, x / out in place, 4 rows' cs / pn / mask, the snapshots
+    ver.clear();
+    if (man.has("decode.verify")) {
+        const kernel & vk = man.get("decode.verify");
+        ver_head = ow && vk.find_input("head") >= 0 && head.bind_merged_verify(vk, ow);
+        GGML_ASSERT(vk.in_bytes("x") == 4 * H * sizeof(ggml_bf16_t) && vk.in_bytes("cs") == 4 * csb &&
+                    vk.in_bytes("pn") == 4 * 3 * sizeof(int32_t) && vk.in_bytes("mask") == 4 * dk.in_bytes("mask"));
+        VX    = axera_cmm_alloc(vk.in_bytes("x"));
+        VCS   = axera_cmm_alloc(vk.in_bytes("cs"));
+        VPN   = axera_cmm_alloc(vk.in_bytes("pn"));
+        VMASK = axera_cmm_alloc(vk.in_bytes("mask"));
+        VNT   = axera_cmm_alloc(sizeof(int32_t));
+        static const char * SN[4] = { "ssnap", "cqsnap", "cksnap", "cvsnap" };
+        for (auto & set : snaps) {
+            set.clear();
+            set.resize(L / G);
+            for (auto & a : set) {
+                for (int k = 0; k < 4; ++k) {
+                    a[k] = axera_cmm_alloc(vk.out_bytes(SN[k]));
+                    GGML_ASSERT(a[k]->size == 4 * (size_t) (G / 4 * 3) * part(k));
+                }
+            }
+        }
+        ver.assign(L / G, {});
+        for (int gi = 0; gi < L / G; ++gi) {
+            call & c = ver[gi];
+            c.k      = &vk;
+            for (const auto & d : vk.desc->in) {
+                if (vk.desc->packs.count(d.name)) {  // the decode group's (the same layout)
+                    GGML_ASSERT(dk.desc->packs.count(d.name) && dk.desc->packs.at(d.name) == vk.desc->packs.at(d.name));
+                    size_t j = 0;
+                    while (dk.desc->in[j].name != d.name) {
+                        ++j;
+                    }
+                    c.in.push_back(dec[gi].in[j]);
+                    continue;
+                }
+                if (d.name.rfind("k_", 0) == 0) {
+                    c.in.push_back(bank_io(vk, d, gi));
+                    continue;
+                }
+                if (ver_head) {
+                    const axera_cmm * hb = d.name == "head" ? &head.mgh : d.name == "norm_w" ? &head.c4norm :
+                                           d.name == "w_lm" ? &head.q : d.name == "s_lm" ? &head.s : nullptr;
+                    if (hb) {
+                        c.in.push_back(axera_io(*hb, d.bytes));
+                        continue;
+                    }
+                }
+                const axera_cmm * b = d.name == "x" ? &VX : d.name == "cs" ? &VCS : d.name == "pn" ? &VPN :
+                                      d.name == "mask" ? &VMASK : d.name == "ntok" ? &VNT : nullptr;
+                if (!b) {
+                    GGML_ABORT("axera qwen35_whole: decode.verify: unexpected input %s\n", d.name.c_str());
+                }
+                c.in.push_back(axera_io(*b, d.bytes));
+            }
+            for (const auto & d : vk.desc->out) {
+                if (ver_head && (d.name == "ids" || d.name == "top_logits" || d.name == "logits")) {
+                    const axera_cmm * hb = d.name == "ids" ? &head.c4ids : d.name == "top_logits" ? &head.c4top :
+                                           &head.mvl;
+                    c.out.push_back(axera_io(*hb, d.bytes));
+                    continue;
+                }
+                int k = -1;
+                for (int j = 0; j < 4; ++j) {
+                    k = d.name == SN[j] ? j : k;
+                }
+                c.out.push_back(d.name == "out" ? axera_io(VX, d.bytes) : k >= 0 ? axera_io(snaps[0][gi][k], d.bytes) :
+                                                   pool_io(d.name, gi * G + atoi(d.name.c_str() + 2)));
+            }
+            bind_state_outs(c, gi * G);
+        }
+    }
+    verify_ready = true;
+    bind_state();
+}
+
 void qwen35_whole::bind_state() {
     for (const auto & s : state_ios) {
         const place & w = where[s.kind][s.g];
@@ -1309,6 +1359,7 @@ void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32
 // state after each row in the other snapshot set, the current state the last row's
 ggml_status qwen35_whole::verify(const kv_view & kv, const rope & rp, const ggml_bf16_t * xb, const int32_t * pb, int T,
                                  float * h, ggml_tensor * logits) {
+    GGML_ASSERT(verify_ready && !ver.empty());
     const int64_t c0 = kv.cell_of(0);
     if (c0 % PG == 0) {  // a page's first cell: the state there is the restart point
         save_state(c0);
@@ -1381,6 +1432,7 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
     if (names.find("mtp_h_input")) {  // a speculative draft context's MTP block
         return compute_mtp(g);
     }
+    const bool    spec_verify = names.find("axera.spec_verify") != nullptr || legacy_plain_verify();
     ggml_tensor * norm0   = names.find("attn_norm-0");
     ggml_tensor * logits  = names.find("result_output");
     ggml_tensor * inp_pos = names.find("inp_pos");
@@ -1477,7 +1529,8 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
             ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]), xb.data() + (size_t) r * H, H);
         });
     }
-    if (T > 1 && T <= 4 && !ver.empty() && c0 > 0 && c0 + 4 <= kv_cells) {
+    if (spec_verify && T > 1 && T <= 4 && man.has("decode.verify") && c0 > 0 && c0 + 4 <= kv_cells) {
+        init_verify();
         axera_timer tv("verify (all groups)");
         if (ver_head) {
             ggml_tensor * hn = logits->src[1];
@@ -1649,7 +1702,7 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
         // Only a four-row verify graph uses this head.  Binding it during a plain T=1 graph would allocate its CMM
         // buffers and perturb the address layout of dormant MTP requests (adaptive prose/sampled), which can flip
         // near-tie greedy tokens relative to the plain manifest.
-        if (T == 4 && man.has("lm_head.verify")) {
+        if (spec_verify && T == 4 && man.has("lm_head.verify")) {
             head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
         }
         if (combined) {
@@ -1659,6 +1712,15 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
         }
     }
     return GGML_STATUS_SUCCESS;
+}
+
+void qwen35_whole::prewarm(ggml_cgraph * g) {
+    names.of(g);
+    // The end-of-prompt multi-row prebuild is the speculative verify graph.  Pay the verify roles' load and CMM
+    // allocation here, not inside the first measured draft round.
+    if (!verify_ready && L > 0 && names.find("axera.spec_verify")) {
+        init_verify();
+    }
 }
 
 // the MTP block's kernels: its packs from blk.<il>.* (both kernels the same layout), its paged KV cache, the IO

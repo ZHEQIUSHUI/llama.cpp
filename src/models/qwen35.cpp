@@ -155,6 +155,14 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // A marker node tells a whole-model accelerator adapter that this graph is a speculative target verification.
+    // It is absent from ordinary prefill/decode graphs, even when their batch has the same few rows (-ub 4).
+    if (params.cparams.spec_verify) {
+        ggml_tensor * marker = ggml_cont(ctx0, inp_pos);
+        cb(marker, "axera.spec_verify", -1);
+        ggml_build_forward_expand(gf, marker);
+    }
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;

@@ -58,6 +58,12 @@ struct composite final : model {
         return cur->compute(g);
     }
 
+    void prewarm(ggml_cgraph * g) override {
+        if (llm) {
+            llm->prewarm(g);
+        }
+    }
+
     size_t state_size(uint32_t flags) const override {
         return llm ? llm->state_size(flags) : 0;
     }

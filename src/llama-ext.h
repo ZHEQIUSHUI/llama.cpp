@@ -106,6 +106,11 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // Build a multi-row verification graph at the end of a prompt. The arm is consumed once.
 LLAMA_API void llama_arm_prebuild_verify(struct llama_context * ctx, uint32_t n_tokens);
 
+// Mark the next llama_process() batch as a speculative-decoding target verification.  The backend then uses its
+// multi-row verify kernels/head; ordinary prefill and decode batches (including a 4-row -ub 4 batch) stay on the
+// plain path even when the kernel manifest also carries the MTP roles.
+LLAMA_API void llama_set_spec_verify(struct llama_context * ctx, bool value);
+
 // Apply a batch's KV-cache metadata without building or running its graph.  The speculative draft chain uses this
 // after it has already written the rows itself.
 LLAMA_API void llama_set_process_meta_only(struct llama_context * ctx, bool value);
