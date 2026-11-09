@@ -1460,7 +1460,10 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
         head.bind_topk(man.get("lm_head.topk"));
     }
     const bool combined = head.bind_combined(man.get("lm_head"), logits->src[0]) && head.combined_ready(g, names);
-    if (man.has("lm_head.verify")) {
+    // Only a four-row verify graph uses this head.  Binding it during a plain T=1 graph would allocate its CMM
+    // buffers and perturb the address layout of dormant MTP requests (adaptive prose/sampled), which can flip
+    // near-tie greedy tokens relative to the plain manifest.
+    if (T == 4 && man.has("lm_head.verify")) {
         head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
     }
     if (combined) {
@@ -1817,7 +1820,7 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
                 GGML_LOG_ERROR("axera qwen35_whole: the MTP head is not a combined lm_head\n");
                 return GGML_STATUS_FAILED;
             }
-            if (man.has("lm_head.verify")) {
+            if (T == 4 && man.has("lm_head.verify")) {
                 head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
             }
             // the draft context's catch-up rows are not host-sampled; publishing them can replace the target verify
