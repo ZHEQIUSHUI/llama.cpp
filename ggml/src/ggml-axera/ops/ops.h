@@ -141,6 +141,19 @@ struct output_head {
     axera_cmm                          cnorm, cids, ctop, cx;
     const float *                      cgw = nullptr;
     std::vector<AX_ENGINE_IO_BUFFER_T> cin, cout;
+    // a layer kernel's merged output head: the last group call writes logits / ids / top_logits (and, for the
+    // decode group, the sampler's top-K).  The host only publishes the outputs, no head kernel call.
+    const kernel *                     mg = nullptr;  // the decode group (role decode.group)
+    const kernel *                     mv = nullptr;  // the verify group (role decode.verify)
+    const kernel *                     mp = nullptr;  // the prefill kernel (role prefill) when it carries the head
+    bool                               mdraft = false;  // the MTP t1 kernel writes the draft logits
+    axera_cmm                          gdraft;          // its [1, 65536] row
+    axera_cmm                          mgh, mgt;        // the layer kernel's runtime head / top-K flags
+    axera_cmm                          mgl;             // one full-vocabulary logits row (a non-last group, MTP catch-up)
+    axera_cmm                          mvl;             // the four-row verify head when the graph has fewer rows
+    axera_cmm                          mpr;             // the prefill head's selected output rows (four int32)
+    const float *                      mgnorm = nullptr;
+    size_t                             fstride = 0;     // the graph logits' row stride, for full_row
     // the same combined head for an MTP verify's four rows (role lm_head.verify; input m = the valid rows)
     const kernel *                     c4k = nullptr;
     axera_cmm                          c4norm, c4x, c4m, c4ids, c4top;
@@ -152,6 +165,19 @@ struct output_head {
     bool bind_fused(const kernel & lm, const ggml_tensor * output_weight);
     bool bind_combined(const kernel & lm, const ggml_tensor * output_weight);
     bool bind_combined4(const kernel & lm, const ggml_tensor * output_weight);
+    // a layer kernel's merged head: the weight is the graph's output weight; the kernel's IO names the rest
+    bool bind_merged(const kernel & g, const ggml_tensor * output_weight);
+    bool bind_merged_verify(const kernel & v, const ggml_tensor * output_weight);
+    bool bind_merged_prefill(const kernel & p, const ggml_tensor * output_weight);
+    bool bind_merged_draft(const kernel & t1);  // the MTP t1 kernel's draft output
+    bool merged_topk() const;
+    void prepare_merged_topk();  // the host sampler's penalty state, before the last decode group runs
+    void set_merged_norm(const float * w, int64_t K);  // the graph's final norm, into the layer head's input
+    void bind_draft_rows(const std::vector<int32_t> & ids);  // the gathered draft head rows
+    void finish_merged_decode(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
+                              ggml_tensor * logits);
+    void finish_merged_verify(ggml_cgraph * g, const graph_names & names, int T, ggml_tensor * logits, bool direct);
+    void finish_merged_draft(ggml_cgraph * g, const graph_names & names, ggml_tensor * logits);
     bool combined_ready(ggml_cgraph * g, const graph_names & names) const;
     bool topk_ready(ggml_cgraph * g, const graph_names & names, int T) const;
     void run_combined(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,

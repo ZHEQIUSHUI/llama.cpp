@@ -157,15 +157,21 @@ class qwen35_whole final : public model {
     std::map<std::string, axera_cmm> banks;
     axera_cmm                      PX, POS, INDPTR, INDICES, LASTLEN, CLOC, VALID, POUT[2];
     output_head                    head;
+    bool                           dec_head = false;  // the decode group computes its own output head
+    bool                           ver_head = false;  // the verification group computes its own output head
+    bool                           pre_head = false;  // the prefill kernel computes the selected rows' logits
+    bool                           mtp_head = false;  // the MTP t1 kernel computes the draft / full logits
 
-    void init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
+    void init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_,
+              const ggml_tensor * output_weight);
     void init_mtp(const std::map<std::string, ggml_tensor *> & t, int il);
     size_t part(int kind) const { return kind == 0 ? st_b : kind == 3 ? cv_b : cq_b; }
     const axera_cmm & pool(int kind) const { return kind == 0 ? ST : kind == 1 ? CQ : kind == 2 ? CK : CV; }
     void bind_state();
     void state_home();
     void state_at(int set, int row);
-    ggml_status verify(const kv_view & kv, const rope & rp, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h);
+    ggml_status verify(const kv_view & kv, const rope & rp, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h,
+                       ggml_tensor * logits);
     ggml_status compute_mtp(ggml_cgraph * g);
     axera_cmm bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d, const rope & rp);
     void      zero_state();
@@ -173,7 +179,8 @@ class qwen35_whole final : public model {
     void      load_state();
     void      swap_kept();
     bool      restart_point(int64_t s0, int k);
-    void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0);
+    void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
+                      ggml_tensor * logits, const std::vector<int32_t> & rows);
     int64_t   state_cell() const { return snap_cell < 0 ? 0 : snap_cell + (int64_t) (page_x.size() / std::max(1, H)); }
 };
 
@@ -420,7 +427,8 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
     return c;
 }
 
-void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_) {
+void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_,
+                        const ggml_tensor * output_weight) {
     L = L_;
     H = H_;
     GGML_ASSERT(L % 4 == 0);
@@ -438,6 +446,8 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     }
     const kernel & dk = man.get("decode.group");
     const kernel & pk = man.get("prefill");
+    dec_head = output_weight && dk.find_input("head") >= 0 && head.bind_merged(dk, output_weight);
+    pre_head = output_weight && pk.find_input("head_on") >= 0 && head.bind_merged_prefill(pk, output_weight);
     G                 = 0;
     for (const auto & d : dk.desc->out) {
         if (d.name.rfind("st", 0) == 0 || d.name.rfind("kv", 0) == 0) {
@@ -573,6 +583,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
                       fp8 ? 8 : 4, (long long) code_k, (long long) scale->shape.back());
         static const std::set<std::string> pools = { "x", "position_ids", "indptr", "indices", "last_page_len", "cache_location",
                                                      "valid_tokens", "b3_kv" };
+        static const std::set<std::string> head_in = { "head_on", "out_row", "nout", "norm_w", "w_lm", "s_lm" };
         // b0 / b1 / b2: the recurrent state banks of the three delta-net phases (a build may use one common b0 for all)
         auto ends = [](const std::string & s, const char * suffix) {
             const size_t n = strlen(suffix);
@@ -584,7 +595,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
                     ends(n, "_attn_v_conv_state_in"));
         };
         for (const auto & d : pk.desc->in) {
-            if (!pools.count(d.name) && !state_pool(d.name)) {
+            if (!pools.count(d.name) && !state_pool(d.name) && !head_in.count(d.name)) {
                 // the weights of all L / 4 blocks (a call binds its slice below); the cos / sin tables are the same
                 // for every block, so the kernel's blocks of them are bound whole to every call
                 const bool cs = ends(d.name, "_attn_cos") || ends(d.name, "_attn_sin");
@@ -619,6 +630,17 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
                 c.in.push_back(axera_io(prm.pack(t, *dk.desc, d.name, gi * G), d.bytes));
                 continue;
             }
+            if (dec_head) {  // the merged head's runtime state, the same buffers in every group (only the last runs it)
+                const axera_cmm * hb = d.name == "head" ? &head.mgh : d.name == "topk_on" ? &head.mgt :
+                                       d.name == "norm_w" ? &head.cnorm : d.name == "w_lm" ? &head.q :
+                                       d.name == "s_lm" ? &head.s : d.name == "bias" ? &head.tbias :
+                                       d.name == "mul_pos" ? &head.tmulp : d.name == "mul_neg" ? &head.tmuln :
+                                       d.name == "temp" ? &head.ttemp : nullptr;
+                if (hb) {
+                    c.in.push_back(axera_io(*hb, d.bytes));
+                    continue;
+                }
+            }
             const axera_cmm * b = d.name == "x" ? &A : d.name == "cs" ? &CS : d.name == "pn" ? &PN : d.name == "mask" ? &MASK : nullptr;
             if (!b) {
                 GGML_ABORT("axera qwen35_whole: decode.group: unexpected input %s\n", d.name.c_str());
@@ -626,6 +648,14 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
             c.in.push_back(axera_io(*b, d.bytes));
         }
         for (const auto & d : dk.desc->out) {
+            if (dec_head && (d.name == "logits" || d.name == "ids" || d.name == "top_logits" || d.name == "values" ||
+                             d.name == "kids" || d.name == "vmax" || d.name == "sumexp")) {
+                const axera_cmm * hb = d.name == "logits" ? &head.mgl : d.name == "ids" ? &head.cids :
+                                       d.name == "top_logits" ? &head.ctop : d.name == "values" ? &head.tval :
+                                       d.name == "kids" ? &head.tids : d.name == "vmax" ? &head.tmax : &head.tsum;
+                c.out.push_back(axera_io(*hb, d.bytes));
+                continue;
+            }
             c.out.push_back(d.name == "out" ? axera_io(A, d.bytes) : pool_io(d.name, gi * G + atoi(d.name.c_str() + 2)));
         }
         // this group's converted parameters, read only through its packs now: freed before the next group's
@@ -663,6 +693,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     ver.clear();
     if (man.has("decode.verify")) {
         const kernel & vk = man.get("decode.verify");
+        ver_head = output_weight && vk.find_input("head") >= 0 && head.bind_merged_verify(vk, output_weight);
         GGML_ASSERT(vk.in_bytes("x") == 4 * H * sizeof(ggml_bf16_t) && vk.in_bytes("cs") == 4 * csb &&
                     vk.in_bytes("pn") == 4 * 3 * sizeof(int32_t) && vk.in_bytes("mask") == 4 * dk.in_bytes("mask"));
         VX    = axera_cmm_alloc(vk.in_bytes("x"));
@@ -699,6 +730,14 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
                     c.in.push_back(bank_io(vk, d, gi));
                     continue;
                 }
+                if (ver_head) {
+                    const axera_cmm * hb = d.name == "head" ? &head.mgh : d.name == "norm_w" ? &head.c4norm :
+                                           d.name == "w_lm" ? &head.q : d.name == "s_lm" ? &head.s : nullptr;
+                    if (hb) {
+                        c.in.push_back(axera_io(*hb, d.bytes));
+                        continue;
+                    }
+                }
                 const axera_cmm * b = d.name == "x" ? &VX : d.name == "cs" ? &VCS : d.name == "pn" ? &VPN :
                                       d.name == "mask" ? &VMASK : d.name == "ntok" ? &VNT : nullptr;
                 if (!b) {
@@ -707,6 +746,12 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
                 c.in.push_back(axera_io(*b, d.bytes));
             }
             for (const auto & d : vk.desc->out) {
+                if (ver_head && (d.name == "ids" || d.name == "top_logits" || d.name == "logits")) {
+                    const axera_cmm * hb = d.name == "ids" ? &head.c4ids : d.name == "top_logits" ? &head.c4top :
+                                           &head.mvl;
+                    c.out.push_back(axera_io(*hb, d.bytes));
+                    continue;
+                }
                 int k = -1;
                 for (int j = 0; j < 4; ++j) {
                     k = d.name == SN[j] ? j : k;
@@ -734,7 +779,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
         ((int32_t *) INDICES->vir)[i] = i;
     }
     INDICES->flush();
-    GGML_ASSERT(pk.desc->out.size() == 1 && pk.desc->out[0].name == "output" && pk.desc->out[0].bytes == POUT[0]->size);
+    GGML_ASSERT(pk.out_bytes("output") == POUT[0]->size);
     pres.assign(ncall, {});
     auto ends = [](const std::string & s, const char * suffix) {
         const size_t z = strlen(suffix);
@@ -778,6 +823,10 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
                                (long long) d.shape[0], (size_t) d.bytes, (size_t) part(kind), (*b)->size, off);
                 }
             } else if (!b) {
+                b = n == "head_on" ? &head.mgh : n == "nout" ? &head.mgt : n == "out_row" ? &head.mpr :
+                    n == "norm_w" ? &head.cnorm : n == "w_lm" ? &head.q : n == "s_lm" ? &head.s : nullptr;
+            }
+            if (!b) {
                 b   = &banks.at(n);
                 // (cos / sin are bound whole; the weight banks hold every call's blocks)
                 off = (*b)->size >= (size_t) ncall * d.bytes ? (size_t) k * d.bytes : 0;
@@ -785,7 +834,16 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
             GGML_ASSERT((*b)->size >= off + (n == "b3_kv" ? kv_alloc : d.bytes));
             c.in.push_back(axera_io(b->get(), (char *) (*b)->vir + off, (uint32_t) d.bytes));
         }
-        c.out.push_back(axera_io(POUT[k & 1], pk.desc->out[0].bytes));
+        for (const auto & d : pk.desc->out) {
+            if (d.name == "output") {
+                c.out.push_back(axera_io(POUT[k & 1], d.bytes));
+            } else if (pre_head && (d.name == "ids" || d.name == "top_logits" || d.name == "logits")) {
+                const axera_cmm * hb = d.name == "ids" ? &head.c4ids : d.name == "top_logits" ? &head.c4top : &head.mvl;
+                c.out.push_back(axera_io(*hb, d.bytes));
+            } else {
+                GGML_ABORT("axera qwen35_whole: prefill: unexpected output %s\n", d.name.c_str());
+            }
+        }
     }
 
     std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> live;
@@ -1154,10 +1212,13 @@ size_t qwen35_whole::state_read(const void * src, size_t size, uint32_t flags) {
 
 // prefill pages from cell c0 (a page's first): n rows x [n][H] bf16 and their M-RoPE positions p4 [n][4]; the hidden
 // states of the rows from out0 on into h
-void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0) {
+void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
+                           ggml_tensor * logits, const std::vector<int32_t> & rows) {
     GGML_ASSERT(c0 % PG == 0);
     GGML_ASSERT(c0 >= 0 && n >= 0 && c0 + n <= man.context);
     GGML_ASSERT(c0 + n <= kv_cells);  // (the pools' pages)
+    GGML_ASSERT(!pre_head || rows.size() <= 4);
+    const bool want_logits = pre_head && logits && !rows.empty();
     for (int64_t r = 0; r < n; ++r) {
         for (int s = 0; s < 4; ++s) {
             GGML_ASSERT(p4[r * 4 + s] >= 0 && p4[r * 4 + s] < man.context);
@@ -1190,8 +1251,41 @@ void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32
         }
         {
             axera_timer tl("prefill (page)");
+            std::vector<std::pair<int, int32_t>> page_rows;  // (graph row, page row)
+            if (want_logits) {
+                for (size_t j = 0; j < rows.size(); ++j) {
+                    const int64_t a = (int64_t) out0 + rows[j];
+                    if (a >= r0 && a < r0 + v) {
+                        page_rows.push_back({ (int) j, (int32_t) (a - r0) });
+                    }
+                }
+            }
+            if (pre_head) {
+                *(int32_t *) head.mgh->vir = page_rows.empty() ? 0 : 1;
+                *(int32_t *) head.mgt->vir = (int32_t) page_rows.size();
+                for (size_t j = 0; j < page_rows.size(); ++j) {
+                    ((int32_t *) head.mpr->vir)[j] = page_rows[j].second;
+                }
+                head.mgh->flush(head.mgh->vir, sizeof(int32_t));
+                head.mgt->flush(head.mgt->vir, sizeof(int32_t));
+                head.mpr->flush(head.mpr->vir, page_rows.size() * sizeof(int32_t));
+            }
             for (auto & c : pres) {
                 c.k->run(c.in, c.out, "prefill");
+            }
+            if (!page_rows.empty()) {
+                const int64_t N = logits->ne[0];
+                head.mvl->invalidate(head.mvl->vir, (size_t) page_rows.size() * N * sizeof(float));
+                for (size_t j = 0; j < page_rows.size(); ++j) {
+                    memcpy((char *) logits->data + (size_t) page_rows[j].first * logits->nb[1],
+                           (const char *) head.mvl->vir + j * N * sizeof(float), (size_t) N * sizeof(float));
+                }
+                if (ggml_backend_buffer_is_axera(logits->buffer)) {
+                    auto * dctx       = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+                    dctx->clean_p     = logits->data;
+                    dctx->clean_n     = (size_t) logits->ne[1] * logits->nb[1];
+                    dctx->clean_epoch = axera_graph_epoch;
+                }
             }
         }
         axera_timer       to("prefill out rows");
@@ -1214,7 +1308,7 @@ void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32
 // hidden states into h: rows T..3 padded (the last row's positions and mask, later cells: KV rows nobody reads); the
 // state after each row in the other snapshot set, the current state the last row's
 ggml_status qwen35_whole::verify(const kv_view & kv, const rope & rp, const ggml_bf16_t * xb, const int32_t * pb, int T,
-                               float * h) {
+                                 float * h, ggml_tensor * logits) {
     const int64_t c0 = kv.cell_of(0);
     if (c0 % PG == 0) {  // a page's first cell: the state there is the restart point
         save_state(c0);
@@ -1242,10 +1336,21 @@ ggml_status qwen35_whole::verify(const kv_view & kv, const rope & rp, const ggml
     }
     const int set = cur_set == 0 ? 1 : 0;
     static const char * SN[4] = { "ssnap", "cqsnap", "cksnap", "cvsnap" };
+    const bool direct = logits && logits->ne[1] == 4 && logits->nb[1] == (int64_t) head.w->ne[1] * sizeof(float);
+    if (ver_head && direct) {
+        call & c = ver.back();
+        c.out[c.k->output("logits")] = axera_io(((ggml_backend_axera_buffer_context *) logits->buffer->context),
+                                                 logits->data, (size_t) 4 * head.w->ne[1] * sizeof(float));
+    }
     {
         axera_timer tl("layers (verify)");
         for (size_t gi = 0; gi < ver.size(); ++gi) {
             call & c = ver[gi];
+            if (ver_head) {
+                const bool last = gi + 1 == ver.size();
+                *(int32_t *) head.mgh->vir = last ? 1 : 0;
+                head.mgh->flush(head.mgh->vir, sizeof(int32_t));
+            }
             for (int k = 0; k < 4; ++k) {
                 c.out[c.k->output(SN[k])] = axera_io(snaps[set][gi][k], snaps[set][gi][k]->size);
             }
@@ -1311,7 +1416,7 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
     GGML_ASSERT(rope_node && "axera qwen35_whole: no ROPE node in the graph");
     const ggml_tensor * w0 = t.at("blk.0.attn_norm.weight");
     if (bound != w0->data || L_ != L) {
-        init(t, rope_node, L_, H_);
+        init(t, rope_node, L_, H_, logits->src[0]);
         bound = w0->data;
     }
     const ggml_tensor * k_idxs = names.find("attn_inp_k_idxs");
@@ -1365,6 +1470,7 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
         zero_state();
     }
     std::vector<ggml_bf16_t> xb((size_t) T * H);
+    bool                   head_done = false;
     {
         axera_timer tin("input rows");
         axera_host_pool().run(T, [&](int64_t r) {
@@ -1373,9 +1479,27 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
     }
     if (T > 1 && T <= 4 && !ver.empty() && c0 > 0 && c0 + 4 <= kv_cells) {
         axera_timer tv("verify (all groups)");
-        const ggml_status st = verify(kv, rp, xb.data(), pb.data(), T, h.data());
+        if (ver_head) {
+            ggml_tensor * hn = logits->src[1];
+            while (hn->op == GGML_OP_GET_ROWS || hn->op == GGML_OP_VIEW || hn->op == GGML_OP_RESHAPE) {
+                hn = hn->src[0];
+            }
+            float         eps = 0.0f;
+            const float * gw  = final_norm(hn, H, &eps);
+            GGML_ASSERT(gw && eps == 1e-6f);
+            GGML_ASSERT(head.c4norm && head.c4norm->size == (size_t) H * sizeof(float));
+            memcpy(head.c4norm->vir, gw, (size_t) H * sizeof(float));
+            head.c4norm->flush(head.c4norm->vir, (size_t) H * sizeof(float));
+        }
+        const ggml_status st = verify(kv, rp, xb.data(), pb.data(), T, h.data(), logits);
         if (st != GGML_STATUS_SUCCESS) {
             return st;
+        }
+        if (ver_head) {
+            const bool direct = T == 4 && logits->ne[1] == 4 &&
+                                logits->nb[1] == (int64_t) logits->ne[0] * sizeof(float);
+            head.finish_merged_verify(g, names, T, logits, direct);
+            head_done = true;
         }
     } else if (T > 1) {
         state_home();
@@ -1397,8 +1521,40 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
         }
         xs.insert(xs.end(), xb.begin(), xb.end());
         ps.insert(ps.end(), pb.begin(), pb.end());
+        std::vector<int32_t> orows;
+        if (pre_head) {
+            const int n_out = (int) logits->ne[1];
+            if (n_out > 4) {
+                GGML_ABORT("axera qwen35_whole: a prompt asking for %d logits rows; the merged prefill head covers 4\n", n_out);
+            }
+            ggml_tensor * out_ids = names.find("out_ids");
+            if (n_out < T && (!out_ids || out_ids->type != GGML_TYPE_I32 || out_ids->ne[0] != n_out)) {
+                out_ids = nullptr;
+                for (int i = 0; i < g->n_nodes && !out_ids; i++) {
+                    ggml_tensor * node = g->nodes[i];
+                    if (node->op == GGML_OP_GET_ROWS && node->src[1] && node->src[1]->type == GGML_TYPE_I32 &&
+                        node->src[1]->ne[0] == n_out && node->src[0]->ne[1] == T) {
+                        out_ids = node->src[1];
+                    }
+                }
+            }
+            for (int r = 0; r < n_out; ++r) {
+                orows.push_back(out_ids ? ((const int32_t *) out_ids->data)[r] : r);
+            }
+            ggml_tensor * hn = logits->src[1];
+            while (hn->op == GGML_OP_GET_ROWS || hn->op == GGML_OP_VIEW || hn->op == GGML_OP_RESHAPE) {
+                hn = hn->src[0];
+            }
+            float         eps = 0.0f;
+            const float * gw  = final_norm(hn, H, &eps);
+            GGML_ASSERT(gw && eps == 1e-6f);
+            head.set_merged_norm(gw, H);
+        }
         axera_timer tp("prefill (all pages)");
-        prefill(s0, k + T, xs.data(), ps.data(), h, k);
+        prefill(s0, k + T, xs.data(), ps.data(), h, k, logits, orows);
+        if (pre_head) {
+            head_done = true;
+        }
         snap_prompt = true;  // (its page's restart point outlives the decode's next pages)
     } else {
         // one token through the decode groups; at a page's first cell the state there is the restart point
@@ -1421,14 +1577,43 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
         ((int32_t *) PN->vir)[2] = (int32_t) ((c0 / PG) * 2 * PG + c0 % PG);
         GGML_ASSERT(((int32_t *) PN->vir)[2] >= 0 && ((int32_t *) PN->vir)[2] < kv_pages * 2 * PG);
         PN->flush();
+        float         heps = 0.0f;
+        const float * hw   = nullptr;
+        if (dec_head) {
+            ggml_tensor * hn = logits->src[1];
+            while (hn->op == GGML_OP_GET_ROWS || hn->op == GGML_OP_VIEW || hn->op == GGML_OP_RESHAPE) {
+                hn = hn->src[0];
+            }
+            hw = final_norm(hn, H, &heps);
+            GGML_ASSERT(hw && heps == 1e-6f);
+            head.set_merged_norm(hw, H);
+            const size_t N = (size_t) logits->ne[0];
+            auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+            dec.back().out[dec.back().k->output("logits")] = axera_io(dctx, logits->data, N * sizeof(float));
+            if (head.merged_topk()) {
+                head.prepare_merged_topk();
+            }
+        }
         {
             axera_timer tl("layers (decode)");
-            for (auto & c : dec) {
+            for (size_t gi = 0; gi < dec.size(); ++gi) {
+                call & c = dec[gi];
+                if (dec_head) {
+                    const bool last = gi + 1 == dec.size() && logits->ne[1] > 0;
+                    *(int32_t *) head.mgh->vir = last ? 1 : 0;
+                    *(int32_t *) head.mgt->vir = last && head.merged_topk() ? 1 : 0;
+                    head.mgh->flush(head.mgh->vir, sizeof(int32_t));
+                    head.mgt->flush(head.mgt->vir, sizeof(int32_t));
+                }
                 c.k->run(c.in, c.out, "decode group");
             }
         }
         A->invalidate(A->vir, H * sizeof(ggml_bf16_t));
         ggml_bf16_to_fp32_row((const ggml_bf16_t *) A->vir, h.data(), H);
+        if (dec_head) {
+            head.finish_merged_decode(g, names, h, T, logits);
+            head_done = true;
+        }
         page_x.insert(page_x.end(), xb.begin(), xb.end());
         page_p.insert(page_p.end(), pb.begin(), pb.end());
     }
@@ -1454,22 +1639,24 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
             ((ggml_backend_axera_buffer_context *) hn->buffer->context)->flush(hn->data, ggml_nbytes(hn));
         }
     }
-    axera_timer th("output head");
-    head.bind(man.get("lm_head"), logits->src[0]);
-    if (man.has("lm_head.topk")) {
-        head.bind_topk(man.get("lm_head.topk"));
-    }
-    const bool combined = head.bind_combined(man.get("lm_head"), logits->src[0]) && head.combined_ready(g, names);
-    // Only a four-row verify graph uses this head.  Binding it during a plain T=1 graph would allocate its CMM
-    // buffers and perturb the address layout of dormant MTP requests (adaptive prose/sampled), which can flip
-    // near-tie greedy tokens relative to the plain manifest.
-    if (T == 4 && man.has("lm_head.verify")) {
-        head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
-    }
-    if (combined) {
-        head.run_combined(g, names, h, T, nullptr, nullptr);
-    } else {
-        head.run(g, names, h, T);
+    if (!head_done) {
+        axera_timer th("output head");
+        head.bind(man.get("lm_head"), logits->src[0]);
+        if (man.has("lm_head.topk")) {
+            head.bind_topk(man.get("lm_head.topk"));
+        }
+        const bool combined = head.bind_combined(man.get("lm_head"), logits->src[0]) && head.combined_ready(g, names);
+        // Only a four-row verify graph uses this head.  Binding it during a plain T=1 graph would allocate its CMM
+        // buffers and perturb the address layout of dormant MTP requests (adaptive prose/sampled), which can flip
+        // near-tie greedy tokens relative to the plain manifest.
+        if (T == 4 && man.has("lm_head.verify")) {
+            head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
+        }
+        if (combined) {
+            head.run_combined(g, names, h, T, nullptr, nullptr);
+        } else {
+            head.run(g, names, h, T);
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -1520,7 +1707,9 @@ void qwen35_whole::init_mtp(const std::map<std::string, ggml_tensor *> & t, int 
         }
     };
     bind(mtp1, k1, { { "e", &ME }, { "h", &MH }, { "cs", &MCS }, { "pn", &MPN }, { "mask", &MMASK }, { "hnext", &MOUT },
-                     { "hraw", &MRAW } });
+                     { "hraw", &MRAW }, { "wd", &head.dq }, { "sd", &head.ds }, { "wl", &head.q }, { "sl", &head.s },
+                     { "hw", &head.cnorm }, { "draft_on", &head.mgh }, { "full_on", &head.mgt },
+                     { "draft", &head.gdraft }, { "logits", &head.mgl } });
     bind(mtpp, kp, { { "e", &PE }, { "h", &PH }, { "cs", &PCS }, { "pn", &PPN }, { "mask", &PMASK }, { "nblk", &PNBLK },
                      { "hnext", &POUT2 }, { "hraw", &PRAW } });
     GGML_ASSERT(MCS->size == (size_t) ROT * sizeof(ggml_bf16_t) && MMASK->size == (size_t) man.context * sizeof(ggml_bf16_t) &&
@@ -1591,6 +1780,26 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
     GGML_ASSERT(hin->type == GGML_TYPE_F32 && hin->ne[0] == H && embd->type == GGML_TYPE_F32 && embd->ne[0] == H &&
                 embd->ne[1] == T && hn->ne[1] == T);
     const ggml_tensor * w0 = t.at("blk." + std::to_string(il) + ".nextn.eh_proj.weight");
+    ggml_tensor * logits = names.find("result_output");
+    if (logits && logits->op == GGML_OP_MUL_MAT && man.has("decode.group") &&
+        man.get("decode.group").find_input("head") >= 0 && !man.has("mtp.m8")) {
+        GGML_ASSERT(head.bind_merged(man.get("decode.group"), logits->src[0]));
+        if (!head.dk) {
+            const std::string f  = man.dir + "/draft_vocab.i32";
+            FILE *            fp = fopen(f.c_str(), "rb");
+            GGML_ASSERT(fp);
+            fseek(fp, 0, SEEK_END);
+            const long fsz = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            GGML_ASSERT(fsz > 0 && fsz % (long) sizeof(int32_t) == 0);
+            std::vector<int32_t> ids((size_t) fsz / sizeof(int32_t));
+            GGML_ASSERT(fread(ids.data(), sizeof(int32_t), ids.size(), fp) == ids.size());
+            fclose(fp);
+            axera_timer tb("init: draft head");
+            head.bind_draft_rows(ids);
+        }
+        mtp_head = head.bind_merged_draft(man.get("mtp.t1"));
+    }
     if (mtp_bound != w0->data) {
         init_mtp(t, il);
         mtp_bound = w0->data;
@@ -1649,6 +1858,16 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) M8RAW->vir + (size_t) r * H, hr.data() + (size_t) r * H, H);
         }
     } else if (T <= 8) {  // a draft step, or a verification's accepted rows: row by row
+        if (mtp_head && T > 1 && logits) {
+            ggml_tensor * hnf = logits->src[1];
+            while (hnf->op == GGML_OP_GET_ROWS || hnf->op == GGML_OP_VIEW || hnf->op == GGML_OP_RESHAPE) {
+                hnf = hnf->src[0];
+            }
+            float         eps = 0.0f;
+            const float * gw  = final_norm(hnf, H, &eps);
+            GGML_ASSERT(gw && eps == 1e-6f);
+            head.set_merged_norm(gw, H);
+        }
         for (int r = 0; r < T; ++r) {
             row_bf16(embd, r, (ggml_bf16_t *) ME->vir);
             row_bf16(hin, r, (ggml_bf16_t *) MH->vir);
@@ -1664,11 +1883,32 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
             for (const axera_cmm * b : { &ME, &MH, &MCS, &MPN, &MMASK }) {
                 (*b)->flush();
             }
+            if (mtp_head) {
+                *(int32_t *) head.mgh->vir = T == 1 ? 1 : 0;
+                *(int32_t *) head.mgt->vir = T == 1 ? 0 : 1;
+                head.mgh->flush(head.mgh->vir, sizeof(int32_t));
+                head.mgt->flush(head.mgt->vir, sizeof(int32_t));
+            }
             mtp1.k->run(mtp1.in, mtp1.out, "mtp t1");
             MOUT->invalidate();
             MRAW->invalidate();
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) MOUT->vir, h.data() + (size_t) r * H, H);
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) MRAW->vir, hr.data() + (size_t) r * H, H);
+            if (mtp_head && logits) {
+                if (T == 1) {
+                    head.finish_merged_draft(g, names, logits);
+                } else {
+                    const size_t N = (size_t) logits->ne[0];
+                    head.mgl->invalidate(head.mgl->vir, N * sizeof(float));
+                    memcpy((char *) logits->data + (size_t) r * logits->nb[1], head.mgl->vir, N * sizeof(float));
+                    if (ggml_backend_buffer_is_axera(logits->buffer)) {
+                        auto * dctx       = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+                        dctx->clean_p     = logits->data;
+                        dctx->clean_n     = (size_t) T * logits->nb[1];
+                        dctx->clean_epoch = axera_graph_epoch;
+                    }
+                }
+            }
         }
     } else {
         const bool kvonly = mtppkv.k != nullptr;  // all but the last row need only their K/V
@@ -1790,8 +2030,7 @@ ggml_status qwen35_whole::compute_mtp(ggml_cgraph * g) {
             ((ggml_backend_axera_buffer_context *) hn->buffer->context)->flush(hn->data, ggml_nbytes(hn));
         }
     }
-    ggml_tensor * logits = names.find("result_output");
-    if (logits && logits->ne[1] > 0 && (logits->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+    if (!mtp_head && logits && logits->ne[1] > 0 && (logits->flags & GGML_TENSOR_FLAG_COMPUTE)) {
         head.bind(man.get("lm_head"), logits->src[0]);
         if (man.has("lm_head.topk")) {
             head.bind_topk(man.get("lm_head.topk"));

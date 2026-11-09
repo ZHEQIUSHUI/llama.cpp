@@ -446,26 +446,38 @@ void output_norm(const graph_names & names, const std::vector<float> & h, int T)
 
 void output_head::bind(const kernel & lm, const ggml_tensor * output_weight) {
     k = &lm;
-    if (w == output_weight) {
-        return;
+    const bool fresh = w != output_weight;
+    if (fresh) {
+        w = output_weight;
     }
-    w                = output_weight;
     const int64_t N = w->ne[1], K = w->ne[0];
     mx4              = lm.in_bytes("w") == N * K / 2;
     R                = lm.find_input("m") >= 0 ? (int) (lm.in_bytes("x") / (K * sizeof(ggml_bf16_t))) : 1;
     GGML_ASSERT((mx4 || lm.in_bytes("w") == N * K) && lm.in_bytes("s") == N * K / AXERA_MX_GROUP &&
                 lm.in_bytes("x") == R * K * sizeof(ggml_bf16_t) && lm.out_bytes("out") == R * N * sizeof(float));
     if (R > 1) {  // rows R at a time (output to y, copied to the logits)
-        yk = axera_cmm_alloc(R * N * sizeof(float));
-        mk = axera_cmm_alloc(sizeof(int32_t));
+        if (!yk) {
+            yk = axera_cmm_alloc(R * N * sizeof(float));
+        }
+        if (!mk) {
+            mk = axera_cmm_alloc(sizeof(int32_t));
+        }
     }
-    if (mx4) {
-        axera_quantize_mxfp4(w, q, s);
-    } else {
-        axera_quantize_mxfp8(w, q, s);
+    if (!q) {
+        if (mx4) {
+            axera_quantize_mxfp4(w, q, s);
+        } else {
+            axera_quantize_mxfp8(w, q, s);
+        }
     }
-    axera_drop_mapped(w, true);  // (a tied output head shares token_embd.weight: the mapped rows are not needed now)
-    x = axera_cmm_alloc(R * K * sizeof(ggml_bf16_t));
+    if (fresh) {
+        axera_drop_mapped(w, true);  // (a tied output head shares token_embd.weight: the mapped rows are not needed now)
+    }
+    // A layer kernel's merged head binds the same weights but not this kernel's input staging row.  Keep it allocated
+    // for the fallback path (a prompt ubatch with no output rows, or a standalone head manifest).
+    if (!x || x->size < (size_t) R * K * sizeof(ggml_bf16_t)) {
+        x = axera_cmm_alloc(R * K * sizeof(ggml_bf16_t));
+    }
 }
 
 void output_head::bind_topk(const kernel & lm) {
@@ -561,10 +573,21 @@ bool output_head::bind_combined(const kernel & lm, const ggml_tensor * output_we
     }
     ck = &lm;
     cR = R;
-    cnorm = axera_cmm_alloc((size_t) K * sizeof(float));
-    cx    = axera_cmm_alloc((size_t) K * sizeof(ggml_bf16_t));
-    cids  = axera_cmm_alloc(sizeof(int32_t));
-    ctop  = axera_cmm_alloc(sizeof(float));
+    // A layer kernel's merged head may already have bound these buffers: its call input vector points at them, so
+    // reallocating here would leave that vector reading the freed addresses.
+    if (!cnorm) {
+        cnorm = axera_cmm_alloc((size_t) K * sizeof(float));
+    }
+    if (!cx) {
+        cx = axera_cmm_alloc((size_t) K * sizeof(ggml_bf16_t));
+    }
+    if (!cids) {
+        cids = axera_cmm_alloc(sizeof(int32_t));
+    }
+    if (!ctop) {
+        ctop = axera_cmm_alloc(sizeof(float));
+    }
+    GGML_ASSERT(cnorm->size >= (size_t) K * sizeof(float));
     cin.assign(ck->info->nInputSize, AX_ENGINE_IO_BUFFER_T{});
     cout.assign(ck->info->nOutputSize, AX_ENGINE_IO_BUFFER_T{});
     cin[ck->input("norm_w")] = axera_io(cnorm, (size_t) K * sizeof(float));
@@ -652,6 +675,366 @@ bool output_head::bind_combined4(const kernel & lm, const ggml_tensor * output_w
     c4out[c4k->output("top_logits")] = axera_io(c4top, 4 * sizeof(float));
     c4gw = nullptr;
     return true;
+}
+
+// a layer kernel's merged head: its inputs name the final norm, the output projection and the sampler state
+static bool head_inputs(const kernel & k) {
+    return k.find_input("norm_w") >= 0 && k.find_input("w_lm") >= 0 && k.find_input("s_lm") >= 0 &&
+           k.find_output("logits") >= 0 && k.find_output("ids") >= 0 && k.find_output("top_logits") >= 0;
+}
+
+bool output_head::bind_merged(const kernel & g, const ggml_tensor * output_weight) {
+    if (!output_weight || !head_inputs(g) || g.find_input("head") < 0 || g.find_input("topk_on") < 0 ||
+        g.find_input("bias") < 0 || g.find_input("mul_pos") < 0 || g.find_input("mul_neg") < 0 ||
+        g.find_input("temp") < 0 || g.find_output("values") < 0 || g.find_output("kids") < 0 ||
+        g.find_output("vmax") < 0 || g.find_output("sumexp") < 0) {
+        return false;
+    }
+    const int64_t N = output_weight->ne[1], K = output_weight->ne[0];
+    const bool    m4 = g.in_bytes("w_lm") == (uint32_t) (N * K / 2);
+    if ((!m4 && g.in_bytes("w_lm") != (uint32_t) (N * K)) || g.in_bytes("s_lm") != (uint32_t) (N * K / AXERA_MX_GROUP) ||
+        g.in_bytes("norm_w") != (uint32_t) (K * sizeof(float)) || g.out_bytes("logits") != (uint32_t) (N * sizeof(float)) ||
+        g.out_bytes("ids") != sizeof(int32_t) || g.out_bytes("top_logits") != sizeof(float) ||
+        g.out_bytes("vmax") != sizeof(float) || g.out_bytes("sumexp") != sizeof(float)) {
+        return false;
+    }
+    tK = (int) (g.out_bytes("values") / sizeof(float));
+    if (tK <= 0 || g.out_bytes("kids") != (uint32_t) (tK * sizeof(int32_t))) {
+        return false;
+    }
+    mg   = &g;
+    mx4  = m4;
+    tR   = 1;
+    if (w != output_weight) {
+        w = output_weight;
+        if (mx4) {
+            axera_quantize_mxfp4(w, q, s);
+        } else {
+            axera_quantize_mxfp8(w, q, s);
+        }
+        axera_drop_mapped(w, true);
+    }
+    if (!cnorm) {
+        cnorm = axera_cmm_alloc((size_t) K * sizeof(float));
+        cids  = axera_cmm_alloc(sizeof(int32_t));
+        ctop  = axera_cmm_alloc(sizeof(float));
+    }
+    if (!mgh) {
+        mgh = axera_cmm_alloc(sizeof(int32_t));
+        mgt = axera_cmm_alloc(sizeof(int32_t));
+        mgl = axera_cmm_alloc((size_t) N * sizeof(float));
+    }
+    if (!tbias) {
+        tbias = axera_cmm_alloc_nc((size_t) N * sizeof(float));
+        tmulp = axera_cmm_alloc_nc((size_t) N * sizeof(float));
+        tmuln = axera_cmm_alloc_nc((size_t) N * sizeof(float));
+        std::fill((float *) tmulp->vir, (float *) tmulp->vir + N, 1.0f);
+        std::fill((float *) tmuln->vir, (float *) tmuln->vir + N, 1.0f);
+        ttemp = axera_cmm_alloc_nc(sizeof(float));
+        *(float *) ttemp->vir = 1.0f;
+        tval = axera_cmm_alloc((size_t) tK * sizeof(float));
+        tids = axera_cmm_alloc((size_t) tK * sizeof(int32_t));
+        tmax = axera_cmm_alloc(sizeof(float));
+        tsum = axera_cmm_alloc(sizeof(float));
+        tv.resize((size_t) tK);
+        ti.resize((size_t) tK);
+    }
+    return true;
+}
+
+bool output_head::bind_merged_verify(const kernel & v, const ggml_tensor * output_weight) {
+    if (!output_weight || !head_inputs(v) || v.find_input("head") < 0) {
+        return false;
+    }
+    const int64_t N = output_weight->ne[1], K = output_weight->ne[0];
+    const bool    m4 = v.in_bytes("w_lm") == (uint32_t) (N * K / 2);
+    if ((!m4 && v.in_bytes("w_lm") != (uint32_t) (N * K)) || v.in_bytes("s_lm") != (uint32_t) (N * K / AXERA_MX_GROUP) ||
+        v.in_bytes("norm_w") != (uint32_t) (K * sizeof(float)) || v.out_bytes("logits") != (uint32_t) (4 * N * sizeof(float)) ||
+        v.out_bytes("ids") != 4 * sizeof(int32_t) || v.out_bytes("top_logits") != 4 * sizeof(float)) {
+        return false;
+    }
+    mv = &v;
+    if (w != output_weight || !q) {
+        w   = output_weight;
+        mx4 = m4;
+        if (mx4) {
+            axera_quantize_mxfp4(w, q, s);
+        } else {
+            axera_quantize_mxfp8(w, q, s);
+        }
+        axera_drop_mapped(w, true);
+    }
+    if (!c4norm) {
+        c4norm = axera_cmm_alloc((size_t) K * sizeof(float));
+        c4ids  = axera_cmm_alloc(4 * sizeof(int32_t));
+        c4top  = axera_cmm_alloc(4 * sizeof(float));
+    }
+    if (!mvl) {
+        mvl = axera_cmm_alloc((size_t) 4 * N * sizeof(float));
+    }
+    return true;
+}
+
+bool output_head::bind_merged_draft(const kernel & t1) {
+    if (t1.find_input("wd") < 0 || t1.find_input("sd") < 0 || t1.find_input("wl") < 0 || t1.find_input("sl") < 0 ||
+        t1.find_input("hw") < 0 || t1.find_output("draft") < 0 || t1.find_output("logits") < 0) {
+        return false;
+    }
+    mdraft = true;
+    dargmax = false;
+    if (!gdraft) {
+        gdraft = axera_cmm_alloc(t1.out_bytes("draft"));
+    }
+    dy = axera_cmm_view(gdraft.get(), 0, gdraft->size);  // the draft TOP_K's row scan reads gdraft here
+    return true;
+}
+
+bool output_head::bind_merged_prefill(const kernel & p, const ggml_tensor * output_weight) {
+    if (!output_weight || p.find_input("head_on") < 0 || p.find_input("out_row") < 0 || p.find_input("nout") < 0 ||
+        p.find_input("norm_w") < 0 || p.find_input("w_lm") < 0 || p.find_input("s_lm") < 0 ||
+        p.find_output("logits") < 0 || p.find_output("ids") < 0 || p.find_output("top_logits") < 0) {
+        return false;
+    }
+    const int64_t N = output_weight->ne[1], K = output_weight->ne[0];
+    const bool    m4 = p.in_bytes("w_lm") == (uint32_t) (N * K / 2);
+    if ((!m4 && p.in_bytes("w_lm") != (uint32_t) (N * K)) || p.in_bytes("s_lm") != (uint32_t) (N * K / AXERA_MX_GROUP) ||
+        p.in_bytes("norm_w") != (uint32_t) (K * sizeof(float)) || p.out_bytes("logits") != (uint32_t) (4 * N * sizeof(float)) ||
+        p.out_bytes("ids") != 4 * sizeof(int32_t) || p.out_bytes("top_logits") != 4 * sizeof(float) ||
+        p.in_bytes("out_row") != 4 * sizeof(int32_t)) {
+        return false;
+    }
+    mp = &p;
+    if (w != output_weight || !q) {
+        w   = output_weight;
+        mx4 = m4;
+        if (mx4) {
+            axera_quantize_mxfp4(w, q, s);
+        } else {
+            axera_quantize_mxfp8(w, q, s);
+        }
+        axera_drop_mapped(w, true);
+    }
+    if (!mpr) {
+        mpr = axera_cmm_alloc(4 * sizeof(int32_t));
+    }
+    if (!mvl) {
+        mvl = axera_cmm_alloc((size_t) 4 * N * sizeof(float));
+    }
+    if (!c4ids) {
+        c4ids = axera_cmm_alloc(4 * sizeof(int32_t));
+        c4top = axera_cmm_alloc(4 * sizeof(float));
+    }
+    return true;
+}
+
+bool output_head::merged_topk() const {
+    const npu_opts opts = npu_get_options();
+    return mg && opts.enabled && opts.K == tK;
+}
+
+void output_head::prepare_merged_topk() {
+    if (!merged_topk()) {
+        return;
+    }
+    const int64_t N = w->ne[1];
+    std::vector<npu_penalty_row> upd;
+    int64_t                      gen = 0;
+    npu_take_updates(upd, &gen);
+    if (gen != tgen) {
+        std::fill((float *) tbias->vir, (float *) tbias->vir + N, 0.0f);
+        std::fill((float *) tmulp->vir, (float *) tmulp->vir + N, 1.0f);
+        std::fill((float *) tmuln->vir, (float *) tmuln->vir + N, 1.0f);
+        tgen = gen;
+    }
+    for (const auto & r : upd) {
+        GGML_ASSERT(r.token >= 0 && r.token < N);
+        memcpy((float *) tbias->vir + r.token, &r.bias, sizeof(float));
+        memcpy((float *) tmulp->vir + r.token, &r.mul_pos, sizeof(float));
+        memcpy((float *) tmuln->vir + r.token, &r.mul_neg, sizeof(float));
+    }
+    *(float *) ttemp->vir = npu_get_options().temp;
+}
+
+void output_head::set_merged_norm(const float * w, int64_t K) {
+    if (!cnorm || !w || cnorm->size != (size_t) K * sizeof(float)) {
+        return;
+    }
+    memcpy(cnorm->vir, w, (size_t) K * sizeof(float));
+    cnorm->flush(cnorm->vir, (size_t) K * sizeof(float));
+    mgnorm = w;
+}
+
+void output_head::bind_draft_rows(const std::vector<int32_t> & ids) {
+    GGML_ASSERT(q && w);
+    const int64_t N = w->ne[1], K = w->ne[0], NS = (int64_t) ids.size();
+    if (dids == ids) {
+        return;
+    }
+    dids = ids;
+    const int64_t rowb = mx4 ? K / 2 : K;
+    dq = axera_cmm_alloc(NS * rowb);
+    ds = axera_cmm_alloc(NS * K / AXERA_MX_GROUP);
+    axera_host_pool().run(NS, [&](int64_t i) {
+        const int64_t r = ids[i];
+        GGML_ASSERT(r >= 0 && r < N && (i == 0 || ids[i - 1] < r));
+        memcpy((uint8_t *) dq->vir + i * rowb, (const uint8_t *) q->vir + r * rowb, rowb);
+        memcpy((uint8_t *) ds->vir + i * (K / AXERA_MX_GROUP), (const uint8_t *) s->vir + r * (K / AXERA_MX_GROUP),
+               K / AXERA_MX_GROUP);
+    });
+    dq->flush();
+    ds->flush();
+}
+
+void output_head::finish_merged_decode(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
+                                       ggml_tensor * logits) {
+    const int64_t N = w->ne[1], K = w->ne[0];
+    GGML_ASSERT(mg && logits && logits->op == GGML_OP_MUL_MAT && logits->type == GGML_TYPE_F32 &&
+                ggml_backend_buffer_is_axera(logits->buffer));
+    auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+    const int n_out = (int) logits->ne[1];
+    if (n_out == 0) {  // a ubatch that asks for no logits (perplexity's first half chunk): nothing to publish
+        after(g, names);
+        return;
+    }
+    const npu_opts opts = npu_get_options();
+    if (opts.enabled && opts.K == tK) {
+        tval->invalidate(tval->vir, (size_t) tK * sizeof(float));
+        tids->invalidate(tids->vir, (size_t) tK * sizeof(int32_t));
+        tmax->invalidate(tmax->vir, sizeof(float));
+        tsum->invalidate(tsum->vir, sizeof(float));
+        memcpy(tv.data(), tval->vir, (size_t) tK * sizeof(float));
+        memcpy(ti.data(), tids->vir, (size_t) tK * sizeof(int32_t));
+        std::vector<uint8_t> usable(1, 0);
+        bool fits = true;
+        if (opts.top_k == 0) {
+            const float vm = ((const float *) tmax->vir)[0];
+            if (opts.min_p > 0.0f && tv[(size_t) tK - 1] >= vm + opts.temp_minp * logf(opts.min_p)) {
+                fits = false;
+            }
+            if (fits && opts.top_p < 1.0f) {
+                const double thr = (double) opts.top_p * (double) ((const float *) tsum->vir)[0];
+                double       cum = 0.0;
+                int          last = -1;
+                for (int i = 0; i < tK; ++i) {
+                    cum += (double) expf((tv[(size_t) i] - vm) / opts.temp);
+                    if (cum >= thr) {
+                        last = i;
+                        break;
+                    }
+                }
+                fits = last >= 0 && last + 2 < tK;
+            } else if (fits && opts.top_p >= 1.0f && opts.min_p <= 0.0f) {
+                fits = false;
+            }
+        }
+        usable[0] = fits;
+        npu_publish(tv.data(), ti.data(), tK, 1, (const float *) tmax->vir, (const float *) tsum->vir, usable.data());
+        flogits = logits;
+        fdctx   = dctx;
+        fy.resize((size_t) n_out * K);
+        frows.clear();
+        for (int r = 0; r < n_out; ++r) {
+            memcpy(fy.data() + (size_t) r * K, h.data() + (size_t) r * K, (size_t) K * sizeof(float));
+            frows.push_back(r);
+        }
+        fn_out  = n_out;
+        fstride = logits->nb[1];
+        npu_set_full_row(&output_head::full_row_cb, this);
+        fdctx   = dctx;
+        // The kernel wrote the full rows, but only a sampler asking for one reads them: invalidate that row lazily
+        // in full_row instead of copying n_out x 248320 floats after every token.
+        after(g, names);
+        return;
+    }
+    GGML_ASSERT(n_out == T);
+    std::vector<int32_t> pids((size_t) n_out);
+    std::vector<float>   pvals((size_t) n_out);
+    cids->invalidate(cids->vir, (size_t) n_out * sizeof(int32_t));
+    ctop->invalidate(ctop->vir, (size_t) n_out * sizeof(float));
+    memcpy(pids.data(), cids->vir, (size_t) n_out * sizeof(int32_t));
+    memcpy(pvals.data(), ctop->vir, (size_t) n_out * sizeof(float));
+    const bool published = axera::argmax_publish(pids.data(), pvals.data(), n_out, logits->data,
+                                                 (size_t) logits->nb[1]);
+    dctx->invalidate(logits->data, (size_t) n_out * logits->nb[1]);
+    if (!published) {
+        dctx->clean_p     = (float *) logits->data;
+        dctx->clean_n     = (size_t) n_out * N * sizeof(float);
+        dctx->clean_epoch = axera_graph_epoch;
+    }
+    after(g, names);
+}
+
+void output_head::finish_merged_verify(ggml_cgraph * g, const graph_names & names, int T, ggml_tensor * logits,
+                                       bool direct) {
+    const int64_t N = w->ne[1];
+    GGML_ASSERT(mv && logits && logits->type == GGML_TYPE_F32 && ggml_backend_buffer_is_axera(logits->buffer) &&
+                T >= 1 && T <= 4);
+    auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+    if (!direct) {
+        GGML_ASSERT(mvl);
+        mvl->invalidate(mvl->vir, (size_t) 4 * N * sizeof(float));
+        for (int r = 0; r < T; ++r) {
+            memcpy((char *) logits->data + (size_t) r * logits->nb[1],
+                   (const char *) mvl->vir + (size_t) r * N * sizeof(float), (size_t) N * sizeof(float));
+        }
+        dctx->clean_p     = logits->data;
+        dctx->clean_n     = (size_t) T * N * sizeof(float);
+        dctx->clean_epoch = axera_graph_epoch;
+    }
+    c4ids->invalidate(c4ids->vir, 4 * sizeof(int32_t));
+    c4top->invalidate(c4top->vir, 4 * sizeof(float));
+    std::vector<int32_t> pids(4);
+    std::vector<float>   pvals(4);
+    memcpy(pids.data(), c4ids->vir, 4 * sizeof(int32_t));
+    memcpy(pvals.data(), c4top->vir, 4 * sizeof(float));
+    const bool published = axera::argmax_publish(pids.data(), pvals.data(), T, logits->data,
+                                                 (size_t) logits->nb[1]);
+    if (direct) {
+        dctx->invalidate(logits->data, (size_t) T * logits->nb[1]);
+    }
+    if (!published) {
+        dctx->clean_p     = (float *) logits->data;
+        dctx->clean_n     = (size_t) T * N * sizeof(float);
+        dctx->clean_epoch = axera_graph_epoch;
+    }
+    after(g, names);
+}
+
+// a TOP_K of the draft head's single row: over its vocabulary's logits only (the others are -inf)
+static const output_head * top_k_draft = nullptr;
+static bool                dargmax_pub = false;  // the draft head just published its row (set around after())
+static int32_t             dargmax_id  = -1;
+// with a TOP_K in its sampler, a draft head writes no logits: the TOP_K writes those of its rows (here and in the
+// padded copy, which is not made) and nothing reads the others
+static float * draft_logits = nullptr;
+
+void output_head::finish_merged_draft(ggml_cgraph * g, const graph_names & names, ggml_tensor * logits) {
+    GGML_ASSERT(mdraft && gdraft && logits && logits->type == GGML_TYPE_F32 &&
+                ggml_backend_buffer_is_axera(logits->buffer));
+    const int64_t N = w->ne[1], NS = (int64_t) dids.size();
+    auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+    axera_timer tf("lm_head (draft merged): logits");
+    float *       o  = (float *) logits->data;
+    const float * yv = (const float *) gdraft->vir;
+    gdraft->invalidate(gdraft->vir, (size_t) NS * sizeof(float));
+    bool tk = false;
+    for (int i = 0; i < g->n_nodes && !tk; i++) {
+        tk = g->nodes[i]->op == GGML_OP_TOP_K && g->nodes[i]->ne[0] <= 64;
+    }
+    if (!tk) {
+        std::fill(o, o + N, -INFINITY);
+        for (size_t i = 0; i < dids.size(); ++i) {
+            o[dids[i]] = yv[i];
+        }
+    }
+    dctx->clean_p     = o;
+    dctx->clean_n     = N * sizeof(float);
+    dctx->clean_epoch = axera_graph_epoch;
+    top_k_draft  = this;
+    draft_logits = tk ? o : nullptr;
+    after(g, names);
+    top_k_draft  = nullptr;
+    draft_logits = nullptr;
 }
 
 void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
@@ -919,13 +1302,6 @@ int32_t output_head::draft_argmax_row(const ggml_bf16_t * row, float * logit) {
     return dids[(size_t) lid];
 }
 
-// a TOP_K of the draft head's single row: over its vocabulary's logits only (the others are -inf)
-static const output_head * top_k_draft = nullptr;
-static bool                dargmax_pub = false;  // the draft head just published its row (set around after())
-static int32_t             dargmax_id  = -1;
-// with a TOP_K in its sampler, a draft head writes no logits: the TOP_K writes those of its rows (here and in the
-// padded copy, which is not made) and nothing reads the others
-static float * draft_logits = nullptr;
 
 void output_head::bind_cpu(const ggml_tensor * output_weight) {
     k = nullptr;
@@ -938,7 +1314,7 @@ void output_head::bind_cpu(const ggml_tensor * output_weight) {
 // the sampler found that a verification row cannot be served by the K candidates: project that row through the regular
 // head into the caller's host buffer. The run that published the candidates kept its normed rows for this.
 int output_head::full_row(int32_t idx, float * out, int32_t n) {
-    if (!k || fn_out <= 0 || !out || n <= 0) {
+    if ((!k && !mg) || fn_out <= 0 || !out || n <= 0) {
         return 0;
     }
     const int64_t N = w->ne[1], K = w->ne[0];
@@ -960,6 +1336,17 @@ int output_head::full_row(int32_t idx, float * out, int32_t n) {
     }
     if (r < 0 || r >= fn_out || (size_t) (r + 1) * K > fy.size()) {
         return 0;
+    }
+    if (mg) {  // the merged group kernel already wrote every full logits row
+        if (!flogits || r >= fn_out) {
+            return 0;
+        }
+        const char * src = (const char *) flogits->data + (size_t) r * fstride;
+        if (fdctx) {
+            ((ggml_backend_axera_buffer_context *) fdctx)->invalidate((void *) src, (size_t) N * sizeof(float));
+        }
+        memcpy(out, src, (size_t) N * sizeof(float));
+        return 1;
     }
     if (ck) {  // the top-k path kept the pre-norm row, and the combined kernel writes the full fallback row
         const float * xr = fy.data() + (size_t) r * K;
