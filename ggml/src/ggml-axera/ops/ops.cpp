@@ -446,26 +446,36 @@ void output_norm(const graph_names & names, const std::vector<float> & h, int T)
 
 void output_head::bind(const kernel & lm, const ggml_tensor * output_weight) {
     k = &lm;
-    if (w == output_weight) {
+    // A merged decode head has already quantized output.weight and released its mapped rows at init.
+    const bool have_weights = w == output_weight && q && s;
+    if (have_weights && x) {
         return;
     }
-    w                = output_weight;
-    const int64_t N = w->ne[1], K = w->ne[0];
+    const int64_t N = output_weight->ne[1], K = output_weight->ne[0];
     mx4              = lm.in_bytes("w") == N * K / 2;
     R                = lm.find_input("m") >= 0 ? (int) (lm.in_bytes("x") / (K * sizeof(ggml_bf16_t))) : 1;
     GGML_ASSERT((mx4 || lm.in_bytes("w") == N * K) && lm.in_bytes("s") == N * K / AXERA_MX_GROUP &&
                 lm.in_bytes("x") == R * K * sizeof(ggml_bf16_t) && lm.out_bytes("out") == R * N * sizeof(float));
+    if (!have_weights || w != output_weight) {
+        w = output_weight;
+        if (mx4) {
+            axera_quantize_mxfp4(w, q, s);
+        } else {
+            axera_quantize_mxfp8(w, q, s);
+        }
+        axera_drop_mapped(w, true);  // (a tied output head shares token_embd.weight: the mapped rows are not needed now)
+    }
     if (R > 1) {  // rows R at a time (output to y, copied to the logits)
-        yk = axera_cmm_alloc(R * N * sizeof(float));
-        mk = axera_cmm_alloc(sizeof(int32_t));
+        if (!yk) {
+            yk = axera_cmm_alloc(R * N * sizeof(float));
+        }
+        if (!mk) {
+            mk = axera_cmm_alloc(sizeof(int32_t));
+        }
     }
-    if (mx4) {
-        axera_quantize_mxfp4(w, q, s);
-    } else {
-        axera_quantize_mxfp8(w, q, s);
+    if (!x) {
+        x = axera_cmm_alloc(R * K * sizeof(ggml_bf16_t));
     }
-    axera_drop_mapped(w, true);  // (a tied output head shares token_embd.weight: the mapped rows are not needed now)
-    x = axera_cmm_alloc(R * K * sizeof(ggml_bf16_t));
 }
 
 void output_head::bind_topk(const kernel & lm) {
@@ -652,6 +662,108 @@ bool output_head::bind_combined4(const kernel & lm, const ggml_tensor * output_w
     c4out[c4k->output("top_logits")] = axera_io(c4top, 4 * sizeof(float));
     c4gw = nullptr;
     return true;
+}
+
+bool output_head::bind_merged_decode(const kernel & dk, const ggml_tensor * output_weight) {
+    if (!output_weight) {
+        return false;
+    }
+    const int64_t N = output_weight->ne[1], K = output_weight->ne[0];
+    if (dk.find_input("head_on") < 0 || dk.find_input("norm_w") < 0 || dk.find_input("w_lm") < 0 ||
+        dk.find_input("s_lm") < 0 || dk.find_output("ids") < 0 || dk.find_output("top_logits") < 0 ||
+        dk.find_output("logits") < 0) {
+        return false;
+    }
+    const bool m4 = dk.in_bytes("w_lm") == (uint32_t) (N * K / 2);
+    if (dk.in_bytes("norm_w") != (uint32_t) (K * sizeof(float)) ||
+        dk.in_bytes("w_lm") != (uint32_t) (m4 ? N * K / 2 : N * K) ||
+        dk.in_bytes("s_lm") != (uint32_t) (N * K / AXERA_MX_GROUP) ||
+        dk.in_bytes("head_on") != (uint32_t) sizeof(int32_t) || dk.out_bytes("ids") != (uint32_t) sizeof(int32_t) ||
+        dk.out_bytes("top_logits") != (uint32_t) sizeof(float) ||
+        dk.out_bytes("logits") != (uint32_t) (N * sizeof(float))) {
+        return false;
+    }
+    md  = &dk;
+    mdN = N;
+    if (w != output_weight || !q || !s) {
+        w   = output_weight;
+        mx4 = m4;
+        // the quantizers allocate q / s themselves: no placeholder buffers, whose 270 MB would double the peak
+        if (mx4) {
+            axera_quantize_mxfp4(w, q, s);
+        } else {
+            axera_quantize_mxfp8(w, q, s);
+        }
+        axera_drop_mapped(w, true);
+    }
+    if (!cnorm) {
+        cnorm = axera_cmm_alloc((size_t) K * sizeof(float));
+    }
+    if (!cids) {
+        cids = axera_cmm_alloc(sizeof(int32_t));
+    }
+    if (!ctop) {
+        ctop = axera_cmm_alloc(sizeof(float));
+    }
+    if (!mdflag) {
+        mdflag = axera_cmm_alloc_nc(sizeof(int32_t));
+    }
+    if (!mdsink) {
+        mdsink = axera_cmm_alloc((size_t) N * sizeof(float));
+    }
+    return true;
+}
+
+bool output_head::prepare_merged_decode(ggml_cgraph * g, const graph_names & names) {
+    GGML_UNUSED(g);
+    if (!md || !cnorm) {
+        return false;
+    }
+    ggml_tensor * logits = graph_head(names);
+    if (!logits || logits->op != GGML_OP_MUL_MAT || logits->src[0] != w || logits->type != GGML_TYPE_F32 ||
+        logits->ne[1] != 1) {
+        return false;
+    }
+    ggml_tensor * hn = logits->src[1];
+    while (hn->op == GGML_OP_GET_ROWS || hn->op == GGML_OP_VIEW || hn->op == GGML_OP_RESHAPE) {
+        hn = hn->src[0];
+    }
+    float         eps;
+    const float * gw = final_norm(hn, (int) w->ne[0], &eps);
+    if (!gw || eps != 1e-6f) {
+        return false;
+    }
+    if (gw != cgw) {
+        memcpy(cnorm->vir, gw, (size_t) w->ne[0] * sizeof(float));
+        cnorm->flush(cnorm->vir, (size_t) w->ne[0] * sizeof(float));
+        cgw = gw;
+    }
+    return true;
+}
+
+void output_head::finish_merged_decode(ggml_cgraph * g, const graph_names & names, ggml_tensor * logits,
+                                       bool publish_argmax) {
+    GGML_ASSERT(md && cids && ctop && logits && logits->op == GGML_OP_MUL_MAT && logits->type == GGML_TYPE_F32 &&
+                ggml_backend_buffer_is_axera(logits->buffer));
+    auto *        dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+    const int64_t N    = mdN;
+    const int     n_out = (int) logits->ne[1];
+    cids->invalidate(cids->vir, sizeof(int32_t));
+    ctop->invalidate(ctop->vir, sizeof(float));
+    int32_t pid;
+    float   pval;
+    memcpy(&pid, cids->vir, sizeof(int32_t));
+    memcpy(&pval, ctop->vir, sizeof(float));
+    const bool published = publish_argmax && n_out == 1 &&
+                           axera::argmax_publish(&pid, &pval, 1, logits->data, (size_t) logits->nb[1]);
+    // The sampler's stale-value check reads the full host-visible row even when the fused argmax was published.
+    dctx->invalidate(logits->data, (size_t) n_out * N * sizeof(float));
+    if (!published) {
+        dctx->clean_p     = (float *) logits->data;
+        dctx->clean_n     = (size_t) n_out * N * sizeof(float);
+        dctx->clean_epoch = axera_graph_epoch;
+    }
+    after(g, names);
 }
 
 void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,

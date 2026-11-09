@@ -61,6 +61,10 @@ struct call {
     const kernel *                     k = nullptr;
     std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
     int                                ix = -1, iout = -1, ires = -1, ipos = -1;  // hot per-page IO entries
+    // a decode kernel with the merged output head (final norm + projection + argmax)
+    int ih_on = -1, ih_norm = -1, ih_w = -1, ih_s = -1, io_ids = -1, io_top = -1, io_out = -1;
+    bool head_capable() const { return ih_on >= 0 && ih_norm >= 0 && ih_w >= 0 && ih_s >= 0 && io_ids >= 0 &&
+                                       io_top >= 0 && io_out >= 0; }
 };
 
 // the adapter blob in llama.cpp's sequence state (context checkpoints / prompt cache)
@@ -294,6 +298,8 @@ class qwen35_moe_sgl final : public model {
     std::vector<int>         orows;
     std::vector<int32_t>     p4b;
     output_head              head;
+    ggml_tensor *            merged_logits = nullptr;  // set while the decode kernel carries the merged head
+    bool                     dec_head_ok = false;      // the base decode role has the merged-head ABI
 
     // the MTP block (blk.<L>.nextn.*): its own paged KV, the weight tensors in the kernels' layouts, the calls
     struct mtp_call {
@@ -400,7 +406,7 @@ class qwen35_moe_sgl final : public model {
     void         prefill(int64_t c0, int n, const ggml_bf16_t * x, const float * xf, size_t xf_nb1,
                          const int32_t * toks,
                          const int32_t * p4, std::vector<float> & h, const std::vector<int> & out_rows);
-    void         decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h);
+    void         decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h, ggml_tensor * lg);
     void         prewarm(ggml_cgraph * g) override;
 };
 
@@ -924,6 +930,17 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         }
     }
 
+    // A decode kernel that carries the merged output head needs the head weights bound on every call, including
+    // hidden-only decodes: quantize them once here, from the same output.weight the standalone head used.
+    if (dk.find_input("head_on") >= 0) {
+        const ggml_tensor * ow = t.count("output.weight") ? t.at("output.weight")
+                                : t.count("token_embd.weight") ? t.at("token_embd.weight")
+                                                               : nullptr;
+        dec_head_ok = ow && head.bind_merged_decode(dk, ow);
+        if (!dec_head_ok) {
+            GGML_LOG_ERROR("axera qwen35_moe_sgl: the merged decode head's ABI does not match output.weight\n");
+        }
+    }
     // decode: the banks, its own rows and paging. Optional smaller-context kernels share every pointer except the
     // page table, RoPE prefix and KV extent, so switching a decode bucket does not copy weights or cache state.
     auto bind_decode = [&](const kernel & k, call & c, std::array<int, 4> & state) {
@@ -942,6 +959,18 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
                 c.in.push_back(axera_io(META.get(), (char *) META->vir + META_LASTLEN, d.bytes));
             } else if (n == "cache_location") {
                 c.in.push_back(axera_io(META.get(), (char *) META->vir + META_CLOC, d.bytes));
+            } else if (n == "head_on" || n == "norm_w" || n == "w_lm" || n == "s_lm") {
+                // the merged head's runtime inputs: filled in when the graph's head resources exist
+                if (n == "head_on") {
+                    c.ih_on = (int) c.in.size();
+                } else if (n == "norm_w") {
+                    c.ih_norm = (int) c.in.size();
+                } else if (n == "w_lm") {
+                    c.ih_w = (int) c.in.size();
+                } else {
+                    c.ih_s = (int) c.in.size();
+                }
+                c.in.push_back(AX_ENGINE_IO_BUFFER_T{});
             } else {
                 const axera_cmm * b = n == "x" ? &DX : n == "attention" ? &DA : n == "position_ids" ? &DPOS :
                                       n == "indices" ? &INDICES : nullptr;
@@ -952,7 +981,16 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
                 }
             }
         }
-        c.out.push_back(axera_io(DOUT, k.out_bytes("output")));
+        for (const auto & d : k.desc->out) {
+            if (d.name == "ids") {
+                c.io_ids = (int) c.out.size();
+            } else if (d.name == "top_logits") {
+                c.io_top = (int) c.out.size();
+            } else if (d.name == "logits") {
+                c.io_out = (int) c.out.size();
+            }
+            c.out.push_back(d.name == "output" ? axera_io(DOUT, k.out_bytes("output")) : AX_ENGINE_IO_BUFFER_T{});
+        }
     };
     bind_decode(dk, dec, dec_state);
     dec_more.clear();
@@ -2473,7 +2511,7 @@ void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const flo
 }
 
 // one token at cell c > 0, its history the c cells before it
-void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h) {
+void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h, ggml_tensor * lg) {
     {
         axera_timer ts("decode host: sync states");
         sync_dec_states();
@@ -2526,6 +2564,35 @@ void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4
             GGML_LOG_INFO("axera qwen35_moe_sgl: decode cell %lld uses %s (%u pages)\n", (long long) c,
                           dc->k->desc->role.c_str(), dc->k->in_bytes("indices") / (uint32_t) sizeof(int32_t));
             last_kernel = dc->k;
+        }
+        // The merged head: bind this graph's logits row, the head weights and the gate into the selected bucket.
+        const bool merged = lg && dec_head_ok && head.merged_decode_ready() && dc->head_capable() && head.cids &&
+                            head.ctop;
+        if (lg && !merged && dec_head_ok) {
+            GGML_LOG_ERROR("axera qwen35_moe_sgl: the merged decode head is unavailable for %s\n",
+                           dc->k->desc->role.c_str());
+        }
+        if (merged) {
+            head.set_merged_on(true);
+            dc->in[dc->ih_on]   = axera_io(head.mdflag, sizeof(int32_t));
+            dc->in[dc->ih_norm] = axera_io(head.cnorm, head.cnorm->size);
+            dc->in[dc->ih_w]    = axera_io(head.q, head.q->size);
+            dc->in[dc->ih_s]    = axera_io(head.s, head.s->size);
+            dc->out[dc->io_ids] = axera_io(head.cids, sizeof(int32_t));
+            dc->out[dc->io_top] = axera_io(head.ctop, sizeof(float));
+            auto * dctx = (ggml_backend_axera_buffer_context *) lg->buffer->context;
+            dctx->flush(lg->data, (size_t) head.mdN * sizeof(float));
+            dc->out[dc->io_out] = axera_io(dctx, lg->data, (size_t) head.mdN * sizeof(float));
+        } else if (dc->head_capable() && head.q && head.s && head.cnorm && head.mdflag && head.cids && head.ctop &&
+                   head.mdsink) {
+            head.set_merged_on(false);
+            dc->in[dc->ih_on]   = axera_io(head.mdflag, sizeof(int32_t));
+            dc->in[dc->ih_norm] = axera_io(head.cnorm, head.cnorm->size);
+            dc->in[dc->ih_w]    = axera_io(head.q, head.q->size);
+            dc->in[dc->ih_s]    = axera_io(head.s, head.s->size);
+            dc->out[dc->io_ids] = axera_io(head.cids, sizeof(int32_t));
+            dc->out[dc->io_top] = axera_io(head.ctop, sizeof(float));
+            dc->out[dc->io_out] = axera_io(head.mdsink, head.mdsink->size);
         }
         static const bool dec_twice = getenv("GGML_AXERA_DECODE_TWICE") != nullptr;
         dc->k->run(dc->in, dc->out, "decode");
@@ -2719,10 +2786,14 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     t_pre2.stop();
     const int64_t ct_pre = ct_on ? ggml_time_us() : 0;
     bool combined_dec = false;
+    bool merged_dec   = false;
     const char * fused_head_env = getenv("GGML_AXERA_FUSED_HEAD");
     const bool   npu_heads      = !fused_head_env || atoi(fused_head_env) != 0;
     if (n_out > 0) {
-        if (npu_heads) {
+        if (npu_heads && dec_head_ok && T == 1 && n_out == 1) {
+            merged_dec = head.prepare_merged_decode(g, names);
+        }
+        if (!merged_dec && npu_heads && man.has("lm_head")) {
             head.bind(man.get("lm_head"), logits->src[0]);
             if (man.has("lm_head.topk")) {
                 head.bind_topk(man.get("lm_head.topk"));
@@ -2732,12 +2803,12 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             if (man.has("lm_head.verify")) {
                 head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
             }
-        } else {
+        } else if (!merged_dec) {
             head.bind(man.get("lm_head.gemm"), logits->src[0]);
         }
     }
     bool fused_dec = false;
-    if (!combined_dec && npu_heads && T == 1 && n_out == 1) {
+    if (!merged_dec && !combined_dec && npu_heads && T == 1 && n_out == 1) {
         if (!fh_loaded) {
             fh_loaded = true;
             const char * e = getenv("GGML_AXERA_FUSED_HEAD");
@@ -2881,10 +2952,11 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             return GGML_STATUS_FAILED;
         }
         materialize_deltas();
-        const bool direct_x = combined_dec && T == 1 && n_out == 1;
+        const bool direct_x = (combined_dec || merged_dec) && T == 1 && n_out == 1;
         float * hd = need_hn ? hnext.data() : ((fused_dec || direct_x) ? nullptr : h.data());
+        ggml_tensor * mlog = merged_dec ? logits : nullptr;
         if (direct_embed) {
-            decode(c0, xb1.data(), pb.data(), hd);
+            decode(c0, xb1.data(), pb.data(), hd, mlog);
         } else if (token_ids) {
             uint32_t one = (uint32_t) *token_ids;
             memcpy(EMBI->vir, &one, sizeof(one));
@@ -2892,11 +2964,11 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             axera_timer te("token embedding (decode)");
             emb1.k->run(emb1.in, emb1.out, "token embedding (decode)");
             te.stop();
-            decode(c0, nullptr, pb.data(), hd);
+            decode(c0, nullptr, pb.data(), hd, mlog);
         } else {
             std::vector<ggml_bf16_t> xb((size_t) H);
             ggml_fp32_to_bf16_row((const float *) x0->data, xb.data(), H);
-            decode(c0, xb.data(), pb.data(), hd);
+            decode(c0, xb.data(), pb.data(), hd, mlog);
         }
     }
     if (need_hn) {
@@ -2906,7 +2978,9 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     }
     if (n_out > 0) {
         axera_timer th(T > 256 ? "output head (prompt)" : T > 1 ? "output head (warmup)" : "output head (decode)");
-        if (combined_dec) {
+        if (merged_dec) {
+            head.finish_merged_decode(g, names, logits, true);
+        } else if (combined_dec) {
             const bool direct_x = T == 1 && n_out == 1;
             head.run_combined(g, names, h, T, &out_rows, direct_x ? &DOUT : nullptr);
         } else if (fused_dec) {

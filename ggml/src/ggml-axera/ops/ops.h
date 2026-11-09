@@ -162,6 +162,26 @@ struct output_head {
     bool fused_ready(ggml_cgraph * g, const graph_names & names) const;
     // the fused head's one row, from the layer kernel's bf16 hidden row
     void run_fused(ggml_cgraph * g, const graph_names & names, const axera_cmm & xb);
+    // A decode kernel that carries the combined output head (final norm + projection + argmax) as a runtime-gated
+    // tail: it names norm_w / w_lm / s_lm / head_on in and out / ids / top_logits out.  The host binds the same q / s
+    // buffers the standalone head uses, so the merged head costs no extra CMM.
+    const kernel * md = nullptr;
+    axera_cmm      mdflag;  // head_on, i32
+    axera_cmm      mdsink;  // a throw-away logits row for head_on = 0
+    int64_t        mdN = 0;
+    bool bind_merged_decode(const kernel & dk, const ggml_tensor * output_weight);
+    bool prepare_merged_decode(ggml_cgraph * g, const graph_names & names);
+    bool merged_decode_ready() const { return md && q && s && cnorm; }
+    // write head_on (the decode call's merge gate)
+    void set_merged_on(bool on) {
+        if (!mdflag) {
+            mdflag = axera_cmm_alloc_nc(sizeof(int32_t));
+        }
+        *(int32_t *) mdflag->vir = on ? 1 : 0;
+        mdflag->flush(mdflag->vir, sizeof(int32_t));
+    }
+    // the decode kernel wrote logits->data, ids and top_logits: publish the greedy choice and retire the logits lines
+    void finish_merged_decode(ggml_cgraph * g, const graph_names & names, ggml_tensor * logits, bool publish_argmax);
     void bind_verify(const kernel & lm);
     void bind_draft(const kernel & dlm, const std::vector<int32_t> & ids);  // after bind (MXFP4)
     void bind_cpu(const ggml_tensor * output_weight);
