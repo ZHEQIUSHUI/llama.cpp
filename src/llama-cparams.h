@@ -33,6 +33,8 @@ struct llama_cparams {
     float yarn_beta_slow;
 
     bool embeddings;
+    bool spec_verify    = false;  // this batch is a speculative-decoding target verification: the backend may use
+                                  // its multi-row verify path (never a plain prefill/decode batch, e.g. -ub 4)
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;

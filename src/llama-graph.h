@@ -853,6 +853,7 @@ struct llm_graph_params {
 
         // a dummy batch's graph carries its marker in an input tensor name: never reuse it for a real batch
         can_reuse_ubatch = can_reuse_ubatch && cparams.dummy_batch == other.cparams.dummy_batch;
+        can_reuse_ubatch = can_reuse_ubatch && cparams.spec_verify == other.cparams.spec_verify;
 
         // when we split the batch using "equal_seqs" we have to verify that the participating sequences are the same
         //   the reason is because the set of attention streams would be different for different sequences

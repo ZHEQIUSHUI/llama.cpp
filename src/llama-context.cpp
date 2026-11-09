@@ -1400,6 +1400,13 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     SCHED_NEED_RESERVE();
 }
 
+void llama_context::set_spec_verify(bool value) {
+    // The graph carries the marker as an extra node, so the flag changes its topology.  Do not force a full
+    // scheduler reserve here: process_ubatch's can_reuse() sees the difference and rebuilds/allocates only when the
+    // graph actually changes (a reserve on every batch would cost >100 ms per speculative round).
+    cparams.spec_verify = value;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -1814,7 +1821,10 @@ bool llama_context::graph_prebuild_decode(const llama_memory_context_i * mctx, u
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        const auto     gparams = graph_params(res, ub, mctx_next.get(), ctx_type_to_graph_type(cparams.ctx_type));
+        auto           gparams = graph_params(res, ub, mctx_next.get(), ctx_type_to_graph_type(cparams.ctx_type));
+        // The multi-row prebuild (llama_arm_prebuild_verify) is the speculative target's verify graph: mark it so
+        // the backend can load/allocate its verify head now rather than inside the first measured round.
+        gparams.cparams.spec_verify = n_tokens > 1;
         ggml_cgraph *  gf      = model.build_graph(gparams);
         if (gf) {
             ggml_graph_set_stable_uid(gf, graph_uid_next.fetch_add(1, std::memory_order_relaxed));
@@ -4816,6 +4826,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_spec_verify(llama_context * ctx, bool value) {
+    ctx->set_spec_verify(value);
 }
 
 void llama_set_process_meta_only(llama_context * ctx, bool value) {

@@ -212,10 +212,20 @@ void kernel::run(std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_
     }
 }
 
+static std::unique_ptr<kernel> load_kernel(const std::string & dir, const kernel_desc & d);
+
 kernel & manifest::get(const std::string & role) const {
     auto it = loaded.find(role);
     if (it == loaded.end()) {
-        GGML_ABORT("axera: the manifest of %s (model %s) has no kernel for %s\n", dir.c_str(), model.c_str(), role.c_str());
+        auto kd = kernels.find(role);
+        if (kd == kernels.end()) {
+            GGML_ABORT("axera: the manifest of %s (model %s) has no kernel for %s\n", dir.c_str(), model.c_str(), role.c_str());
+        }
+        GGML_LOG_INFO("axera: loading optional kernel %s (%s)\n", role.c_str(), kd->second.file.c_str());
+        auto k = load_kernel(dir, kd->second);
+        auto & out = *k;
+        loaded[role] = std::move(k);
+        return out;
     }
     return *it->second;
 }
@@ -329,8 +339,9 @@ static std::unique_ptr<manifest> load_manifest(const std::string & dir) {
     }
     for (const auto & [role, k] : j.at("kernels").items()) {
         kernel_desc d;
-        d.role = role;
-        d.file = k.at("file").get<std::string>();
+        d.role     = role;
+        d.file     = k.at("file").get<std::string>();
+        d.optional = k.value("optional", false);
         d.in   = read_io(k.at("in"));
         d.out  = read_io(k.at("out"));
         if (k.contains("packs")) {
@@ -368,11 +379,15 @@ static std::unique_ptr<manifest> load_manifest(const std::string & dir) {
         m->kernels[role] = std::move(d);
     }
     const int64_t t0 = ggml_time_us();
+    size_t        nloaded = 0;
     for (const auto & [role, d] : m->kernels) {
-        m->loaded[role] = load_kernel(dir, d);
+        if (!d.optional) {
+            m->loaded[role] = load_kernel(dir, d);
+            ++nloaded;
+        }
     }
-    GGML_LOG_INFO("axera: %s: model %s, context %lld, %zu kernels loaded in %.1f s\n", dir.c_str(), m->model.c_str(),
-                  (long long) m->context, m->kernels.size(), (ggml_time_us() - t0) / 1e6);
+    GGML_LOG_INFO("axera: %s: model %s, context %lld, %zu of %zu kernels loaded in %.1f s\n", dir.c_str(), m->model.c_str(),
+                  (long long) m->context, nloaded, m->kernels.size(), (ggml_time_us() - t0) / 1e6);
     return m;
 }
 
