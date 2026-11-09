@@ -1389,13 +1389,18 @@ ggml_status qwen35_whole::verify(const kv_view & kv, const rope & rp, const ggml
     }
     const int set = cur_set == 0 ? 1 : 0;
     static const char * SN[4] = { "ssnap", "cqsnap", "cksnap", "cvsnap" };
-    const bool use_head = ver_head && T == 4;  // the merged four-row head is only valid for a complete batch
+    const bool use_head = ver_head;
     const bool direct = use_head && logits && logits->ne[1] == 4 &&
                         logits->nb[1] == (int64_t) head.w->ne[1] * sizeof(float);
     if (direct) {
         call & c = ver.back();
         c.out[c.k->output("logits")] = axera_io(((ggml_backend_axera_buffer_context *) logits->buffer->context),
                                                  logits->data, (size_t) 4 * head.w->ne[1] * sizeof(float));
+    } else if (ver_head) {
+        // the head always emits four rows: a partial batch writes them to head.mvl, not the
+        // graph buffer a previous four-row batch bound here (that one holds only T rows)
+        call & c = ver.back();
+        c.out[c.k->output("logits")] = axera_io(head.mvl, 4 * head.w->ne[1] * sizeof(float));
     }
     {
         axera_timer tl("layers (verify)");
@@ -1552,8 +1557,9 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
         if (st != GGML_STATUS_SUCCESS) {
             return st;
         }
-        if (ver_head && T == 4) {
-            const bool direct = T == 4 && logits->ne[1] == 4 &&
+        if (ver_head) {
+            // the head always emits four rows; only a four-row logits buffer takes them in place
+            const bool direct = logits->ne[1] == 4 &&
                                 logits->nb[1] == (int64_t) logits->ne[0] * sizeof(float);
             head.finish_merged_verify(g, names, T, logits, direct);
             head_done = true;
