@@ -351,9 +351,20 @@ AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, vo
     memset(&b, 0, sizeof(b));
     b.phyAddr  = ctx->phy_of(p);
     b.pVirAddr = p;
-    // SDK 0.6.0 keeps a 32-bit nSize in AX_ENGINE_IO_BUFFER_T (the kernel allocator is 64-bit).
-    // A single IO above 4 GiB cannot be spelled there; 0 asks the engine to use the model's IO size.
-    b.nSize    = size > UINT32_MAX ? 0u : (AX_U32) size;
+    // SDK 0.6.0 keeps a 32-bit nSize in AX_ENGINE_IO_BUFFER_T (only the CMM allocator is 64-bit).
+    // The engine reports 0 for an IO above 4 GiB, so 0 is what it expects back; the other spellings
+    // are kept behind GGML_AXERA_IO_SIZE_MODE for probing a board's engine.
+    b.nSize = (AX_U32) size;
+    if (size > UINT32_MAX) {
+        static const std::string mode = getenv("GGML_AXERA_IO_SIZE_MODE") ? getenv("GGML_AXERA_IO_SIZE_MODE") : "zero";
+        if (mode == "zero") {
+            b.nSize = 0;
+        } else if (mode == "max") {
+            b.nSize = UINT32_MAX;
+        } else if (mode == "reserved") {
+            b.u64Reserved[0] = size >> 32;
+        }
+    }
     return b;
 }
 
