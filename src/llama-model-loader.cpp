@@ -12,14 +12,45 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <future>
 #include <regex>
 #include <unordered_set>
 
 #if !defined(_WIN32)
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+
+
+// Device weights are copied out of the mmap'd GGUF exactly once. Prefetch each tensor before the
+// copy and drop its pages afterwards, so a model file larger than the machine's RAM (the AX8860
+// boards have 16 GB and the 27B GGUF is 15.8 GB) does not have to stay resident. Set
+// LLAMA_MMAP_DROP=0 to restore the plain fault-in behaviour.
+static void llama_mmap_copy_hint(int fd, int64_t off, void * addr, size_t size, bool before) {
+#if defined(__linux__)
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_MMAP_DROP");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!enabled || size == 0) {
+        return;
+    }
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t a0 = (uintptr_t) addr & ~(uintptr_t) (page - 1);
+    const uintptr_t a1 = ((uintptr_t) addr + size + page - 1) & ~(uintptr_t) (page - 1);
+    const off_t off0 = (off_t) (off - (int64_t) ((uintptr_t) addr - a0));
+    if (before) {
+        madvise((void *) a0, a1 - a0, MADV_WILLNEED);
+    } else {
+        madvise((void *) a0, a1 - a0, MADV_DONTNEED);
+        posix_fadvise(fd, off0, (off_t) (a1 - a0), POSIX_FADV_DONTNEED);
+    }
+#else
+    (void) fd; (void) off; (void) addr; (void) size; (void) before;
+#endif
+}
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1778,7 +1809,9 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
+                llama_mmap_copy_hint(files.at(weight->idx)->file_id(), weight->offs, data, n_size, true);
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                llama_mmap_copy_hint(files.at(weight->idx)->file_id(), weight->offs, data, n_size, false);
             }
         } else {
             const auto & file = files.at(weight->idx);
