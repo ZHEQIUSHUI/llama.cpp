@@ -391,7 +391,10 @@ axera_cmm dense_blocks::bank_sgl(const std::map<std::string, ggml_tensor *> & t,
                 std::vector<float> u((size_t) C * tp);
                 memcpy(u.data(), v.data() + (size_t) c0 * tp, u.size() * sizeof(float));
                 put(u);
-            } else if (n == "w_k" || n == "w_scale_k") {
+            } else if (n == "w_k" || n == "w_scale_k" || n == "w_k_scale") {
+                // The sgl runtime fuses qkv+z (and their scales) into one bank whose
+                // single registered name is w_k / w_k_scale; the old prefill named
+                // the scale slice w_scale_k. Both spellings are the same bank.
                 const ggml_tensor * qkv = T(il, "attn_qkv.weight");
                 const ggml_tensor * z   = T(il, "attn_gate.weight");
                 const int64_t        K  = qkv->ne[0];
