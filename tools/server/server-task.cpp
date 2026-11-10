@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+#include "../../src/llama-host-prof.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1823,6 +1824,7 @@ size_t pc_file_size(size_t size_main, size_t size_drft, const std::list<common_p
 }
 
 bool pc_write_file(const std::string & path, const server_prompt_data & data) {
+    llama_host_prof_scope prof("cache: disk write");
     const std::string tmp = path + ".tmp";
     std::ofstream ofs(std::filesystem::u8path(tmp), std::ios::binary | std::ios::trunc);
     if (!ofs) {
@@ -1874,6 +1876,7 @@ bool pc_write_file(const std::string & path, const server_prompt_data & data) {
 }
 
 bool pc_read_file(const std::string & path, server_prompt_data & data, size_t expected_size) {
+    llama_host_prof_scope prof("cache: disk read");
     std::ifstream ifs(std::filesystem::u8path(path), std::ios::binary | std::ios::ate);
     if (!ifs) {
         return false;

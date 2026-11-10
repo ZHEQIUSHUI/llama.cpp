@@ -183,7 +183,11 @@ void kernel::run(std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_
     }
     axera_thermal_guard();
     tpre.stop();
-    axera_timer trun("kernel: RunSync");
+    char run_label[128] = {};
+    if (axera_prof_on()) {
+        snprintf(run_label, sizeof(run_label), "kernel: RunSync %s", desc->role.c_str());
+    }
+    axera_timer trun(run_label);
     const int ret  = AX_ENGINE_RunSync(handle, &io);
     trun.stop();
     if (ret != 0) {  // the IO the kernel got (stderr: the log is asynchronous)
@@ -232,6 +236,11 @@ kernel & manifest::load_memory(const std::string & role, std::vector<char> model
     auto k   = std::make_unique<kernel>();
     k->desc  = d.get();
     k->model = std::move(model);
+    char load_label[128] = {};
+    if (axera_prof_on()) {
+        snprintf(load_label, sizeof(load_label), "load: handle %s", role.c_str());
+    }
+    axera_timer th(load_label);
     int ret  = k->model.empty() ? -1 : AX_ENGINE_CreateHandle(&k->handle, k->model.data(), k->model.size());
     if (ret == 0) {
         ret = AX_ENGINE_CreateContext(k->handle);
@@ -276,7 +285,19 @@ static std::unique_ptr<kernel> load_kernel(const std::string & dir, const kernel
     std::ifstream     f(path, std::ios::binary);
     auto              k = std::make_unique<kernel>();
     k->desc             = &d;
-    k->model.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    {
+        char file_label[128] = {};
+        if (axera_prof_on()) {
+            snprintf(file_label, sizeof(file_label), "load: file %s", d.role.c_str());
+        }
+        axera_timer tf(file_label);
+        k->model.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    char handle_label[128] = {};
+    if (axera_prof_on()) {
+        snprintf(handle_label, sizeof(handle_label), "load: handle %s", d.role.c_str());
+    }
+    axera_timer th(handle_label);
     int ret = k->model.empty() ? -1 : AX_ENGINE_CreateHandle(&k->handle, k->model.data(), k->model.size());
     if (ret == 0) {
         ret = AX_ENGINE_CreateContext(k->handle);

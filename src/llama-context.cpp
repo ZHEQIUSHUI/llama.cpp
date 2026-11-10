@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-host-prof.h"
 
 #include <map>
 #include <atomic>
@@ -181,6 +182,7 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+    llama_host_prof_scope prof_ctx("load: context init");
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -4073,6 +4075,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
+    llama_host_prof_scope prof("state: write data");
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
     // write model info
@@ -4095,6 +4098,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    llama_host_prof_scope prof("state: read data");
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
@@ -4123,6 +4127,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    llama_host_prof_scope prof("state: seq write");
     if (memory) {
         memory->state_write(io, seq_id, flags);
     }
@@ -4133,6 +4138,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    llama_host_prof_scope prof("state: seq read");
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
@@ -4151,6 +4157,7 @@ static void * llama_backend_state_proc(ggml_backend_t backend, const char * name
 }
 
 void llama_context::state_write_backends(llama_io_write_i & io, llama_state_seq_flags flags) {
+    llama_host_prof_scope prof("state: backend write");
     uint32_t count = 0;
     for (auto & backend : backends) {
         auto * size_fn = (size_t (*)(ggml_backend_t, uint32_t)) llama_backend_state_proc(backend.get(), "ggml_backend_state_size");
@@ -4194,6 +4201,7 @@ void llama_context::state_write_backends(llama_io_write_i & io, llama_state_seq_
 }
 
 void llama_context::state_read_backends(llama_io_read_i & io, llama_state_seq_flags flags) {
+    llama_host_prof_scope prof("state: backend read");
     uint32_t count = 0;
     io.read(&count, sizeof(count));
     for (uint32_t n = 0; n < count; ++n) {

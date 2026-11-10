@@ -205,6 +205,7 @@ struct mx4 {
     int64_t             N = 0, K = 0;
     explicit mx4(const ggml_tensor * w) : w(w), N(w->ne[1]), K(w->ne[0]) {
         if (w->type != GGML_TYPE_MXFP4) {
+            axera_timer tq("load: quantize mxfp4");
             axera_quantize_mxfp4(w, q, s);
         }
     }

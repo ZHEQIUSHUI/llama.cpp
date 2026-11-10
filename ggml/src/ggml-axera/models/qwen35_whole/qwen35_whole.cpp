@@ -187,8 +187,10 @@ struct mx4 {
     int64_t             N = 0, K = 0;
     mx4(const ggml_tensor * w, bool fp8) : w(w), fp8(fp8), N(w->ne[1]), K(w->ne[0]) {
         if (fp8) {
+            axera_timer tq("load: quantize mxfp8");
             axera_quantize_mxfp8(w, q, s);
         } else if (w->type != GGML_TYPE_MXFP4) {
+            axera_timer tq("load: quantize mxfp4");
             axera_quantize_mxfp4(w, q, s);
         }
     }

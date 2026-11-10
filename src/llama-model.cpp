@@ -21,6 +21,7 @@
 
 #include "llama.h"
 #include "models/models.h"
+#include "llama-host-prof.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -2039,9 +2040,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
-    for (auto & [ctx, bufs] : ctx_bufs) {
-        if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-            return false;
+    {
+        llama_host_prof_scope prof_data("load: tensor data");
+        for (auto & [ctx, bufs] : ctx_bufs) {
+            if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+                return false;
+            }
         }
     }
 

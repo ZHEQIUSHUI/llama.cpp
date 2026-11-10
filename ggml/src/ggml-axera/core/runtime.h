@@ -137,19 +137,32 @@ void axera_thermal_guard();
 void    axera_note_kv_cells(int64_t cells);
 int64_t axera_kv_cells();
 
-// GGML_AXERA_PROF=1: wall time per part, printed at exit
-struct axera_prof {
-    const bool on = [] {
+// GGML_AXERA_PROF=1: wall time per part, printed at exit.  The switch is read on first use, so a
+// front-end that maps its own umbrella variable to GGML_AXERA_PROF before the first NPU graph still
+// sees it even though this header's static object itself was initialized earlier.
+inline bool axera_prof_on() {
+    static const bool on = [] {
         const char * e = std::getenv("GGML_AXERA_PROF");
-        return e != nullptr && std::atoi(e) != 0;
+        const char * h = std::getenv("LLAMA_AXERA_HOST_PROF");
+        return (e != nullptr && std::atoi(e) != 0) || (h != nullptr && std::atoi(h) != 0);
     }();
-    std::map<std::string, std::pair<double, int64_t>> t;   // ms, calls
-    std::mutex                                        mu;  // timers on other threads
+    return on;
+}
+
+struct axera_prof {
+    struct entry {
+        double  ms = 0.0;
+        double  min = 1.0e300;
+        double  max = 0.0;
+        int64_t n = 0;
+    };
+    std::map<std::string, entry> t;
+    std::mutex                   mu;  // timers on other threads
 
     ~axera_prof() {
         for (const auto & [k, v] : t) {
-            fprintf(stderr, "axera prof: %-34s %10.1f ms %8lld calls %8.3f ms/call\n", k.c_str(), v.first,
-                    (long long) v.second, v.first / (double) std::max<int64_t>(v.second, 1));
+            fprintf(stderr, "axera prof: %-34s %10.1f ms %8lld calls %8.3f ms/call min %8.3f max %8.3f\n",
+                    k.c_str(), v.ms, (long long) v.n, v.ms / (double) std::max<int64_t>(v.n, 1), v.min, v.max);
         }
     }
 };
@@ -159,7 +172,7 @@ struct axera_timer {
     const char *                          what;
     std::chrono::steady_clock::time_point t0;
 
-    explicit axera_timer(const char * w) : what(g_axera_prof.on ? w : nullptr) {
+    explicit axera_timer(const char * w) : what(axera_prof_on() ? w : nullptr) {
         if (what) {
             t0 = std::chrono::steady_clock::now();
         }
@@ -169,8 +182,11 @@ struct axera_timer {
         if (what) {
             std::lock_guard<std::mutex> lock(g_axera_prof.mu);
             auto &                      e = g_axera_prof.t[what];
-            e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            e.second++;
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            e.ms += ms;
+            e.min = std::min(e.min, ms);
+            e.max = std::max(e.max, ms);
+            ++e.n;
             what = nullptr;
         }
     }

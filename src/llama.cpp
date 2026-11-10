@@ -10,6 +10,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-host-prof.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -22,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
@@ -121,6 +123,12 @@ const char * llama_version(void) {
 
 void llama_backend_init(void) {
     ggml_time_init();
+
+    // one switch for board host measurements; the individual switches remain the source of truth
+    if (const char * e = std::getenv("LLAMA_AXERA_HOST_PROF"); e && std::atoi(e) != 0) {
+        setenv("GGML_AXERA_PROF", "1", 1);
+        setenv("LLAMA_GRAPH_PROF", "1", 1);
+    }
 
     // needed to initialize f16 tables
     {
@@ -316,8 +324,15 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+        llama_host_prof_scope prof_model("load: total");
+        std::unique_ptr<llama_model_loader> ml_ptr;
+        {
+            llama_host_prof_scope prof_loader("load: loader/mmap");
+            ml_ptr = std::make_unique<llama_model_loader>(metadata, set_tensor_data, set_tensor_data_ud, fname, splits,
+                file, params.load_mode, params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides,
+                params.tensor_buft_overrides);
+        }
+        llama_model_loader & ml = *ml_ptr;
 
         ml.lazy.mode = params.lazy_mode;
 
@@ -345,6 +360,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         model->hparams.no_alloc   = params.no_alloc;
 
         try {
+            llama_host_prof_scope prof_hparams("load: hparams");
             model->load_hparams(ml);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
@@ -353,6 +369,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }
         try {
+            llama_host_prof_scope prof_vocab("load: vocab");
             model->load_vocab(ml);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
@@ -366,8 +383,11 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {0, model_ptr.release()};
         }
 
-        if (!model->load_tensors(ml)) {
-            return {-2, nullptr};
+        {
+            llama_host_prof_scope prof_tensors("load: tensors total");
+            if (!model->load_tensors(ml)) {
+                return {-2, nullptr};
+            }
         }
 
         return {0, model_ptr.release()};

@@ -1,4 +1,5 @@
 #include "sampling.h"
+#include "../src/llama-host-prof.h"
 
 #include "common.h"
 #include "fit.h"
@@ -1168,6 +1169,7 @@ struct argmax_pool {
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
+    llama_host_prof_scope prof_sample("sampling: common_sampler_sample (after sync)");
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
