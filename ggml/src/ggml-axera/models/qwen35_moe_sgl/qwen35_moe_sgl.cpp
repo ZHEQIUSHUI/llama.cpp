@@ -268,6 +268,7 @@ class qwen35_moe_sgl final : public model {
     std::vector<call>                pre_big3840[2], pre_big4096[2];  // optional all-full-page GDN / attention variants
     int                              state_parity = 0;
     axera_cmm DX, DA, DOUT, DPOS, INDICES, PX, PA, XB, POS, GPT, PBIG, META;
+    axera_cmm PF_POS, PF_IND, PF_LOC, PF_COUNT;
     // the token embedding as an NPU gather (the GGUF table converted to bf16 once), for the whole-prefill chunk
     // and a decode token; when absent compute() falls back to the graph's CPU GET_ROWS
     bool      emb = false;
@@ -400,6 +401,9 @@ class qwen35_moe_sgl final : public model {
     void         prefill(int64_t c0, int n, const ggml_bf16_t * x, const float * xf, size_t xf_nb1,
                          const int32_t * toks,
                          const int32_t * p4, std::vector<float> & h, const std::vector<int> & out_rows);
+    void         prefill_new(int64_t c0, int n, const ggml_bf16_t * x, const float * xf, size_t xf_nb1,
+                             const int32_t * toks, const int32_t * p4, std::vector<float> & h,
+                             const std::vector<int> & out_rows);
     void         decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h);
     void         prewarm(ggml_cgraph * g) override;
 };
@@ -863,7 +867,12 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     XB      = axera_cmm_alloc((size_t) WN * H * sizeof(ggml_bf16_t));
     POS     = axera_cmm_alloc((size_t) WN * ak.in_bytes("position_ids") / PG);
     META    = axera_cmm_alloc_nc(32);  // host-written scalars: the NPU sees each write without a cache flush
-    AX      = (int) (ak.in_bytes("position_ids") / (PG * sizeof(int32_t)));
+    // the Range prefill carries one position row per page in the 4096-row workspace
+    AX      = (int) (ak.in_bytes("position_ids") / ((WN / PG) * PG * sizeof(int32_t)));
+    PF_POS   = axera_cmm_alloc((size_t) (WN / PG) * AX * PG * sizeof(int32_t));
+    PF_IND   = axera_cmm_alloc((size_t) (WN / PG) * 2 * sizeof(int32_t));
+    PF_LOC   = axera_cmm_alloc((size_t) (WN / PG) * 2 * sizeof(int32_t));
+    PF_COUNT = axera_cmm_alloc_nc(sizeof(int32_t));
     GPT     = axera_cmm_alloc((size_t) AX * 128 * sizeof(int32_t));
     PBIG    = axera_cmm_alloc((size_t) AX * WN * sizeof(int32_t));
     GGML_ASSERT((AX == 1 || AX == 3) && (int64_t) NP * PG == man.context && dk.in_bytes("indices") == INDICES->size);
@@ -1014,25 +1023,28 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
                     c.in.push_back(axera_io(PX, d.bytes));
                 } else if (n == "position_ids") {
                     c.ipos = (int) c.in.size();
-                    c.in.push_back(axera_io(POS, d.bytes));
-                } else if (n == "valid_tokens") {
-                    c.in.push_back(meta(META_VALID, d.bytes));
+                    c.in.push_back(axera_io(PF_POS, d.bytes));
+                } else if (n == "valid_tokens" || n == "chunk_prefill_size") {
+                    c.in.push_back(axera_io(PF_COUNT, d.bytes));
                 } else if (n == "indptr") {
-                    c.in.push_back(meta(META_INDPTR, d.bytes));
+                    c.in.push_back(axera_io(PF_IND, d.bytes));
                 } else if (n == "indices") {
                     c.in.push_back(axera_io(INDICES, d.bytes));
                 } else if (n == "cache_location") {
-                    c.in.push_back(meta(META_CLOC, d.bytes));
+                    c.in.push_back(axera_io(PF_LOC, d.bytes));
                 } else if (n.find("scale2") != std::string::npos) {
                     c.in.push_back(part(pa + n, blk, d.bytes));
                 } else if (n.rfind("w_zeropoint_", 0) == 0) {
                     c.in.push_back(axera_io(ZERO, d.bytes));
-                } else if (n == "paged_kv_cache") {
+                } else if (n == "paged_kv_cache" || n == "cache") {
                     c.in.push_back(kv_io(ord[il], d.bytes));
                 } else if (n == "cos_sin_cache") {
                     c.in.push_back(axera_io(B("b3_attn_cos_sin_cache"), d.bytes));
-                } else if (n == "state_in" || n == "q_conv_state_in" || n == "k_conv_state_in" || n == "v_conv_state_in") {
-                    c.in.push_back(par == 0 ? slice("b0_attn_" + n, ord[il], d.bytes) : state_second(n, il, d.bytes));
+                } else if (n == "state_in" || n == "q_conv_state_in" || n == "k_conv_state_in" || n == "v_conv_state_in" ||
+                           n == "state_out" || n == "q_conv_state_out" || n == "k_conv_state_out" || n == "v_conv_state_out") {
+                    const bool        out = n.size() > 4 && n.compare(n.size() - 4, 4, "_out") == 0;
+                    const std::string in  = out ? n.substr(0, n.size() - 4) + "_in" : n;
+                    c.in.push_back(slice("b0_attn_" + in, ord[il], d.bytes));
                 } else {
                     static const std::map<std::string, std::string> A = { { "x_norm_w", "w_norm_attn" }, { "q_norm_w", "w_norm_q" },
                                                                            { "k_norm_w", "w_norm_k" } };
@@ -1044,9 +1056,9 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
                 if (n == "output" || n == "residual_out") {
                     (n == "output" ? c.iout : c.ires) = (int) c.out.size();
                     c.out.push_back(axera_io(PA, d.bytes));
-                } else {  // <x>_out: the other state set
+                } else {  // <x>_out: the Range kernel updates its input pool in place
                     const std::string in = n.substr(0, n.size() - 4) + "_in";
-                    c.out.push_back(par == 0 ? state_second(in, il, d.bytes) : slice("b0_attn_" + in, ord[il], d.bytes));
+                    c.out.push_back(slice("b0_attn_" + in, ord[il], d.bytes));
                 }
             }
         }
@@ -1207,15 +1219,17 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     if (man.has("prefill.moev")) {
         bind_moe(pre_moev, man.get("prefill.moev"));
     }
-    pad   = {};
-    pad.k = &man.get("prefill.padding");
-    for (const auto & d : pad.k->desc->in) {
-        if (d.name == "x" || d.name == "activation") {
-            pad.in.push_back(axera_io(PA, d.bytes));
-        } else if (d.name == "token_count") {
-            pad.in.push_back(meta(META_VALID, d.bytes));
-        } else {
-            GGML_ABORT("axera qwen35_moe_sgl: unexpected padding input %s\n", d.name.c_str());
+    pad = {};
+    if (man.has("prefill.padding")) {
+        pad.k = &man.get("prefill.padding");
+        for (const auto & d : pad.k->desc->in) {
+            if (d.name == "x" || d.name == "activation") {
+                pad.in.push_back(axera_io(PA, d.bytes));
+            } else if (d.name == "token_count") {
+                pad.in.push_back(meta(META_VALID, d.bytes));
+            } else {
+                GGML_ABORT("axera qwen35_moe_sgl: unexpected padding input %s\n", d.name.c_str());
+            }
         }
     }
 
@@ -2286,11 +2300,128 @@ void qwen35_moe_sgl::embed_tokens(const int32_t * toks, int n) {
     emb4k.k->run(emb4k.in, emb4k.out, "token embedding (prefill)");
 }
 
+// The upstream Range prefill: one launch per layer for every group of up to 4096 rows, then a separate launch for a
+// partial last page.  A call must start at a page boundary: prefill_attention writes complete 256-row pages and its
+// Range path requires a zero write offset, so the caller replays a partially filled page from its start (the compute
+// path below does that with page_x and the state snapshot at the page's first cell).
+void qwen35_moe_sgl::prefill_new(int64_t c0, int n, const ggml_bf16_t * x, const float * xf, size_t xf_nb1,
+                                 const int32_t * toks, const int32_t * p4, std::vector<float> & h,
+                                 const std::vector<int> & out_rows) {
+    GGML_ASSERT(n > 0 && c0 >= 0 && c0 + n <= kv_cells);
+    GGML_ASSERT(c0 % PG == 0 && "the Range prefill starts at a page boundary");
+    GGML_ASSERT((x != nullptr) + (xf != nullptr) + (toks != nullptr) == 1);
+    const size_t xr = (size_t) H * sizeof(ggml_bf16_t);
+    // The caller passes the whole page from its start (a rewind's cached prefix plus the new rows), so an old page_x
+    // does not apply here; the state is already at c0.
+    save_state(c0);
+    page_x.clear();
+    page_p.clear();
+    std::vector<ggml_bf16_t> cur((size_t) n * H);
+    std::vector<int32_t>     curp((size_t) n * 4);
+    for (int r0 = 0; r0 < n; r0 += WN) {
+        const int rows = std::min(WN, n - r0);
+        if (toks) {
+            embed_tokens(toks + r0, rows);
+            XB->invalidate(XB->vir, (size_t) rows * xr);
+            memcpy(cur.data() + (size_t) r0 * H, XB->vir, (size_t) rows * xr);
+        } else if (xf) {
+            axera_host_pool().run(rows, [&](int64_t i) {
+                ggml_fp32_to_bf16_row((const float *) ((const char *) xf + (size_t) (r0 + i) * xf_nb1),
+                                      cur.data() + (size_t) (r0 + i) * H, H);
+            });
+        } else {
+            memcpy(cur.data() + (size_t) r0 * H, x + (size_t) r0 * H, (size_t) rows * xr);
+        }
+    }
+    memcpy(curp.data(), p4, (size_t) n * 4 * sizeof(int32_t));
+
+    auto run_round = [&](int offset, int rows, int64_t cell, bool collect) {
+        GGML_ASSERT(rows > 0 && cell % PG == 0 && rows <= WN);
+        memcpy(PX->vir, cur.data() + (size_t) offset * H, (size_t) rows * xr);
+        memset((ggml_bf16_t *) PX->vir + (size_t) rows * H, 0, (size_t) (WN - rows) * xr);
+        PX->flush();
+        *(int32_t *) PF_COUNT->vir = rows;
+        PF_COUNT->flush(PF_COUNT->vir, sizeof(int32_t));
+        const int pages_live = (rows + PG - 1) / PG;
+        auto *    pp = (int32_t *) PF_POS->vir;
+        auto *    ip = (int32_t *) PF_IND->vir;
+        auto *    lp = (int32_t *) PF_LOC->vir;
+        for (int c = 0; c < pages_live; ++c) {
+            const int page = (int) (cell / PG) + c;
+            for (int r = 0; r < PG; ++r) {
+                const int row = c * PG + r;
+                for (int a = 0; a < AX; ++a) {
+                    pp[((size_t) c * AX + a) * PG + r] = row < rows ? curp[(size_t) (offset + row) * 4 + a] : 0;
+                }
+            }
+            ip[2 * c] = 0;
+            ip[2 * c + 1] = page;
+            lp[2 * c] = page;
+            lp[2 * c + 1] = 0;
+        }
+        PF_POS->flush(PF_POS->vir, (size_t) pages_live * AX * PG * sizeof(int32_t));
+        PF_IND->flush(PF_IND->vir, (size_t) pages_live * 2 * sizeof(int32_t));
+        PF_LOC->flush(PF_LOC->vir, (size_t) pages_live * 2 * sizeof(int32_t));
+        for (int il = 0; il < L; ++il) {
+            call & at = pre_attn[0][il];
+            GGML_ASSERT(at.k);
+            at.in[at.ix] = axera_io(PX, at.k->in_bytes("x"));
+            if (at.iout >= 0) {
+                at.out[at.iout] = axera_io(PA, at.k->out_bytes("output"));
+            }
+            if (at.ires >= 0) {
+                at.out[at.ires] = axera_io(PA, at.k->out_bytes("residual_out"));
+            }
+            at.k->run(at.in, at.out, (il % 4 == 3) ? "prefill attn" : "prefill gdn");
+            call & mo = pre_moe[il];
+            GGML_ASSERT(mo.k);
+            mo.k->run(mo.in, mo.out, "prefill moe");
+        }
+        PX->invalidate(PX->vir, (size_t) rows * xr);
+        if (collect) {
+            for (size_t i = 0; i < out_rows.size(); ++i) {
+                const int ci = out_rows[i];
+                if (ci >= offset && ci < offset + rows) {
+                    ggml_bf16_to_fp32_row((const ggml_bf16_t *) PX->vir + (size_t) (ci - offset) * H,
+                                          h.data() + i * H, H);
+                }
+            }
+        }
+    };
+
+    for (int p0 = 0; p0 < n; ) {
+        const int chunk = std::min(WN, n - p0);
+        const int full  = chunk / PG * PG;
+        const bool tail = p0 + chunk == n && chunk % PG != 0;
+        if (!tail) {
+            run_round(p0, chunk, c0 + p0, true);
+        } else {
+            if (full > 0) {
+                run_round(p0, full, c0 + p0, true);
+            }
+            save_state(c0 + p0 + full);
+            run_round(p0 + full, chunk - full, c0 + p0 + full, true);
+        }
+        p0 += chunk;
+    }
+    if (n % PG != 0) {
+        const int full = n / PG * PG;
+        page_x.assign(cur.begin() + (size_t) full * H, cur.end());
+        page_p.assign(curp.begin() + (size_t) full * 4, curp.end());
+    } else {
+        save_state(c0 + n);
+    }
+    state_cell = c0 + n;
+    state_dirty = true;
+}
+
 // prefill pages from cell c0 (a page's first): n rows x [n][H] bf16 (x) or f32 (xf, xf_nb1 bytes per row), their
 // positions p4 [n][4]; the hidden states of the requested rows into the compact h (one [H] row per out_rows entry)
 void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const float * xf, size_t xf_nb1,
                              const int32_t * toks, const int32_t * p4, std::vector<float> & h,
                              const std::vector<int> & out_rows) {
+    return prefill_new(c0, n, x, xf, xf_nb1, toks, p4, h, out_rows);
+#if 0
     GGML_ASSERT(c0 % PG == 0 && c0 + n <= kv_cells);
     GGML_ASSERT((x != nullptr) + (xf != nullptr) + (toks != nullptr) == 1);
     const size_t xr = (size_t) H * sizeof(ggml_bf16_t);
@@ -2470,6 +2601,7 @@ void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const flo
     }
     state_cell = c0 + n;
     state_dirty = true;
+#endif
 }
 
 // one token at cell c > 0, its history the c cells before it
