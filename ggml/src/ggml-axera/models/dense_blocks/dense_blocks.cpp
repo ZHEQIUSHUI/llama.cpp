@@ -18,6 +18,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <regex>
 #include <set>
 
@@ -58,7 +59,7 @@ struct state_header_dense {
     uint64_t kpage_x_n;
     uint64_t kpage_p_n;
     uint32_t partial;
-    uint32_t reserved;
+    uint32_t kblocks;
 };
 
 inline int tiled(int g) {
@@ -88,6 +89,53 @@ struct mx4 {
     }
 };
 
+// GGUF NVFP4 rows of an [N, K] weight: the standard block layout (4 E4M3 scales, then bytes that hold value j and
+// value j + 8) -> the kernels' pair-major codes [K/2] and E4M3 scale rows [K/16]. The per-tensor FP32 global scale
+// lives in the GGUF's "<tensor>.scale" sidecar and is filled into the w_*_scale2 banks below.
+struct nv4 {
+    const ggml_tensor * w;
+    int64_t             N = 0, K = 0;
+    explicit nv4(const ggml_tensor * w) : w(w), N(w->ne[1]), K(w->ne[0]) {
+        if (w->type != GGML_TYPE_NVFP4) {
+            GGML_ABORT("axera dense_blocks: NVFP4 manifest, but %s is not an NVFP4 tensor\n", w->name);
+        }
+    }
+    void row(int64_t r, bool scales, uint8_t * dst) const {
+        thread_local std::vector<uint8_t> tq, ts;
+        tq.resize((size_t) K / 2);
+        ts.resize((size_t) K / 16);
+        axera_copy_nvfp4_slice(w, r, 1, tq.data(), K / 2, ts.data(), K / 16);
+        const size_t nb = (size_t) (scales ? K / 16 : K / 2);
+        memcpy(dst, scales ? ts.data() : tq.data(), nb);
+    }
+};
+
+// one weight tensor in either family: same row() interface, so the bank fillers stay format-agnostic
+struct q4 {
+    std::unique_ptr<mx4> m;
+    std::unique_ptr<nv4> n;
+    int64_t              N = 0, K = 0;
+    q4(const ggml_tensor * w, bool nv) {
+        if (nv) {
+            n = std::make_unique<nv4>(w);
+            N = n->N;
+            K = n->K;
+        } else {
+            m = std::make_unique<mx4>(w);
+            N = m->N;
+            K = m->K;
+        }
+    }
+    bool is_nv() const { return (bool) n; }
+    void row(int64_t r, bool scales, uint8_t * dst) const {
+        if (n) {
+            n->row(r, scales, dst);
+        } else {
+            m->row(r, scales, dst);
+        }
+    }
+};
+
 std::vector<float> f32_of(const ggml_tensor * w) {
     std::vector<float> v((size_t) ggml_nelements(w));
     if (w->type == GGML_TYPE_F32) {
@@ -110,12 +158,16 @@ class dense_blocks final : public model {
     const manifest & man;
     graph_names      names;
     const void *     bound = nullptr;
-    int              L = 0, H = 0, NB = 0;  // layers, hidden, blocks (kernel calls per row batch)
+    int              L = 0, H = 0, NB = 0;  // layers, hidden, blocks in the model (64 layers = 16 blocks)
+    int              kB = 1;               // blocks carried by one kernel call (1 = 4-layer kernel, 16 = all)
+    int              NC = 0;               // kernel calls per row batch
+    bool             nvfp4 = false;         // manifest banks are NVFP4 (K/16 E4M3 scales) or MXFP4 (K/32 E8M0)
     int              kv_pages = 0;
     int64_t          kv_cells = 0;
 
-    std::vector<axera_cmm> KVC;          // one 1-layer KV pool per block
-    size_t                 kv_b = 0;     // bytes of one block's KV pool
+    axera_cmm              KV;           // KV pools of all blocks, kv_blk_b each (kv_b per call)
+    size_t                 kv_b = 0;     // bytes of one call's KV input
+    size_t                 kv_blk_b = 0; // bytes of one block's KV pool
     axera_cmm              ST, CQ, CK, CV;
     size_t                 st_b = 0, cq_b = 0, cv_b = 0;
     axera_cmm              INDPTR, INDICES, LASTLEN, CLOC, VALID;
@@ -175,7 +227,8 @@ axera_cmm dense_blocks::bank(const std::map<std::string, ggml_tensor *> & t, con
     const int         phase = std::stoi(mt[1]);
     const bool        mlp   = mt[2] == "mlp";
     const std::string n     = mt[3];
-    const size_t      bb    = d.bytes;  // one block's bytes (the kernels hold one block)
+    const bool        shared = d.name == "b3_attn_cos_sin_cache";
+    const size_t      bb     = d.bytes / (shared ? 1 : (size_t) kB);  // one block's bytes
     axera_cmm         c     = axera_cmm_alloc(bb * (size_t) NB);
     std::vector<const ggml_tensor *> read;
     auto T = [&](int il, const char * g) -> ggml_tensor * {
@@ -185,6 +238,28 @@ axera_cmm dense_blocks::bank(const std::map<std::string, ggml_tensor *> & t, con
         }
         read.push_back(t.at(nm));
         return t.at(nm);
+    };
+    // GDN q / k slice row counts in the fused attn_qkv tensor (the kernel's banks are per projection)
+    const int64_t nq = (int64_t) in_of(man.get("prefill"), "b0_attn_w_q").shape[1];
+    // the FP32 global scale2 of an NVFP4 tensor (the standard GGUF "<tensor>.scale" sidecar): one value, or one per
+    // output row for the fused attn_qkv (q / k / v are quantized as separate slices, each with its own global)
+    auto scale2_of = [&](const ggml_tensor * w, int64_t row) -> float {
+        if (!nvfp4) {
+            return 1.0f;
+        }
+        std::string nm = w->name;
+        const std::string suf = ".weight";
+        if (nm.size() >= suf.size() && nm.compare(nm.size() - suf.size(), suf.size(), suf) == 0) {
+            nm.resize(nm.size() - suf.size());
+        }
+        nm += ".scale";
+        auto it = t.find(nm);
+        if (it == t.end() || it->second->type != GGML_TYPE_F32) {
+            GGML_ABORT("axera dense_blocks: NVFP4 tensor %s has no F32 .scale sidecar\n", w->name);
+        }
+        const int64_t ne = ggml_nelements(it->second);
+        GGML_ASSERT(ne == 1 || (row >= 0 && row < ne));
+        return ((const float *) it->second->data)[ne == 1 ? 0 : row];
     };
     for (int b = 0; b < NB; ++b) {
         const int il    = 4 * b + phase;
@@ -208,8 +283,8 @@ axera_cmm dense_blocks::bank(const std::map<std::string, ggml_tensor *> & t, con
                 }
             }
         };
-        auto rows = [&](const mx4 & w, int64_t r0, int64_t nr, bool scales, int64_t vrow = -1, int64_t hr = 0) {
-            const size_t rb = scales ? w.K / 32 : w.K / 2;
+        auto rows = [&](const q4 & w, int64_t r0, int64_t nr, bool scales, int64_t vrow = -1, int64_t hr = 0) {
+            const size_t rb = scales ? w.K / (w.is_nv() ? 16 : 32) : w.K / 2;
             GGML_ASSERT((size_t) nr * rb == bb);
             axera_host_pool().run(nr, [&](int64_t r) {
                 int64_t src = r0 + r;
@@ -220,8 +295,8 @@ axera_cmm dense_blocks::bank(const std::map<std::string, ggml_tensor *> & t, con
                 w.row(src, scales, dst + r * rb);
             });
         };
-        auto cols = [&](const mx4 & w, bool scales) {
-            const size_t rb = scales ? w.K / 32 : w.K / 2, cb = rb / VH;
+        auto cols = [&](const q4 & w, bool scales) {
+            const size_t rb = scales ? w.K / (w.is_nv() ? 16 : 32) : w.K / 2, cb = rb / VH;
             GGML_ASSERT((size_t) w.N * rb == bb);
             axera_host_pool().run(w.N, [&](int64_t r) {
                 thread_local std::vector<uint8_t> src;
@@ -251,14 +326,14 @@ axera_cmm dense_blocks::bank(const std::map<std::string, ggml_tensor *> & t, con
             } else if (n == "input_permutation") {
                 memset(dst, 0, bb);
             } else if (n.rfind("w_scale2_", 0) == 0) {
-                fill(1.0f);
+                fill(scale2_of(T(il, W.at(n.substr(9))), 0));
             } else if (n.rfind("w_zp_scale", 0) == 0) {
                 fill(0.0f);
             } else if (n.size() == 2 && W.count(n.substr(1))) {
-                const mx4 w(T(il, W.at(n.substr(1))));
+                const q4 w(T(il, W.at(n.substr(1))), nvfp4);
                 rows(w, 0, w.N, false);
             } else if (n.rfind("w_scale", 0) == 0 && W.count(n.substr(7))) {
-                const mx4 w(T(il, W.at(n.substr(7))));
+                const q4 w(T(il, W.at(n.substr(7))), nvfp4);
                 rows(w, 0, w.N, true);
             } else {
                 GGML_ABORT("axera dense_blocks: unexpected MLP input %s\n", d.name.c_str());
@@ -292,11 +367,15 @@ axera_cmm dense_blocks::bank(const std::map<std::string, ggml_tensor *> & t, con
                     }
                 }
             } else if (n.rfind("w_scale2_", 0) == 0) {
-                fill(1.0f);
+                const std::string q2 = n.substr(9);
+                if (!W.count(q2)) {
+                    GGML_ABORT("axera dense_blocks: unexpected attention input %s\n", d.name.c_str());
+                }
+                fill(scale2_of(T(il, W.at(q2)), 0));
             } else if (n.rfind("w_zeropoint_", 0) == 0) {
                 fill(0.0f);
             } else if (W.count(p) && (n == "w_" + p || n == "w_scale_" + p)) {
-                const mx4 w(T(il, W.at(p)));
+                const q4 w(T(il, W.at(p)), nvfp4);
                 rows(w, 0, w.N, n != "w_" + p);
             } else {
                 GGML_ABORT("axera dense_blocks: unexpected attention input %s\n", d.name.c_str());
@@ -331,13 +410,29 @@ axera_cmm dense_blocks::bank(const std::map<std::string, ggml_tensor *> & t, con
             const char        p      = n[2];
             const std::string suffix = n.substr(3);
             if (suffix == "_scale2") {
-                fill(1.0f);
+                const ggml_tensor * sw = nullptr;
+                int64_t             s2row = 0;
+                if (p == 'q' || p == 'k' || p == 'v') {
+                    sw    = T(il, "attn_qkv.weight");
+                    s2row = p == 'q' ? 0 : p == 'k' ? nq : 2 * nq;
+                } else if (p == 'z') {
+                    sw = T(il, "attn_gate.weight");
+                } else if (p == 'a') {
+                    sw = T(il, "ssm_alpha.weight");
+                } else if (p == 'b') {
+                    sw = T(il, "ssm_beta.weight");
+                } else if (p == 'o') {
+                    sw = T(il, "ssm_out.weight");
+                } else {
+                    GGML_ABORT("axera dense_blocks: unexpected delta-net input %s\n", d.name.c_str());
+                }
+                fill(scale2_of(sw, s2row));
                 continue;
             }
             const bool scales = suffix == "_scale";
             GGML_ASSERT(suffix.empty() || scales);
             if (p == 'q' || p == 'k' || p == 'v') {
-                const mx4     w(T(il, "attn_qkv.weight"));
+                const q4      w(T(il, "attn_qkv.weight"), nvfp4);
                 const int64_t nr = d.shape[1];
                 if (p == 'v') {
                     rows(w, w.N - nr, nr, scales, w.N - nr, nr / VH);
@@ -345,13 +440,13 @@ axera_cmm dense_blocks::bank(const std::map<std::string, ggml_tensor *> & t, con
                     rows(w, p == 'q' ? 0 : nr, nr, scales);
                 }
             } else if (p == 'z') {
-                const mx4 w(T(il, "attn_gate.weight"));
+                const q4 w(T(il, "attn_gate.weight"), nvfp4);
                 rows(w, 0, w.N, scales, 0, w.N / VH);
             } else if (p == 'a' || p == 'b') {
-                const mx4 w(T(il, p == 'a' ? "ssm_alpha.weight" : "ssm_beta.weight"));
+                const q4 w(T(il, p == 'a' ? "ssm_alpha.weight" : "ssm_beta.weight"), nvfp4);
                 rows(w, 0, w.N, scales, 0, 1);
             } else if (p == 'o') {
-                const mx4 w(T(il, "ssm_out.weight"));
+                const q4 w(T(il, "ssm_out.weight"), nvfp4);
                 cols(w, scales);
             } else {
                 GGML_ABORT("axera dense_blocks: unexpected delta-net input %s\n", d.name.c_str());
@@ -373,24 +468,40 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
     NB = L / 4;
     const kernel & pk = man.get("prefill");
     const kernel & dk = man.get("decode");
+    // The scale banks say which quantization family this manifest was compiled for: E8M0 per 32 inputs (MXFP4,
+    // dtype 1) or E4M3 per 16 inputs (NVFP4, dtype 11). Everything below fills banks the same way.
+    nvfp4 = in_of(pk, "b0_attn_w_q_scale").dtype == 11;
+    GGML_ASSERT(nvfp4 == (in_of(dk, "b0_attn_w_q_scale").dtype == 11));
     const io_desc & pst = in_of(pk, "b0_attn_state_in");
     const io_desc & pcq = in_of(pk, "b0_attn_q_conv_state_in");
     const io_desc & pcv = in_of(pk, "b0_attn_v_conv_state_in");
     const io_desc & pkv = in_of(pk, "b3_kv");
-    st_b = pst.bytes;
-    cq_b = pcq.bytes;
-    cv_b = pcv.bytes;
+    // A compiled kernel either carries one 4-layer block (host chains 16 of them) or the whole bank of 16
+    // blocks with the runtime loop inside forward_qwen38_blocks.  The weight bank's leading dim says which.
+    kB = (int) in_of(pk, "b0_mlp_w_norm").shape[0];
+    GGML_ASSERT(kB >= 1 && NB % kB == 0);
+    NC = NB / kB;
+    st_b = pst.bytes / (size_t) kB;
+    cq_b = pcq.bytes / (size_t) kB;
+    cv_b = pcv.bytes / (size_t) kB;
     kv_b = pkv.bytes;
-    GGML_ASSERT(pkv.shape[0] == 1 && pkv.shape[2] == PG && (int64_t) man.context == (int64_t) pkv.shape[1] * PG);
-    kv_pages = (int) pkv.shape[1];
+    kv_blk_b = kv_b / (size_t) kB;
+    // The pool is [pages, 2, PG, KV heads, 256]; the upstream module adds a leading batch dim of 1, so the
+    // compiled kernel spells it [1, pages, 2, PG, 4, 256].  Read the trailing five dims and accept either.
+    const std::vector<int64_t> & ks = pkv.shape;
+    GGML_ASSERT(ks.size() >= 5);
+    const size_t kd = ks.size();
+    GGML_ASSERT(ks[kd - 4] == 2 && ks[kd - 3] == PG && ks[kd - 2] == 4 && ks[kd - 1] == 256);
+    GGML_ASSERT((int64_t) man.context == (int64_t) ks[kd - 5] * PG);
+    for (size_t i = 0; i + 5 < kd; ++i) {
+        GGML_ASSERT(ks[i] == 1);
+    }
+    kv_pages = (int) ks[kd - 5];
     kv_cells = man.context;
-    GGML_ASSERT(in_of(dk, "b3_kv").bytes == kv_b && in_of(dk, "b0_attn_state_in").bytes == st_b);
+    GGML_ASSERT(in_of(dk, "b3_kv").bytes == kv_b && in_of(dk, "b0_attn_state_in").bytes == st_b * (size_t) kB);
 
     axera_timer tl("init: dense_blocks");
-    KVC.resize(NB);
-    for (int b = 0; b < NB; ++b) {
-        KVC[b] = axera_cmm_alloc(kv_b);
-    }
+    KV = axera_cmm_alloc(kv_b * (size_t) NC);
     ST = axera_cmm_alloc(st_b * (size_t) (NB * 3));
     CQ = axera_cmm_alloc(cq_b * (size_t) (NB * 3));
     CK = axera_cmm_alloc(cq_b * (size_t) (NB * 3));
@@ -418,7 +529,7 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
             c = std::move(one);
         }
         banks[d.name] = std::move(c);
-        GGML_ASSERT(c->size == (size_t) (shared ? d.bytes : d.bytes * NB));
+        GGML_ASSERT(c->size == (size_t) (shared ? d.bytes : d.bytes * NC));
     }
 
     // the four phase banks above are one layer each: the state/conv-state pools hold every block's three layers
@@ -444,8 +555,8 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
     A    = axera_cmm_alloc((size_t) H * sizeof(ggml_bf16_t));
 
     auto bind = [&](const kernel & k, std::vector<call> & calls, bool decode) {
-        calls.assign(NB, {});
-        for (int b = 0; b < NB; ++b) {
+        calls.assign(NC, {});
+        for (int b = 0; b < NC; ++b) {
             call & c = calls[b];
             c.k      = &k;
             for (const auto & d : k.desc->in) {
@@ -466,14 +577,14 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
                     c.in.push_back(axera_io(VALID, d.bytes));
                 } else if (n == "b3_kv") {
                     GGML_ASSERT(d.bytes == kv_b);
-                    c.in.push_back(axera_io(KVC[b], (uint32_t) kv_b));
+                    c.in.push_back(axera_io(KV.get(), (char *) KV->vir + (size_t) b * kv_b, d.bytes));
                 } else if (state_phase(n) >= 0) {
                     const int p = state_phase(n);
                     const axera_cmm * pool = n.find("q_conv_state_in") != std::string::npos ? &CQ :
                                              n.find("k_conv_state_in") != std::string::npos ? &CK :
                                              n.find("v_conv_state_in") != std::string::npos ? &CV : &ST;
-                    const size_t part = pool == &ST ? st_b : pool == &CV ? cv_b : cq_b;
-                    const size_t off  = (size_t) (3 * b + p) * part;
+                    const size_t part = (pool == &ST ? st_b : pool == &CV ? cv_b : cq_b) * (size_t) kB;
+                    const size_t off  = (size_t) (p * NB + b * kB) * (part / (size_t) kB);
                     GGML_ASSERT(off + part <= (*pool)->size);
                     c.in.push_back(axera_io(pool->get(), (char *) (*pool)->vir + off, d.bytes));
                 } else {
@@ -481,7 +592,8 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
                     if (it == banks.end()) {
                         GGML_ABORT("axera dense_blocks: %s: unexpected input %s\n", k.desc->role.c_str(), n.c_str());
                     }
-                    const size_t off = it->second->size == (size_t) d.bytes ? 0 : (size_t) b * d.bytes;
+                    const bool   shared = n == "b3_attn_cos_sin_cache";
+                    const size_t off    = shared ? 0 : (size_t) b * kB * (it->second->size / NB);
                     c.in.push_back(axera_io(it->second.get(), (char *) it->second->vir + off, d.bytes));
                 }
             }
@@ -496,13 +608,14 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
     GGML_ASSERT(ppos.bytes == 3 * (size_t) PG * sizeof(int32_t));
     bind(pk, pf, false);
     bind(dk, dec, true);
-    GGML_LOG_INFO("axera dense_blocks: %d layers, %d blocks, banks %.1f GiB, state %.2f GiB, %lld cells\n", L, NB,
+    GGML_LOG_INFO("axera dense_blocks: %d layers, %d blocks, %d per call, banks %.1f GiB, state %.2f GiB, %lld cells\n",
+                  L, NB, kB,
                   [&] {
                       size_t s = 0;
                       for (auto & [n, b] : banks) s += b->size;
                       return s / 1073741824.0;
                   }(),
-                  (ST->size + CQ->size + CK->size + CV->size + KVC[0]->size * NB) / 1073741824.0, (long long) kv_cells);
+                  (ST->size + CQ->size + CK->size + CV->size + KV->size) / 1073741824.0, (long long) kv_cells);
     snap_cell = -1;
     page_x.clear();
     page_p.clear();
@@ -777,7 +890,7 @@ size_t dense_blocks::state_size(uint32_t flags) const {
     const size_t nkv_pages = std::min<size_t>((size_t) kv_pages, (size_t) ((cur_cell + PG - 1) / PG));
     size_t n = sizeof(state_header_dense);
     if (!partial) {
-        n += (size_t) NB * nkv_pages * (kv_b / kv_pages);
+        n += (size_t) NB * nkv_pages * (kv_blk_b / kv_pages);
     }
     n += ST->size + CQ->size + CK->size + CV->size;
     n += snap.size() + ksnap.size() + page_x.size() * sizeof(ggml_bf16_t) + page_p.size() * sizeof(int32_t) +
@@ -796,7 +909,7 @@ size_t dense_blocks::state_write(void * dst, size_t size, uint32_t flags) {
     state_header_dense h;
     memset(&h, 0, sizeof(h));
     memcpy(h.magic, "AXDBLK1", sizeof(h.magic) - 1);
-    h.version    = 1;
+    h.version    = 2;
     h.kind       = 3;
     h.has_target = 1;
     h.state_cell = cur_cell;
@@ -805,8 +918,8 @@ size_t dense_blocks::state_write(void * dst, size_t size, uint32_t flags) {
     h.snap_prompt = snap_prompt;
     h.ncall      = (uint32_t) NB;
     h.nkv_pages  = partial ? 0 : (uint32_t) nkv_pages;
-    h.kv_page_b  = kv_b / kv_pages;
-    h.kv_n       = partial ? 0 : (uint64_t) NB * nkv_pages * (kv_b / kv_pages);
+    h.kv_page_b  = kv_blk_b / kv_pages;
+    h.kv_n       = partial ? 0 : (uint64_t) NB * nkv_pages * (kv_blk_b / kv_pages);
     h.st_b = ST->size;
     h.cq_b = CQ->size;
     h.ck_b = CK->size;
@@ -817,15 +930,16 @@ size_t dense_blocks::state_write(void * dst, size_t size, uint32_t flags) {
     h.page_p_n = page_p.size() * sizeof(int32_t);
     h.kpage_x_n = kpage_x.size() * sizeof(ggml_bf16_t);
     h.kpage_p_n = kpage_p.size() * sizeof(int32_t);
-    h.partial = partial;
+    h.partial  = partial;
+    h.kblocks  = (uint32_t) kB;
     char * p = (char *) dst;
     memcpy(p, &h, sizeof(h));
     p += sizeof(h);
     if (!partial) {
-        const size_t page_n = nkv_pages * (kv_b / kv_pages);
-        for (const axera_cmm & c : KVC) {
-            c->invalidate(c->vir, page_n);
-            memcpy(p, c->vir, page_n);
+        const size_t page_n = nkv_pages * (kv_blk_b / kv_pages);
+        KV->invalidate(KV->vir, (size_t) NB * kv_blk_b);
+        for (int j = 0; j < NB; ++j) {
+            memcpy(p, (char *) KV->vir + (size_t) j * kv_blk_b, page_n);
             p += page_n;
         }
     }
@@ -856,10 +970,11 @@ size_t dense_blocks::state_read(const void * src, size_t size, uint32_t flags) {
     const bool partial = flags & state_flags_partial_only;
     state_header_dense h;
     memcpy(&h, src, sizeof(h));
-    if (memcmp(h.magic, "AXDBLK1", sizeof(h.magic) - 1) != 0 || h.version != 1 || h.kind != 3 || h.partial != partial) {
+    if (memcmp(h.magic, "AXDBLK1", sizeof(h.magic) - 1) != 0 || h.version != 2 || h.kind != 3 || h.partial != partial ||
+        h.kblocks != (uint32_t) kB) {
         return 0;
     }
-    if (!h.has_target || h.ncall != (uint32_t) NB || h.kv_page_b != kv_b / kv_pages || h.st_b != ST->size ||
+    if (!h.has_target || h.ncall != (uint32_t) NB || h.kv_page_b != kv_blk_b / kv_pages || h.st_b != ST->size ||
         h.cq_b != CQ->size || h.ck_b != CK->size || h.cv_b != CV->size || h.page_x_n % (H * sizeof(ggml_bf16_t)) ||
         h.page_p_n % (4 * sizeof(int32_t)) || h.kpage_x_n % (H * sizeof(ggml_bf16_t)) ||
         h.kpage_p_n % (4 * sizeof(int32_t)) || h.state_cell < 0 || h.state_cell > kv_cells ||
@@ -875,11 +990,11 @@ size_t dense_blocks::state_read(const void * src, size_t size, uint32_t flags) {
     const char * p = (const char *) src + sizeof(h);
     if (!partial) {
         const size_t page_n = h.nkv_pages * h.kv_page_b;
-        for (const axera_cmm & c : KVC) {
-            memcpy(c->vir, p, page_n);
-            c->flush(c->vir, page_n);
+        for (int j = 0; j < NB; ++j) {
+            memcpy((char *) KV->vir + (size_t) j * kv_blk_b, p, page_n);
             p += page_n;
         }
+        KV->flush(KV->vir, (size_t) NB * kv_blk_b);
     }
     for (const axera_cmm * b : { &ST, &CQ, &CK, &CV }) {
         memcpy((*b)->vir, p, (*b)->size);
