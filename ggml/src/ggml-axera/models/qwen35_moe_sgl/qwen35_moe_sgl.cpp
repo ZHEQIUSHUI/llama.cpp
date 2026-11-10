@@ -256,7 +256,7 @@ class qwen35_moe_sgl final : public model {
     bool                             dec_state_dirty = false;  // the decode calls' state entries follow the prefill's swaps
     std::vector<call>                pre_attn[2], pre_moe;  // per layer and recurrent-state parity
     int                              state_parity = 0;
-    axera_cmm DX, DA, DOUT, DPOS, INDICES, PX, PA, XB, POS, META;
+    axera_cmm DX, DOUT, DPOS, INDICES, PX, PA, XB, POS, META;
     axera_cmm PF_POS, PF_IND, PF_LOC, PF_COUNT;
     // the token embedding as an NPU gather (the GGUF table converted to bf16 once), for the whole-prefill chunk
     // and a decode token; when absent compute() falls back to the graph's CPU GET_ROWS
@@ -847,7 +847,6 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     }
     kv_cells = (int64_t) kv_pages * PG;
     DX      = axera_cmm_alloc(dk.in_bytes("x"));
-    DA      = axera_cmm_alloc(dk.in_bytes("attention"));
     DOUT    = axera_cmm_alloc(dk.out_bytes("output"));
     DPOS    = axera_cmm_alloc(dk.in_bytes("position_ids"));
     INDICES = axera_cmm_alloc((size_t) NP * sizeof(int32_t));
@@ -942,7 +941,9 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
             } else if (n == "cache_location") {
                 c.in.push_back(axera_io(META.get(), (char *) META->vir + META_CLOC, d.bytes));
             } else {
-                const axera_cmm * b = n == "x" ? &DX : n == "attention" ? &DA : n == "position_ids" ? &DPOS :
+                // the 6f539383b0 decode kernel has no separate attention buffer: every stage
+                // hands its activation on chip, so only x / position_ids / indices are bound here.
+                const axera_cmm * b = n == "x" ? &DX : n == "position_ids" ? &DPOS :
                                       n == "indices" ? &INDICES : nullptr;
                 if (split && n.rfind("b3_kv", 0) == 0) {
                     c.in.push_back(kv_io(std::stoi(n.substr(5)), d.bytes));
