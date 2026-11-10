@@ -876,7 +876,9 @@ void output_head::run_fused(ggml_cgraph * g, const graph_names & names, const ax
         axera_timer tl("lm_head (fused)");
         fk->run(fin, fout, "output head (fused)");
         tl.stop();
-        ny->invalidate(ny->vir, (size_t) nR * N * sizeof(float));  // written on the NPU
+        // written on the NPU: only row 0 is read here; rows 1..nR-1 are never touched by the host, so
+        // invalidating their 7/8 of the buffer costs ~0.5 ms/token for no visibility
+        ny->invalidate(ny->vir, (size_t) N * sizeof(float));
         memcpy(o, ny->vir, (size_t) N * sizeof(float));
         dctx->flush(o, (size_t) N * sizeof(float));  // the host wrote the logits row
         if (getenv("GGML_AXERA_HEAD_TRACE")) {
