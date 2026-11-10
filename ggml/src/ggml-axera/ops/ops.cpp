@@ -537,6 +537,44 @@ bool output_head::bind_fused(const kernel & lm, const ggml_tensor * output_weigh
     return true;
 }
 
+bool output_head::bind_norm_gemm(const kernel & lm, const ggml_tensor * output_weight, float scale2) {
+    if (lm.find_input("b_t") < 0 || lm.find_input("b_scale2") < 0 || lm.find_input("norm_weight") < 0 ||
+        lm.find_output("output") < 0) {
+        return false;
+    }
+    if (nk == &lm && nw == output_weight) {
+        return true;
+    }
+    nk = &lm;
+    nw = output_weight;
+    ns2 = scale2;
+    const int64_t N = output_weight->ne[1], K = output_weight->ne[0];
+    const uint32_t Kb = (uint32_t) K, Nb = (uint32_t) N;
+    GGML_ASSERT(lm.in_bytes("a") == 8 * Kb * sizeof(ggml_bf16_t) &&
+                lm.in_bytes("norm_weight") == Kb * sizeof(float) && lm.in_bytes("b_t") == Nb * Kb / 2 &&
+                lm.in_bytes("b_scale") == Nb * Kb / 16 && lm.in_bytes("b_scale2") == sizeof(float) &&
+                lm.out_bytes("output") == 8 * Nb * sizeof(float));
+    na    = axera_cmm_alloc(8 * (size_t) K * sizeof(ggml_bf16_t));
+    nnorm = axera_cmm_alloc((size_t) K * sizeof(float));
+    nbt   = axera_cmm_alloc((size_t) N * K / 2);
+    nbs   = axera_cmm_alloc((size_t) N * K / 16);
+    nbs2  = axera_cmm_alloc(sizeof(float));
+    nout  = axera_cmm_alloc(8 * (size_t) N * sizeof(float));
+    if (output_weight->type == GGML_TYPE_NVFP4) {
+        axera_copy_nvfp4_slice(output_weight, 0, N, (uint8_t *) nbt->vir, K / 2, (uint8_t *) nbs->vir, K / 16);
+    } else {
+        ns2 = axera_quantize_nvfp4_slice(output_weight, 0, N, (uint8_t *) nbt->vir, K / 2, (uint8_t *) nbs->vir,
+                                         K / 16);
+    }
+    *(float *) nbs2->vir = ns2;
+    nbs2->flush();
+    nbt->flush();
+    nbs->flush();
+    ngw = nullptr;
+    axera_drop_mapped(output_weight, true);
+    return true;
+}
+
 bool output_head::bind_combined(const kernel & lm, const ggml_tensor * output_weight) {
     if (!k || w != output_weight) {
         return false;
@@ -1089,6 +1127,38 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
     thn.stop();
     if (rn && ggml_backend_buffer_is_axera(rn->buffer)) {
         ((ggml_backend_axera_buffer_context *) rn->buffer->context)->flush(rn->data, ggml_nbytes(rn));
+    }
+    if (nk) {  // the upstream rmsnorm_gemm head: it normalizes the [8,K] bf16 tile itself
+        axera_timer tm("lm_head (rmsnorm_gemm)");
+        if (gw != ngw) {
+            memcpy(nnorm->vir, gw, (size_t) K * sizeof(float));
+            nnorm->flush(nnorm->vir, (size_t) K * sizeof(float));
+            ngw = gw;
+        }
+        std::vector<AX_ENGINE_IO_BUFFER_T> in(nk->info->nInputSize), out(nk->info->nOutputSize);
+        in[nk->input("a")]           = axera_io(na, 8 * (size_t) K * sizeof(ggml_bf16_t));
+        in[nk->input("norm_weight")] = axera_io(nnorm, (size_t) K * sizeof(float));
+        in[nk->input("b_t")]         = axera_io(nbt, (size_t) N * K / 2);
+        in[nk->input("b_scale")]     = axera_io(nbs, (size_t) N * K / 16);
+        in[nk->input("b_scale2")]    = axera_io(nbs2, sizeof(float));
+        out[nk->output("output")]    = axera_io(nout, 8 * (size_t) N * sizeof(float));
+        auto * dctx2 = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+        for (int r = 0; r < n_out; ++r) {
+            const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : r;
+            GGML_ASSERT(row >= 0 && row < T);
+            memset(na->vir, 0, 8 * (size_t) K * sizeof(ggml_bf16_t));
+            ggml_fp32_to_bf16_row(h.data() + (size_t) row * K, (ggml_bf16_t *) na->vir, K);
+            na->flush(na->vir, 8 * (size_t) K * sizeof(ggml_bf16_t));
+            nk->run(in, out, "lm_head (rmsnorm_gemm)");
+            nout->invalidate(nout->vir, (size_t) N * sizeof(float));
+            float * o = (float *) ((char *) logits->data + r * logits->nb[1]);
+            memcpy(o, nout->vir, (size_t) N * sizeof(float));
+            dctx2->flush(o, (size_t) N * sizeof(float));
+            dctx2->clean_p     = o;
+            dctx2->clean_n     = (size_t) N * sizeof(float);
+            dctx2->clean_epoch = axera_graph_epoch;
+        }
+        return;
     }
     auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
     // the fused head: the decode row(s) through lm_head.topk, which applies the host sampler's penalty state and keeps

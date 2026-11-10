@@ -261,7 +261,7 @@ static std::vector<io_desc> read_io(const nlohmann::json & a) {
     for (const auto & e : a) {
         io_desc d;
         d.name  = e.at("name").get<std::string>();
-        d.bytes = e.at("bytes").get<uint32_t>();
+        d.bytes = e.at("bytes").get<uint64_t>();
         d.dtype = e.at("dtype").get<int>();
         d.shape = e.at("shape").get<std::vector<int64_t>>();
         d.param = e.value("param", std::string());
@@ -290,10 +290,13 @@ static std::unique_ptr<kernel> load_kernel(const std::string & dir, const kernel
     // the kernel's IO table is the manifest's
     bool same = k->info->nInputSize == d.in.size() && k->info->nOutputSize == d.out.size();
     for (size_t i = 0; same && i < d.in.size(); ++i) {
-        same = d.in[i].name == k->info->pInputs[i].pName && d.in[i].bytes == k->info->pInputs[i].nSize;
+        // The engine's meta size is 32-bit; a manifest IO above 4 GiB cannot be compared there.
+        same = d.in[i].name == k->info->pInputs[i].pName &&
+               (d.in[i].bytes > UINT32_MAX || d.in[i].bytes == k->info->pInputs[i].nSize);
     }
     for (size_t i = 0; same && i < d.out.size(); ++i) {
-        same = d.out[i].name == k->info->pOutputs[i].pName && d.out[i].bytes == k->info->pOutputs[i].nSize;
+        same = d.out[i].name == k->info->pOutputs[i].pName &&
+               (d.out[i].bytes > UINT32_MAX || d.out[i].bytes == k->info->pOutputs[i].nSize);
     }
     if (!same) {
         GGML_ABORT("axera: kernel %s (%s): its IO is not the manifest's\n", d.role.c_str(), path.c_str());
@@ -320,7 +323,7 @@ static std::unique_ptr<manifest> load_manifest(const std::string & dir) {
             param_desc d;
             d.gguf    = p.at("gguf").get<std::string>();
             d.convert = p.at("convert").get<std::string>();
-            d.bytes   = p.at("bytes").get<uint32_t>();
+            d.bytes   = p.at("bytes").get<uint64_t>();
             d.dtype   = p.at("dtype").get<int>();
             d.shape   = p.at("shape").get<std::vector<int64_t>>();
             d.vperm   = p.value("vperm", std::string());

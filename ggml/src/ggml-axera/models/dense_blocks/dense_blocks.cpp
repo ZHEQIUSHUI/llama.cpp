@@ -160,6 +160,7 @@ class dense_blocks final : public model {
     const void *     bound = nullptr;
     int              L = 0, H = 0, NB = 0;  // layers, hidden, blocks in the model (64 layers = 16 blocks)
     int              kB = 1;               // blocks carried by one kernel call (1 = 4-layer kernel, 16 = all)
+    bool             sgl = false;          // the upstream forward_qwen38_blocks banks (fused qkvz / ba, one norm head)
     int              NC = 0;               // kernel calls per row batch
     bool             nvfp4 = false;         // manifest banks are NVFP4 (K/16 E4M3 scales) or MXFP4 (K/32 E8M0)
     int              kv_pages = 0;
@@ -189,6 +190,8 @@ class dense_blocks final : public model {
 
     void init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
     axera_cmm bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d, const ggml_tensor * rope_node);
+    axera_cmm bank_sgl(const std::map<std::string, ggml_tensor *> & t, const io_desc & d, const ggml_tensor * rope,
+                       int phase, bool mlp, const std::string & n);
     void zero_state();
     void save_state(int64_t cell);
     void load_state();
@@ -216,6 +219,216 @@ class dense_blocks final : public model {
     }
 };
 
+// The upstream forward_qwen38_blocks banks: one bank name per fused projection, row-major, raw checkpoint order.
+// GDN packs q,k,v,z into one w_k and b,a into one w_a; the gated attention packs q+gate,k,v into one w_k; the MLP
+// packs gate,up into w1.  Blocks are 4*b + phase.
+axera_cmm dense_blocks::bank_sgl(const std::map<std::string, ggml_tensor *> & t, const io_desc & d,
+                                 const ggml_tensor * rope, int phase, bool mlp, const std::string & n) {
+    GGML_UNUSED(rope);
+    const bool   shared = d.name == "b3_attn_cos_sin_cache";
+    const size_t bb     = d.bytes / (shared ? 1 : (size_t) kB);
+    axera_cmm    c      = axera_cmm_alloc(bb * (size_t) NB);
+    std::vector<const ggml_tensor *> read;
+    auto T = [&](int il, const char * g) -> ggml_tensor * {
+        const std::string nm = "blk." + std::to_string(il) + "." + g;
+        if (!t.count(nm)) {
+            GGML_ABORT("axera dense_blocks: %s not in the graph\n", nm.c_str());
+        }
+        read.push_back(t.at(nm));
+        return t.at(nm);
+    };
+    auto scale2_of = [&](const ggml_tensor * w, int64_t row) -> float {
+        if (!nvfp4) {
+            return 1.0f;
+        }
+        std::string nm = w->name;
+        const std::string suf = ".weight";
+        if (nm.size() >= suf.size() && nm.compare(nm.size() - suf.size(), suf.size(), suf) == 0) {
+            nm.resize(nm.size() - suf.size());
+        }
+        nm += ".scale";
+        auto it = t.find(nm);
+        if (it == t.end() || it->second->type != GGML_TYPE_F32) {
+            GGML_ABORT("axera dense_blocks: NVFP4 tensor %s has no F32 .scale sidecar\n", w->name);
+        }
+        const int64_t ne = ggml_nelements(it->second);
+        GGML_ASSERT(ne == 1 || (row >= 0 && row < ne));
+        return ((const float *) it->second->data)[ne == 1 ? 0 : row];
+    };
+    const size_t stride = c->size / (size_t) NB;
+    for (int b = 0; b < NB; ++b) {
+        const int il      = 4 * b + phase;
+        uint8_t * dst     = (uint8_t *) c->vir + (size_t) b * stride;
+        auto put = [&](const std::vector<float> & v, float mul = 1.0f) {
+            GGML_ASSERT(v.size() * (d.dtype == 3 ? sizeof(float) : sizeof(ggml_bf16_t)) == bb);
+            for (size_t i = 0; i < v.size(); ++i) {
+                if (d.dtype == 3) {
+                    ((float *) dst)[i] = v[i] * mul;
+                } else {
+                    GGML_ASSERT(d.dtype == 9);
+                    ((ggml_bf16_t *) dst)[i] = ggml_fp32_to_bf16(v[i] * mul);
+                }
+            }
+        };
+        auto zero = [&]() { memset(dst, 0, bb); };
+        auto scalar = [&](float v) {
+            for (size_t i = 0; i < bb / (d.dtype == 3 ? 4 : 2); ++i) {
+                if (d.dtype == 3) {
+                    ((float *) dst)[i] = v;
+                } else {
+                    ((ggml_bf16_t *) dst)[i] = ggml_fp32_to_bf16(v);
+                }
+            }
+        };
+        // NVFP4 rows of the source: codes (q) and/or E4M3 scales (s) into the destination rows at row0.
+        auto nv = [&](const ggml_tensor * w, int64_t s0, int64_t nr, int64_t row0, bool codes, bool scales, int64_t K) {
+            thread_local std::vector<uint8_t> tq, ts;
+            uint8_t * qp = codes ? dst + (size_t) row0 * (K / 2) : nullptr;
+            uint8_t * sp = scales ? dst + (size_t) row0 * (K / 16) : nullptr;
+            if (!codes) {
+                tq.resize((size_t) nr * (K / 2));
+                qp = tq.data();
+            }
+            if (!scales) {
+                ts.resize((size_t) nr * (K / 16));
+                sp = ts.data();
+            }
+            axera_copy_nvfp4_slice(w, s0, nr, qp, K / 2, sp, K / 16);
+        };
+        const bool codes = d.dtype == 15;
+        const bool scales = d.dtype == 11;
+        GGML_ASSERT(codes || scales || d.dtype == 3 || d.dtype == 9 || d.dtype == 6);
+        if (mlp) {
+            if (n == "w_norm") {
+                put(f32_of(T(il, "post_attention_norm.weight")));
+            } else if (n == "input_permutation") {
+                zero();
+            } else if (n == "w1" || n == "w_scale1") {
+                const ggml_tensor * g = T(il, "ffn_gate.weight");
+                const ggml_tensor * u = T(il, "ffn_up.weight");
+                const int64_t        K = g->ne[0];
+                GGML_ASSERT(g->ne[0] == u->ne[0] && (size_t) (g->ne[1] + u->ne[1]) * (codes ? K / 2 : K / 16) == bb);
+                nv(g, 0, g->ne[1], 0, codes, scales, K);
+                nv(u, 0, u->ne[1], g->ne[1], codes, scales, K);
+            } else if (n == "w3" || n == "w_scale3") {
+                const ggml_tensor * w = T(il, "ffn_down.weight");
+                nv(w, 0, w->ne[1], 0, codes, scales, w->ne[0]);
+            } else if (n.rfind("w_scale2_", 0) == 0) {
+                const std::string p = n.substr(9);
+                const char *      g = p == "1" ? "ffn_gate.weight" : p == "2" ? "ffn_up.weight" : "ffn_down.weight";
+                scalar(scale2_of(T(il, g), 0));
+            } else if (n.rfind("w_zp_scale", 0) == 0) {
+                zero();
+            } else {
+                GGML_ABORT("axera dense_blocks: unexpected upstream MLP input %s\n", d.name.c_str());
+            }
+        } else if (phase == 3) {
+            if (n == "w_k" || n == "w_scale_k") {
+                const ggml_tensor * q = T(il, "attn_q.weight");
+                const ggml_tensor * k = T(il, "attn_k.weight");
+                const ggml_tensor * v = T(il, "attn_v.weight");
+                const int64_t        K = q->ne[0];
+                GGML_ASSERT(q->ne[0] == k->ne[0] && k->ne[0] == v->ne[0]);
+                GGML_ASSERT((size_t) (q->ne[1] + k->ne[1] + v->ne[1]) * (codes ? K / 2 : K / 16) == bb);
+                nv(q, 0, q->ne[1], 0, codes, scales, K);
+                nv(k, 0, k->ne[1], q->ne[1], codes, scales, K);
+                nv(v, 0, v->ne[1], q->ne[1] + k->ne[1], codes, scales, K);
+            } else if (n == "w_o" || n == "w_scale_o") {
+                const ggml_tensor * w = T(il, "attn_output.weight");
+                nv(w, 0, w->ne[1], 0, codes, scales, w->ne[0]);
+            } else if (n == "w_norm_attn") {
+                put(f32_of(T(il, "attn_norm.weight")));
+            } else if (n == "w_norm_q") {
+                put(f32_of(T(il, "attn_q_norm.weight")), 1.0f / std::sqrt((float) d.shape.back()));
+            } else if (n == "w_norm_k") {
+                put(f32_of(T(il, "attn_k_norm.weight")));
+            } else if (n.rfind("w_scale2_", 0) == 0) {
+                const std::string p = n.substr(9);
+                const char *      g = p == "q" ? "attn_q.weight" : p == "k" ? "attn_k.weight" :
+                                      p == "v" ? "attn_v.weight" : "attn_output.weight";
+                scalar(scale2_of(T(il, g), 0));
+            } else if (n.rfind("w_zeropoint_", 0) == 0) {
+                zero();
+            } else if (n == "cos_sin_cache") {
+                // [max_position, rotary_dim] f32: cos for channels 0..31, sin for 32..63, theta 1e7 (upstream get_rope)
+                const int64_t P = d.shape[1];
+                GGML_ASSERT(d.dtype == 3 && d.shape[2] == ROT && bb == (size_t) P * ROT * sizeof(float));
+                if (b == 0) {
+                    std::vector<float> inv(ROT / 2);
+                    for (int i = 0; i < ROT / 2; ++i) {
+                        inv[i] = 1.0f / std::pow(10000000.0f, (float) (2 * i) / ROT);
+                    }
+                    for (int64_t q = 0; q < P; ++q) {
+                        for (int i = 0; i < ROT / 2; ++i) {
+                            const float th = (float) q * inv[i];
+                            ((float *) dst)[q * ROT + i]            = std::cos(th);
+                            ((float *) dst)[q * ROT + ROT / 2 + i]  = std::sin(th);
+                        }
+                    }
+                }
+            } else {
+                GGML_ABORT("axera dense_blocks: unexpected upstream attention input %s\n", d.name.c_str());
+            }
+        } else {
+            if (n == "input_norm_w") {
+                put(f32_of(T(il, "attn_norm.weight")));
+            } else if (n == "o_norm_w") {
+                put(f32_of(T(il, "ssm_norm.weight")));
+            } else if (n == "a_log") {
+                put(f32_of(T(il, "ssm_a")));
+            } else if (n == "dt_bias") {
+                put(f32_of(T(il, "ssm_dt.bias")));
+            } else if (n == "w_q_conv" || n == "w_k_conv" || n == "w_v_conv") {
+                const ggml_tensor *      w = T(il, "ssm_conv1d.weight");
+                const std::vector<float> v = f32_of(w);
+                const int64_t            tp = w->ne[0], C = d.shape[1] * d.shape[2] * d.shape[3];
+                const int64_t            c0 = n[2] == 'q' ? 0 : n[2] == 'k' ? 2048 : 4096;
+                GGML_ASSERT(d.shape[2] == 1 && d.shape[3] == 4 && C + c0 <= w->ne[1]);
+                std::vector<float> u((size_t) C * tp);
+                memcpy(u.data(), v.data() + (size_t) c0 * tp, u.size() * sizeof(float));
+                put(u);
+            } else if (n == "w_k" || n == "w_scale_k") {
+                const ggml_tensor * qkv = T(il, "attn_qkv.weight");
+                const ggml_tensor * z   = T(il, "attn_gate.weight");
+                const int64_t        K  = qkv->ne[0];
+                GGML_ASSERT(qkv->ne[0] == z->ne[0]);
+                GGML_ASSERT((size_t) (qkv->ne[1] + z->ne[1]) * (codes ? K / 2 : K / 16) == bb);
+                nv(qkv, 0, qkv->ne[1], 0, codes, scales, K);
+                nv(z, 0, z->ne[1], qkv->ne[1], codes, scales, K);
+            } else if (n == "w_a" || n == "w_a_scale") {
+                const ggml_tensor * beta  = T(il, "ssm_beta.weight");
+                const ggml_tensor * alpha = T(il, "ssm_alpha.weight");
+                const int64_t        K     = beta->ne[0];
+                GGML_ASSERT(beta->ne[0] == alpha->ne[0]);
+                GGML_ASSERT((size_t) (beta->ne[1] + alpha->ne[1]) * (codes ? K / 2 : K / 16) == bb);
+                nv(beta, 0, beta->ne[1], 0, codes, scales, K);
+                nv(alpha, 0, alpha->ne[1], beta->ne[1], codes, scales, K);
+            } else if (n == "w_o" || n == "w_o_scale") {
+                const ggml_tensor * w = T(il, "ssm_out.weight");
+                nv(w, 0, w->ne[1], 0, codes, scales, w->ne[0]);
+            } else if (n == "w_q_scale2" || n == "w_k_scale2" || n == "w_v_scale2") {
+                const int64_t row = n[2] == 'q' ? 0 : n[2] == 'k' ? 2048 : 4096;
+                scalar(scale2_of(T(il, "attn_qkv.weight"), row));
+            } else if (n == "w_z_scale2") {
+                scalar(scale2_of(T(il, "attn_gate.weight"), 0));
+            } else if (n == "w_a_scale2") {
+                scalar(scale2_of(T(il, "ssm_alpha.weight"), 0));
+            } else if (n == "w_b_scale2") {
+                scalar(scale2_of(T(il, "ssm_beta.weight"), 0));
+            } else if (n == "w_o_scale2") {
+                scalar(scale2_of(T(il, "ssm_out.weight"), 0));
+            } else {
+                GGML_ABORT("axera dense_blocks: unexpected upstream delta-net input %s\n", d.name.c_str());
+            }
+        }
+    }
+    c->flush();
+    for (const ggml_tensor * w : read) {
+        axera_drop_mapped(w);
+    }
+    return c;
+}
+
 // Fill one bank name for all NB blocks from the GGUF. A block's four layers are 4*b + phase.
 axera_cmm dense_blocks::bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d,
                              const ggml_tensor * rope_node) {
@@ -227,6 +440,9 @@ axera_cmm dense_blocks::bank(const std::map<std::string, ggml_tensor *> & t, con
     const int         phase = std::stoi(mt[1]);
     const bool        mlp   = mt[2] == "mlp";
     const std::string n     = mt[3];
+    if (sgl) {
+        return bank_sgl(t, d, rope_node, phase, mlp, n);
+    }
     const bool        shared = d.name == "b3_attn_cos_sin_cache";
     const size_t      bb     = d.bytes / (shared ? 1 : (size_t) kB);  // one block's bytes
     axera_cmm         c     = axera_cmm_alloc(bb * (size_t) NB);
@@ -240,7 +456,7 @@ axera_cmm dense_blocks::bank(const std::map<std::string, ggml_tensor *> & t, con
         return t.at(nm);
     };
     // GDN q / k slice row counts in the fused attn_qkv tensor (the kernel's banks are per projection)
-    const int64_t nq = (int64_t) in_of(man.get("prefill"), "b0_attn_w_q").shape[1];
+    const int64_t nq = sgl ? 0 : (int64_t) in_of(man.get("prefill"), "b0_attn_w_q").shape[1];
     // the FP32 global scale2 of an NVFP4 tensor (the standard GGUF "<tensor>.scale" sidecar): one value, or one per
     // output row for the fused attn_qkv (q / k / v are quantized as separate slices, each with its own global)
     auto scale2_of = [&](const ggml_tensor * w, int64_t row) -> float {
@@ -471,10 +687,13 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
     NB = L / 4;
     const kernel & pk = man.get("prefill");
     const kernel & dk = man.get("decode");
+    // The upstream banks fuse q/k/v/z into b0_attn_w_k and b/a into b0_attn_w_a; the old per-projection banks
+    // have b0_attn_w_q.  Pick the filler from the compiled IO itself, never from the file name.
+    sgl  = pk.find_input("b0_attn_w_q") < 0 && pk.find_input("b0_attn_w_k") >= 0;
     // The scale banks say which quantization family this manifest was compiled for: E8M0 per 32 inputs (MXFP4,
     // dtype 1) or E4M3 per 16 inputs (NVFP4, dtype 11). Everything below fills banks the same way.
-    nvfp4 = in_of(pk, "b0_attn_w_q_scale").dtype == 11;
-    GGML_ASSERT(nvfp4 == (in_of(dk, "b0_attn_w_q_scale").dtype == 11));
+    nvfp4 = in_of(pk, sgl ? "b0_attn_w_k_scale" : "b0_attn_w_q_scale").dtype == 11;
+    GGML_ASSERT(nvfp4 == (in_of(dk, sgl ? "b0_attn_w_k_scale" : "b0_attn_w_q_scale").dtype == 11));
     const io_desc & pst = in_of(pk, "b0_attn_state_in");
     const io_desc & pcq = in_of(pk, "b0_attn_q_conv_state_in");
     const io_desc & pcv = in_of(pk, "b0_attn_v_conv_state_in");
@@ -495,7 +714,9 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
     GGML_ASSERT(ks.size() >= 5);
     const size_t kd = ks.size();
     GGML_ASSERT(ks[kd - 4] == 2 && ks[kd - 3] == PG && ks[kd - 2] == 4 && ks[kd - 1] == 256);
-    GGML_ASSERT((int64_t) man.context == (int64_t) ks[kd - 5] * PG);
+    // Upstream pools max(32, max_total_tokens / 256 + 1) pages, so 262144 tokens get 1025 pages and the last page
+    // is slack; the adapter's sequence still ends at man.context cells.
+    GGML_ASSERT((int64_t) ks[kd - 5] * PG >= (int64_t) man.context);
     for (size_t i = 0; i + 5 < kd; ++i) {
         GGML_ASSERT(ks[i] == 1);
     }
@@ -504,16 +725,19 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
     GGML_ASSERT(in_of(dk, "b3_kv").bytes == kv_b && in_of(dk, "b0_attn_state_in").bytes == st_b * (size_t) kB);
 
     axera_timer tl("init: dense_blocks");
-    // The runtime's AX_ENGINE_IO_BUFFER_T.nSize is 32-bit, so never allocate one buffer above 4 GiB: with kB = 16
-    // the pool is 16 GiB and cannot be bound at all.  One buffer per call keeps every IO under the limit.
+    // One pool per kernel call.  With the upstream 16-block kernels NC is 1 and the pool is the whole bank
+    // (16 GiB at context 262144); the SDK 0.6.0 CMM allocator takes 64-bit sizes, so no splitting is needed.
     KVC.resize(NC);
     for (int c = 0; c < NC; ++c) {
         KVC[c] = axera_cmm_alloc(kv_b);
     }
-    ST = axera_cmm_alloc(st_b * (size_t) (NB * 3));
-    CQ = axera_cmm_alloc(cq_b * (size_t) (NB * 3));
-    CK = axera_cmm_alloc(cq_b * (size_t) (NB * 3));
-    CV = axera_cmm_alloc(cv_b * (size_t) (NB * 3));
+    // Upstream's state input already carries all three GDN phases of its kB blocks ([kB * 3] rows), so the pool is
+    // one bank per block; the old per-one-block kernels carry one layer per input and need three banks per block.
+    const size_t st_banks = (size_t) (sgl ? NB : NB * 3);
+    ST = axera_cmm_alloc(st_b * st_banks);
+    CQ = axera_cmm_alloc(cq_b * st_banks);
+    CK = axera_cmm_alloc(cq_b * st_banks);
+    CV = axera_cmm_alloc(cv_b * st_banks);
     snap.assign(ST->size + CQ->size + CK->size + CV->size, 0);
 
     // the weight banks: every block's copy of each input, except the runtime buffers and the shared RoPE table
@@ -552,8 +776,10 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
     LASTLEN = axera_cmm_alloc(plp.bytes);
     CLOC    = axera_cmm_alloc(2 * sizeof(int32_t));
     VALID   = axera_cmm_alloc(sizeof(int32_t));
-    GGML_ASSERT(pk.in_bytes("indices") == (size_t) kv_pages * sizeof(int32_t));
-    for (int i = 0; i < kv_pages; ++i) {
+    // The page table covers the logical pages ceil(context / 256); upstream's pool has one more physical page.
+    const int n_indices = (int) (pk.in_bytes("indices") / sizeof(int32_t));
+    GGML_ASSERT(n_indices >= (int) ((man.context + PG - 1) / PG) && n_indices <= kv_pages);
+    for (int i = 0; i < n_indices; ++i) {
         ((int32_t *) INDICES->vir)[i] = i;
     }
     INDICES->flush();
@@ -593,7 +819,10 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
                                              n.find("k_conv_state_in") != std::string::npos ? &CK :
                                              n.find("v_conv_state_in") != std::string::npos ? &CV : &ST;
                     const size_t part = (pool == &ST ? st_b : pool == &CV ? cv_b : cq_b) * (size_t) kB;
-                    const size_t off  = (size_t) (p * NB + b * kB) * (part / (size_t) kB);
+                    // upstream pools are [block][phase] (linear_index = 3 * block + phase) and the compiled bank
+                    // selects local row phase + 3 * block; the old per-one-block kernels index phase-major.
+                    const size_t per  = sgl ? (part / (size_t) kB) / 3 : (part / (size_t) kB);
+                    const size_t off  = sgl ? (size_t) (3 * b * kB) * per : (size_t) (p * NB + b * kB) * per;
                     GGML_ASSERT(off + part <= (*pool)->size);
                     c.in.push_back(axera_io(pool->get(), (char *) (*pool)->vir + off, d.bytes));
                 } else {
@@ -873,15 +1102,27 @@ ggml_status dense_blocks::compute(ggml_cgraph * g) {
         page_p.insert(page_p.end(), pb.begin(), pb.end());
     }
     axera_timer th("output head");
-    head.bind(man.get("lm_head"), logits->src[0]);
-    if (man.has("lm_head.topk")) {
-        head.bind_topk(man.get("lm_head.topk"));
+    // The upstream dense LM head is rmsnorm_gemm_kernel: it normalizes its [8,K] bf16 tile itself and takes the
+    // NVFP4 lm_head as b_t / b_scale / b_scale2.  The old dense_blocks manifests keep the combined head below.
+    float s2 = 1.0f;
+    if (sgl && logits->src[0]->type == GGML_TYPE_NVFP4) {
+        auto it = t.find("output.scale");
+        GGML_ASSERT(it != t.end() && it->second->type == GGML_TYPE_F32 && ggml_nelements(it->second) == 1);
+        s2 = ((const float *) it->second->data)[0];
     }
-    const bool combined = head.bind_combined(man.get("lm_head"), logits->src[0]) && head.combined_ready(g, names);
-    if (combined) {
-        head.run_combined(g, names, h, T, nullptr, nullptr);
-    } else {
+    if (head.bind_norm_gemm(man.get("lm_head"), logits->src[0], s2)) {
         head.run(g, names, h, T);
+    } else {
+        head.bind(man.get("lm_head"), logits->src[0]);
+        if (man.has("lm_head.topk")) {
+            head.bind_topk(man.get("lm_head.topk"));
+        }
+        const bool combined = head.bind_combined(man.get("lm_head"), logits->src[0]) && head.combined_ready(g, names);
+        if (combined) {
+            head.run_combined(g, names, h, T, nullptr, nullptr);
+        } else {
+            head.run(g, names, h, T);
+        }
     }
     if (warmup) {
         zero_state();

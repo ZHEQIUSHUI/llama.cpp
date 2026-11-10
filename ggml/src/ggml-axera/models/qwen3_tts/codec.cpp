@@ -204,7 +204,7 @@ const ggml_tensor * tts_codec::T(const std::string & n, const graph_names & name
 
 void tts_codec::bank(axera_cmm & c, const char * name, size_t n) {
     if (n * sizeof(ggml_bf16_t) != k.in_bytes(name)) {
-        GGML_ABORT("axera qwen3_tts codec: %s: %zu bf16 packed, the kernel takes %u bytes\n", name, n, k.in_bytes(name));
+        GGML_ABORT("axera qwen3_tts codec: %s: %zu bf16 packed, the kernel takes %zu bytes\n", name, n, k.in_bytes(name));
     }
     c->flush();
 }

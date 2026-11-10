@@ -117,12 +117,12 @@ axera_cmm axera_cmm_alloc_nc(size_t size);  // non-cacheable (host writes only)
 // bytes off .. off + size of b as a buffer of its own (b outlives it)
 axera_cmm axera_cmm_view(const ggml_backend_axera_buffer_context * b, size_t off, size_t size);
 // a kernel IO entry over p (within ctx)
-AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint32_t size);
+AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint64_t size);
 inline AX_ENGINE_IO_BUFFER_T axera_io(const axera_cmm & c, size_t size) {
-    return axera_io(c.get(), c->vir, (uint32_t) size);
+    return axera_io(c.get(), c->vir, size);
 }
 inline AX_ENGINE_IO_BUFFER_T axera_io(const axera_cmm & c) {
-    return axera_io(c.get(), c->vir, (uint32_t) c->size);
+    return axera_io(c.get(), c->vir, c->size);
 }
 
 extern std::atomic<uint64_t> axera_graph_epoch;  // graphs computed so far

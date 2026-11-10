@@ -3161,7 +3161,7 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
             if (d.name.rfind("w_", 0) == 0) {
                 auto it = mtp_w.find(d.name);
                 if (it == mtp_w.end() || it->second->size < d.bytes) {
-                    GGML_ABORT("axera qwen35_moe_sgl: MTP: %s %s: weight %s is %u bytes\n",
+                    GGML_ABORT("axera qwen35_moe_sgl: MTP: %s %s: weight %s is %zu bytes\n",
                                k.desc->role.c_str(), k.desc->file.c_str(), d.name.c_str(), d.bytes);
                 }
                 mc.c.in.push_back(axera_io(it->second, d.bytes));
@@ -3254,7 +3254,7 @@ void qwen35_moe_sgl::bind_mtp_chain(const kernel & ck) {
         if (d.name.rfind("w_", 0) == 0) {
             auto it = mtp_w.find(d.name);
             if (it == mtp_w.end() || it->second->size < d.bytes) {
-                GGML_ABORT("axera qwen35_moe_sgl: mtp.chain: weight %s is %u bytes\n", d.name.c_str(), d.bytes);
+                GGML_ABORT("axera qwen35_moe_sgl: mtp.chain: weight %s is %zu bytes\n", d.name.c_str(), d.bytes);
             }
             mtp_chain.in[ck.input(d.name)] = axera_io(it->second, d.bytes);
             continue;

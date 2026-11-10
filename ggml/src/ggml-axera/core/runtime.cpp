@@ -308,7 +308,7 @@ void axera_cmm_memory(size_t * free, size_t * total) {
 axera_cmm axera_cmm_alloc(size_t size) {
     auto b  = std::make_unique<ggml_backend_axera_buffer_context>();
     b->size = GGML_PAD(std::max<size_t>(size, 1), AXERA_ALIGNMENT);
-    if (AX_SYS_MemAllocCached(&b->phy, &b->vir, (AX_U32) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera") != 0) {
+    if (AX_SYS_MemAllocCached(&b->phy, &b->vir, (AX_U64) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera") != 0) {
         GGML_ABORT("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
     }
     memset(b->vir, 0, b->size);
@@ -319,7 +319,7 @@ axera_cmm axera_cmm_alloc(size_t size) {
 axera_cmm axera_cmm_alloc_raw(size_t size) {
     auto b  = std::make_unique<ggml_backend_axera_buffer_context>();
     b->size = GGML_PAD(std::max<size_t>(size, 1), AXERA_ALIGNMENT);
-    if (AX_SYS_MemAllocCached(&b->phy, &b->vir, (AX_U32) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera") != 0) {
+    if (AX_SYS_MemAllocCached(&b->phy, &b->vir, (AX_U64) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera") != 0) {
         GGML_ABORT("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
     }
     return b;
@@ -329,7 +329,7 @@ axera_cmm axera_cmm_alloc_nc(size_t size) {
     auto b  = std::make_unique<ggml_backend_axera_buffer_context>();
     b->size = GGML_PAD(std::max<size_t>(size, 1), AXERA_ALIGNMENT);
     b->nc   = true;
-    if (AX_SYS_MemAlloc(&b->phy, &b->vir, (AX_U32) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera-nc") != 0) {
+    if (AX_SYS_MemAlloc(&b->phy, &b->vir, (AX_U64) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera-nc") != 0) {
         GGML_ABORT("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
     }
     return b;
@@ -346,12 +346,14 @@ axera_cmm axera_cmm_view(const ggml_backend_axera_buffer_context * b, size_t off
     return v;
 }
 
-AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint32_t size) {
+AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint64_t size) {
     AX_ENGINE_IO_BUFFER_T b;
     memset(&b, 0, sizeof(b));
     b.phyAddr  = ctx->phy_of(p);
     b.pVirAddr = p;
-    b.nSize    = size;
+    // SDK 0.6.0 keeps a 32-bit nSize in AX_ENGINE_IO_BUFFER_T (the kernel allocator is 64-bit).
+    // A single IO above 4 GiB cannot be spelled there; 0 asks the engine to use the model's IO size.
+    b.nSize    = size > UINT32_MAX ? 0u : (AX_U32) size;
     return b;
 }
 

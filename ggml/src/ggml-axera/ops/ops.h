@@ -140,6 +140,14 @@ struct output_head {
     axera_cmm                          cnorm, cids, ctop, cx;
     const float *                      cgw = nullptr;
     std::vector<AX_ENGINE_IO_BUFFER_T> cin, cout;
+    // the upstream rmsnorm_gemm head (role lm_head): a [8,K] bf16 hidden tile, norm_weight f32, NVFP4 b_t/b_scale
+    // and one f32 b_scale2; output the [8,N] f32 logits, of which the host keeps row 0
+    const kernel *                             nk = nullptr;
+    const ggml_tensor *                        nw = nullptr;
+    float                                      ns2 = 1.0f;
+    axera_cmm                                  na, nnorm, nbt, nbs, nbs2, nout;
+    const float *                              ngw = nullptr;
+    bool bind_norm_gemm(const kernel & lm, const ggml_tensor * output_weight, float scale2);
     // the same combined head for an MTP verify's four rows (role lm_head.verify; input m = the valid rows)
     const kernel *                     c4k = nullptr;
     axera_cmm                          c4norm, c4x, c4m, c4ids, c4top;
