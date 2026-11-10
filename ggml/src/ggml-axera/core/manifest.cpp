@@ -4,6 +4,7 @@
 
 #include <map>
 #include <set>
+#include <string>
 
 #include <sys/stat.h>
 #include <cstdint>
@@ -183,7 +184,9 @@ void kernel::run(std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_
     }
     axera_thermal_guard();
     tpre.stop();
-    axera_timer trun("kernel: RunSync");
+    // GGML_AXERA_PROF: one entry per role, so the prefill / decode / head split is visible
+    const std::string trun_name = g_axera_prof.on ? "kernel " + desc->role + ": RunSync" : std::string();
+    axera_timer       trun(trun_name.empty() ? nullptr : trun_name.c_str());
     const int ret  = AX_ENGINE_RunSync(handle, &io);
     trun.stop();
     if (ret != 0) {  // the IO the kernel got (stderr: the log is asynchronous)
