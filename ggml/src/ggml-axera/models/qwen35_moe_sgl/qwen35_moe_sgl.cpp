@@ -489,19 +489,23 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
                 const int64_t P = d.shape[1], R = d.shape[2] / 2;
                 GGML_ASSERT((size_t) R == rp.inv_freq.size() && d.dtype == 3);
                 memset(c->vir, 0, c->size);  // raw allocation: zero the alignment tail (this bank is not in the batch)
-                // every block reads its own [positions][ROT] slice of the bank: each needs the table from position 0
+                // every block reads its own [positions][ROT] slice of the bank from position 0: the slices are
+                // identical, so build one table and copy it (the trigonometric functions cost ~10 s for ten copies)
                 const int64_t B = d.shape[0];
                 GGML_ASSERT((size_t) B * P * 2 * R * sizeof(float) == c->size ||
                             (size_t) B * P * 2 * R * sizeof(float) <= c->size);
-                for (int64_t b = 0; b < B; ++b) {
-                    float * slice = (float *) c->vir + (size_t) b * P * 2 * R;
-                    for (int64_t q = 0; q < P; ++q) {
-                        for (int64_t i = 0; i < R; ++i) {
-                            const double th = (double) q * rp.freq_scale * rp.inv_freq[i];
-                            slice[q * 2 * R + i]     = (float) std::cos(th);
-                            slice[q * 2 * R + R + i] = (float) std::sin(th);
-                        }
+                axera_timer trope("fill: rope table");
+                std::vector<float> table((size_t) P * 2 * R);
+                axera_host_pool().run(P, [&](int64_t q) {
+                    float * row = table.data() + (size_t) q * 2 * R;
+                    for (int64_t i = 0; i < R; ++i) {
+                        const double th = (double) q * rp.freq_scale * rp.inv_freq[i];
+                        row[i]     = (float) std::cos(th);
+                        row[R + i] = (float) std::sin(th);
                     }
+                });
+                for (int64_t b = 0; b < B; ++b) {
+                    memcpy((float *) c->vir + (size_t) b * P * 2 * R, table.data(), table.size() * sizeof(float));
                 }
                 c->flush();
                 continue;
