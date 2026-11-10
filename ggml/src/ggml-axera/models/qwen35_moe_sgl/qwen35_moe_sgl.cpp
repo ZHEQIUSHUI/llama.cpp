@@ -326,6 +326,10 @@ class qwen35_moe_sgl final : public model {
     axera_cmm chain_tok, chain_h, chain_e[3], chain_hn[3], chain_ids, chain_dids;
     axera_cmm chain_pos, chain_pids, chain_indptr, chain_loc, chain_ntok;
     int                              mtp_kv_pages = 0;
+    int                              mtp_np = 0;
+    int                              mtp_cos_rows = 0;
+    size_t                           mtp_page_kv = 0;
+    size_t                           mtp_pool_bytes = 0;
     size_t                           mtp_kv_bytes = 0;
     const void *                     mtp_bound = nullptr;
 
@@ -408,6 +412,7 @@ class qwen35_moe_sgl final : public model {
     ggml_status  verify(const kv_view & kv, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h,
                         const std::vector<int> * out_rows, ggml_tensor * logits);
     void         init_mtp(const std::map<std::string, ggml_tensor *> & t, int il, const rope & rq);
+    void         mtp_validate_io(const mtp_call & mc, int rows, const char * what) const;
     void         bind_mtp_chain(const kernel & ck);
     ggml_status  compute_mtp(ggml_cgraph * g);
     void         paging(int64_t hist, int64_t write_cell);
@@ -3202,17 +3207,23 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
         const kernel & k8 = man.get("mtp.m8");
         GGML_ASSERT(k8.in_bytes("paged_kv") == k1.in_bytes("paged_kv"));
     }
-    const size_t mtp_page_kv = (size_t) 2 * PG * 2 * 256 * mtp_elem_b;
+    mtp_page_kv = (size_t) 2 * PG * 2 * 256 * mtp_elem_b;
     GGML_ASSERT(k1.in_bytes("paged_kv") % mtp_page_kv == 0);
-    const int mtp_np = (int) (k1.in_bytes("paged_kv") / mtp_page_kv);
-    mtp_kv_pages     = mtp_np;
+    mtp_np        = (int) (k1.in_bytes("paged_kv") / mtp_page_kv);
+    mtp_kv_pages  = mtp_np;
     if (kv_cells > 0) {
         mtp_kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(mtp_np, (kv_cells + PG - 1) / PG));
     }
     if (const char * e = getenv("GGML_AXERA_MTP_KV_PAGES")) {
         mtp_kv_pages = std::max(1, std::min(mtp_np, atoi(e)));
     }
-    mtp_kv_bytes = (size_t) mtp_kv_pages * mtp_page_kv;
+    mtp_kv_bytes   = (size_t) mtp_kv_pages * mtp_page_kv;
+    mtp_pool_bytes = (size_t) mtp_np * mtp_page_kv;
+    {
+        const size_t cos_bytes = k1.in_bytes("w_attn_cos_sin_cache");
+        GGML_ASSERT(cos_bytes % (64 * sizeof(float)) == 0);
+        mtp_cos_rows = (int) (cos_bytes / (64 * sizeof(float)));
+    }
     // one buffer per weight input, shared by t1 / m8 / prompt (they have the same layout)
     for (const auto & d : k1.desc->in) {
         if (d.name.rfind("w_", 0) == 0 && !mtp_w.count(d.name)) {
@@ -3404,13 +3415,13 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
                 GGML_ABORT("axera qwen35_moe_sgl: MTP: %s: unexpected input %s\n", k.desc->role.c_str(), d.name.c_str());
             }
             if (!*b) {
-                *b = axera_cmm_alloc(b == &MKV ? mtp_kv_bytes : d.bytes);
+                *b = axera_cmm_alloc(b == &MKV ? mtp_pool_bytes : d.bytes);
                 if (b == &MKV) {
                     memset((*b)->vir, 0, (*b)->size);
                     (*b)->flush();
                 }
             }
-            GGML_ASSERT(b == &MKV ? (*b)->size >= mtp_kv_bytes : (*b)->size >= d.bytes);
+            GGML_ASSERT((*b)->size >= d.bytes);
             mc.c.in.push_back(axera_io(*b, d.bytes));
         }
         for (const auto & d : k.desc->out) {
@@ -3420,13 +3431,13 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
                 GGML_ABORT("axera qwen35_moe_sgl: MTP: %s: unexpected output %s\n", k.desc->role.c_str(), d.name.c_str());
             }
             if (!*b) {
-                *b = axera_cmm_alloc(b == &MKV ? mtp_kv_bytes : d.bytes);
+                *b = axera_cmm_alloc(b == &MKV ? mtp_pool_bytes : d.bytes);
                 if (b == &MKV) {
                     memset((*b)->vir, 0, (*b)->size);
                     (*b)->flush();
                 }
             }
-            GGML_ASSERT(b == &MKV ? (*b)->size >= mtp_kv_bytes : (*b)->size >= d.bytes);
+            GGML_ASSERT((*b)->size >= d.bytes);
             mc.c.out.push_back(axera_io(*b, d.bytes));
         }
     };
@@ -3453,14 +3464,63 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
     } else if (man.has("mtp.m4")) {  // a 4-row catch-up variant (the board rejects the 8-row one)
         bind(mtp8, man.get("mtp.m4"));
     }
-    GGML_ASSERT(MKV && MKV->size >= mtp_kv_bytes && MINDICES &&
-                MINDICES->size >= k1.in_bytes("indices"));
-    GGML_LOG_INFO("axera qwen35_moe_sgl: MTP KV pool of %d of the kernels' %d pages, %.2f GiB\n", mtp_kv_pages,
-                  mtp_np, mtp_kv_bytes / 1073741824.0);
+    GGML_ASSERT(MKV && MKV->size >= mtp_pool_bytes && MINDICES &&
+                MINDICES->size >= (size_t) mtp_np * sizeof(int32_t));
+    GGML_LOG_INFO("axera qwen35_moe_sgl: MTP KV pool of %d of the kernels' %d pages, %.2f GiB (used %.2f GiB)\n",
+                  mtp_kv_pages, mtp_np, mtp_pool_bytes / 1073741824.0, mtp_kv_bytes / 1073741824.0);
     for (int i = 0; i < (int) (MINDICES->size / sizeof(int32_t)); ++i) {
         ((int32_t *) MINDICES->vir)[i] = i;
     }
     MINDICES->flush();
+}
+
+void qwen35_moe_sgl::mtp_validate_io(const mtp_call & mc, int rows, const char * what) const {
+    GGML_ASSERT(rows > 0 && mc.ntok && mc.indptr && mc.loc && mc.pos && mc.pids && MINDICES && MKV);
+    const auto * ntok = (const int32_t *) mc.ntok->vir;
+    const auto * ptr  = (const int32_t *) mc.indptr->vir;
+    const auto * loc  = (const int32_t *) mc.loc->vir;
+    const auto * pos  = (const int32_t *) mc.pos->vir;
+    const auto * pids = (const int32_t *) mc.pids->vir;
+    const auto * idx  = (const int32_t *) MINDICES->vir;
+    const int    n    = ntok[0];
+    const int    p0   = ptr[0];
+    const int    p1   = ptr[1];
+    auto fail = [&](const char * field, int row, int64_t value) {
+        GGML_ABORT("axera qwen35_moe_sgl: %s: %s[%d] = %lld is outside the MTP input contract\n", what, field, row,
+                   (long long) value);
+    };
+    if (n < 1 || n > rows) {
+        fail("ntok", 0, n);
+    }
+    if (p0 != 0 || p1 < 1 || p1 > mtp_np || p1 > mtp_kv_pages) {
+        fail("indptr", 1, p1);
+    }
+    for (int i = 0; i < p1; ++i) {
+        if (idx[i] != i) {
+            fail("indices", i, idx[i]);
+        }
+    }
+    for (int r = 0; r < rows; ++r) {
+        const int page = loc[2 * r], off = loc[2 * r + 1], cell = pos[r];
+        if (page < 0 || page >= p1 || page >= mtp_kv_pages) {
+            fail("cache_location.page", r, page);
+        }
+        if (off < 0 || off >= PG) {
+            fail("cache_location.offset", r, off);
+        }
+        if (cell < 0 || cell >= mtp_cos_rows || page != cell / PG || off != cell % PG) {
+            fail("positions", r, cell);
+        }
+        for (int s = 0; s < 3; ++s) {
+            const int p = pids[s * rows + r];
+            if (p < 0 || p >= mtp_cos_rows) {
+                fail("position_ids", s * rows + r, p);
+            }
+        }
+    }
+    if (p1 != loc[2 * (n - 1)] + 1) {
+        fail("indptr", 1, p1);
+    }
 }
 
 // The static draft chain shares the MTP weights, the draft-head tables and the single MTP KV pool with the row-wise
@@ -3503,9 +3563,8 @@ void qwen35_moe_sgl::bind_mtp_chain(const kernel & ck) {
         const bool host_in = d.name == "token_id" || d.name == "h0" || d.name == "positions" ||
                              d.name == "position_ids" || d.name == "indptr" || d.name == "cache_location" ||
                              d.name == "ntok";
-        // The MTP kernels describe the whole 1024-page pool in their IO table; the adapter may keep only the pages
-        // the context uses, as the row-wise kernels already do.
-        need(*b, b == &MKV ? mtp_kv_bytes : d.bytes, host_in);
+        need(*b, b == &MKV ? mtp_pool_bytes : d.bytes, host_in);
+        GGML_ASSERT(b->get()->size >= d.bytes);
         mtp_chain.in[ck.input(d.name)] = axera_io(*b, d.bytes);
     }
     for (const auto & d : ck.desc->out) {
@@ -3516,6 +3575,7 @@ void qwen35_moe_sgl::bind_mtp_chain(const kernel & ck) {
             GGML_ABORT("axera qwen35_moe_sgl: mtp.chain: unexpected output %s\n", d.name.c_str());
         }
         need(*b, d.bytes);
+        GGML_ASSERT(b->get()->size >= d.bytes);
         mtp_chain.out[ck.output(d.name)] = axera_io(*b, d.bytes);
     }
     memcpy(chain_dids->vir, head.dids.data(), head.dids.size() * sizeof(int32_t));
@@ -3743,6 +3803,23 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
                 chain_loc->flush();
                 chain_ntok->flush();
                 chain_pids->flush();
+                for (int r = 0; r < chain_n; ++r) {
+                    const int64_t c = cell_of(r);
+                    const int32_t page = ((const int32_t *) chain_loc->vir)[2 * r];
+                    const int32_t off  = ((const int32_t *) chain_loc->vir)[2 * r + 1];
+                    if (c < 0 || c >= mtp_cos_rows || page < 0 || page >= mtp_kv_pages || off < 0 || off >= PG ||
+                        page != c / PG || off != c % PG) {
+                        GGML_ABORT("axera qwen35_moe_sgl: mtp chain row %d has an invalid MTP cell %lld\n", r,
+                                   (long long) c);
+                    }
+                    for (int s = 0; s < 3; ++s) {
+                        const int32_t p = ((const int32_t *) chain_pids->vir)[s * 3 + r];
+                        if (p < 0 || p >= mtp_cos_rows) {
+                            GGML_ABORT("axera qwen35_moe_sgl: mtp chain position_ids[%d][%d] = %d is invalid\n", s, r,
+                                       p);
+                        }
+                    }
+                }
                 thost.stop();
                 {
                     axera_timer tb("mtp chain: one call");
@@ -3854,6 +3931,7 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
         }
         {
             axera_timer tb("mtp catch-up: block");
+            mtp_validate_io(mtp8, R8, "mtp catch-up");
             mtp8.c.k->run(mtp8.c.in, mtp8.c.out, mtp8.c.k->desc->role.c_str());
         }
         {
@@ -3876,6 +3954,7 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
                 set_ntok(mtp1.ntok, 1);
                 set_indptr(mtp1.indptr, cell_of(r));
             }
+            mtp_validate_io(mtp1, 1, "mtp t1");
             mtp1.c.k->run(mtp1.c.in, mtp1.c.out, "mtp t1");
             {
                 axera_timer thost("mtp host: read h (t1)");
@@ -3896,6 +3975,7 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
             fill_loc(mtpP.loc, P, it, n - 1, kv, cell_of);
             set_ntok(mtpP.ntok, n);
             set_indptr(mtpP.indptr, cell_of(it + n - 1));
+            mtp_validate_io(mtpP, P, "mtp prompt");
             mtpP.c.k->run(mtpP.c.in, mtpP.c.out, "mtp prompt");
             mtpP.hnext->invalidate(mtpP.hnext->vir, (size_t) n * H * sizeof(ggml_bf16_t));
             mtpP.hraw->invalidate(mtpP.hraw->vir, (size_t) n * H * sizeof(ggml_bf16_t));
