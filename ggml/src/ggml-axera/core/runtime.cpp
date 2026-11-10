@@ -308,7 +308,7 @@ void axera_cmm_memory(size_t * free, size_t * total) {
 axera_cmm axera_cmm_alloc(size_t size) {
     auto b  = std::make_unique<ggml_backend_axera_buffer_context>();
     b->size = GGML_PAD(std::max<size_t>(size, 1), AXERA_ALIGNMENT);
-    if (AX_SYS_MemAllocCached(&b->phy, &b->vir, (AX_U32) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera") != 0) {
+    if (axera_sdk::mem_alloc_cached(&b->phy, &b->vir, b->size, (const AX_S8 *) "ggml-axera") != 0) {
         GGML_ABORT("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
     }
     memset(b->vir, 0, b->size);
@@ -319,7 +319,7 @@ axera_cmm axera_cmm_alloc(size_t size) {
 axera_cmm axera_cmm_alloc_raw(size_t size) {
     auto b  = std::make_unique<ggml_backend_axera_buffer_context>();
     b->size = GGML_PAD(std::max<size_t>(size, 1), AXERA_ALIGNMENT);
-    if (AX_SYS_MemAllocCached(&b->phy, &b->vir, (AX_U32) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera") != 0) {
+    if (axera_sdk::mem_alloc_cached(&b->phy, &b->vir, b->size, (const AX_S8 *) "ggml-axera") != 0) {
         GGML_ABORT("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
     }
     return b;
@@ -329,7 +329,7 @@ axera_cmm axera_cmm_alloc_nc(size_t size) {
     auto b  = std::make_unique<ggml_backend_axera_buffer_context>();
     b->size = GGML_PAD(std::max<size_t>(size, 1), AXERA_ALIGNMENT);
     b->nc   = true;
-    if (AX_SYS_MemAlloc(&b->phy, &b->vir, (AX_U32) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera-nc") != 0) {
+    if (axera_sdk::mem_alloc(&b->phy, &b->vir, b->size, (const AX_S8 *) "ggml-axera-nc") != 0) {
         GGML_ABORT("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
     }
     return b;

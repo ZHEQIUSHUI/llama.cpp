@@ -12,6 +12,7 @@
 #include <ax_engine_api.h>
 #include <ax_sys_api.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -24,12 +25,75 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 inline constexpr size_t AXERA_ALIGNMENT = 128;
 // the largest single IO: AX_ENGINE_IO_BUFFER_T.nSize is AX_U32 on SDK 0.6.0 (/usr/local/axhelix/include/
 // ax_engine_type.h:243), so a single IO can be at most 4 GiB - 1 byte
 inline constexpr size_t AXERA_IO_MAX = ((size_t) 4 << 30) - 1;
+
+// The SDK's memory APIs took AX_U32 sizes before 0.6.0 and take AX_U64 from 0.6.0 on (ax_sys_api.h:378/403/520/535
+// on the board); the engine's IO descriptor (ax_engine_type.h) is AX_U32 in both. Detect the header's parameter
+// width: with the 64-bit header a buffer above 4 GiB is allocated and maintained in one call, with the old header it
+// is refused (allocation) or split into <= 4 GiB cache operations (maintenance), never truncated.
+namespace axera_sdk {
+template <typename T> struct fn_third_argument;
+template <typename R, typename A, typename B, typename S, typename... Rest>
+struct fn_third_argument<R (*)(A, B, S, Rest...)> {
+    using type = S;
+};
+inline constexpr bool wide_alloc =
+    std::is_same<typename fn_third_argument<decltype(&AX_SYS_MemAllocCached)>::type, AX_U64>::value;
+inline constexpr bool wide_cache =
+    std::is_same<typename fn_third_argument<decltype(&AX_SYS_MflushCache)>::type, AX_U64>::value;
+
+inline AX_S32 mem_alloc_cached(AX_U64 * phy, AX_VOID ** vir, size_t n, const AX_S8 * tag) {
+    if constexpr (wide_alloc) {
+        return AX_SYS_MemAllocCached(phy, vir, (AX_U64) n, AXERA_ALIGNMENT, tag);
+    } else {
+        GGML_ASSERT(n <= UINT32_MAX);
+        return AX_SYS_MemAllocCached(phy, vir, (AX_U32) n, AXERA_ALIGNMENT, tag);
+    }
+}
+
+inline AX_S32 mem_alloc(AX_U64 * phy, AX_VOID ** vir, size_t n, const AX_S8 * tag) {
+    if constexpr (wide_alloc) {
+        return AX_SYS_MemAlloc(phy, vir, (AX_U64) n, AXERA_ALIGNMENT, tag);
+    } else {
+        GGML_ASSERT(n <= UINT32_MAX);
+        return AX_SYS_MemAlloc(phy, vir, (AX_U32) n, AXERA_ALIGNMENT, tag);
+    }
+}
+
+inline void flush_cache(AX_U64 phy, void * p, size_t n) {
+    if (n == 0) {
+        return;
+    }
+    if constexpr (wide_cache) {
+        AX_SYS_MflushCache(phy, p, (AX_U64) n);
+    } else {
+        for (size_t off = 0; off < n; off += ((size_t) 1 << 30)) {
+            const size_t c = std::min<size_t>(n - off, (size_t) 1 << 30);
+            AX_SYS_MflushCache(phy + off, (char *) p + off, (AX_U32) c);
+        }
+    }
+}
+
+inline void invalidate_cache(AX_U64 phy, void * p, size_t n) {
+    if (n == 0) {
+        return;
+    }
+    if constexpr (wide_cache) {
+        AX_SYS_MinvalidateCache(phy, p, (AX_U64) n);
+    } else {
+        for (size_t off = 0; off < n; off += ((size_t) 1 << 30)) {
+            const size_t c = std::min<size_t>(n - off, (size_t) 1 << 30);
+            AX_SYS_MinvalidateCache(phy + off, (char *) p + off, (AX_U32) c);
+        }
+    }
+}
+}  // namespace axera_sdk
 
 // the backend's buffers (CMM, or the mapped GGUF): ggml-axera-buffer.cpp
 bool ggml_backend_buffer_is_axera(struct ggml_backend_buffer * buffer);
@@ -85,8 +149,8 @@ struct ggml_backend_axera_buffer_context {
     ~ggml_backend_axera_buffer_context() {
         if (vir && !view) {
             if (!nc && size) {  // no dirty line of ours may reach the memory after its next owner (the engine) writes it
-                AX_SYS_MflushCache(phy, vir, (AX_U32) size);
-                AX_SYS_MinvalidateCache(phy, vir, (AX_U32) size);
+                axera_sdk::flush_cache(phy, vir, size);
+                axera_sdk::invalidate_cache(phy, vir, size);
             }
             AX_SYS_MemFree(phy, vir);
         }
@@ -96,13 +160,13 @@ struct ggml_backend_axera_buffer_context {
 
     void flush(void * p, size_t n) const {
         if (n && !nc) {
-            AX_SYS_MflushCache(phy_of(p), p, (AX_U32) n);
+            axera_sdk::flush_cache(phy_of(p), p, n);
         }
     }
 
     void invalidate(void * p, size_t n) const {
         if (n && !nc) {
-            AX_SYS_MinvalidateCache(phy_of(p), p, (AX_U32) n);
+            axera_sdk::invalidate_cache(phy_of(p), p, n);
         }
     }
 
