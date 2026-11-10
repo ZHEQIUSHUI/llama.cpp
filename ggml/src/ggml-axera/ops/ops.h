@@ -131,6 +131,10 @@ struct output_head {
     // directly, so a decode saves the host final norm, the bf16 conversion and the hidden-row cache round trip
     const kernel *                             fk = nullptr;
     axera_cmm                                  fkw;  // the final norm weight, f32
+    // the same upstream kernel (sgl_kernel_axera.gemm.rmsnorm_gemm_kernel): NVFP4 weights instead of MXFP4,
+    // R rows per call, its own global scale and the untied E4M3 block scales
+    axera_cmm                                  nq, ns, ns2, nx, ny;
+    int                                        nR = 0;
     const float *                              fgw = nullptr;
     std::vector<AX_ENGINE_IO_BUFFER_T>         fin, fout;
     // The combined output head (role lm_head): final RMSNorm + projection + greedy argmax. It always writes the full

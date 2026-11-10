@@ -27,8 +27,9 @@
 #include <vector>
 
 inline constexpr size_t AXERA_ALIGNMENT = 128;
-// the largest single IO: the runtime's size field overflows at 2 GiB (packs are split well below it)
-inline constexpr size_t AXERA_IO_MAX = (size_t) 2 << 30;
+// the largest single IO: AX_ENGINE_IO_BUFFER_T.nSize is AX_U32 on SDK 0.6.0 (/usr/local/axhelix/include/
+// ax_engine_type.h:243), so a single IO can be at most 4 GiB - 1 byte
+inline constexpr size_t AXERA_IO_MAX = ((size_t) 4 << 30) - 1;
 
 // the backend's buffers (CMM, or the mapped GGUF): ggml-axera-buffer.cpp
 bool ggml_backend_buffer_is_axera(struct ggml_backend_buffer * buffer);

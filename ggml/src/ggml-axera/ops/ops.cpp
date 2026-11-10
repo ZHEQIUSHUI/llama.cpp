@@ -511,19 +511,60 @@ void output_head::bind_topk(const kernel & lm) {
 }
 
 bool output_head::bind_fused(const kernel & lm, const ggml_tensor * output_weight) {
-    if (!k || w != output_weight || !mx4) {
+    // the NVFP4 (sglang rmsnorm_gemm) variant needs no MXFP4 conversion state from bind()
+    const bool nv4_in = lm.find_input("b_scale2") >= 0;
+    if (!nv4_in && (!k || w != output_weight)) {
         return false;
     }
+    if (nv4_in && nR > 0 && fk == &lm && w == output_weight) {
+        return true;  // already bound: the NVFP4 conversion of the whole head runs once
+    }
+    w = output_weight;
     const int64_t N = w->ne[1], K = w->ne[0];
     if (lm.find_input("a") < 0 || lm.find_input("norm_weight") < 0 || lm.find_input("b_t") < 0 ||
         lm.find_input("b_scale") < 0 || lm.find_output("output") < 0) {
         return false;
+    }
+    // sglang's non-greedy logits kernel: rmsnorm_gemm_kernel[4, 4](hidden[n-1 : n+7], norm, head, None, None,
+    // logits, LM_HEAD_TILE, eps, w_scale, weight_scale_2) - bf16 rows in, raw (pre-norm) hidden, NVFP4 b_t.
+    const int R = (int) (lm.in_bytes("a") / (K * sizeof(ggml_bf16_t)));
+    const bool nv4 = lm.find_input("b_scale2") >= 0;
+    if (nv4) {
+        if (R < 1 || lm.in_bytes("norm_weight") != (uint32_t) (K * sizeof(float)) ||
+            lm.in_bytes("b_t") != (uint32_t) (N * K / 2) || lm.in_bytes("b_scale") != (uint32_t) (N * K / 16) ||
+            lm.in_bytes("b_scale2") != sizeof(float) || lm.out_bytes("output") != (uint32_t) (R * N * sizeof(float))) {
+            return false;
+        }
+        axera_nv4 qs = axera_quantize_nvfp4_rows(w, 0, N);
+        nq   = std::move(qs.q);
+        ns   = std::move(qs.s);
+        ns2  = axera_cmm_alloc(sizeof(float));
+        *(float *) ns2->vir = qs.scale2;
+        ns2->flush();
+        nR   = R;
+        nx   = axera_cmm_alloc((size_t) R * K * sizeof(ggml_bf16_t));
+        ny   = axera_cmm_alloc((size_t) R * N * sizeof(float));
+        axera_drop_mapped(w, true);
+        fk = &lm;
+        if (!fkw) {
+            fkw = axera_cmm_alloc((size_t) K * sizeof(float));
+        }
+        fin.assign(fk->info->nInputSize, AX_ENGINE_IO_BUFFER_T{});
+        fout.assign(fk->info->nOutputSize, AX_ENGINE_IO_BUFFER_T{});
+        fin[fk->input("norm_weight")] = axera_io(fkw, (size_t) K * sizeof(float));
+        fin[fk->input("b_t")]         = axera_io(nq, (size_t) N * K / 2);
+        fin[fk->input("b_scale")]     = axera_io(ns, (size_t) N * K / 16);
+        fin[fk->input("b_scale2")]    = axera_io(ns2, sizeof(float));
+        fout[fk->output("output")]    = axera_io(ny, (size_t) R * N * sizeof(float));
+        fgw  = nullptr;
+        return true;
     }
     if (lm.in_bytes("a") != (uint32_t) (K * sizeof(ggml_bf16_t)) || lm.in_bytes("norm_weight") != (uint32_t) (K * sizeof(float)) ||
         lm.in_bytes("b_t") != (uint32_t) (N * K / 2) || lm.in_bytes("b_scale") != (uint32_t) (N * K / AXERA_MX_GROUP) ||
         lm.out_bytes("output") != (uint32_t) (N * sizeof(float))) {
         return false;
     }
+    nR = 0;
     fk = &lm;
     if (!fkw) {
         fkw = axera_cmm_alloc((size_t) K * sizeof(float));
@@ -823,14 +864,39 @@ void output_head::run_fused(ggml_cgraph * g, const graph_names & names, const ax
     }
     auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
     float * o   = (float *) logits->data;
-    fin[fk->input("a")]         = axera_io(xb, (size_t) K * sizeof(ggml_bf16_t));
-    fout[fk->output("output")] = axera_io(dctx, o, (size_t) N * sizeof(float));
-    ts.stop();
-    axera_timer tl("lm_head (fused)");
-    fk->run(fin, fout, "output head (fused)");
-    tl.stop();
+    if (nR > 0) {  // the upstream rmsnorm_gemm kernel: R rows, the row is written at row 0
+        xb->invalidate(xb->vir, (size_t) K * sizeof(ggml_bf16_t));  // the decode kernel wrote it on the NPU
+        memcpy(nx->vir, xb->vir, (size_t) K * sizeof(ggml_bf16_t));
+        if (nR > 1) {
+            memset((char *) nx->vir + K * sizeof(ggml_bf16_t), 0, (size_t) (nR - 1) * K * sizeof(ggml_bf16_t));
+        }
+        nx->flush();
+        fin[fk->input("a")] = axera_io(nx, (size_t) nR * K * sizeof(ggml_bf16_t));
+        ts.stop();
+        axera_timer tl("lm_head (fused)");
+        fk->run(fin, fout, "output head (fused)");
+        tl.stop();
+        ny->invalidate(ny->vir, (size_t) nR * N * sizeof(float));  // written on the NPU
+        memcpy(o, ny->vir, (size_t) N * sizeof(float));
+        dctx->flush(o, (size_t) N * sizeof(float));  // the host wrote the logits row
+        if (getenv("GGML_AXERA_HEAD_TRACE")) {
+            fprintf(stderr, "head nv4 fused: a0=%g o0=%g o1=%g o2=%g s2=%g q0=%u s0=%u\n",
+                    (double) ggml_bf16_to_fp32(((ggml_bf16_t *) nx->vir)[0]), (double) o[0], (double) o[1],
+                    (double) o[2], (double) *(float *) ns2->vir, (unsigned) ((uint8_t *) nq->vir)[0],
+                    (unsigned) ((uint8_t *) ns->vir)[0]);
+        }
+    } else {
+        fin[fk->input("a")]        = axera_io(xb, (size_t) K * sizeof(ggml_bf16_t));
+        fout[fk->output("output")] = axera_io(dctx, o, (size_t) N * sizeof(float));
+        ts.stop();
+        axera_timer tl("lm_head (fused)");
+        fk->run(fin, fout, "output head (fused)");
+        tl.stop();
+    }
     axera_timer ti("lm_head (fused): invalidate");
-    dctx->invalidate(o, (size_t) N * sizeof(float));
+    if (nR == 0) {  // the kernel wrote the logits directly; above, the host copied them out
+        dctx->invalidate(o, (size_t) N * sizeof(float));
+    }
     ti.stop();
     dctx->clean_p     = o;
     dctx->clean_n     = (size_t) N * sizeof(float);
@@ -1091,6 +1157,44 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         ((ggml_backend_axera_buffer_context *) rn->buffer->context)->flush(rn->data, ggml_nbytes(rn));
     }
     auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+    if (nR > 0) {  // the upstream rmsnorm_gemm head: raw hidden rows, the kernel's own final norm
+        GGML_ASSERT(logits->nb[1] == N * sizeof(float));
+        if (gw != fgw) {  // the kernel applies the final norm itself
+            memcpy(fkw->vir, gw, (size_t) K * sizeof(float));
+            fkw->flush();
+            fgw = gw;
+        }
+        for (int r = 0; r < n_out; ++r) {
+            const float * xr = h.data() + (size_t) (compact_rows ? r : rows[r]) * K;
+            ggml_fp32_to_bf16_row(xr, (ggml_bf16_t *) nx->vir, (int) K);
+            if (nR > 1) {  // sglang pads the tile's spare rows with the last row
+                for (int q = 1; q < nR; ++q) {
+                    memcpy((char *) nx->vir + (size_t) q * K * sizeof(ggml_bf16_t), nx->vir,
+                           (size_t) K * sizeof(ggml_bf16_t));
+                }
+            }
+            nx->flush();
+            fin[fk->input("a")] = axera_io(nx, (size_t) nR * K * sizeof(ggml_bf16_t));
+            {
+                axera_timer tk("lm_head (nvfp4 rmsnorm_gemm)");
+                fk->run(fin, fout, "output head (prompt)");
+                tk.stop();
+            }
+            ny->invalidate(ny->vir, (size_t) nR * N * sizeof(float));  // written on the NPU
+            float * o = (float *) ((char *) logits->data + (size_t) r * logits->nb[1]);
+            memcpy(o, ny->vir, (size_t) N * sizeof(float));
+            dctx->flush(o, (size_t) N * sizeof(float));  // the host wrote the logits row
+            if (getenv("GGML_AXERA_HEAD_TRACE")) {
+                fprintf(stderr, "head nv4 run r=%d: xr0=%g o0=%g o1=%g\n", r, (double) xr[0], (double) o[0],
+                        (double) o[1]);
+            }
+        }
+        dctx->clean_p     = (float *) logits->data;
+        dctx->clean_n     = (size_t) n_out * N * sizeof(float);
+        dctx->clean_epoch = axera_graph_epoch;
+        after(g, names);
+        return;
+    }
     // the fused head: the decode row(s) through lm_head.topk, which applies the host sampler's penalty state and keeps
     // the exact top-K, so common/sampling can run the chain on K candidates instead of the vocabulary. A verification
     // batch fills all of the kernel's rows in one call (m: the valid ones).
