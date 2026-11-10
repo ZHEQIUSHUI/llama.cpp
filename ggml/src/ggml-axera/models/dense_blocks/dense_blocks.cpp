@@ -533,8 +533,9 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
             one->flush();
             c = std::move(one);
         }
+        const size_t csize = c->size;
         banks[d.name] = std::move(c);
-        GGML_ASSERT(c->size == (size_t) (shared ? d.bytes : d.bytes * NC));
+        GGML_ASSERT(csize == (size_t) (shared ? d.bytes : d.bytes * NC));
     }
 
     // the four phase banks above are one layer each: the state/conv-state pools hold every block's three layers
