@@ -485,15 +485,22 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
                 n == "kv") {
                 continue;  // the state pools: zero
             }
-            if (n == "cos_sin_cache") {  // [positions][cos | sin of ROT / 2] f32
+            if (n == "cos_sin_cache") {  // [blocks][positions][cos | sin of ROT / 2] f32
                 const int64_t P = d.shape[1], R = d.shape[2] / 2;
                 GGML_ASSERT((size_t) R == rp.inv_freq.size() && d.dtype == 3);
                 memset(c->vir, 0, c->size);  // raw allocation: zero the alignment tail (this bank is not in the batch)
-                for (int64_t q = 0; q < P; ++q) {
-                    for (int64_t i = 0; i < R; ++i) {
-                        const double th = (double) q * rp.freq_scale * rp.inv_freq[i];
-                        ((float *) c->vir)[q * 2 * R + i]     = (float) std::cos(th);
-                        ((float *) c->vir)[q * 2 * R + R + i] = (float) std::sin(th);
+                // every block reads its own [positions][ROT] slice of the bank: each needs the table from position 0
+                const int64_t B = d.shape[0];
+                GGML_ASSERT((size_t) B * P * 2 * R * sizeof(float) == c->size ||
+                            (size_t) B * P * 2 * R * sizeof(float) <= c->size);
+                for (int64_t b = 0; b < B; ++b) {
+                    float * slice = (float *) c->vir + (size_t) b * P * 2 * R;
+                    for (int64_t q = 0; q < P; ++q) {
+                        for (int64_t i = 0; i < R; ++i) {
+                            const double th = (double) q * rp.freq_scale * rp.inv_freq[i];
+                            slice[q * 2 * R + i]     = (float) std::cos(th);
+                            slice[q * 2 * R + R + i] = (float) std::sin(th);
+                        }
                     }
                 }
                 c->flush();
@@ -2788,17 +2795,22 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
     }());
     put_bf16("w_attn_k_norm", f32_of(T("attn_k_norm.weight")));
 
-    // the rotary table: [max positions][cos | sin of ROT / 2] f32, theta and freq scale of the graph's ROPE node
+    // the rotary table: [blocks][max positions][cos | sin of ROT / 2] f32, theta and freq scale of the graph's ROPE
+    // node. Each block's bank slice starts at position 0 (block_layer selects bank[block_index]).
     {
         const int64_t R = (int64_t) rq.inv_freq.size();
-        GGML_ASSERT(R == 32 && Wn("w_attn_cos_sin_cache")->size % (2 * R * sizeof(float)) == 0);
-        const int64_t P = (int64_t) (Wn("w_attn_cos_sin_cache")->size / (2 * R * sizeof(float)));
-        float *       d = (float *) W("w_attn_cos_sin_cache")->vir;
-        for (int64_t q = 0; q < P; ++q) {
-            for (int64_t i = 0; i < R; ++i) {
-                const double th = (double) q * rq.freq_scale * rq.inv_freq[i];
-                d[q * 2 * R + i]     = (float) std::cos(th);
-                d[q * 2 * R + R + i] = (float) std::sin(th);
+        GGML_ASSERT(R == 32 && Wn("w_attn_cos_sin_cache")->size % ((size_t) NB * 2 * R * sizeof(float)) == 0);
+        const int64_t P = (int64_t) (Wn("w_attn_cos_sin_cache")->size / ((size_t) NB * 2 * R * sizeof(float)));
+        GGML_ASSERT(P == man.context);
+        float * d = (float *) W("w_attn_cos_sin_cache")->vir;
+        for (int64_t b = 0; b < NB; ++b) {
+            float * slice = d + (size_t) b * P * 2 * R;
+            for (int64_t q = 0; q < P; ++q) {
+                for (int64_t i = 0; i < R; ++i) {
+                    const double th = (double) q * rq.freq_scale * rq.inv_freq[i];
+                    slice[q * 2 * R + i]     = (float) std::cos(th);
+                    slice[q * 2 * R + R + i] = (float) std::sin(th);
+                }
             }
         }
     }

@@ -120,6 +120,8 @@ axera_cmm axera_cmm_view(const ggml_backend_axera_buffer_context * b, size_t off
 // a kernel IO entry over p (within ctx)
 AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, void * p, uint32_t size);
 inline AX_ENGINE_IO_BUFFER_T axera_io(const axera_cmm & c, size_t size) {
+    // AX_ENGINE_IO_BUFFER_T.nSize is AX_U32 (SDK 0.6.0), so a larger IO cannot be described
+    GGML_ASSERT(size <= AXERA_IO_MAX);
     return axera_io(c.get(), c->vir, (uint32_t) size);
 }
 inline AX_ENGINE_IO_BUFFER_T axera_io(const axera_cmm & c) {
