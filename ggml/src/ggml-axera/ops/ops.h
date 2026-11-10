@@ -177,6 +177,10 @@ struct output_head {
     static int full_row_cb(void * ud, int32_t idx, float * out, int32_t n) {
         return static_cast<output_head *>(ud)->full_row(idx, out, n);
     }
+    // a whole decode kernel's (role decode.greedy) logits row and its (id, logit): copy the row into the graph's
+    // logits and publish the id so a greedy sampler skips the full-row scan
+    void write_greedy(ggml_cgraph * g, const graph_names & names, const axera_cmm & logits_buf,
+                      const axera_cmm & words);
     // the logits the caller wrote (a whole-model kernel's) into the graph's: the sampler nodes after them
     static void after(ggml_cgraph * g, const graph_names & names);
 };

@@ -239,6 +239,12 @@ class qwen35_moe_sgl final : public model {
     axera_cmm                        ST2, CQ2, CK2, CV2;  // the second recurrent-state set (prefill outputs)
     axera_cmm                        ONES, ZERO;           // global scales (1) and zero points (0) of the prefill kernels
     call                             dec;
+    // role decode.greedy (the upstream whole decode kernel): embedding + blocks + final norm + lm_head + argmax.
+    // Its weight inputs share the decode banks and the head's NVFP4 conversion; only its activation rows differ.
+    call                             gdec;
+    std::array<int, 4>               gdec_state = { -1, -1, -1, -1 };
+    bool                             gdec_ready = false;
+    axera_cmm                        GTOKIN, GTOKOUT, GHID, GOUT, GLOG;
     call                             ver;  // role decode.verify: four rows, one rank-1 delta per row
     call                             app;  // role gdn.apply: advance the recurrent state by accepted deltas
     axera_cmm                        VX, VOUT, VPOSN, VPIDS, VINDPTR, VLOC, VNT, VNPREV, VST0, VROUTE;
@@ -385,7 +391,8 @@ class qwen35_moe_sgl final : public model {
     void         prefill_new(int64_t c0, int n, const ggml_bf16_t * x, const float * xf, size_t xf_nb1,
                              const int32_t * toks, const int32_t * p4, std::vector<float> & h,
                              const std::vector<int> & out_rows);
-    void         decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h);
+    bool         bind_greedy(const kernel & gk);
+    void         decode(int64_t c, const ggml_bf16_t * x, int32_t token, const int32_t * p4, float * h);
     void         prewarm(ggml_cgraph * g) override;
 };
 
@@ -1171,6 +1178,9 @@ void qwen35_moe_sgl::states_swap() {
             }
         };
         rebind(dec.in);
+        if (gdec.k) {
+            rebind(gdec.in);
+        }
         if (ver.k) {
             rebind(ver.in);
             rebind(app.in);
@@ -1196,6 +1206,9 @@ void qwen35_moe_sgl::sync_dec_states() {
         }
     };
     update(dec, dec_state);
+    if (gdec.k) {
+        update(gdec, gdec_state);
+    }
     dec_state_dirty = false;
 }
 
@@ -1275,6 +1288,9 @@ void qwen35_moe_sgl::bind_state() {
         }
     };
     rebind(dec);
+    if (gdec.k) {
+        rebind(gdec);
+    }
     if (ver.k) {
         rebind(ver);
     }
@@ -2200,8 +2216,84 @@ void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const flo
     return prefill_new(c0, n, x, xf, xf_nb1, toks, p4, h, out_rows);
 }
 
+// Bind the upstream whole decode kernel (sgl_kernel_axera.models.qwen36_35b_a3b.decode_qwen35_greedy) to the same
+// banks the decode kernel uses. Its extra inputs are the head's already-quantized NVFP4 banks (head.nq / ns / ns2 and
+// the final-norm row head.fkw), the loader's bf16 embedding table and this adapter's activation scratch. Called after
+// output_head::bind_fused has converted the LM head once.
+bool qwen35_moe_sgl::bind_greedy(const kernel & gk) {
+    if (!emb || !EMBW || !head.fk || !head.nq || !head.ns || !head.ns2 || !head.fkw) {
+        return false;
+    }
+    // Allocate the extra activation rows only for a greedy request: a non-greedy run must keep exactly the decode
+    // kernel's CMM layout.
+    if (!GLOG) {  // scratch the kernels overwrite: the cached allocator's zero + flush of 8 MB is not needed
+        GTOKIN  = axera_cmm_alloc_raw(gk.in_bytes("token_ids"));
+        GTOKOUT = axera_cmm_alloc_raw(gk.out_bytes("next_token_words"));
+        GHID    = axera_cmm_alloc_raw(gk.in_bytes("hidden_buffer"));
+        GOUT    = axera_cmm_alloc_raw(gk.in_bytes("output_buffer"));
+        GLOG    = axera_cmm_alloc_raw(gk.in_bytes("logits_buffer"));
+    }
+    gdec       = {};
+    gdec.k     = &gk;
+    gdec_state = { -1, -1, -1, -1 };
+    auto sized = [&](const std::string & n, const axera_cmm & b, uint32_t bytes) {
+        if ((size_t) bytes > b->size) {
+            GGML_ABORT("axera qwen35_moe_sgl: decode.greedy input %s is %u bytes, the bank has %zu\n", n.c_str(), bytes,
+                       (size_t) b->size);
+        }
+        return axera_io(b, bytes);
+    };
+    for (const auto & d : gk.desc->in) {
+        const std::string & n = d.name;
+        const int           st = state_kind(n);
+        if (st >= 0 && n == STATE_BANK[st]) {
+            gdec_state[st] = (int) gdec.in.size();
+            gdec.in.push_back(axera_io(B(n), d.bytes));
+            continue;
+        }
+        if (n == "indptr") {
+            gdec.in.push_back(axera_io(META.get(), (char *) META->vir + META_INDPTR, d.bytes));
+        } else if (n == "last_page_len") {
+            gdec.in.push_back(axera_io(META.get(), (char *) META->vir + META_LASTLEN, d.bytes));
+        } else if (n == "cache_location") {
+            gdec.in.push_back(axera_io(META.get(), (char *) META->vir + META_CLOC, d.bytes));
+        } else if (n == "token_ids") {
+            gdec.in.push_back(sized(n, GTOKIN, d.bytes));
+        } else if (n == "embedding_weight") {
+            gdec.in.push_back(sized(n, EMBW, d.bytes));
+        } else if (n == "hidden_buffer") {
+            gdec.in.push_back(sized(n, GHID, d.bytes));
+        } else if (n == "output_buffer") {
+            gdec.in.push_back(sized(n, GOUT, d.bytes));
+        } else if (n == "logits_buffer") {
+            gdec.in.push_back(sized(n, GLOG, d.bytes));
+        } else if (n == "lm_norm_weight") {
+            gdec.in.push_back(sized(n, head.fkw, d.bytes));
+        } else if (n == "lm_head_weight") {
+            gdec.in.push_back(sized(n, head.nq, d.bytes));
+        } else if (n == "lm_head_scale") {
+            gdec.in.push_back(sized(n, head.ns, d.bytes));
+        } else if (n == "lm_head_scale2") {
+            gdec.in.push_back(sized(n, head.ns2, d.bytes));
+        } else if (n == "position_ids") {
+            gdec.in.push_back(axera_io(DPOS, d.bytes));
+        } else if (n == "indices") {
+            gdec.in.push_back(axera_io(INDICES, d.bytes));
+        } else {
+            gdec.in.push_back(axera_io(B(n), d.bytes));
+        }
+    }
+    for (const auto & d : gk.desc->out) {
+        if (d.name != "next_token_words") {
+            GGML_ABORT("axera qwen35_moe_sgl: decode.greedy output %s\n", d.name.c_str());
+        }
+        gdec.out.push_back(sized(d.name, GTOKOUT, d.bytes));
+    }
+    return true;
+}
+
 // one token at cell c > 0, its history the c cells before it
-void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h) {
+void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, int32_t token, const int32_t * p4, float * h) {
     {
         axera_timer ts("decode host: sync states");
         sync_dec_states();
@@ -2209,7 +2301,13 @@ void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4
     if (c % PG == 0) {  // a page's first cell: its state plus page_x replay any later prompt in this page
         save_state(c);
     }
-    if (x) {
+    const bool greedy = token >= 0 && gdec.k != nullptr;
+    if (greedy) {  // the whole decode kernel gathers the token's embedding on the NPU
+        axera_timer tx("decode host: token");
+        GGML_ASSERT(x || token >= 0);
+        memcpy(GTOKIN->vir, &token, sizeof(int32_t));
+        GTOKIN->flush(GTOKIN->vir, sizeof(int32_t));
+    } else if (x) {
         axera_timer tx("decode host: x");
         memcpy(DX->vir, x, H * sizeof(ggml_bf16_t));
         DX->flush();
@@ -2229,7 +2327,8 @@ void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4
     }
     {
         axera_timer tl("layers (decode)");
-        call * dc = &dec;
+        call * dc = greedy ? &gdec : &dec;
+        const char * what = greedy ? "decode greedy" : "decode";
         static const void * last_kernel = nullptr;
         if (last_kernel != dc->k) {
             GGML_LOG_INFO("axera qwen35_moe_sgl: decode cell %lld uses %s (%u pages)\n", (long long) c,
@@ -2237,7 +2336,7 @@ void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4
             last_kernel = dc->k;
         }
         static const bool dec_twice = getenv("GGML_AXERA_DECODE_TWICE") != nullptr;
-        dc->k->run(dc->in, dc->out, "decode");
+        dc->k->run(dc->in, dc->out, what);
         if (dec_twice) {
             static int64_t n = 0, us = 0;
             const auto     t0 = std::chrono::steady_clock::now();
@@ -2251,8 +2350,13 @@ void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4
     {
         axera_timer to("decode host: output");
         if (h) {  // (a fused head reads the bf16 row on the NPU)
-            DOUT->invalidate(DOUT->vir, H * sizeof(ggml_bf16_t));
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) DOUT->vir, h, H);
+            const axera_cmm & hb = greedy ? GOUT : DOUT;
+            hb->invalidate(hb->vir, H * sizeof(ggml_bf16_t));
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) hb->vir, h, H);
+        }
+        if (!x) {  // the greedy kernel did not need the host row, but page replay still does
+            GGML_ASSERT(EMBW);
+            x = (const ggml_bf16_t *) EMBW->vir + (size_t) token * H;
         }
         page_x.insert(page_x.end(), x, x + H);
         page_p.insert(page_p.end(), p4, p4 + 4);
@@ -2321,6 +2425,7 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     // backend (0.18 ms/token, measured); the one-row NPU gather costs more (0.32 ms). Read the bf16 copy the loader
     // already keeps on the NPU (EMBW) directly instead: one 4 KiB memcpy.
     const bool cpu_embed = npu_emb && T == 1;
+    const int32_t dec_token = npu_emb ? ((const int32_t *) inp_tokens->data)[0] : -1;
     std::vector<ggml_bf16_t> xb1;
     bool direct_embed = false;
     if (!npu_emb || cpu_embed) {
@@ -2461,6 +2566,36 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             }
         }
         fused_dec = fh_ok && head.fused_ready(g, names);
+    }
+    // the upstream whole decode path: decode_qwen35_greedy. It needs the LM head's NVFP4 conversion (bind_fused
+    // above) and the bf16 embedding table. A pure greedy sampler (llama.cpp's backend argmax) asks for it; every
+    // other decode keeps the blocks kernel + lm_head.gemm, exactly as upstream's non-greedy branch does.
+    static const bool greedy_off = [] {
+        const char * e = getenv("GGML_AXERA_GREEDY_DECODE");
+        return e && strcmp(e, "0") == 0;
+    }();
+    if (!greedy_off && !gdec.k && man.has("decode.greedy") && n_out == 1 && T == 1 && head.fk &&
+        axera::argmax_wanted()) {
+        gdec_ready = bind_greedy(man.get("decode.greedy"));
+        if (!gdec_ready) {
+            GGML_LOG_WARN("axera qwen35_moe_sgl: decode.greedy could not be bound; keeping decode + lm_head.gemm\n");
+        }
+    }
+    bool greedy_dec = gdec_ready && T == 1 && n_out == 1 && dec_token >= 0 && axera::argmax_wanted();
+    if (greedy_dec) {
+        axera_timer tn("decode greedy: norm row");
+        ggml_tensor * hn2 = logits->src[1];
+        while (hn2->op == GGML_OP_GET_ROWS || hn2->op == GGML_OP_VIEW || hn2->op == GGML_OP_RESHAPE) {
+            hn2 = hn2->src[0];
+        }
+        float         eps;
+        const float * gw = final_norm(hn2, H, &eps);
+        GGML_ASSERT(gw && eps == 1e-6f && head.fkw);
+        if (head.fgw != gw) {
+            memcpy(head.fkw->vir, gw, (size_t) H * sizeof(float));
+            head.fkw->flush();
+            head.fgw = gw;
+        }
     }
     const int64_t ct_bind = ct_on ? ggml_time_us() : 0;
     axera_timer        tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
@@ -2605,9 +2740,12 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
         }
         materialize_deltas();
         const bool direct_x = combined_dec && T == 1 && n_out == 1;
-        float * hd = need_hn ? hnext.data() : ((fused_dec || direct_x) ? nullptr : h.data());
-        if (direct_embed) {
-            decode(c0, xb1.data(), pb.data(), hd);
+        float * hd = need_hn ? hnext.data() : ((fused_dec || direct_x || greedy_dec) ? nullptr : h.data());
+        if (greedy_dec) {
+            GGML_ASSERT(xb1.size() == (size_t) H);  // page replay needs the row the kernel gathers itself
+            decode(c0, xb1.data(), dec_token, pb.data(), hd);
+        } else if (direct_embed) {
+            decode(c0, xb1.data(), -1, pb.data(), hd);
         } else if (token_ids) {
             uint32_t one = (uint32_t) *token_ids;
             memcpy(EMBI->vir, &one, sizeof(one));
@@ -2615,11 +2753,11 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
             axera_timer te("token embedding (decode)");
             emb1.k->run(emb1.in, emb1.out, "token embedding (decode)");
             te.stop();
-            decode(c0, nullptr, pb.data(), hd);
+            decode(c0, nullptr, -1, pb.data(), hd);
         } else {
             std::vector<ggml_bf16_t> xb((size_t) H);
             ggml_fp32_to_bf16_row((const float *) x0->data, xb.data(), H);
-            decode(c0, xb.data(), pb.data(), hd);
+            decode(c0, xb.data(), -1, pb.data(), hd);
         }
     }
     if (need_hn) {
@@ -2629,7 +2767,9 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     }
     if (n_out > 0) {
         axera_timer th(T > 256 ? "output head (prompt)" : T > 1 ? "output head (warmup)" : "output head (decode)");
-        if (combined_dec) {
+        if (greedy_dec) {
+            head.write_greedy(g, names, GLOG, GTOKOUT);
+        } else if (combined_dec) {
             const bool direct_x = T == 1 && n_out == 1;
             head.run_combined(g, names, h, T, &out_rows, direct_x ? &DOUT : nullptr);
         } else if (fused_dec) {

@@ -778,6 +778,32 @@ void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const
     after(g, names);
 }
 
+void output_head::write_greedy(ggml_cgraph * g, const graph_names & names, const axera_cmm & logits_buf,
+                               const axera_cmm & words) {
+    ggml_tensor * logits = graph_head(names);
+    GGML_ASSERT(logits && logits->type == GGML_TYPE_F32 && logits->ne[1] == 1 &&
+                ggml_backend_buffer_is_axera(logits->buffer));
+    const int64_t N    = logits->ne[0];
+    auto *        dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+    // the kernel wrote the row on the NPU; only rows 0..N-1 of its eight-row buffer are the row the sampler reads
+    logits_buf->invalidate(logits_buf->vir, (size_t) N * sizeof(float));
+    memcpy(logits->data, logits_buf->vir, (size_t) N * sizeof(float));
+    dctx->flush(logits->data, (size_t) N * sizeof(float));
+    // next_token_words is the upstream buffer: an INT64 token id viewed as two INT32 words (low, high)
+    words->invalidate(words->vir, 2 * sizeof(int32_t));
+    int32_t id = -1;
+    memcpy(&id, words->vir, sizeof(int32_t));
+    // the row it chose carries the logit the sampler's fused-row check compares against
+    const float lg = id >= 0 && id < N ? ((const float *) logits_buf->vir)[id] : 0.0f;
+    const bool ok = id >= 0 && id < N && axera::argmax_publish(&id, &lg, 1, logits->data, (size_t) logits->nb[1]);
+    if (!ok) {
+        dctx->clean_p     = (float *) logits->data;
+        dctx->clean_n     = (size_t) N * sizeof(float);
+        dctx->clean_epoch = axera_graph_epoch;
+    }
+    after(g, names);
+}
+
 void output_head::run_combined4(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
                                 bool publish_argmax) {
     ggml_tensor * logits = graph_head(names);
