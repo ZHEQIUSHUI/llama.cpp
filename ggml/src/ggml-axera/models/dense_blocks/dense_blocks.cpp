@@ -298,6 +298,34 @@ axera_cmm dense_blocks::bank_sgl(const std::map<std::string, ggml_tensor *> & t,
             }
             axera_copy_nvfp4_slice(w, s0, nr, qp, K / 2, sp, K / 16);
         };
+        // The GGUF converter stores the delta-net value rows/columns in ggml's tiled order
+        // (grouped -> tiled, see conversion/qwen.py _reorder_v_heads); the upstream kernel takes the checkpoint's
+        // grouped order. Undo it in groups of `hr` rows, exactly as the old per-projection bank filler did.
+        auto nv_rows = [&](const ggml_tensor * w, int64_t row0, int64_t nr, bool codes, bool scales, int64_t K,
+                           int64_t hr, int64_t vrow) {
+            GGML_ASSERT(hr > 0 && nr % hr == 0);
+            for (int64_t j = 0; j < nr; j += hr) {
+                nv(w, vrow + (int64_t) tiled((int) (j / hr)) * hr, hr, row0 + j, codes, scales, K);
+            }
+        };
+        auto nv_cols = [&](const ggml_tensor * w, int64_t row0, int64_t nr, bool codes, bool scales, int64_t K) {
+            thread_local std::vector<uint8_t> tq, ts;
+            tq.resize((size_t) K / 2);
+            ts.resize((size_t) K / 16);
+            const size_t cq = (size_t) (K / 2) / VH, cs = (size_t) (K / 16) / VH;
+            GGML_ASSERT((size_t) VH * cq == (size_t) (K / 2) && (size_t) VH * cs == (size_t) (K / 16));
+            for (int64_t r = 0; r < nr; ++r) {
+                axera_copy_nvfp4_slice(w, row0 + r, 1, tq.data(), K / 2, ts.data(), K / 16);
+                for (int g = 0; g < VH; ++g) {
+                    if (codes) {
+                        memcpy(dst + (size_t) (row0 + r) * (K / 2) + (size_t) g * cq, tq.data() + tiled(g) * cq, cq);
+                    }
+                    if (scales) {
+                        memcpy(dst + (size_t) (row0 + r) * (K / 16) + (size_t) g * cs, ts.data() + tiled(g) * cs, cs);
+                    }
+                }
+            }
+        };
         const bool codes = d.dtype == 15;
         const bool scales = d.dtype == 11;
         GGML_ASSERT(codes || scales || d.dtype == 3 || d.dtype == 9 || d.dtype == 6);
@@ -378,18 +406,34 @@ axera_cmm dense_blocks::bank_sgl(const std::map<std::string, ggml_tensor *> & t,
             } else if (n == "o_norm_w") {
                 put(f32_of(T(il, "ssm_norm.weight")));
             } else if (n == "a_log") {
-                put(f32_of(T(il, "ssm_a")));
+                // GGUF ssm_a is -exp(A_log) in tiled order; the kernel takes the checkpoint's A_log grouped by head.
+                const std::vector<float> a = f32_of(T(il, "ssm_a"));
+                std::vector<float>       u(VH);
+                for (int h = 0; h < VH; ++h) {
+                    u[h] = std::log(-a[(size_t) tiled(h)]);
+                }
+                put(u);
             } else if (n == "dt_bias") {
-                put(f32_of(T(il, "ssm_dt.bias")));
+                const std::vector<float> v = f32_of(T(il, "ssm_dt.bias"));
+                std::vector<float>       u(VH);
+                for (int h = 0; h < VH; ++h) {
+                    u[h] = v[(size_t) tiled(h)];
+                }
+                put(u);
             } else if (n == "w_q_conv" || n == "w_k_conv" || n == "w_v_conv") {
                 const ggml_tensor *      w = T(il, "ssm_conv1d.weight");
                 const std::vector<float> v = f32_of(w);
                 // The bank is [blocks, channels, 1, taps]; the taps are the GGUF row dim, not a channel dim.
                 const int64_t            tp = w->ne[0], C = d.shape[1] * d.shape[2];
-                const int64_t            c0 = n[2] == 'q' ? 0 : n[2] == 'k' ? 2048 : 4096;
+                const int64_t            v0 = w->ne[1] - C;
+                const int64_t            c0 = n[2] == 'q' ? 0 : n[2] == 'k' ? C : v0;
                 GGML_ASSERT(d.shape[2] == 1 && d.shape[3] == tp && C + c0 <= w->ne[1]);
                 std::vector<float> u((size_t) C * tp);
-                memcpy(u.data(), v.data() + (size_t) c0 * tp, u.size() * sizeof(float));
+                for (int64_t r = 0; r < C; ++r) {
+                    const int64_t hr  = C / VH;
+                    const int64_t src = n[2] == 'v' ? v0 + (int64_t) tiled((int) (r / hr)) * hr + r % hr : c0 + r;
+                    memcpy(&u[(size_t) r * tp], &v[(size_t) src * tp], tp * sizeof(float));
+                }
                 put(u);
             } else if (n == "w_k" || n == "w_scale_k" || n == "w_k_scale") {
                 // The sgl runtime fuses qkv+z (and their scales) into one bank whose
@@ -400,19 +444,23 @@ axera_cmm dense_blocks::bank_sgl(const std::map<std::string, ggml_tensor *> & t,
                 const int64_t        K  = qkv->ne[0];
                 GGML_ASSERT(qkv->ne[0] == z->ne[0]);
                 GGML_ASSERT((size_t) (qkv->ne[1] + z->ne[1]) * (codes ? K / 2 : K / 16) == bb);
-                nv(qkv, 0, qkv->ne[1], 0, codes, scales, K);
-                nv(z, 0, z->ne[1], qkv->ne[1], codes, scales, K);
+                const int64_t kh = KH * 128, vh = qkv->ne[1] - 2 * kh;  // q | k | v
+                GGML_ASSERT(kh * 2 + vh == qkv->ne[1] && vh % VH == 0 && z->ne[1] % VH == 0);
+                nv(qkv, 0, kh, 0, codes, scales, K);
+                nv(qkv, kh, kh, kh, codes, scales, K);
+                nv_rows(qkv, 2 * kh, vh, codes, scales, K, vh / VH, 2 * kh);
+                nv_rows(z, 2 * kh + vh, z->ne[1], codes, scales, K, z->ne[1] / VH, 0);
             } else if (n == "w_a" || n == "w_a_scale") {
                 const ggml_tensor * beta  = T(il, "ssm_beta.weight");
                 const ggml_tensor * alpha = T(il, "ssm_alpha.weight");
                 const int64_t        K     = beta->ne[0];
                 GGML_ASSERT(beta->ne[0] == alpha->ne[0]);
                 GGML_ASSERT((size_t) (beta->ne[1] + alpha->ne[1]) * (codes ? K / 2 : K / 16) == bb);
-                nv(beta, 0, beta->ne[1], 0, codes, scales, K);
-                nv(alpha, 0, alpha->ne[1], beta->ne[1], codes, scales, K);
+                nv_rows(beta, 0, beta->ne[1], codes, scales, K, 1, 0);
+                nv_rows(alpha, beta->ne[1], alpha->ne[1], codes, scales, K, 1, 0);
             } else if (n == "w_o" || n == "w_o_scale") {
                 const ggml_tensor * w = T(il, "ssm_out.weight");
-                nv(w, 0, w->ne[1], 0, codes, scales, w->ne[0]);
+                nv_cols(w, 0, w->ne[1], codes, scales, w->ne[0]);
             } else if (n == "w_q_scale2" || n == "w_k_scale2" || n == "w_v_scale2") {
                 const int64_t row = n[2] == 'q' ? 0 : n[2] == 'k' ? 2048 : 4096;
                 scalar(scale2_of(T(il, "attn_qkv.weight"), row));
@@ -1112,26 +1160,68 @@ ggml_status dense_blocks::compute(ggml_cgraph * g) {
         page_p.insert(page_p.end(), pb.begin(), pb.end());
     }
     axera_timer th("output head");
+    if (const char * p = getenv("GGML_AXERA_DUMP_H")) {
+        FILE * f = fopen(*p ? p : "axera_h.bin", "wb");
+        if (f) {
+            fwrite(h.data(), sizeof(float), h.size(), f);
+            fclose(f);
+        }
+    }
     // The upstream dense LM head is rmsnorm_gemm_kernel: it normalizes its [8,K] bf16 tile itself and takes the
     // NVFP4 lm_head as b_t / b_scale / b_scale2.  The old dense_blocks manifests keep the combined head below.
     float s2 = 1.0f;
-    if (sgl && logits->src[0]->type == GGML_TYPE_NVFP4) {
+    // llama.cpp may wrap result_output in the NVFP4 output.scale MUL; graph_head walks to the mm.
+    ggml_tensor * const head_mm = axera::graph_head(names);
+    GGML_ASSERT(head_mm && head_mm->op == GGML_OP_MUL_MAT && head_mm->src[0]);
+    const ggml_tensor * head_w = head_mm->src[0];
+    if (sgl && head_w->type == GGML_TYPE_NVFP4) {
         auto it = t.find("output.scale");
         GGML_ASSERT(it != t.end() && it->second->type == GGML_TYPE_F32 && ggml_nelements(it->second) == 1);
         s2 = ((const float *) it->second->data)[0];
     }
-    if (head.bind_norm_gemm(man.get("lm_head"), logits->src[0], s2)) {
+    if (getenv("GGML_AXERA_HEAD_DEBUG")) {
+        static bool once = false;
+        if (!once) {
+            once = true;
+            fprintf(stderr, "DBG head: logits %s op %d ne [%lld %lld %lld %lld] | src0 %s op %d type %d ne [%lld %lld %lld %lld]\n",
+                    logits->name ? logits->name : "?", (int) logits->op,
+                    (long long) logits->ne[0], (long long) logits->ne[1], (long long) logits->ne[2], (long long) logits->ne[3],
+                    logits->src[0]->name ? logits->src[0]->name : "?", (int) logits->src[0]->op, (int) logits->src[0]->type,
+                    (long long) logits->src[0]->ne[0], (long long) logits->src[0]->ne[1],
+                    (long long) logits->src[0]->ne[2], (long long) logits->src[0]->ne[3]);
+            if (logits->src[1]) {
+                fprintf(stderr, "DBG head: src1 %s op %d type %d ne [%lld %lld %lld %lld] n=%lld\n",
+                        logits->src[1]->name ? logits->src[1]->name : "?", (int) logits->src[1]->op,
+                        (int) logits->src[1]->type, (long long) logits->src[1]->ne[0], (long long) logits->src[1]->ne[1],
+                        (long long) logits->src[1]->ne[2], (long long) logits->src[1]->ne[3],
+                        (long long) ggml_nelements(logits->src[1]));
+            }
+            fflush(stderr);
+        }
+    }
+    if (head.bind_norm_gemm(man.get("lm_head"), head_w, s2)) {
         head.run(g, names, h, T);
     } else {
-        head.bind(man.get("lm_head"), logits->src[0]);
+        head.bind(man.get("lm_head"), head_w);
         if (man.has("lm_head.topk")) {
             head.bind_topk(man.get("lm_head.topk"));
         }
-        const bool combined = head.bind_combined(man.get("lm_head"), logits->src[0]) && head.combined_ready(g, names);
+        const bool combined = head.bind_combined(man.get("lm_head"), head_w) && head.combined_ready(g, names);
         if (combined) {
             head.run_combined(g, names, h, T, nullptr, nullptr);
         } else {
             head.run(g, names, h, T);
+        }
+    }
+    if (const char * p = getenv("GGML_AXERA_DUMP_LOGITS")) {
+        if (ggml_backend_buffer_is_axera(logits->buffer)) {
+            auto * dc = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+            dc->invalidate(logits->data, (size_t) logits->ne[0] * sizeof(float));
+        }
+        FILE * f = fopen(*p ? p : "axera_logits.bin", "wb");
+        if (f) {
+            fwrite(logits->data, sizeof(float), (size_t) logits->ne[0], f);
+            fclose(f);
         }
     }
     if (warmup) {
