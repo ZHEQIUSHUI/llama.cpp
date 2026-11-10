@@ -424,7 +424,12 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
     // the four phase banks above are one layer each: the state/conv-state pools hold every block's three layers
     INDPTR  = axera_cmm_alloc(2 * sizeof(int32_t));
     INDICES = axera_cmm_alloc(pk.in_bytes("indices"));
-    LASTLEN = axera_cmm_alloc(sizeof(int32_t));
+    // The prefill kernel declares last_page_len as two int32 (forward.py passes last_len[:2]); it reads only the
+    // first, but the runtime validates the whole buffer.
+    const io_desc & plp = in_of(pk, "last_page_len");
+    const io_desc & dlp = in_of(dk, "last_page_len");
+    GGML_ASSERT(plp.bytes == 2 * sizeof(int32_t) && dlp.bytes == sizeof(int32_t));
+    LASTLEN = axera_cmm_alloc(plp.bytes);
     CLOC    = axera_cmm_alloc(2 * sizeof(int32_t));
     VALID   = axera_cmm_alloc(sizeof(int32_t));
     GGML_ASSERT(pk.in_bytes("indices") == (size_t) kv_pages * sizeof(int32_t));
@@ -590,7 +595,8 @@ void dense_blocks::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32
         POS->flush();
         ((int32_t *) INDPTR->vir)[0] = 0;
         ((int32_t *) INDPTR->vir)[1] = (int32_t) (cell / PG);
-        *(int32_t *) LASTLEN->vir    = PG;
+        ((int32_t *) LASTLEN->vir)[0] = PG;
+        ((int32_t *) LASTLEN->vir)[1] = PG;
         ((int32_t *) CLOC->vir)[0]   = (int32_t) (cell / PG);
         ((int32_t *) CLOC->vir)[1]   = 0;
         *(int32_t *) VALID->vir      = v;
