@@ -776,12 +776,14 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
     // the four phase banks above are one layer each: the state/conv-state pools hold every block's three layers
     INDPTR  = axera_cmm_alloc(2 * sizeof(int32_t));
     INDICES = axera_cmm_alloc(pk.in_bytes("indices"));
-    // The prefill kernel declares last_page_len as two int32 (forward.py passes last_len[:2]); it reads only the
-    // first, but the runtime validates the whole buffer.
+    // The upstream ABIs differ: prefill declares last_page_len as two int32 (forward.py passes last_len[:2]),
+    // decode declares one int32 per physical page (the sglang page table shape). Both read only the first
+    // element; the runtime still validates the whole buffer, so allocate the larger of the two.
     const io_desc & plp = in_of(pk, "last_page_len");
     const io_desc & dlp = in_of(dk, "last_page_len");
-    GGML_ASSERT(plp.bytes == 2 * sizeof(int32_t) && dlp.bytes == sizeof(int32_t));
-    LASTLEN = axera_cmm_alloc(plp.bytes);
+    GGML_ASSERT(plp.bytes >= sizeof(int32_t) && plp.bytes % sizeof(int32_t) == 0);
+    GGML_ASSERT(dlp.bytes >= sizeof(int32_t) && dlp.bytes % sizeof(int32_t) == 0);
+    LASTLEN = axera_cmm_alloc(std::max(plp.bytes, dlp.bytes));
     CLOC    = axera_cmm_alloc(2 * sizeof(int32_t));
     VALID   = axera_cmm_alloc(sizeof(int32_t));
     // The page table covers the logical pages ceil(context / 256); upstream's pool has one more physical page.
