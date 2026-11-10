@@ -812,7 +812,7 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
                     c.in.push_back(axera_io(VALID, d.bytes));
                 } else if (n == "b3_kv") {
                     GGML_ASSERT(d.bytes == kv_b);
-                    c.in.push_back(axera_io(KVC[b], (uint32_t) kv_b));
+                    c.in.push_back(axera_io(KVC[b], kv_b));
                 } else if (state_phase(n) >= 0) {
                     const int p = state_phase(n);
                     const axera_cmm * pool = n.find("q_conv_state_in") != std::string::npos ? &CQ :
