@@ -707,14 +707,14 @@ void qwen3_tts::conv(ggml_tensor * n, const ggml_tensor * ic, std::string name, 
     const uint32_t n_in = 2 + (br || bo) + br;
     GGML_ASSERT(k.info->nInputSize == n_in && k.info->nOutputSize == 1 && (ib >= 0) == (br || bo) && (ir >= 0) == br);
     std::vector<AX_ENGINE_IO_BUFFER_T> in(n_in), out(1);
-    in[ix]  = axera_io(tmp[1].get(), tmp[1]->vir, (uint32_t) xb);
-    in[iw]  = axera_io(wk.get(), wk->vir, (uint32_t) wk->size);
-    out[io] = axera_io(dctx, dst->data, (uint32_t) ggml_nbytes(dst));
+    in[ix]  = axera_io(tmp[1].get(), tmp[1]->vir, (size_t) xb);
+    in[iw]  = axera_io(wk.get(), wk->vir, wk->size);
+    out[io] = axera_io(dctx, dst->data, ggml_nbytes(dst));
     if (ib >= 0) {  // the bias, f32 (a CMM copy unless it is in CMM already)
         const ggml_tensor * b  = e->bias;
         const size_t        bs = ggml_nbytes(b);
         if (b->buffer && ggml_backend_buffer_is_axera(b->buffer)) {
-            in[ib] = axera_io((const ggml_backend_axera_buffer_context *) b->buffer->context, b->data, (uint32_t) bs);
+            in[ib] = axera_io((const ggml_backend_axera_buffer_context *) b->buffer->context, b->data, bs);
         } else {
             auto & c = w[{ b->data, bs + 2 }];  // (+2: not a bf16 copy of the same data)
             if (!c) {
@@ -722,13 +722,13 @@ void qwen3_tts::conv(ggml_tensor * n, const ggml_tensor * ic, std::string name, 
                 memcpy(c->vir, b->data, bs);
                 c->flush(c->vir, bs);
             }
-            in[ib] = axera_io(c.get(), c->vir, (uint32_t) bs);
+            in[ib] = axera_io(c.get(), c->vir, bs);
         }
     }
     if (ir >= 0) {  // the residual, the host's f32 written back to DRAM first
         auto * rctx = (const ggml_backend_axera_buffer_context *) e->res->buffer->context;
         rctx->flush(e->res->data, ggml_nbytes(e->res));
-        in[ir] = axera_io(rctx, e->res->data, (uint32_t) ggml_nbytes(e->res));
+        in[ir] = axera_io(rctx, e->res->data, ggml_nbytes(e->res));
     }
     dctx->invalidate(dst->data, ggml_nbytes(dst));  // no dirty line of the output left to be written back over the NPU's
     {
@@ -886,9 +886,9 @@ template <typename F> bool qwen3_tts::mm(ggml_tensor * n, F before) {
     const kernel & k = man.get("gen." + name);
     GGML_ASSERT(k.info->nInputSize == 2 && k.info->nOutputSize == 1);
     std::vector<AX_ENGINE_IO_BUFFER_T> in(2), out(1);
-    in[k.input("x")]   = axera_io(x.first, x.second, (uint32_t) (M * K * sizeof(ggml_bf16_t)));
-    in[k.input("w")]   = axera_io(wb.first, wb.second, (uint32_t) (N * K * sizeof(ggml_bf16_t)));
-    out[k.output("out")] = axera_io(dctx, n->data, (uint32_t) ggml_nbytes(n));
+    in[k.input("x")]   = axera_io(x.first, x.second, (size_t) (M * K * sizeof(ggml_bf16_t)));
+    in[k.input("w")]   = axera_io(wb.first, wb.second, (size_t) (N * K * sizeof(ggml_bf16_t)));
+    out[k.output("out")] = axera_io(dctx, n->data, ggml_nbytes(n));
     dctx->invalidate(n->data, ggml_nbytes(n));  // no dirty line of the output left to be written back over the NPU's
     k.run(in, out, name.c_str());
     dctx->invalidate(n->data, ggml_nbytes(n));

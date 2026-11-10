@@ -265,7 +265,7 @@ void qwen3::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tens
         for (const auto & d : dk->desc->out) {
             head_in = head_in || d.name == "logits";
         }
-        const uint32_t csb = dk->in_bytes("cs");
+        const size_t csb = dk->in_bytes("cs");
         DX    = axera_cmm_alloc(dk->in_bytes("x"));
         DOUT  = axera_cmm_alloc(dk->out_bytes("out"));
         COS   = axera_cmm_alloc(csb / 2);

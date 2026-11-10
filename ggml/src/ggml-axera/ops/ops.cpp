@@ -1417,7 +1417,7 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         ggml_fp32_to_bf16_row(y.data() + (size_t) r * K, (ggml_bf16_t *) x->vir, K);
         x->flush(x->vir, K * sizeof(ggml_bf16_t));
         dctx->flush(o, N * sizeof(float));
-        out[kk->output("out")] = axera_io(dctx, o, (uint32_t) (N * sizeof(float)));
+        out[kk->output("out")] = axera_io(dctx, o, (size_t) (N * sizeof(float)));
         kk->run(in, out, "output head");
         dctx->invalidate(o, N * sizeof(float));
         dctx->clean_p     = o;  // the host reads these logits back without more cache maintenance this graph
@@ -1438,7 +1438,7 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         if (direct) {
             float * o = (float *) ((char *) dst->data + kr[i0] * dst->nb[1]);
             dctx->flush(o, (size_t) Rk * N * sizeof(float));
-            out[kk->output("out")] = axera_io(dctx, o, (uint32_t) (Rk * N * sizeof(float)));
+            out[kk->output("out")] = axera_io(dctx, o, (size_t) (Rk * N * sizeof(float)));
             kk->run(in, out, "output head");
             dctx->invalidate(o, (size_t) Rk * N * sizeof(float));
             dctx->clean_p     = o;

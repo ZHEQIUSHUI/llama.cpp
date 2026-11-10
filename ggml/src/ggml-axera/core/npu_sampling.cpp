@@ -47,12 +47,12 @@ static int kernel_rows_and_k(const kernel & k, int32_t * K, int32_t * R) {
             rows = (int) d.shape[0];
         }
     }
-    const uint32_t vb = k.out_bytes("values");
-    const uint32_t ib = k.out_bytes("ids");
+    const size_t vb = k.out_bytes("values");
+    const size_t ib = k.out_bytes("ids");
     if (rows <= 0 || rows > 4 || vb % (sizeof(float) * rows) || ib % (sizeof(int32_t) * rows) ||
         vb / (sizeof(float) * rows) != ib / (sizeof(int32_t) * rows) ||
-        k.out_bytes("vmax") != (uint32_t) rows * sizeof(float) ||
-        k.out_bytes("sumexp") != (uint32_t) rows * sizeof(float)) {
+        k.out_bytes("vmax") != (size_t) rows * sizeof(float) ||
+        k.out_bytes("sumexp") != (size_t) rows * sizeof(float)) {
         return 0;
     }
     *R = rows;

@@ -27,8 +27,10 @@
 #include <vector>
 
 inline constexpr size_t AXERA_ALIGNMENT = 128;
-// the largest single IO: the runtime's size field overflows at 2 GiB (packs are split well below it)
-inline constexpr size_t AXERA_IO_MAX = (size_t) 2 << 30;
+// The SDK's CMM allocator and cache-maintenance calls take 64-bit sizes. The engine's IO descriptor still has a
+// 32-bit nSize (AX_ENGINE_IO_BUFFER_T, SDK 0.6.0), which is checked against the model's 64-bit IO size in
+// api_impl_run_handle2.c:38; host-side size/offset arithmetic must not add a second, smaller limit.
+inline constexpr size_t AXERA_IO_MAX = (size_t) -1;
 
 // the backend's buffers (CMM, or the mapped GGUF): ggml-axera-buffer.cpp
 bool ggml_backend_buffer_is_axera(struct ggml_backend_buffer * buffer);
@@ -84,8 +86,8 @@ struct ggml_backend_axera_buffer_context {
     ~ggml_backend_axera_buffer_context() {
         if (vir && !view) {
             if (!nc && size) {  // no dirty line of ours may reach the memory after its next owner (the engine) writes it
-                AX_SYS_MflushCache(phy, vir, (AX_U32) size);
-                AX_SYS_MinvalidateCache(phy, vir, (AX_U32) size);
+                AX_SYS_MflushCache(phy, vir, (AX_U64) size);
+                AX_SYS_MinvalidateCache(phy, vir, (AX_U64) size);
             }
             AX_SYS_MemFree(phy, vir);
         }
@@ -95,13 +97,13 @@ struct ggml_backend_axera_buffer_context {
 
     void flush(void * p, size_t n) const {
         if (n && !nc) {
-            AX_SYS_MflushCache(phy_of(p), p, (AX_U32) n);
+            AX_SYS_MflushCache(phy_of(p), p, (AX_U64) n);
         }
     }
 
     void invalidate(void * p, size_t n) const {
         if (n && !nc) {
-            AX_SYS_MinvalidateCache(phy_of(p), p, (AX_U32) n);
+            AX_SYS_MinvalidateCache(phy_of(p), p, (AX_U64) n);
         }
     }
 

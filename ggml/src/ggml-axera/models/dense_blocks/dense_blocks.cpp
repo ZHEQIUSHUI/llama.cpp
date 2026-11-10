@@ -2,7 +2,7 @@
 //
 // The manifest's kernels are the upstream fused block functions, split by IO size only: one axmodel holds one
 // 4-layer block (all of its weights and its attention layer's KV are separate kernel inputs, each below the runtime's
-// 2 GiB IO limit). One call runs one block; the host chains L / 4 calls per page (prefill, 256 rows) or per token
+// IO-descriptor limits). One call runs one block; the host chains L / 4 calls per page (prefill, 256 rows) or per token
 // (decode, 1 row).
 //
 // Layout: prefill role, x [256, H], the b0..b3 bank inputs (one layer each), b3_kv [pages, 2, 256, 4, 256] bf16 and

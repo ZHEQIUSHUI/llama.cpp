@@ -108,7 +108,7 @@ AX_ENGINE_IO_BUFFER_T qwen35_moe::cache_io(int il, int what) const {
     const cache & c = lc[il];
     const int     w = what % 2;
     const int64_t o = what < 2 ? row : stream;
-    return axera_io(c.b[w], c.base[w] + o * c.stride[w], (uint32_t) c.size[w]);
+    return axera_io(c.b[w], c.base[w] + o * c.stride[w], c.size[w]);
 }
 
 void qwen35_moe::set_place(int64_t r, int64_t s) {
@@ -238,7 +238,7 @@ void qwen35_moe::init(ggml_cgraph * g, const std::map<std::string, ggml_tensor *
         for (int w = 0; w < 2; ++w) {
             const std::string cn = std::string("cache_") + (gdn[il] ? (w ? "r" : "s") : (w ? "v" : "k")) + "_l" + std::to_string(il);
             ggml_tensor *     c  = t.count(cn) ? t.at(cn) : nullptr;
-            const uint32_t    sz = gdn[il] ? (w ? cv->bytes : st->bytes) : kc->bytes;
+            const size_t      sz = gdn[il] ? (w ? cv->bytes : st->bytes) : kc->bytes;
             if (!c || !ggml_backend_buffer_is_axera(c->buffer) || !ggml_is_contiguous(c)) {
                 GGML_ABORT("axera qwen35_moe: %s not in CMM (all layers on the device: -ngl 99)\n", cn.c_str());
             }
@@ -592,21 +592,21 @@ void qwen35_moe::experts_group(int il, int ng) {
                     in[i] = axera_io(GH2);
                 } else if (d.name == "tok") {
                     in[i] = axera_io(TOK.get(), tok + r.tok0 + (size_t) done * (1 + r.G),
-                                     (uint32_t) (kp->S * (1 + r.G) * sizeof(int32_t)));
+                                     (size_t) (kp->S * (1 + r.G) * sizeof(int32_t)));
                 } else if (d.name == "rw") {
-                    in[i] = axera_io(SRW.get(), sw + r0, (uint32_t) (kp->S * r.G * sizeof(float)));
+                    in[i] = axera_io(SRW.get(), sw + r0, (size_t) (kp->S * r.G * sizeof(float)));
                 } else {
                     GGML_ABORT("axera qwen35_moe: %s: unexpected input %s\n", k.desc->role.c_str(), d.name.c_str());
                 }
             }
-            out[k.output("out")] = axera_io(SOUT.get(), (char *) SOUT->vir + r0 * H * es, (uint32_t) (kp->S * r.G * H * es));
+            out[k.output("out")] = axera_io(SOUT.get(), (char *) SOUT->vir + r0 * H * es, (size_t) (kp->S * r.G * H * es));
             axera_timer tm(&r == &rg[0] ? "moe prefill slots (big)" : "moe prefill slots");
             k.run(in, out, "moe prefill slots");
             done += kp->S;
         }
     }
     const axera_cmm & xo = il % 2 == 0 ? GB : GA;  // the group's next x (its first cb.T rows)
-    const uint32_t    xb = (uint32_t) ((size_t) cb.T * H * sizeof(ggml_bf16_t));
+    const size_t      xb = (size_t) cb.T * H * sizeof(ggml_bf16_t);
     std::vector<AX_ENGINE_IO_BUFFER_T> in(cb.k->info->nInputSize), out(cb.k->info->nOutputSize);
     in[cb.k->input("base")]  = axera_io(GBASE, xb);
     in[cb.k->input("loc")]   = axera_io(LOC, (size_t) K * cb.T * sizeof(int32_t));
@@ -694,9 +694,9 @@ void qwen35_moe::experts_single(int il, chunk & c) {
             } else if (d.name == "h2") {
                 in[i] = axera_io(SX.get(), sx, k.in_bytes("h2"));
             } else if (d.name == "tok") {
-                in[i] = axera_io(TOK.get(), tk + (size_t) cl * S * (1 + G1), (uint32_t) (S * (1 + G1) * sizeof(int32_t)));
+                in[i] = axera_io(TOK.get(), tk + (size_t) cl * S * (1 + G1), (size_t) (S * (1 + G1) * sizeof(int32_t)));
             } else if (d.name == "rw") {
-                in[i] = axera_io(SRW.get(), sw + r0, (uint32_t) (S * G1 * sizeof(float)));
+                in[i] = axera_io(SRW.get(), sw + r0, (size_t) (S * G1 * sizeof(float)));
             } else {
                 GGML_ABORT("axera qwen35_moe: %s: unexpected input %s\n", k.desc->role.c_str(), d.name.c_str());
             }

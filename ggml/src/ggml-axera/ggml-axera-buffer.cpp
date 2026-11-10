@@ -179,7 +179,7 @@ static const char * ggml_backend_axera_buffer_type_get_name(ggml_backend_buffer_
 static ggml_backend_buffer_t ggml_backend_axera_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     auto * ctx = new ggml_backend_axera_buffer_context;
     ctx->size  = std::max<size_t>(size, AXERA_ALIGNMENT);
-    if (AX_SYS_MemAllocCached(&ctx->phy, &ctx->vir, (AX_U32) ctx->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml") != 0) {
+    if (AX_SYS_MemAllocCached(&ctx->phy, &ctx->vir, (AX_U64) ctx->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml") != 0) {
         GGML_LOG_ERROR("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
         ctx->vir = nullptr;
         delete ctx;
@@ -194,7 +194,7 @@ static size_t ggml_backend_axera_buffer_type_get_alignment(ggml_backend_buffer_t
 }
 
 static size_t ggml_backend_axera_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    return (size_t) 1 << 31;  // AX_SYS_MemAllocCached / cache maintenance take 32-bit sizes
+    return SIZE_MAX;  // AX_SYS_MemAllocCached / cache maintenance take 64-bit sizes in SDK 0.6.0
     GGML_UNUSED(buft);
 }
 

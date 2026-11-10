@@ -65,7 +65,7 @@ void run(const kernel & k, const io_map & io, const char * what) {
 }
 
 AX_ENGINE_IO_BUFFER_T cm_io(const axera_cmm & c, size_t bytes = 0) {
-    return axera_io(c.get(), c->vir, (uint32_t) (bytes ? bytes : c->size));
+    return axera_io(c.get(), c->vir, bytes ? bytes : c->size);
 }
 
 class qwen3_asr final : public model {
