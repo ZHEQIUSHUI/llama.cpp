@@ -68,6 +68,9 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    // an NVFP4 per-tensor scale sidecar may carry one global value per quantized slice, i.e. one value per output
+    // row of a fused qkv; the graph broadcasts it with ggml_mul, so accept the file's element count
+    static const int TENSOR_SCALE_VECTOR    = 1 << 6;
 
     int n_kv      = 0;
     int n_tensors = 0;

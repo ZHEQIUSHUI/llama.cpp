@@ -1738,7 +1738,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.wo_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wqkv_s && layer.wqkv) {
-                layer.wqkv_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "scale", i), {1},
+                                             TENSOR_NOT_REQUIRED | llama_model_loader::TENSOR_SCALE_VECTOR);
             }
             if (!layer.wqkv_gate_s && layer.wqkv_gate) {
                 layer.wqkv_gate_s = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);

@@ -165,7 +165,7 @@ class dense_blocks final : public model {
     int              kv_pages = 0;
     int64_t          kv_cells = 0;
 
-    axera_cmm              KV;           // KV pools of all blocks, kv_blk_b each (kv_b per call)
+    std::vector<axera_cmm> KVC;          // one KV input per call: kv_b bytes (kB pools of kv_blk_b each)
     size_t                 kv_b = 0;     // bytes of one call's KV input
     size_t                 kv_blk_b = 0; // bytes of one block's KV pool
     axera_cmm              ST, CQ, CK, CV;
@@ -501,7 +501,12 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
     GGML_ASSERT(in_of(dk, "b3_kv").bytes == kv_b && in_of(dk, "b0_attn_state_in").bytes == st_b * (size_t) kB);
 
     axera_timer tl("init: dense_blocks");
-    KV = axera_cmm_alloc(kv_b * (size_t) NC);
+    // The runtime's AX_ENGINE_IO_BUFFER_T.nSize is 32-bit, so never allocate one buffer above 4 GiB: with kB = 16
+    // the pool is 16 GiB and cannot be bound at all.  One buffer per call keeps every IO under the limit.
+    KVC.resize(NC);
+    for (int c = 0; c < NC; ++c) {
+        KVC[c] = axera_cmm_alloc(kv_b);
+    }
     ST = axera_cmm_alloc(st_b * (size_t) (NB * 3));
     CQ = axera_cmm_alloc(cq_b * (size_t) (NB * 3));
     CK = axera_cmm_alloc(cq_b * (size_t) (NB * 3));
@@ -577,7 +582,7 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
                     c.in.push_back(axera_io(VALID, d.bytes));
                 } else if (n == "b3_kv") {
                     GGML_ASSERT(d.bytes == kv_b);
-                    c.in.push_back(axera_io(KV.get(), (char *) KV->vir + (size_t) b * kv_b, d.bytes));
+                    c.in.push_back(axera_io(KVC[b], (uint32_t) kv_b));
                 } else if (state_phase(n) >= 0) {
                     const int p = state_phase(n);
                     const axera_cmm * pool = n.find("q_conv_state_in") != std::string::npos ? &CQ :
@@ -615,7 +620,7 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
                       for (auto & [n, b] : banks) s += b->size;
                       return s / 1073741824.0;
                   }(),
-                  (ST->size + CQ->size + CK->size + CV->size + KV->size) / 1073741824.0, (long long) kv_cells);
+                  (ST->size + CQ->size + CK->size + CV->size + (size_t) NC * kv_b) / 1073741824.0, (long long) kv_cells);
     snap_cell = -1;
     page_x.clear();
     page_p.clear();
@@ -937,10 +942,12 @@ size_t dense_blocks::state_write(void * dst, size_t size, uint32_t flags) {
     p += sizeof(h);
     if (!partial) {
         const size_t page_n = nkv_pages * (kv_blk_b / kv_pages);
-        KV->invalidate(KV->vir, (size_t) NB * kv_blk_b);
-        for (int j = 0; j < NB; ++j) {
-            memcpy(p, (char *) KV->vir + (size_t) j * kv_blk_b, page_n);
-            p += page_n;
+        for (int c = 0; c < NC; ++c) {
+            KVC[c]->invalidate(KVC[c]->vir, (size_t) kB * kv_blk_b);
+            for (int j = 0; j < kB; ++j) {
+                memcpy(p, (char *) KVC[c]->vir + (size_t) j * kv_blk_b, page_n);
+                p += page_n;
+            }
         }
     }
     for (const axera_cmm * b : { &ST, &CQ, &CK, &CV }) {
@@ -990,11 +997,13 @@ size_t dense_blocks::state_read(const void * src, size_t size, uint32_t flags) {
     const char * p = (const char *) src + sizeof(h);
     if (!partial) {
         const size_t page_n = h.nkv_pages * h.kv_page_b;
-        for (int j = 0; j < NB; ++j) {
-            memcpy((char *) KV->vir + (size_t) j * kv_blk_b, p, page_n);
-            p += page_n;
+        for (int c = 0; c < NC; ++c) {
+            for (int j = 0; j < kB; ++j) {
+                memcpy((char *) KVC[c]->vir + (size_t) j * kv_blk_b, p, page_n);
+                p += page_n;
+            }
+            KVC[c]->flush(KVC[c]->vir, (size_t) kB * kv_blk_b);
         }
-        KV->flush(KV->vir, (size_t) NB * kv_blk_b);
     }
     for (const axera_cmm * b : { &ST, &CQ, &CK, &CV }) {
         memcpy((*b)->vir, p, (*b)->size);
