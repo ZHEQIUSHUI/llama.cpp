@@ -5,7 +5,6 @@
 //   prefill.gdn     one 256-row gated-delta-net layer.
 //   prefill.attn    one 256-row gated attention layer with paged KV and M-RoPE.
 //   prefill.moe     one layer's MoE for a fixed 4096-row workspace.
-//   prefill.padding zeros the workspace rows beyond the live token count.
 // Prefill is layer-outer over up to 4096 tokens: for each layer, run 256-row attention chunks, clear the padded rows,
 // then run the fixed 4096-row MoE. The decode and prefill kernels read the same NVFP4 weight banks.
 // The state is this adapter's (the decode kernel's banks): KV cache paged [10][64 pages][K, V][256][2 x 256] in the
@@ -241,12 +240,6 @@ class qwen35_moe_sgl final : public model {
     axera_cmm                        ST2, CQ2, CK2, CV2;  // the second recurrent-state set (prefill outputs)
     axera_cmm                        ONES, ZERO;           // global scales (1) and zero points (0) of the prefill kernels
     call                             dec;
-    struct dec_more_t {
-        call               c;
-        std::array<int, 4> state = { -1, -1, -1, -1 };
-        int                pages = 0;
-    };
-    std::vector<dec_more_t>          dec_more;  // optional smaller-context decode kernels, ascending pages
     call                             ver;  // role decode.verify: four rows, one rank-1 delta per row
     call                             app;  // role gdn.apply: advance the recurrent state by accepted deltas
     axera_cmm                        VX, VOUT, VPOSN, VPIDS, VINDPTR, VLOC, VNT, VNPREV, VST0, VROUTE;
@@ -259,15 +252,11 @@ class qwen35_moe_sgl final : public model {
     bool                             delta_live = false;
     int64_t                          ver_c0 = -1;
     int                              ver_T = 0;
-    call                             pad;
     std::array<int, 4>               dec_state = { -1, -1, -1, -1 };
     bool                             dec_state_dirty = false;  // the decode calls' state entries follow the prefill's swaps
     std::vector<call>                pre_attn[2], pre_moe;  // per layer and recurrent-state parity
-    std::vector<call>                pre_moev;              // optional routing-masked MoE for a short last chunk
-    std::vector<call>                pre_tail[2];            // optional 128-row last-page variants
-    std::vector<call>                pre_big3840[2], pre_big4096[2];  // optional all-full-page GDN / attention variants
     int                              state_parity = 0;
-    axera_cmm DX, DA, DOUT, DPOS, INDICES, PX, PA, XB, POS, GPT, PBIG, META;
+    axera_cmm DX, DA, DOUT, DPOS, INDICES, PX, PA, XB, POS, META;
     axera_cmm PF_POS, PF_IND, PF_LOC, PF_COUNT;
     // the token embedding as an NPU gather (the GGUF table converted to bf16 once), for the whole-prefill chunk
     // and a decode token; when absent compute() falls back to the graph's CPU GET_ROWS
@@ -866,15 +855,16 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     PA      = axera_cmm_alloc((size_t) WN * H * sizeof(ggml_bf16_t));
     XB      = axera_cmm_alloc((size_t) WN * H * sizeof(ggml_bf16_t));
     POS     = axera_cmm_alloc((size_t) WN * ak.in_bytes("position_ids") / PG);
-    META    = axera_cmm_alloc_nc(32);  // host-written scalars: the NPU sees each write without a cache flush
+    // Host-written scalars: the NPU sees each write without a cache flush. The decode kernel declares
+    // last_page_len as [MAX_PAGES] int32 (only [0] is read), so the block keeps that full range after
+    // META_LASTLEN; the unused tail stays zero.
+    META    = axera_cmm_alloc_nc(META_LASTLEN + dk.in_bytes("last_page_len") + META_BYTES);
     // the Range prefill carries one position row per page in the 4096-row workspace
     AX      = (int) (ak.in_bytes("position_ids") / ((WN / PG) * PG * sizeof(int32_t)));
     PF_POS   = axera_cmm_alloc((size_t) (WN / PG) * AX * PG * sizeof(int32_t));
     PF_IND   = axera_cmm_alloc((size_t) (WN / PG) * 2 * sizeof(int32_t));
     PF_LOC   = axera_cmm_alloc((size_t) (WN / PG) * 2 * sizeof(int32_t));
     PF_COUNT = axera_cmm_alloc_nc(sizeof(int32_t));
-    GPT     = axera_cmm_alloc((size_t) AX * 128 * sizeof(int32_t));
-    PBIG    = axera_cmm_alloc((size_t) AX * WN * sizeof(int32_t));
     GGML_ASSERT((AX == 1 || AX == 3) && (int64_t) NP * PG == man.context && dk.in_bytes("indices") == INDICES->size);
     for (int i = 0; i < NP; ++i) {
         ((int32_t *) INDICES->vir)[i] = i;
@@ -964,51 +954,14 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         c.out.push_back(axera_io(DOUT, k.out_bytes("output")));
     };
     bind_decode(dk, dec, dec_state);
-    dec_more.clear();
-    static const bool decode_buckets = [] {
-        const char * e = std::getenv("GGML_AXERA_DECODE_BUCKET");
-        return !e || std::atoi(e) != 0;
-    }();
-    if (split && decode_buckets) {
-        for (const char * role : { "decode16k", "decode64k" }) {
-            if (!man.has(role)) {
-                continue;
-            }
-            const kernel & k  = man.get(role);
-            const int      np = (int) (k.in_bytes("b3_kv0") / page_kv);
-            if (np <= 0 || np >= NP) {
-                GGML_ABORT("axera qwen35_moe_sgl: %s has %d of the base's %d pages\n", role, np, NP);
-            }
-            dec_more.emplace_back();
-            dec_more.back().pages = np;
-            bind_decode(k, dec_more.back().c, dec_more.back().state);
-        }
-        std::sort(dec_more.begin(), dec_more.end(), [](const dec_more_t & a, const dec_more_t & b) {
-            return a.pages < b.pages;
-        });
-        for (const auto & d : dec_more) {
-            GGML_LOG_INFO("axera qwen35_moe_sgl: decode bucket %s: %d pages (%lld cells)\n",
-                          d.c.k->desc->role.c_str(), d.pages, (long long) d.pages * PG);
-        }
-    }
 
     // prefill: per layer and state parity, the slices of the decode banks of its phase and block. Both parities are
     // bound once: a page only swaps the four state pools and selects the other call, no IO scanning per layer.
     pre_attn[0].assign(L, {});
     pre_attn[1].assign(L, {});
-    pre_tail[0].assign(L, {});
-    pre_tail[1].assign(L, {});
-    pre_big3840[0].assign(L, {});
-    pre_big3840[1].assign(L, {});
-    pre_big4096[0].assign(L, {});
-    pre_big4096[1].assign(L, {});
     pre_moe.assign(L, {});
     auto meta = [&](size_t off, uint32_t bytes) {
         return axera_io(META.get(), (char *) META->vir + off, bytes);
-    };
-    auto state_second = [&](const std::string & in, int il, uint32_t bytes) {
-        const axera_cmm & s2 = in == "state_in" ? ST2 : in == "q_conv_state_in" ? CQ2 : in == "k_conv_state_in" ? CK2 : CV2;
-        return axera_io(s2.get(), (char *) s2->vir + (size_t) ord[il] * bytes, bytes);
     };
     for (int par = 0; par < 2; ++par) {
         for (int il = 0; il < L; ++il) {
@@ -1063,135 +1016,6 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
             }
         }
     }
-    const bool gdn_tail = man.has("prefill.gdn128");
-    const bool attn_tail = man.has("prefill.attn128");
-    if (gdn_tail || attn_tail) {
-        const kernel & tgk = gdn_tail ? man.get("prefill.gdn128") : gk;
-        const kernel & tak = attn_tail ? man.get("prefill.attn128") : ak;
-        for (int par = 0; par < 2; ++par) {
-            for (int il = 0; il < L; ++il) {
-                const int         phase = il % 4, blk = il / 4;
-                const bool        gdn   = phase != 3;
-                if ((gdn && !gdn_tail) || (!gdn && !attn_tail)) {
-                    continue;
-                }
-                const std::string pa = "b" + std::to_string(phase) + "_attn_";
-                call &            c = pre_tail[par][il];
-                c.k                 = gdn ? &tgk : &tak;
-                for (const auto & d : c.k->desc->in) {
-                    const std::string & n = d.name;
-                    c.ix = n == "x" ? (int) c.in.size() : c.ix;
-                    if (n == "x") {
-                        c.in.push_back(axera_io(PX, d.bytes));
-                    } else if (n == "position_ids") {
-                        c.ipos = (int) c.in.size();
-                        c.in.push_back(axera_io(GPT, d.bytes));
-                    } else if (n == "valid_tokens") {
-                        c.in.push_back(meta(META_VALID, d.bytes));
-                    } else if (n == "indptr") {
-                        c.in.push_back(meta(META_INDPTR, d.bytes));
-                    } else if (n == "indices") {
-                        c.in.push_back(axera_io(INDICES, d.bytes));
-                    } else if (n == "cache_location") {
-                        c.in.push_back(meta(META_CLOC, d.bytes));
-                    } else if (n.find("scale2") != std::string::npos) {
-                        c.in.push_back(part(pa + n, blk, d.bytes));
-                    } else if (n.rfind("w_zeropoint_", 0) == 0) {
-                        c.in.push_back(axera_io(ZERO, d.bytes));
-                    } else if (n == "paged_kv_cache") {
-                        c.in.push_back(kv_io(ord[il], d.bytes));
-                    } else if (n == "cos_sin_cache") {
-                        c.in.push_back(axera_io(B("b3_attn_cos_sin_cache"), d.bytes));
-                    } else if (n == "state_in" || n == "q_conv_state_in" || n == "k_conv_state_in" ||
-                               n == "v_conv_state_in") {
-                        c.in.push_back(par == 0 ? slice("b0_attn_" + n, ord[il], d.bytes) : state_second(n, il, d.bytes));
-                    } else {
-                        static const std::map<std::string, std::string> A = {
-                            { "x_norm_w", "w_norm_attn" }, { "q_norm_w", "w_norm_q" }, { "k_norm_w", "w_norm_k" } };
-                        c.in.push_back(slice(pa + (A.count(n) ? A.at(n) : n), blk, d.bytes));
-                    }
-                }
-                for (const auto & d : c.k->desc->out) {
-                    const std::string & n = d.name;
-                    if (n == "output" || n == "residual_out") {
-                        (n == "output" ? c.iout : c.ires) = (int) c.out.size();
-                        c.out.push_back(axera_io(PA, d.bytes));
-                    } else {
-                        const std::string in = n.substr(0, n.size() - 4) + "_in";
-                        c.out.push_back(par == 0 ? state_second(in, il, d.bytes) : slice("b0_attn_" + in, ord[il], d.bytes));
-                    }
-                }
-            }
-        }
-    }
-    auto bind_big = [&](std::vector<call> (&dst)[2], const kernel & k, bool gdn) {
-        for (int par = 0; par < 2; ++par) {
-            for (int il = 0; il < L; ++il) {
-                const int         phase = il % 4, blk = il / 4;
-                if ((phase == 3) == gdn) {
-                    continue;
-                }
-                const std::string pa = "b" + std::to_string(phase) + "_attn_";
-                call &            c = dst[par][il];
-                c.k                 = &k;
-                for (const auto & d : c.k->desc->in) {
-                    const std::string & n = d.name;
-                    c.ix = n == "x" ? (int) c.in.size() : c.ix;
-                    if (n == "x") {
-                        c.in.push_back(axera_io(PX, d.bytes));
-                    } else if (n == "position_ids") {
-                        c.ipos = (int) c.in.size();
-                        c.in.push_back(axera_io(PBIG, d.bytes));
-                    } else if (n == "valid_tokens") {
-                        c.in.push_back(meta(META_VALID, d.bytes));
-                    } else if (n == "indptr") {
-                        c.in.push_back(meta(META_INDPTR, d.bytes));
-                    } else if (n == "indices") {
-                        c.in.push_back(axera_io(INDICES, d.bytes));
-                    } else if (n == "cache_location") {
-                        c.in.push_back(meta(META_CLOC, d.bytes));
-                    } else if (n.find("scale2") != std::string::npos) {
-                        c.in.push_back(part(pa + n, blk, d.bytes));
-                    } else if (n.rfind("w_zeropoint_", 0) == 0) {
-                        c.in.push_back(axera_io(ZERO, d.bytes));
-                    } else if (n == "paged_kv_cache") {
-                        c.in.push_back(kv_io(ord[il], d.bytes));
-                    } else if (n == "cos_sin_cache") {
-                        c.in.push_back(axera_io(B("b3_attn_cos_sin_cache"), d.bytes));
-                    } else if (n == "state_in" || n == "q_conv_state_in" || n == "k_conv_state_in" ||
-                               n == "v_conv_state_in") {
-                        c.in.push_back(par == 0 ? slice("b0_attn_" + n, ord[il], d.bytes) : state_second(n, il, d.bytes));
-                    } else {
-                        static const std::map<std::string, std::string> A = {
-                            { "x_norm_w", "w_norm_attn" }, { "q_norm_w", "w_norm_q" }, { "k_norm_w", "w_norm_k" } };
-                        c.in.push_back(slice(pa + (A.count(n) ? A.at(n) : n), blk, d.bytes));
-                    }
-                }
-                for (const auto & d : c.k->desc->out) {
-                    const std::string & n = d.name;
-                    if (n == "output" || n == "residual_out") {
-                        (n == "output" ? c.iout : c.ires) = (int) c.out.size();
-                        c.out.push_back(axera_io(PA, d.bytes));
-                    } else {
-                        const std::string in = n.substr(0, n.size() - 4) + "_in";
-                        c.out.push_back(par == 0 ? state_second(in, il, d.bytes) : slice("b0_attn_" + in, ord[il], d.bytes));
-                    }
-                }
-            }
-        }
-    };
-    if (man.has("prefill.gdn3840")) {
-        bind_big(pre_big3840, man.get("prefill.gdn3840"), true);
-    }
-    if (man.has("prefill.gdn4096")) {
-        bind_big(pre_big4096, man.get("prefill.gdn4096"), true);
-    }
-    if (man.has("prefill.attn3840")) {
-        bind_big(pre_big3840, man.get("prefill.attn3840"), false);
-    }
-    if (man.has("prefill.attn4096")) {
-        bind_big(pre_big4096, man.get("prefill.attn4096"), false);
-    }
     auto bind_moe = [&](std::vector<call> & v, const kernel & k) {
         v.assign(L, {});
         for (int il = 0; il < L; ++il) {
@@ -1216,23 +1040,6 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         }
     };
     bind_moe(pre_moe, mk);
-    if (man.has("prefill.moev")) {
-        bind_moe(pre_moev, man.get("prefill.moev"));
-    }
-    pad = {};
-    if (man.has("prefill.padding")) {
-        pad.k = &man.get("prefill.padding");
-        for (const auto & d : pad.k->desc->in) {
-            if (d.name == "x" || d.name == "activation") {
-                pad.in.push_back(axera_io(PA, d.bytes));
-            } else if (d.name == "token_count") {
-                pad.in.push_back(meta(META_VALID, d.bytes));
-            } else {
-                GGML_ABORT("axera qwen35_moe_sgl: unexpected padding input %s\n", d.name.c_str());
-            }
-        }
-    }
-
     // verification (role decode.verify): four rows' positions, the entry state, the accepted-delta
     // prologue, one rank-1 delta per row, and the small Conv history snapshots
     ver = {};
@@ -1399,9 +1206,6 @@ void qwen35_moe_sgl::sync_dec_states() {
         }
     };
     update(dec, dec_state);
-    for (auto & d : dec_more) {
-        update(d.c, d.state);
-    }
     dec_state_dirty = false;
 }
 
@@ -2421,187 +2225,6 @@ void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const flo
                              const int32_t * toks, const int32_t * p4, std::vector<float> & h,
                              const std::vector<int> & out_rows) {
     return prefill_new(c0, n, x, xf, xf_nb1, toks, p4, h, out_rows);
-#if 0
-    GGML_ASSERT(c0 % PG == 0 && c0 + n <= kv_cells);
-    GGML_ASSERT((x != nullptr) + (xf != nullptr) + (toks != nullptr) == 1);
-    const size_t xr = (size_t) H * sizeof(ggml_bf16_t);
-    for (int r0 = 0; r0 < n; r0 += WN) {
-        const int     live = std::min(WN, n - r0);
-        const int64_t cell = c0 + r0;
-        save_state(cell);
-        // a batch that ends inside a page keeps that page's start as a restart point (per layer, at its own last page)
-        const bool tail  = r0 + live == n && live % PG != 0;
-        const int  lastp = tail ? live - live % PG : 0;
-        {  // the first layer reads this padded chunk directly; the MoE writes the next layer's input to PX
-            axera_timer tx("prefill: input copy + flush");
-            if (toks) {
-                embed_tokens(toks + r0, live);
-            } else if (xf) {
-                axera_host_pool().run(live, [&](int64_t i) {
-                    ggml_fp32_to_bf16_row((const float *) ((const char *) xf + (size_t) (r0 + i) * xf_nb1),
-                                          (ggml_bf16_t *) XB->vir + (size_t) i * H, H);
-                });
-            } else {
-                memcpy(XB->vir, x + (size_t) r0 * H, (size_t) live * xr);
-            }
-            if (!toks) {
-                memset((ggml_bf16_t *) XB->vir + (size_t) live * H, 0, (size_t) (WN - live) * xr);
-                XB->flush();
-            }
-        }
-        {  // every page's positions once, in its kernel layout; a page then only moves the pointer
-            axera_timer tpos("prefill: positions");
-            auto * pp = (int32_t *) POS->vir;
-            const size_t page_ints = (size_t) AX * PG;
-            const int pages_live = (live + PG - 1) / PG;
-            for (int r = 0; r < pages_live * PG; ++r) {
-                for (int a = 0; a < AX; ++a) {
-                    pp[(size_t) (r / PG) * page_ints + (size_t) a * PG + r % PG] =
-                        r < live ? p4[(size_t) r * 4 + a] : 0;
-                }
-            }
-            POS->flush(POS->vir, (size_t) pages_live * page_ints * sizeof(int32_t));
-            const int full_rows = live - live % PG;
-            if (full_rows == 3840 || full_rows == 4096) {
-                auto * bp = (int32_t *) PBIG->vir;
-                for (int r = 0; r < full_rows; ++r) {
-                    for (int a = 0; a < AX; ++a) {
-                        bp[(size_t) a * full_rows + r] = p4[(size_t) r * 4 + a];
-                    }
-                }
-                PBIG->flush(PBIG->vir, (size_t) AX * full_rows * sizeof(int32_t));
-            }
-            const int tail_live = live % PG;
-            if (tail_live > 0 && tail_live <= 128 && man.has("prefill.attn128")) {
-                auto * tp = (int32_t *) GPT->vir;
-                for (int r = 0; r < 128; ++r) {
-                    for (int a = 0; a < AX; ++a) {
-                        tp[(size_t) a * 128 + r] = r < tail_live ? p4[(size_t) (r0 + live - tail_live + r) * 4 + a] : 0;
-                    }
-                }
-                GPT->flush();
-            }
-        }
-        axera_timer tl("prefill (chunk)");
-        for (int il = 0; il < L; ++il) {
-            const bool gdn = il % 4 != 3;
-            const int  full = live - live % PG;
-            call *     big  = full == 4096 ? &pre_big4096[state_parity][il] :
-                              full == 3840 ? &pre_big3840[state_parity][il] : nullptr;
-            const bool big_run = big && big->k != nullptr;
-            int        s0      = 0;
-            int        page_parity = state_parity;
-            if (big_run) {
-                const axera_cmm & src = il == 0 ? XB : PX;
-                big->in[big->ix] = axera_io(src.get(), (char *) src->vir, big->k->in_bytes("x"));
-                if (big->ires >= 0) {
-                    big->out[big->ires] = axera_io(PA.get(), (char *) PA->vir, big->k->out_bytes("residual_out"));
-                }
-                if (big->iout >= 0) {
-                    big->out[big->iout] = axera_io(PA.get(), (char *) PA->vir, big->k->out_bytes("output"));
-                }
-                if (!gdn) {
-                    paging(cell, cell);
-                    META->flush(META->vir, META_BYTES);
-                }
-                axera_timer ta(gdn ? "prefill: gdn (big, layer)" : "prefill: attn (big, layer)");
-                big->k->run(big->in, big->out, gdn ? "prefill gdn big" : "prefill attn big");
-                s0 = full;
-                if (s0 == live) {
-                    states_swap();
-                } else {
-                    page_parity ^= 1;  // the big call's output set holds the page-start state
-                }
-            }
-            for (int s = s0; s < live; s += PG) {
-                const int     v    = std::min(PG, live - s);
-                const int64_t c    = cell + s;
-                const bool  big_tail = big_run && s == full;
-                const int   par      = big_tail ? page_parity : state_parity;
-                call &      pcf  = pre_attn[par][il];
-                call &      pct  = pre_tail[par][il];
-                const bool  tail_call = pct.k != nullptr && v <= 128;
-                call &      pc   = tail_call ? pct : pcf;
-                const axera_cmm & src = il == 0 ? XB : PX;
-                pc.in[pc.ix] = axera_io(src.get(), (char *) src->vir + (size_t) s * xr, tail_call ? pc.k->in_bytes("x") : (uint32_t) (PG * xr));
-                if (gdn) {
-                    pc.out[pc.ires] = axera_io(PA.get(), (char *) PA->vir + (size_t) s * xr,
-                                               tail_call ? pc.k->out_bytes("residual_out") : (uint32_t) (PG * xr));
-                } else {
-                    pc.out[pc.iout] = axera_io(PA.get(), (char *) PA->vir + (size_t) s * xr,
-                                               tail_call ? pc.k->out_bytes("output") : (uint32_t) (PG * xr));
-                    pc.in[pc.ipos]  = tail_call ? axera_io(GPT, pc.k->desc->in[pc.ipos].bytes) :
-                                                  axera_io(POS.get(), (char *) POS->vir + (size_t) (s / PG) * AX * PG * sizeof(int32_t),
-                                                           pc.k->desc->in[pc.ipos].bytes);
-                }
-                {
-                    axera_timer tpg("prefill: paging");
-                    paging(c, c);
-                    *(int32_t *) ((char *) META->vir + META_VALID) = v;
-                    META->flush(META->vir, META_BYTES);
-                }
-                axera_timer ta(gdn ? "prefill: gdn (chunk, layer)" : "prefill: attn (chunk, layer)");
-                pc.k->run(pc.in, pc.out, gdn ? "prefill gdn" : "prefill attn");
-                if (gdn && !big_tail) {
-                    states_swap();
-                }
-            }
-            const bool moev_run = !pre_moev.empty() && live < WN;
-            if (live < WN) {
-                *(int32_t *) ((char *) META->vir + META_VALID) = live;
-                META->flush(META->vir, META_BYTES);
-                if (!moev_run) {
-                    axera_timer tp("prefill: padding");
-                    pad.k->run(pad.in, pad.out, "prefill padding");
-                }
-            }
-            axera_timer tm("prefill: moe (chunk, layer)");
-            call & mo = moev_run ? pre_moev[il] : pre_moe[il];
-            mo.k->run(mo.in, mo.out, moev_run ? "prefill moev" : "prefill moe");
-        }
-        const bool     at_page = (cell + live) % PG == 0;
-        if (at_page) {
-            save_state(cell + live);
-        }
-        PX->invalidate(PX->vir, (size_t) live * xr);
-        axera_timer tconv("prefill: output rows");
-        std::vector<int> want;
-        for (size_t i = 0; i < out_rows.size(); ++i) {
-            if (out_rows[i] >= r0 && out_rows[i] < r0 + live) {
-                want.push_back((int) i);
-            }
-        }
-        if (!want.empty()) {
-            axera_host_pool().run((int64_t) want.size(), [&](int64_t i) {
-                const int slot = want[(size_t) i];
-                ggml_bf16_to_fp32_row((const ggml_bf16_t *) PX->vir + (size_t) (out_rows[slot] - r0) * H,
-                                      h.data() + (size_t) slot * H, H);
-            });
-        }
-        if (!at_page) {  // the last partial page: from its start, where the per-layer state was snapshotted
-            if (tail && lastp > 0) {
-                snap_cell = cell + lastp;
-                snap_parity = 1;  // the state set the last page read from still holds its start state
-            }
-            page_x.resize((size_t) (live - lastp) * H);
-            if (toks) {
-                XB->invalidate(XB->vir, (size_t) live * xr);
-                memcpy(page_x.data(), (const ggml_bf16_t *) XB->vir + (size_t) lastp * H,
-                       page_x.size() * sizeof(ggml_bf16_t));
-            } else if (xf) {
-                for (int r = lastp; r < live; ++r) {
-                    ggml_fp32_to_bf16_row((const float *) ((const char *) xf + (size_t) (r0 + r) * xf_nb1),
-                                          page_x.data() + (size_t) (r - lastp) * H, H);
-                }
-            } else {
-                memcpy(page_x.data(), x + (size_t) (r0 + lastp) * H, page_x.size() * sizeof(ggml_bf16_t));
-            }
-            page_p.assign(p4 + (size_t) (r0 + lastp) * 4, p4 + (size_t) (r0 + live) * 4);
-        }
-    }
-    state_cell = c0 + n;
-    state_dirty = true;
-#endif
 }
 
 // one token at cell c > 0, its history the c cells before it
@@ -2634,25 +2257,6 @@ void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4
     {
         axera_timer tl("layers (decode)");
         call * dc = &dec;
-        static const bool buckets_on = [] {
-            const char * e = std::getenv("GGML_AXERA_DECODE_BUCKET");
-            return !e || std::atoi(e) != 0;
-        }();
-        // Every history takes the smallest bucket that fits its context by default. GGML_AXERA_DECODE_BUCKET_MIN
-        // remains an escape hatch for reproducing the old 2048-cell threshold.
-        static const int64_t bucket_min = [] {
-            const char * e = std::getenv("GGML_AXERA_DECODE_BUCKET_MIN");
-            return e ? std::max<int64_t>(0, std::atoll(e)) : 0;
-        }();
-        if (buckets_on && c >= bucket_min) {
-            const int64_t need = c / PG + 1;  // the history pages and the page this token writes
-            for (auto & d : dec_more) {
-                if (d.pages >= need) {
-                    dc = &d.c;
-                    break;
-                }
-            }
-        }
         static const void * last_kernel = nullptr;
         if (last_kernel != dc->k) {
             GGML_LOG_INFO("axera qwen35_moe_sgl: decode cell %lld uses %s (%u pages)\n", (long long) c,
