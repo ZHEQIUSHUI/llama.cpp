@@ -21,6 +21,7 @@ ggml_add_backend_library(ggml-axera
                          models/qwen35_moe/qwen35_moe.cpp
                          models/qwen35_dense/qwen35_dense.cpp
                          models/qwen38_27b/qwen38_27b.cpp
+                         models/dense_blocks/dense_blocks.cpp
                          models/qwen35_whole/qwen35_whole.cpp
                          models/qwen35_35b_a3b/qwen35_35b_a3b.cpp
                          models/qwen35_moe_sgl/qwen35_moe_sgl.cpp

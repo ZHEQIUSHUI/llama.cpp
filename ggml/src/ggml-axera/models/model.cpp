@@ -81,6 +81,8 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
         llm = make_qwen35_dense(m);
     } else if (m.model == "qwen38_27b") {
         llm = make_qwen38_27b(m);
+    } else if (m.model == "dense_blocks") {
+        llm = make_dense_blocks(m);
     } else if (m.model == "qwen35_whole") {
         llm = make_qwen35_whole(m);
     } else if (m.model == "qwen35_35b_a3b") {
