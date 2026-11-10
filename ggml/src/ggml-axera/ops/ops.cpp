@@ -1192,6 +1192,23 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
         dctx->clean_p     = (float *) logits->data;
         dctx->clean_n     = (size_t) n_out * N * sizeof(float);
         dctx->clean_epoch = axera_graph_epoch;
+        if (const char * dp = getenv("GGML_AXERA_DUMP_HEAD")) {  // debug: the head's input rows and its logits
+            const std::string base(dp);
+            if (FILE * fd = fopen((base + ".h.bin").c_str(), "ab")) {
+                for (int r = 0; r < n_out; ++r) {
+                    fwrite(h.data() + (size_t) (compact_rows ? r : rows[r]) * K, sizeof(float), (size_t) K, fd);
+                }
+                fclose(fd);
+            }
+            if (FILE * fd = fopen((base + ".logits.bin").c_str(), "ab")) {
+                for (int r = 0; r < n_out; ++r) {
+                    fwrite((const char *) logits->data + (size_t) r * logits->nb[1], sizeof(float), (size_t) N, fd);
+                }
+                fclose(fd);
+            }
+            fprintf(stderr, "head dump: n_out=%d row0=%d K=%lld N=%lld\n", n_out, rows.empty() ? -1 : rows[0],
+                    (long long) K, (long long) N);
+        }
         after(g, names);
         return;
     }
