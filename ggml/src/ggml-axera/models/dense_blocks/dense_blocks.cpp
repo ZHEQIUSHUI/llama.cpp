@@ -260,7 +260,10 @@ axera_cmm dense_blocks::bank_sgl(const std::map<std::string, ggml_tensor *> & t,
         const int il      = 4 * b + phase;
         uint8_t * dst     = (uint8_t *) c->vir + (size_t) b * stride;
         auto put = [&](const std::vector<float> & v, float mul = 1.0f) {
-            GGML_ASSERT(v.size() * (d.dtype == 3 ? sizeof(float) : sizeof(ggml_bf16_t)) == bb);
+            if (v.size() * (d.dtype == 3 ? sizeof(float) : sizeof(ggml_bf16_t)) != bb) {
+                GGML_ABORT("axera dense_blocks: bank %s: %zu values of dtype %d, kernel block wants %zu bytes\n",
+                           d.name.c_str(), v.size(), d.dtype, bb);
+            }
             for (size_t i = 0; i < v.size(); ++i) {
                 if (d.dtype == 3) {
                     ((float *) dst)[i] = v[i] * mul;
@@ -381,9 +384,10 @@ axera_cmm dense_blocks::bank_sgl(const std::map<std::string, ggml_tensor *> & t,
             } else if (n == "w_q_conv" || n == "w_k_conv" || n == "w_v_conv") {
                 const ggml_tensor *      w = T(il, "ssm_conv1d.weight");
                 const std::vector<float> v = f32_of(w);
-                const int64_t            tp = w->ne[0], C = d.shape[1] * d.shape[2] * d.shape[3];
+                // The bank is [blocks, channels, 1, taps]; the taps are the GGUF row dim, not a channel dim.
+                const int64_t            tp = w->ne[0], C = d.shape[1] * d.shape[2];
                 const int64_t            c0 = n[2] == 'q' ? 0 : n[2] == 'k' ? 2048 : 4096;
-                GGML_ASSERT(d.shape[2] == 1 && d.shape[3] == 4 && C + c0 <= w->ne[1]);
+                GGML_ASSERT(d.shape[2] == 1 && d.shape[3] == tp && C + c0 <= w->ne[1]);
                 std::vector<float> u((size_t) C * tp);
                 memcpy(u.data(), v.data() + (size_t) c0 * tp, u.size() * sizeof(float));
                 put(u);
