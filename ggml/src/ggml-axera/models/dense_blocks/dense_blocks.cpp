@@ -261,9 +261,12 @@ axera_cmm dense_blocks::bank(const std::map<std::string, ggml_tensor *> & t, con
         GGML_ASSERT(ne == 1 || (row >= 0 && row < ne));
         return ((const float *) it->second->data)[ne == 1 ? 0 : row];
     };
+    // CMM allocations are padded to the runtime's alignment: keep one padded stride for every block so the fill
+    // and the per-call slices in bind() address the same offsets.
+    const size_t stride = c->size / (size_t) NB;
     for (int b = 0; b < NB; ++b) {
         const int il    = 4 * b + phase;
-        uint8_t * dst   = (uint8_t *) c->vir + (size_t) b * bb;
+        uint8_t * dst   = (uint8_t *) c->vir + (size_t) b * stride;
         auto put_f32 = [&](const std::vector<float> & v, float scale = 1.0f) {
             GGML_ASSERT(v.size() * sizeof(float) == bb || v.size() * sizeof(ggml_bf16_t) == bb);
             for (size_t i = 0; i < v.size(); ++i) {
@@ -535,7 +538,7 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
         }
         const size_t csize = c->size;
         banks[d.name] = std::move(c);
-        GGML_ASSERT(csize == (size_t) (shared ? d.bytes : d.bytes * NC));
+        GGML_ASSERT(csize >= (size_t) (shared ? d.bytes : d.bytes * NC));
     }
 
     // the four phase banks above are one layer each: the state/conv-state pools hold every block's three layers
