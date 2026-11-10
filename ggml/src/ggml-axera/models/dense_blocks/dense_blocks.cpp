@@ -708,8 +708,9 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
     cv_b = pcv.bytes / (size_t) kB;
     kv_b = pkv.bytes;
     kv_blk_b = kv_b / (size_t) kB;
-    // The pool is [pages, 2, PG, KV heads, 256]; the upstream module adds a leading batch dim of 1, so the
-    // compiled kernel spells it [1, pages, 2, PG, 4, 256].  Read the trailing five dims and accept either.
+    // The pool is [blocks, pages, 2, PG, KV heads, 256]; upstream keeps one pool per layer, so a one-block
+    // kernel spells it [1, pages, 2, PG, 4, 256] and the 16-block kernel [16, pages, 2, PG, 4, 256].
+    // Read the trailing five dims and accept either leading extent.
     const std::vector<int64_t> & ks = pkv.shape;
     GGML_ASSERT(ks.size() >= 5);
     const size_t kd = ks.size();
@@ -718,7 +719,7 @@ void dense_blocks::init(const std::map<std::string, ggml_tensor *> & t, const gg
     // is slack; the adapter's sequence still ends at man.context cells.
     GGML_ASSERT((int64_t) ks[kd - 5] * PG >= (int64_t) man.context);
     for (size_t i = 0; i + 5 < kd; ++i) {
-        GGML_ASSERT(ks[i] == 1);
+        GGML_ASSERT(ks[i] == 1 || ks[i] == (int64_t) kB);
     }
     kv_pages = (int) ks[kd - 5];
     kv_cells = man.context;
