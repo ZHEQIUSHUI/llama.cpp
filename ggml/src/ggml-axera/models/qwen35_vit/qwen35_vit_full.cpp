@@ -14,6 +14,7 @@
 #include "../../core/patch_embed.h"
 
 #include <cmath>
+#include <thread>
 
 namespace axera {
 namespace {
@@ -21,6 +22,11 @@ namespace {
 class qwen35_vit_full final : public model {
   public:
     explicit qwen35_vit_full(const manifest & m) : man(m), k(man.get("vit")) {}
+    ~qwen35_vit_full() override {
+        if (pairs_bg.joinable()) {
+            pairs_bg.join();
+        }
+    }
     ggml_status compute(ggml_cgraph * g) override;
 
   private:
@@ -34,6 +40,7 @@ class qwen35_vit_full final : public model {
     std::vector<int>                  py, px;       // the patches in merge order
     patch_embed                       pemb;         // the patch projection: the kernel's px rows and w_patch
     int                               w_frames = 0; // the frames per call w_patch is filled for
+    std::thread                       pairs_bg;     // builds the frame pairs' weight while the model loads
 
     axera_cmm & io(const char * n, bool out = false) {
         auto & c = buf[n];
@@ -96,10 +103,15 @@ void qwen35_vit_full::weights(int L, int H) {
     const int           PW = (int) (k.in_bytes("px") / sizeof(ggml_bf16_t) / N);
     GGML_ASSERT(w0->type == GGML_TYPE_F32 && w1->type == GGML_TYPE_F32 && ggml_nelements(w0) == ggml_nelements(w1) &&
                 (size_t) H * PW * sizeof(ggml_bf16_t) == k.in_bytes("w_patch"));
-    const bool ok = pemb.init((const float *) w0->data, (const float *) w1->data, H, CP, PW,
-                              [](int64_t n, const std::function<void(int64_t)> & fn) { axera_host_pool().run(n, fn); });
+    if (pairs_bg.joinable()) {
+        pairs_bg.join();
+    }
+    const bool ok = pemb.init((const float *) w0->data, (const float *) w1->data, H, CP, PW);
     GGML_ASSERT(ok && "axera qwen35_vit_full: the kernel's px row is neither one nor two frames wide");
     w_frames = 0;
+    // a video's first frame pair would otherwise wait seconds for the pairs' weight: build it now, on threads of its
+    // own (the host pool is the loader's and the prompts')
+    pairs_bg = std::thread([this] { pemb.prepare_pairs(patch_embed::threads((int) std::max(1u, std::thread::hardware_concurrency()))); });
 }
 
 void qwen35_vit_full::patch_weight(int frames) {
@@ -107,7 +119,9 @@ void qwen35_vit_full::patch_weight(int frames) {
         return;
     }
     axera_timer                tm(frames == 2 ? "vit patch weight (frame pairs)" : "vit patch weight (stills)");
-    const std::vector<float> & w = pemb.weight(frames);
+    const std::vector<float> & w = frames == 2 ? pemb.weight_pairs([](int64_t n, const std::function<void(int64_t)> & fn) {
+        axera_host_pool().run(n, fn);
+    }) : pemb.weight_still();
     GGML_ASSERT(w.size() * sizeof(ggml_bf16_t) == k.in_bytes("w_patch"));
     ggml_fp32_to_bf16_row(w.data(), (ggml_bf16_t *) io("w_patch")->vir, (int64_t) w.size());
     io("w_patch")->flush();

@@ -1,7 +1,9 @@
 #include "patch_embed.h"
 
 #include <cmath>
+#include <algorithm>
 #include <cstring>
+#include <thread>
 
 namespace axera {
 
@@ -41,70 +43,133 @@ float dotf(const float * a, const float * b, int n) {
     return ((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7));
 }
 
-// orthonormal columns: q [n][m] (column j at q + j * m), classical Gram-Schmidt run twice per column
+// orthonormal columns: q [n][m] (column j at q + j * m), n <= m, by Cholesky QR done twice (the second pass restores
+// the orthogonality the first loses to the columns' conditioning): a few large parallel loops, not one per column
 void orthonormalize(std::vector<double> & q, int n, int m, const patch_embed::parallel & par) {
-    std::vector<double> r(n);
-    const int           chunks = 8, step = (m + chunks - 1) / chunks;
-    for (int j = 0; j < n; ++j) {
-        double * y = q.data() + (size_t) j * m;
-        for (int pass = 0; pass < 2 && j > 0; ++pass) {
-            par(j, [&](int64_t i) { r[i] = dot(q.data() + (size_t) i * m, y, m); });
-            par(chunks, [&](int64_t c) {
-                const int h0 = (int) c * step, h1 = h0 + step < m ? h0 + step : m;
-                for (int i = 0; i < j; ++i) {
-                    const double * qi = q.data() + (size_t) i * m;
-                    const double   ri = r[i];
-                    for (int h = h0; h < h1; ++h) {
-                        y[h] -= ri * qi[h];
-                    }
+    std::vector<double> g((size_t) n * n), l((size_t) n * n, 0.0), row((size_t) m * n);
+    for (int pass = 0; pass < 2; ++pass) {
+        par(n, [&](int64_t i) {  // the Gram matrix (upper triangle)
+            const double * qi = q.data() + (size_t) i * m;
+            for (int j = (int) i; j < n; ++j) {
+                g[(size_t) i * n + j] = dot(qi, q.data() + (size_t) j * m, m);
+            }
+        });
+        // g = L L^T, L lower triangular by rows (every inner loop runs along two rows)
+        for (int i = 0; i < n; ++i) {
+            double * li = l.data() + (size_t) i * n;
+            for (int j = 0; j <= i; ++j) {
+                const double * lj = l.data() + (size_t) j * n;
+                double         s  = g[(size_t) j * n + i] - dot(li, lj, j);
+                if (j == i) {
+                    li[i] = std::sqrt(s > 1e-30 ? s : 1e-30);
+                } else {
+                    li[j] = s / lj[j];
                 }
-            });
+            }
         }
-        const double nrm = std::sqrt(dot(y, y, m));
-        const double inv = nrm > 0 ? 1.0 / nrm : 0.0;
-        for (int h = 0; h < m; ++h) {
-            y[h] *= inv;
-        }
+        // Q = Y L^-T, row by row of Y (x L^T = y: x_j = (y_j - sum_k<j x_k L[j][k]) / L[j][j])
+        par(m, [&](int64_t h) {
+            double * x = row.data() + (size_t) h * n;
+            for (int j = 0; j < n; ++j) {
+                const double * lj = l.data() + (size_t) j * n;
+                x[j]              = (q[(size_t) j * m + h] - dot(x, lj, j)) / lj[j];
+            }
+        });
+        par(n, [&](int64_t j) {
+            double * qj = q.data() + (size_t) j * m;
+            for (int h = 0; h < m; ++h) {
+                qj[h] = row[(size_t) h * n + j];
+            }
+        });
     }
 }
 
 }  // namespace
 
-bool patch_embed::init(const float * w0, const float * w1, int H_, int CP_, int width, parallel par_) {
+patch_embed::parallel patch_embed::threads(int n) {
+    return [n](int64_t count, const std::function<void(int64_t)> & fn) {
+        const int t = (int) std::min<int64_t>(n, count);
+        if (t <= 1) {
+            serial(count, fn);
+            return;
+        }
+        std::vector<std::thread> th;
+        for (int w = 0; w < t; ++w) {
+            th.emplace_back([&, w] {
+                for (int64_t i = count * w / t; i < count * (w + 1) / t; ++i) {
+                    fn(i);
+                }
+            });
+        }
+        for (auto & x : th) {
+            x.join();
+        }
+    };
+}
+
+void patch_embed::serial(int64_t n, const std::function<void(int64_t)> & fn) {
+    for (int64_t i = 0; i < n; ++i) {
+        fn(i);
+    }
+}
+
+bool patch_embed::init(const float * w0, const float * w1, int H_, int CP_, int width) {
     if (H_ <= 0 || CP_ <= 0 || (width != CP_ && width != 2 * CP_)) {
         return false;
     }
-    H   = H_;
-    CP  = CP_;
-    PW  = width;
-    par = std::move(par_);
+    std::lock_guard<std::mutex> lock(mu);
+    H  = H_;
+    CP = CP_;
+    PW = width;
     W0.assign(w0, w0 + (size_t) H * CP);
     W1.assign(w1, w1 + (size_t) H * CP);
-    frames_cur = 0;
-    basis      = false;
-    resid      = 0;
-    Wk.clear();
-    A.clear();
+    Ws.resize((size_t) H * PW);
+    if (PW == 2 * CP) {  // room for both frames: the weights as they are, a still is both frames
+        for (int h = 0; h < H; ++h) {
+            memcpy(Ws.data() + (size_t) h * PW, W0.data() + (size_t) h * CP, CP * sizeof(float));
+            memcpy(Ws.data() + (size_t) h * PW + CP, W1.data() + (size_t) h * CP, CP * sizeof(float));
+        }
+        Wp    = Ws;
+        pairs = true;
+    } else {
+        for (size_t i = 0; i < Ws.size(); ++i) {
+            Ws[i] = W0[i] + W1[i];
+        }
+        Wp.clear();
+        A.clear();
+        pairs = false;
+    }
+    resid = 0;
     return true;
+}
+
+const std::vector<float> & patch_embed::weight_pairs(const parallel & par) {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!pairs) {
+        build_basis(par);
+        pairs = true;
+    }
+    return Wp;
 }
 
 // Q: the CP leading directions of [W0 W1]'s column space (a randomized range finder with one power iteration: the
 // spectrum drops by orders of magnitude after CP, one iteration is at the limit already), and A = Q^T [W0 W1]
-void patch_embed::build_basis() {
-    basis = true;
+void patch_embed::build_basis(const parallel & par) {
     A.assign((size_t) CP * 2 * CP, 0.0f);
-    Wk.assign((size_t) H * CP, 0.0f);
+    Wp.assign((size_t) H * CP, 0.0f);
     if (H <= CP) {  // e itself fits a px row: W = [I 0], px = [e 0]
         for (int h = 0; h < H; ++h) {
             memcpy(A.data() + (size_t) h * 2 * CP, W0.data() + (size_t) h * CP, CP * sizeof(float));
             memcpy(A.data() + (size_t) h * 2 * CP + CP, W1.data() + (size_t) h * CP, CP * sizeof(float));
-            Wk[(size_t) h * CP + h] = 1.0f;
+            Wp[(size_t) h * CP + h] = 1.0f;
         }
         resid = 0;
         return;
     }
-    // Y = [W0 W1] Omega, Omega [2 CP][CP] standard normal (a fixed seed: the same basis every run), stored by column
-    std::vector<double> om((size_t) 2 * CP * CP);
+    // The products with the weights run in float (their rows are float; a dot product of 2 CP terms keeps ~1e-6, below
+    // the kernels' bf16 inputs), the orthonormalization in double. Y = [W0 W1] Omega, Omega [2 CP][CP] standard normal
+    // (a fixed seed: the same basis every run), stored by column
+    std::vector<float> om((size_t) 2 * CP * CP);
     {
         uint64_t   s    = 0x9e3779b97f4a7c15ull;
         const auto next = [&]() {
@@ -115,48 +180,44 @@ void patch_embed::build_basis() {
         };
         for (size_t i = 0; i + 1 < om.size(); i += 2) {
             const double a = std::sqrt(-2.0 * std::log(next())), b = 6.283185307179586 * next();
-            om[i]     = a * std::cos(b);
-            om[i + 1] = a * std::sin(b);
+            om[i]     = (float) (a * std::cos(b));
+            om[i + 1] = (float) (a * std::sin(b));
         }
     }
     std::vector<double> q((size_t) CP * H);  // column j at q + j * H
     par(CP, [&](int64_t j) {
-        double *       y  = q.data() + (size_t) j * H;
-        const double * oj = om.data() + (size_t) j * 2 * CP;
+        double *      y  = q.data() + (size_t) j * H;
+        const float * oj = om.data() + (size_t) j * 2 * CP;
         for (int h = 0; h < H; ++h) {
-            const float * a = W0.data() + (size_t) h * CP, *b = W1.data() + (size_t) h * CP;
-            double        s = 0;
-            for (int m = 0; m < CP; ++m) {
-                s += a[m] * oj[m] + b[m] * oj[CP + m];
-            }
-            y[h] = s;
+            y[h] = (double) dotf(W0.data() + (size_t) h * CP, oj, CP) + dotf(W1.data() + (size_t) h * CP, oj + CP, CP);
         }
     });
     om.clear();
     om.shrink_to_fit();
     orthonormalize(q, CP, H, par);
+    // t = [W0 W1]^T y for a column y of q: [2 CP] floats
+    const auto times_wt = [&](const double * y, float * t) {
+        std::fill(t, t + 2 * CP, 0.0f);
+        for (int h = 0; h < H; ++h) {
+            const float * a = W0.data() + (size_t) h * CP, *b = W1.data() + (size_t) h * CP;
+            const float   v = (float) y[h];
+            for (int m = 0; m < CP; ++m) {
+                t[m] += v * a[m];
+            }
+            for (int m = 0; m < CP; ++m) {
+                t[CP + m] += v * b[m];
+            }
+        }
+    };
     // one power iteration: q <- orth([W0 W1] [W0 W1]^T q)
     {
         std::vector<double> z((size_t) CP * H);
         par(CP, [&](int64_t j) {
-            const double *      y = q.data() + (size_t) j * H;
-            std::vector<double> t0(CP, 0.0), t1(CP, 0.0);
-            for (int h = 0; h < H; ++h) {
-                const float * a = W0.data() + (size_t) h * CP, *b = W1.data() + (size_t) h * CP;
-                const double  v = y[h];
-                for (int m = 0; m < CP; ++m) {
-                    t0[m] += v * a[m];
-                    t1[m] += v * b[m];
-                }
-            }
+            std::vector<float> t((size_t) 2 * CP);
+            times_wt(q.data() + (size_t) j * H, t.data());
             double * o = z.data() + (size_t) j * H;
             for (int h = 0; h < H; ++h) {
-                const float * a = W0.data() + (size_t) h * CP, *b = W1.data() + (size_t) h * CP;
-                double        s = 0;
-                for (int m = 0; m < CP; ++m) {
-                    s += a[m] * t0[m] + b[m] * t1[m];
-                }
-                o[h] = s;
+                o[h] = (double) dotf(W0.data() + (size_t) h * CP, t.data(), CP) + dotf(W1.data() + (size_t) h * CP, t.data() + CP, CP);
             }
         });
         q.swap(z);
@@ -164,25 +225,16 @@ void patch_embed::build_basis() {
     orthonormalize(q, CP, H, par);
     std::vector<double> kept(CP, 0.0);
     par(CP, [&](int64_t j) {
-        const double *      y = q.data() + (size_t) j * H;
-        std::vector<double> t((size_t) 2 * CP, 0.0);
-        for (int h = 0; h < H; ++h) {
-            const float * a = W0.data() + (size_t) h * CP, *b = W1.data() + (size_t) h * CP;
-            const double  v = y[h];
-            for (int m = 0; m < CP; ++m) {
-                t[m]      += v * a[m];
-                t[CP + m] += v * b[m];
-            }
-        }
-        float * o = A.data() + (size_t) j * 2 * CP;
-        double  e = 0;
+        const double * y = q.data() + (size_t) j * H;
+        float *        o = A.data() + (size_t) j * 2 * CP;
+        times_wt(y, o);
+        double e = 0;
         for (int m = 0; m < 2 * CP; ++m) {
-            o[m] = (float) t[m];
-            e   += t[m] * t[m];
+            e += (double) o[m] * o[m];
         }
         kept[j] = e;
         for (int h = 0; h < H; ++h) {
-            Wk[(size_t) h * CP + j] = (float) y[h];
+            Wp[(size_t) h * CP + j] = (float) y[h];
         }
     });
     double all = 0, in = 0;
@@ -194,29 +246,6 @@ void patch_embed::build_basis() {
     }
     resid = all > 0 ? (all - in) / all : 0;
     resid = resid < 0 ? 0 : resid;
-}
-
-const std::vector<float> & patch_embed::weight(int frames) {
-    if (frames == frames_cur) {
-        return Wk;
-    }
-    frames_cur = frames;
-    if (PW == 2 * CP) {  // room for both frames: the weights as they are
-        Wk.resize((size_t) H * PW);
-        for (int h = 0; h < H; ++h) {
-            memcpy(Wk.data() + (size_t) h * PW, W0.data() + (size_t) h * CP, CP * sizeof(float));
-            memcpy(Wk.data() + (size_t) h * PW + CP, W1.data() + (size_t) h * CP, CP * sizeof(float));
-        }
-    } else if (frames == 1) {
-        Wk.resize((size_t) H * CP);
-        for (size_t i = 0; i < Wk.size(); ++i) {
-            Wk[i] = W0[i] + W1[i];
-        }
-        basis = false;  // (Wk is not the basis any more)
-    } else {
-        build_basis();
-    }
-    return Wk;
 }
 
 void patch_embed::row(const float * p0, const float * p1, float * dst) const {

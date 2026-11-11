@@ -3,10 +3,12 @@
 
 #include "../core/patch_embed.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <thread>
 #include <vector>
 
 using namespace axera;
@@ -22,11 +24,15 @@ void serial(int64_t n, const std::function<void(int64_t)> & fn) {
 // the relative error of px W^T against W0 p0 + W1 p1 over random patches
 double check(const std::vector<float> & w0, const std::vector<float> & w1, int H, int CP, int width, int frames, std::mt19937 & rng) {
     patch_embed pe;
-    if (!pe.init(w0.data(), w1.data(), H, CP, width, serial)) {
+    if (!pe.init(w0.data(), w1.data(), H, CP, width)) {
         fprintf(stderr, "FAIL init\n");
         exit(1);
     }
-    const std::vector<float> & W = pe.weight(frames);
+    if (frames == 2 && width == CP) {  // as the adapter does: built on another thread, then used
+        std::thread bg([&] { pe.prepare_pairs(patch_embed::threads(4)); });
+        bg.join();
+    }
+    const std::vector<float> & W = frames == 2 ? pe.weight_pairs(serial) : pe.weight_still();
     std::normal_distribution<float> nd;
     double num = 0, den = 0;
     for (int t = 0; t < 64; ++t) {
@@ -67,7 +73,10 @@ int main(int argc, char ** argv) {
         for (size_t i = 0; i < w1.size(); ++i) {
             w1[i] = w0[i] + 0.1f * nd(rng);
         }
-        return check(w0, w1, H, CP, CP, 2, rng) < 1 ? 0 : 1;
+        const auto t0  = std::chrono::steady_clock::now();
+        const int  rc  = check(w0, w1, H, CP, CP, 2, rng) < 1 ? 0 : 1;
+        printf("%.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        return rc;
     }
     std::mt19937                    rng(7);
     std::normal_distribution<float> nd;

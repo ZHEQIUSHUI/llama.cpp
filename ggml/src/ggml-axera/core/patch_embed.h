@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <vector>
 
 namespace axera {
@@ -23,29 +24,34 @@ class patch_embed {
   public:
     // run fn(i) for i in [0, n), possibly on several threads
     using parallel = std::function<void(int64_t, const std::function<void(int64_t)> &)>;
+    static void serial(int64_t n, const std::function<void(int64_t)> & fn);
+    static parallel threads(int n);  // n threads of its own per call (few, large calls)
 
     // w0, w1: [H][CP] (a patch's pixels in the weights' own order); width: the kernel's px row
-    bool init(const float * w0, const float * w1, int H, int CP, int width, parallel par);
+    bool init(const float * w0, const float * w1, int H, int CP, int width);
 
     int width() const { return PW; }
-    // the kernel's weight [H][width] for calls of `frames` (1 or 2) frames; the same object until frames changes
-    const std::vector<float> & weight(int frames);
-    // one patch's px row [width] (p1 == nullptr: a still); weight(frames) of the same frame count must be current
+    // the kernel's weight [H][width] for still images
+    const std::vector<float> & weight_still() const { return Ws; }
+    // the kernel's weight [H][width] for frame pairs: built on the first call (several seconds for a tower wider than
+    // a px row), unless prepare_pairs() ran first, e.g. on a thread started at load; a call while it runs waits
+    const std::vector<float> & weight_pairs(const parallel & par);
+    void                       prepare_pairs(const parallel & par) { weight_pairs(par); }
+    // one patch's px row [width] (p1 == nullptr: a still); a pair's needs weight_pairs() first
     void row(const float * p0, const float * p1, float * dst) const;
-    // the share of [W0 W1]'s energy outside the frame pairs' basis (0: exact)
+    // the share of [W0 W1]'s energy outside the frame pairs' basis (0: exact); valid after weight_pairs()
     double pair_residual() const { return resid; }
 
   private:
-    int      H = 0, CP = 0, PW = 0;
-    int      frames_cur = 0;
-    parallel par;
+    int                H = 0, CP = 0, PW = 0;
     std::vector<float> W0, W1;  // [H][CP]
-    std::vector<float> Wk;      // the weight of frames_cur
-    std::vector<float> A;       // one-frame kernels, pairs: [CP][2 * CP], px = A [p0 p1]
-    bool               basis = false;
+    std::vector<float> Ws, Wp;  // the kernel weights of stills, of pairs
+    std::vector<float> A;       // one-frame rows of pairs: [CP][2 * CP], px = A [p0 p1]
+    std::mutex         mu;      // (weight_pairs)
+    bool               pairs = false;
     double             resid = 0;
 
-    void build_basis();
+    void build_basis(const parallel & par);
 };
 
 }  // namespace axera
