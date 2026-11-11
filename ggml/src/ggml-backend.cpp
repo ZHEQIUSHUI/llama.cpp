@@ -1111,16 +1111,21 @@ void ggml_graph_set_stable_uid(struct ggml_cgraph * graph, uint64_t uid) {
 }
 
 static uint64_t ggml_topology_hash_name(uint64_t h, const char * s) {
-    // ggml_tensor.name is a fixed GGML_MAX_NAME array: hash all of it, including the zero padding. This avoids a
-    // strlen pass and a variable-length loop for each of the thousands of tensors of a prompt graph.
+    // ggml_tensor.name is a fixed GGML_MAX_NAME array. Hash whole words until the word containing the terminator,
+    // which avoids a strlen pass while skipping the long zero tail of most names.
     const uint64_t prime = 1099511628211ull;
     size_t i = 0;
+    bool   done = false;
     for (; i + sizeof(uint64_t) <= GGML_MAX_NAME; i += sizeof(uint64_t)) {
         uint64_t v;
         memcpy(&v, s + i, sizeof(v));
         h = (h ^ v) * prime;
+        if (((v - 0x0101010101010101ull) & ~v & 0x8080808080808080ull) != 0) {
+            done = true;
+            break;
+        }
     }
-    for (; i < GGML_MAX_NAME; ++i) {
+    for (; !done && i < GGML_MAX_NAME; ++i) {
         h = (h ^ (unsigned char) s[i]) * prime;
     }
     return h;
