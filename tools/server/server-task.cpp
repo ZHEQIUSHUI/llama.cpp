@@ -710,10 +710,42 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     return server_sent_events;
 }
 
+static void parse_asr_transcript(const std::string & raw, std::string & text, std::string & language) {
+    static const std::string prefix = "language ";
+    static const std::string marker = "<asr_text>";
+
+    if (raw.compare(0, prefix.size(), prefix) == 0) {
+        const size_t marker_pos = raw.find(marker, prefix.size());
+        if (marker_pos != std::string::npos && marker_pos > prefix.size()) {
+            language = raw.substr(prefix.size(), marker_pos - prefix.size());
+            text = raw.substr(marker_pos + marker.size());
+            return;
+        }
+    }
+
+    text = raw;
+    language.clear();
+}
+
 json server_task_result_cmpl_final::to_json_oaicompat_asr() {
-    return json {
-        {"text", oaicompat_msg.content},
+    std::string text;
+    std::string language;
+    parse_asr_transcript(oaicompat_msg.content, text, language);
+
+    json event = json {
+        {"text",  text},
+        {"usage", json {
+            {"type",         "tokens"},
+            {"input_tokens",  n_prompt_tokens},
+            {"output_tokens", n_decoded},
+            {"total_tokens",  n_decoded + n_prompt_tokens},
+            {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
+        }},
     };
+    if (!language.empty()) {
+        event["language"] = language;
+    }
+    return event;
 }
 
 json server_task_result_cmpl_final::to_json_anthropic() {

@@ -667,8 +667,8 @@ json convert_transcriptions_to_chatcmpl(
     std::string prompt          = json_value(inp_body, "prompt", std::string());
     std::string language        = json_value(inp_body, "language", std::string());
     std::string response_format = json_value(inp_body, "response_format", std::string("json"));
-    if (response_format != "json") {
-        throw std::invalid_argument("Only 'json' response_format is supported for transcription");
+    if (response_format != "json" && response_format != "text") {
+        throw std::invalid_argument("Only 'json' and 'text' response_format are supported for transcription");
     }
     const common_chat_prompt_preset preset = common_chat_get_asr_prompt(tmpls);
     if (prompt.empty()) {
@@ -687,6 +687,8 @@ json convert_transcriptions_to_chatcmpl(
 
     json chatcmpl_body = inp_body; // copy all fields
     chatcmpl_body["messages"] = messages;
+    chatcmpl_body["__transcription_response_format"] = response_format;
+    chatcmpl_body.erase("response_format");
 
     // because input from form-data, everything is string, we need to correct the types here
     std::string stream = json_value(inp_body, "stream", std::string("false"));

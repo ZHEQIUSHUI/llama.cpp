@@ -5915,8 +5915,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
-            if (has_audio_input) {
-                // AXERA audio encoder state cannot be restored reliably from the prompt cache
+            if (has_audio_input && ggml_backend_reg_by_name("AXERA") != nullptr) {
+                // Prompt-cache matching sees all media tokens as LLAMA_TOKEN_NULL, so it can
+                // mistake a different audio clip for a cached prefix and reuse the old
+                // encoder's KV state. Keep the AXERA audio path out of prompt-cache reuse.
                 task.params.cache_prompt = false;
             }
 
@@ -5948,6 +5950,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     }
 
     bool stream = json_value(data, "stream", false);
+    const std::string asr_response_format = res_type == TASK_RESPONSE_TYPE_OAI_ASR
+        ? json_value(data, "__transcription_response_format", std::string("json"))
+        : std::string();
 
     if (!stream) {
         // non-stream, wait for the results
@@ -5966,7 +5971,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             GGML_ASSERT(!arr.empty() && "empty results");
             if (arr.size() == 1) {
                 // if single request, return single object instead of array
-                res->ok(arr[0]);
+                if (res_type == TASK_RESPONSE_TYPE_OAI_ASR && asr_response_format == "text") {
+                    res->status = 200;
+                    res->content_type = "text/plain; charset=utf-8";
+                    res->data = json_value(arr[0], "text", std::string());
+                } else {
+                    res->ok(arr[0]);
+                }
             } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
                 // if multiple results in OAI format, we need to re-format them
                 json & choices = arr[0]["choices"];
