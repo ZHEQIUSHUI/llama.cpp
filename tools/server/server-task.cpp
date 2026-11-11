@@ -161,6 +161,68 @@ task_result_state::task_result_state(common_chat_session session)
     , oai_resp_message_id("msg_" + random_string()) {
 }
 
+std::string task_result_state::filter_asr_delta(const std::string & delta) {
+    static const std::string prefix = "language ";
+    static const std::string marker = "<asr_text>";
+
+    if (asr_prefix_resolved) {
+        return delta;
+    }
+
+    asr_prefix_buffer += delta;
+
+    if (asr_prefix_buffer.size() <= prefix.size() &&
+            prefix.compare(0, asr_prefix_buffer.size(), asr_prefix_buffer) == 0) {
+        return "";
+    }
+
+    if (asr_prefix_buffer.compare(0, prefix.size(), prefix) != 0) {
+        std::string out = std::move(asr_prefix_buffer);
+        asr_prefix_buffer.clear();
+        asr_prefix_resolved = true;
+        return out;
+    }
+
+    const size_t marker_pos = asr_prefix_buffer.find(marker, prefix.size());
+    if (marker_pos != std::string::npos) {
+        std::string out;
+        if (marker_pos > prefix.size()) {
+            asr_language = asr_prefix_buffer.substr(prefix.size(), marker_pos - prefix.size());
+            out = asr_prefix_buffer.substr(marker_pos + marker.size());
+        } else {
+            out = std::move(asr_prefix_buffer);
+        }
+        asr_prefix_buffer.clear();
+        asr_prefix_resolved = true;
+        return out;
+    }
+
+    // A literal "language ..." output without the marker is not a Qwen3-ASR
+    // header. Stop waiting once the candidate no longer starts like the marker.
+    const size_t angle = asr_prefix_buffer.find('<', prefix.size());
+    if ((angle != std::string::npos &&
+            marker.compare(0, asr_prefix_buffer.size() - angle, asr_prefix_buffer.substr(angle)) != 0) ||
+            asr_prefix_buffer.size() > 256) {
+        std::string out = std::move(asr_prefix_buffer);
+        asr_prefix_buffer.clear();
+        asr_prefix_resolved = true;
+        return out;
+    }
+
+    return "";
+}
+
+std::string task_result_state::flush_asr_prefix() {
+    if (asr_prefix_resolved) {
+        return "";
+    }
+
+    asr_prefix_resolved = true;
+    std::string out = std::move(asr_prefix_buffer);
+    asr_prefix_buffer.clear();
+    return out;
+}
+
 common_chat_msg task_result_state::update_chat_msg(
         const common_chat_input & added,
         bool is_partial,
@@ -731,6 +793,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_asr() {
     std::string text;
     std::string language;
     parse_asr_transcript(oaicompat_msg.content, text, language);
+    if (language.empty()) {
+        language = asr_language;
+    }
 
     json event = json {
         {"text",  text},
@@ -1009,6 +1074,10 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     is_updated = true;
     if (is_begin) {
         return; // begin marker only flushes headers, skip parsing
+    }
+    if (res_type == TASK_RESPONSE_TYPE_OAI_ASR) {
+        content.text = state.filter_asr_delta(content.text);
+        content.tokens.assign(content.text.size(), LLAMA_TOKEN_NULL);
     }
     state.update_chat_msg(content, true, oaicompat_msg_diffs);
 

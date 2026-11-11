@@ -130,7 +130,16 @@ struct task_result_state {
     const std::string oai_resp_message_id;
     std::string oai_resp_fc_id; // function call ID for current args delta
 
+    // ASR streams start with "language <language><asr_text>"; buffer just enough
+    // text to decide whether that marker is present before forwarding deltas.
+    bool        asr_prefix_resolved = false;
+    std::string asr_prefix_buffer;
+    std::string asr_language;
+
     task_result_state(common_chat_session session = {});
+
+    std::string filter_asr_delta(const std::string & delta);
+    std::string flush_asr_prefix();
 
     // parse partial tool calls and update the internal state
     common_chat_msg update_chat_msg(
@@ -422,6 +431,7 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
     common_chat_msg    oaicompat_msg; // to be populated by update()
+    std::string        asr_language;
 
     std::vector<common_chat_msg_diff> oaicompat_msg_diffs; // to be populated by update()
     bool is_updated = false;
@@ -439,7 +449,13 @@ struct server_task_result_cmpl_final : server_task_result {
 
     virtual void update(task_result_state & state) override {
         is_updated = true;
-        oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
+        common_chat_input added = content;
+        if (stream && res_type == TASK_RESPONSE_TYPE_OAI_ASR) {
+            added.text = state.flush_asr_prefix();
+            added.tokens.assign(added.text.size(), LLAMA_TOKEN_NULL);
+        }
+        oaicompat_msg = state.update_chat_msg(added, false, oaicompat_msg_diffs);
+        asr_language = state.asr_language;
 
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;
