@@ -390,7 +390,7 @@ class qwen35_moe_sgl final : public model {
     void         bind_deltas(call & c, int out_set, int prev_set);
     void         bind_state();
     AX_ENGINE_IO_BUFFER_T state_io(const std::string & name);
-    ggml_status  verify(const kv_view & kv, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h,
+    ggml_status  verify(int64_t c0, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h,
                         const std::vector<int> * out_rows);
     void         init_mtp(const std::map<std::string, ggml_tensor *> & t, int il, const rope & rq);
     void         bind_mtp_chain(const kernel & ck);
@@ -1787,10 +1787,9 @@ size_t qwen35_moe_sgl::state_read(const void * src, size_t size, uint32_t flags)
 // T (2 - 4) consecutive tokens from cell c0 through the verification kernel: the four rows' hidden
 // states into h, one rank-1 state delta per row, and the small Conv snapshots.  The recurrent state
 // stays in its pool at the entry cell; the accepted prefix is folded in by the next call.
-ggml_status qwen35_moe_sgl::verify(const kv_view & kv, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h,
+ggml_status qwen35_moe_sgl::verify(int64_t c0, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h,
                                    const std::vector<int> * out_rows) {
     GGML_ASSERT(ver.k);
-    const int64_t c0 = kv.cell_of(0);
     if (c0 % PG == 0) {
         materialize_deltas();
         save_state(c0);
@@ -2753,34 +2752,41 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     const int64_t ct_bind = ct_on ? ggml_time_us() : 0;
     axera_timer        tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
     const int64_t      c0 = kv.cell_of(0);
-    if (ver_c0 >= 0 && c0 != 0) {
-        if (c0 < ver_c0 || c0 > ver_c0 + ver_T) {
-            GGML_LOG_ERROR("axera qwen35_moe_sgl: cell %lld is outside the last verify's %lld..%lld window\n",
-                           (long long) c0, (long long) ver_c0, (long long) (ver_c0 + ver_T));
-            return GGML_STATUS_FAILED;
+    // the rows the sampler accepted from the last verify, up to cell ca (a chained verify accepts its own rows)
+    const auto accept_verified = [&](const int64_t ca) -> bool {
+        if (ver_c0 >= 0 && ca != 0) {
+            if (ca < ver_c0 || ca > ver_c0 + ver_T) {
+                GGML_LOG_ERROR("axera qwen35_moe_sgl: cell %lld is outside the last verify's %lld..%lld window\n",
+                               (long long) ca, (long long) ver_c0, (long long) (ver_c0 + ver_T));
+                return false;
+            }
+            // The sampler accepted ca - ver_c0 rows.  The recurrent state pool is
+            // still at the verify's entry cell; keep the accepted prefix pending
+            // for the next verify prologue (or gdn.apply before decode / prefill).
+            const int accepted = (int) (ca - ver_c0);
+            restore_conv(accepted);
+            delta_n    = accepted;
+            delta_live = accepted > 0;
+            if (snap_cell > ca && ksnap_cell >= 0 && ksnap_cell <= ca && ca < ksnap_cell + PG) {
+                swap_kept();  // (a page start inside the rejected rows: the kept one, the page of ca)
+                snap_prompt = true;
+            }
+            if (snap_cell > ca) {  // (no restart point of ca's page kept)
+                snap_cell = -1;
+                page_x.clear();
+                page_p.clear();
+            } else if (snap_cell >= 0) {
+                page_x.resize((size_t) (ca - snap_cell) * H);
+                page_p.resize((size_t) (ca - snap_cell) * 4);
+            }
+            state_cell = ca;
+            ver_c0     = -1;
+            ver_T      = 0;
         }
-        // The sampler accepted c0 - ver_c0 rows.  The recurrent state pool is
-        // still at the verify's entry cell; keep the accepted prefix pending
-        // for the next verify prologue (or gdn.apply before decode / prefill).
-        const int accepted = (int) (c0 - ver_c0);
-        restore_conv(accepted);
-        delta_n    = accepted;
-        delta_live = accepted > 0;
-        if (snap_cell > c0 && ksnap_cell >= 0 && ksnap_cell <= c0 && c0 < ksnap_cell + PG) {
-            swap_kept();  // (a page start inside the rejected rows: the kept one, the page of c0)
-            snap_prompt = true;
-        }
-        if (snap_cell > c0) {  // (no restart point of c0's page kept)
-            snap_cell = -1;
-            page_x.clear();
-            page_p.clear();
-        } else if (snap_cell >= 0) {
-            page_x.resize((size_t) (c0 - snap_cell) * H);
-            page_p.resize((size_t) (c0 - snap_cell) * 4);
-        }
-        state_cell = c0;
-        ver_c0     = -1;
-        ver_T      = 0;
+        return true;
+    };
+    if (!accept_verified(c0)) {
+        return GGML_STATUS_FAILED;
     }
     if (c0 == 0) {
         ver_c0 = -1;
@@ -2789,7 +2795,15 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     if (c0 == 0) {  // a new sequence
         zero_state();
     }
-    if (T > 1 && T <= 4 && ver.k && c0 > 0 && c0 + 4 <= man.context) {
+    // A short batch that continues the state (a chat turn's few new tokens, the tail the server splits off a prompt):
+    // chained 4-row verify calls, ~6 ms per token. The prefill kernels have fixed-size workspaces and restart from the
+    // page start, which costs over 300 ms however few rows there are. GGML_AXERA_VERIFY_CHAIN=<rows> (0: off).
+    static const int ver_chain = [] {
+        const char * e = getenv("GGML_AXERA_VERIFY_CHAIN");
+        return e ? atoi(e) : 32;
+    }();
+    const bool chain = T > 4 && T <= ver_chain && ver.k && c0 > 0 && c0 == state_cell && c0 + T + 4 <= man.context;
+    if ((T > 1 && T <= 4 && ver.k && c0 > 0 && c0 + 4 <= man.context) || chain) {
         axera_timer tv("verify (all layers)");
         std::vector<ggml_bf16_t> vxb((size_t) T * H);
         if (token_ids) {
@@ -2815,7 +2829,33 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
                                       vxb.data() + (size_t) r * H, H);
             });
         }
-        const ggml_status st = verify(kv, vxb.data(), pb.data(), T, hf.data(), &hfrow);
+        ggml_status st = GGML_STATUS_SUCCESS;
+        if (!chain) {
+            st = verify(c0, vxb.data(), pb.data(), T, hf.data(), &hfrow);
+        } else {
+            std::vector<int>    rows;
+            std::vector<size_t> slots;
+            std::vector<float>  ht;
+            for (int r0 = 0; r0 < T && st == GGML_STATUS_SUCCESS; r0 += 4) {
+                const int n = std::min(4, T - r0);
+                if (r0 > 0 && !accept_verified(c0 + r0)) {
+                    return GGML_STATUS_FAILED;
+                }
+                rows.clear();
+                slots.clear();
+                for (size_t i = 0; i < hfrow.size(); ++i) {
+                    if (hfrow[i] >= r0 && hfrow[i] < r0 + n) {
+                        rows.push_back(hfrow[i] - r0);
+                        slots.push_back(i);
+                    }
+                }
+                ht.resize(rows.size() * H);
+                st = verify(c0 + r0, vxb.data() + (size_t) r0 * H, pb.data() + (size_t) r0 * 4, n, ht.data(), &rows);
+                for (size_t j = 0; j < slots.size() && st == GGML_STATUS_SUCCESS; ++j) {
+                    memcpy(hf.data() + slots[j] * H, ht.data() + j * H, (size_t) H * sizeof(float));
+                }
+            }
+        }
         if (st != GGML_STATUS_SUCCESS) {
             return st;
         }
