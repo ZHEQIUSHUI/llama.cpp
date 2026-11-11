@@ -5896,12 +5896,29 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.id = rd.get_new_id();
 
+            bool has_audio_input = false;
+            for (size_t media_idx = 0;;) {
+                const auto [chunk, next_idx] = inputs[i].find_next_media_chunk(media_idx);
+                if (chunk == nullptr) {
+                    break;
+                }
+                if (mtmd_input_chunk_get_type(chunk->get()) == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+                    has_audio_input = true;
+                    break;
+                }
+                media_idx = next_idx;
+            }
+
             task.tokens = std::move(inputs[i]);
             task.params = server_schema::eval_llama_cmpl_schema(
                     ctx_server.vocab,
                     params,
                     meta->logit_bias_eog,
                     data);
+            if (has_audio_input) {
+                // AXERA audio encoder state cannot be restored reliably from the prompt cache
+                task.params.cache_prompt = false;
+            }
 
             task.apply_chat_session(chat_session);
 
