@@ -178,6 +178,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const double audio_s = run_result.sample_rate > 0
+            ? (double) run_result.n_samples / run_result.sample_rate : 0.0;
+    LOG_INF("generated %d frames, %zu bytes of WAV audio (%d Hz)\n",
+            run_result.n_frames, data_len, run_result.sample_rate);
+    LOG_INF("timings: prompt eval %.2fs + generation %.2fs + vocoder %.2fs = total %.2fs\n",
+            run_result.t_prompt_s, run_result.t_gen_s, run_result.t_vocoder_s, run_result.t_total_s);
+    LOG_INF("         output audio = %.2fs (audio time = %.2fx process time)\n",
+            audio_s, run_result.t_total_s > 0 ? audio_s / run_result.t_total_s : 0.0);
+
     FILE * f = fopen(params.out_file.c_str(), "wb");
     if (!f) {
         LOG_ERR("failed to open %s\n", params.out_file.c_str());
