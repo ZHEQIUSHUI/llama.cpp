@@ -155,7 +155,7 @@ class seqstate {
     void   retire_cur();
     void    begin_page(int64_t c, int peek_k);
     void    record(const uint16_t * xr, const int32_t * pr, int batch_row0, int n);
-    void    materialize(point & p);
+    bool    materialize(point & p);
     void    drop_after(int64_t c);
     void    truncate_to(int64_t c);
     point * find(int64_t s0, int k);

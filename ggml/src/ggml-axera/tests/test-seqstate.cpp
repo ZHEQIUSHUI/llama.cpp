@@ -81,6 +81,7 @@ struct fake final : seq_model {
     }
     void seq_state_load(const uint8_t * src) override {
         pending = false;
+        def_valid = false;  // the model's spare image is gone after a load, as in the real adapter
         if (src) {
             memcpy(&st, src, sizeof(st));
         } else {

@@ -98,16 +98,19 @@ void seqstate::record(const uint16_t * xr, const int32_t * pr, int batch_row0, i
     cur.rows += n;
 }
 
-void seqstate::materialize(point & p) {
+bool seqstate::materialize(point & p) {
     if (!p.deferred) {
-        return;
+        return true;
     }
     p.image.resize(caps.image_bytes);
     if (!m.seq_snap_fetch(p.image.data())) {  // (a model that defers must be able to fetch)
         fprintf(stderr, "axera seqstate: the deferred restart point of cell %lld is gone\n", (long long) p.cell);
         p.cell = -1;
+        p.deferred = false;
+        return false;
     }
     p.deferred = false;
+    return true;
 }
 
 // the sequence is cut at c: the restart points of later pages describe cells that are gone
@@ -304,6 +307,21 @@ seq_status seqstate::run_pages(int64_t s0, int k, int T, const uint16_t * x, con
     const bool    partial = end != lastp;
     const uint16_t * rx = x;
     const int32_t *  rp = p4;
+    // A deferred image lives in the model's spare set only until this run's first model call (seq_state_load
+    // included), so take every image out before touching the model. In particular, a kept point may still be deferred
+    // when cur is loaded for a rewind; materializing it afterwards would find the model's copy already gone.
+    if (!materialize(cur)) {
+        state_cell = -1;
+        return fail(SEQ_MISS, "the current restart point's image is gone");
+    }
+    for (size_t i = 0; i < kept.size();) {
+        if (materialize(kept[i])) {
+            ++i;
+        } else {
+            give(std::move(kept[i]));
+            kept.erase(kept.begin() + (long) i);
+        }
+    }
     if (direct) {
         if (!(cur.cell == s0 && cur.rows == 0) && partial && lastp == s0) {
             begin_page(s0, -1);  // (the run stays in this page: its restart point is the state before the run)
@@ -331,11 +349,6 @@ seq_status seqstate::run_pages(int64_t s0, int k, int T, const uint16_t * x, con
             rx = xs.data();
             rp = ps.data();
         }
-    }
-    // a deferred image lives until the model's next page run: this one
-    materialize(cur);
-    for (auto & p : kept) {
-        materialize(p);
     }
     point    np;
     seq_snap snap;
@@ -535,6 +548,13 @@ void seqstate::check() const {
     const auto bad = [&](const char * what) {
         fprintf(stderr, "axera seqstate: invariant broken after '%s': %s (state cell %lld, restart point %lld + %d rows)\n",
                 last_path, what, (long long) state_cell, (long long) cur.cell, cur.rows);
+        fprintf(stderr, "  cur cell=%lld rows=%d prompt=%d deferred=%d zero=%d\n", (long long) cur.cell, cur.rows,
+                (int) cur.prompt, (int) cur.deferred, (int) cur.zero);
+        for (size_t i = 0; i < kept.size(); ++i) {
+            fprintf(stderr, "  kept[%zu] cell=%lld rows=%d prompt=%d deferred=%d zero=%d\n", i,
+                    (long long) kept[i].cell, kept[i].rows, (int) kept[i].prompt, (int) kept[i].deferred,
+                    (int) kept[i].zero);
+        }
         abort();
     };
     int        deferred = 0;
