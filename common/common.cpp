@@ -1295,8 +1295,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         char arch[64] = {};
         if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) >= 0 &&
             std::strcmp(arch, "qwen3tts") == 0 && !params.embedding) {
-            params.embedding = true;
+            params.embedding   = true;
             cparams.embeddings = true;
+            // the TTS pipeline reads the embedding of every prompt token
+            cparams.n_outputs_max         = std::min(cparams.n_batch, cparams.n_ubatch);
+            cparams.n_outputs_max_per_seq = 1;
             COM_WRN("%s", "qwen3tts model reads the backbone embeddings, enabling embedding mode\n");
         }
     }
