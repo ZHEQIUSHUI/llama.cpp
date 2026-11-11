@@ -2478,7 +2478,7 @@ void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4
         axera_timer ts("decode host: sync states");
         sync_dec_states();
     }
-    if (c % WN == 0) {  // a chunk's first cell: the state here is the restart point
+    if (c % PG == 0) {  // a page's first cell: the state here is the restart point (a later prompt rewinds to it)
         save_state(c);
     }
     if (x) {
