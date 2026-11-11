@@ -312,6 +312,10 @@ extern "C" {
     // state can use it to recognize a reused graph; the scheduler copies it into every split graph.
     GGML_API void ggml_graph_set_stable_uid(struct ggml_cgraph * graph, uint64_t uid);
 
+    // A hash of the graph's node and leaf topology (ops, names and order). It is the same for two graphs that differ
+    // only in tensor shapes, so it can identify an allocation plan that a larger batch can share with a smaller one.
+    GGML_API uint64_t ggml_graph_topology_hash(const struct ggml_cgraph * graph);
+
     // Evaluation callback for each node in the graph (set with ggml_backend_sched_set_eval_callback)
     // when ask == true, the scheduler wants to know if the user wants to observe this node
     // this allows the scheduler to batch nodes together in order to evaluate them in a single call
@@ -345,6 +349,10 @@ extern "C" {
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
+
+    // Number of output rows a whole-graph backend wants in its last reserve graph (0 = the caller's choice). A value
+    // below n_tokens keeps the runtime out_ids input in that graph, so its allocation plan matches prompt batches.
+    GGML_API int                  ggml_backend_sched_reserve_outputs(ggml_backend_sched_t sched);
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);

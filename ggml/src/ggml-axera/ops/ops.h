@@ -16,16 +16,19 @@ namespace axera {
 // the graph's tensors by name (the scheduler's copies "<backend>#<name>#<copy>" by <name>), rebuilt when the graph's
 // nodes change (llama.cpp reuses the decode graph: rebuilding the map of a 35B graph takes ~10 ms on the A55)
 struct graph_names {
+    struct named_map {
+        std::map<std::string, ggml_tensor *> t;
+        // map value of each traversal occurrence, into t: a topology hit updates these in place
+        std::vector<ggml_tensor **>         slots;
+    };
+
     uint64_t                             uid = 0;  // ggml_cgraph.uid, when non-zero (the exact graph identity)
     std::vector<uintptr_t>               key;      // the node / op fallback when the graph has no uid
-    std::map<std::string, ggml_tensor *> t;
-    // the tensors and base names the map was built from, in graph order: a rebuilt graph with the same tensors and
-    // names maps every name the same way, even when their shapes changed (a prompt after the warmup)
-    std::vector<std::pair<const ggml_tensor *, uint64_t>> sig;
+    named_map                            cur;
     // uid-keyed maps of recent graphs (llama.cpp alternates a few: a speculative target's and draft's)
-    std::vector<std::pair<uint64_t, std::map<std::string, ggml_tensor *>>> recent_uid;
+    std::vector<std::pair<uint64_t, named_map>> recent_uid;
     // the maps of the last few other graphs (llama.cpp alternates a few: a speculative target's and draft's)
-    std::vector<std::pair<std::vector<uintptr_t>, std::map<std::string, ggml_tensor *>>> recent;
+    std::vector<std::pair<std::vector<uintptr_t>, named_map>> recent;
 
     const std::map<std::string, ggml_tensor *> & of(const ggml_cgraph * g);
     ggml_tensor * find(const std::string & name) const;

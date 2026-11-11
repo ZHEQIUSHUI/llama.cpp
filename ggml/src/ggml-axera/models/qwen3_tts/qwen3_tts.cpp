@@ -982,7 +982,7 @@ void qwen3_tts::frame_bind(ggml_cgraph * cgraph, const frame_io & fr) {
             packs.push_back(d.name);
         }
     }
-    const std::vector<const axera_cmm *> built = prm.pack_all(names.t, *k.desc, packs, 0);
+    const std::vector<const axera_cmm *> built = prm.pack_all(names.cur.t, *k.desc, packs, 0);
     std::map<std::string, const axera_cmm *> by_name;
     for (size_t i = 0; i < packs.size(); ++i) {
         by_name[packs[i]] = built[i];

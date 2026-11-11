@@ -884,6 +884,16 @@ void llama_context::sched_reserve() {
         }
     }
 
+    // A whole-graph backend gets one more plan with the topology of a runtime prompt: fewer output rows than tokens,
+    // hence the out_ids input. Reserved at n_ubatch tokens, it also fits every smaller prompt batch.
+    const int runtime_outputs = ggml_backend_sched_reserve_outputs(sched.get());
+    if (runtime_outputs > 0 && (uint32_t) runtime_outputs < n_outputs_pp) {
+        ggml_cgraph * gf = graph_reserve(n_tokens, n_seqs, (uint32_t) runtime_outputs, mctx.get(), model.hparams.no_alloc);
+        if (!gf) {
+            throw std::runtime_error("failed to allocate compute prompt buffers");
+        }
+    }
+
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -1454,8 +1464,11 @@ void llama_context::set_warmup(bool value) {
         }
     }
 
-    // warmups are usually with small batches, so no need to reserve
-    //SCHED_NEED_RESERVE();
+    // A warmup graph is small and may replace the worst-case plan of a whole-graph backend. Restore it before the
+    // first real batch. Other backends keep their current plan, as before.
+    if (!value && ggml_backend_sched_reserve_outputs(sched.get()) > 0) {
+        SCHED_NEED_RESERVE();
+    }
 }
 
 void llama_context::set_dummy_batch(bool value) {
@@ -1591,11 +1604,10 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-static int64_t gp_build_us = 0, gp_alloc_us = 0;
+static int64_t gp_build_us = 0, gp_hash_us = 0, gp_alloc_us = 0;
 
 // the graph's identity for a backend that caches per-graph state. The scheduler assigns a fresh uid to every split
 // on every call, so the split graphs carry this one instead (it changes only when the graph is rebuilt).
-static std::atomic<uint64_t> graph_uid_next{ 1 };
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     // LLAMA_GRAPH_PROF=1: per context, the time of graph builds (with allocation), reuses and input setting
@@ -1656,7 +1668,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
-        ggml_graph_set_stable_uid(gf, graph_uid_next.fetch_add(1, std::memory_order_relaxed));
+        const int64_t gp_h0 = gprof ? ggml_time_us() : 0;
+        ggml_graph_set_stable_uid(gf, ggml_graph_topology_hash(gf));
+        const int64_t gp_h1 = gprof ? ggml_time_us() : 0;
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -1665,7 +1679,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
         const int64_t gp_a1 = gprof ? ggml_time_us() : 0;
         gp_build_us = gp_b1 - gp_b0;
-        gp_alloc_us = gp_a1 - gp_b1;
+        gp_hash_us  = gp_h1 - gp_h0;
+        gp_alloc_us = gp_a1 - gp_h1;
 
         gf_res_prev_active = res;
         gp_built           = true;
@@ -1711,8 +1726,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
     if (gprof && ubatch.n_tokens > 1) {  // (a prompt ubatch: its own line)
-        fprintf(stderr, "graph prof ubatch %u tokens: build+alloc %.3f ms%s (build %.3f, alloc %.3f, %d nodes), inputs %.3f ms, compute %.3f ms\n",
-                ubatch.n_tokens, (gp_t1 - gp_t0) / 1e3, gp_built ? "" : " (reused)", gp_build_us / 1e3, gp_alloc_us / 1e3,
+        fprintf(stderr, "graph prof ubatch %u tokens: build+alloc %.3f ms%s (build %.3f, topo %.3f, alloc %.3f, %d nodes), inputs %.3f ms, compute %.3f ms\n",
+                ubatch.n_tokens, (gp_t1 - gp_t0) / 1e3, gp_built ? "" : " (reused)", gp_build_us / 1e3,
+                gp_hash_us / 1e3, gp_alloc_us / 1e3,
                 gf ? ggml_graph_n_nodes(gf) : -1, (gp_t2 - gp_t1) / 1e3, (ggml_time_us() - gp_t2) / 1e3);
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -1831,7 +1847,7 @@ bool llama_context::graph_prebuild_decode(const llama_memory_context_i * mctx, u
         const auto     gparams = graph_params(res, ub, mctx_next.get(), ctx_type_to_graph_type(cparams.ctx_type));
         ggml_cgraph *  gf      = model.build_graph(gparams);
         if (gf) {
-            ggml_graph_set_stable_uid(gf, graph_uid_next.fetch_add(1, std::memory_order_relaxed));
+            ggml_graph_set_stable_uid(gf, ggml_graph_topology_hash(gf));
         }
         if (gf && ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             gf_res_prev_active = res;
@@ -3073,6 +3089,9 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+    if (gf) {
+        ggml_graph_set_stable_uid(gf, ggml_graph_topology_hash(gf));
+    }
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {

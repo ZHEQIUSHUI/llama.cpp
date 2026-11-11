@@ -3239,7 +3239,7 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
     }
     const rope rq(rope_node, pos, T);
     if (mtp_bound != w0->data) {
-        init_mtp(names.t, il, rq);
+        init_mtp(names.cur.t, il, rq);
         mtp_bound = w0->data;
     }
     const kv_view kv(kidx, kqm, man.context, PG);

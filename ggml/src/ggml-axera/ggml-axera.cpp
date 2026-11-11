@@ -476,6 +476,26 @@ static void ggml_backend_axera_prewarm_graph(ggml_backend_t backend, struct ggml
     ctx->model->prewarm(g);
 }
 
+// the adapter runs every node of the graph: the scheduler can keep it in one split without copy tensors
+static bool ggml_backend_axera_sched_whole_graph(const struct ggml_cgraph * g) {
+    if (g == NULL || g->n_nodes == 0) {
+        return false;
+    }
+    for (int i = 0; i < g->n_nodes; ++i) {
+        if (axera_pooling_op(g->nodes[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A prompt graph has fewer output rows than tokens and therefore an out_ids input; the generic reserve graph with all
+// rows as outputs does not. Ask for one output row so the last reserve plan has the prompt graph's topology.
+static int ggml_backend_axera_sched_reserve_outputs(void) {
+    const axera::manifest * m = axera::kernels();
+    return m && m->model == "qwen35_moe_sgl" ? 1 : 0;
+}
+
 static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_axera_npu_sampling") == 0) {
         return (void *) &g_npu_sampling;
@@ -518,6 +538,12 @@ static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_axera_prewarm_graph") == 0) {
         return (void *) ggml_backend_axera_prewarm_graph;
+    }
+    if (strcmp(name, "ggml_backend_sched_whole_graph") == 0) {
+        return (void *) ggml_backend_axera_sched_whole_graph;
+    }
+    if (strcmp(name, "ggml_backend_sched_reserve_outputs") == 0) {
+        return (void *) ggml_backend_axera_sched_reserve_outputs;
     }
     return NULL;
     GGML_UNUSED(reg);

@@ -1622,7 +1622,7 @@ void qwen38_27b::init_mtp(const std::map<std::string, ggml_tensor *> & t, int il
 // a draft context's MTP graph: token x_p (its embedding row) with the target's final-norm hidden of p - 1 through the
 // MTP block at the draft context's cells; h_nextn (the block's shared head norm) and the logits of the output rows
 ggml_status qwen38_27b::compute_mtp(ggml_cgraph * g) {
-    const auto &  t     = names.t;
+    const auto &  t     = names.cur.t;
     ggml_tensor * hin   = names.find("mtp_h_input");
     ggml_tensor * hn    = names.find("h_nextn");
     ggml_tensor * pos   = names.find("inp_pos");

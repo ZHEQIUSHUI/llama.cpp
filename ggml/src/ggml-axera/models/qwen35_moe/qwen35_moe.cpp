@@ -587,7 +587,7 @@ void qwen35_moe::experts_group(int il, int ng) {
             for (const auto & d : k.desc->in) {
                 const int i = k.input(d.name);
                 if (!d.param.empty()) {
-                    in[i] = prm.get(names.t, il, d.kind, d.param);
+                    in[i] = prm.get(names.cur.t, il, d.kind, d.param);
                 } else if (d.name == "h2") {
                     in[i] = axera_io(GH2);
                 } else if (d.name == "tok") {
@@ -690,7 +690,7 @@ void qwen35_moe::experts_single(int il, chunk & c) {
         for (const auto & d : k.desc->in) {
             const int i = k.input(d.name);
             if (!d.param.empty()) {
-                in[i] = prm.get(names.t, il, d.kind, d.param);
+                in[i] = prm.get(names.cur.t, il, d.kind, d.param);
             } else if (d.name == "h2") {
                 in[i] = axera_io(SX.get(), sx, k.in_bytes("h2"));
             } else if (d.name == "tok") {

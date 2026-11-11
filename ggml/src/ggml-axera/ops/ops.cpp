@@ -22,6 +22,9 @@ static std::string_view base_name(const char * name) {  // "<backend>#<name>#<co
 
 const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph * g) {
     axera_timer tm("graph name map");
+    static const bool prof = getenv("LLAMA_GRAPH_PROF") != nullptr;
+    const int64_t     prof_t0 = prof ? ggml_time_us() : 0;
+    int64_t           scan_us = 0, cmp_us = 0, map_us = 0;
     static const bool stats = getenv("GGML_AXERA_GRAPH_STATS") != nullptr;
     enum { ST_UID, ST_RECENT, ST_KEY, ST_TOPO, ST_BUILD } st = ST_BUILD;
     // ggml_cgraph.uid is the exact identity llama.cpp assigns to a graph and reuses while the graph is unchanged. Fall
@@ -46,111 +49,138 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
             key[2 * i + 1] = (uintptr_t) g->nodes[i]->op;
         }
     };
-    // The map's exact identity: every tensor it holds and the base name it holds it under, in the order the map is
-    // built. A rebuild with the same sequence maps every name the same way; tensor shapes may differ.
-    auto build_sig = [&](std::vector<std::pair<const ggml_tensor *, uint64_t>> & s) {
-        s.clear();
-        s.reserve(5 * (size_t) g->n_nodes);  // (no set or string: this runs once per rebuilt prompt graph)
-        auto add = [&](ggml_tensor * x) {
-            const char * name = x->name;
-            const char * a    = strchr(name, '#');
-            const char * b    = a ? strrchr(name, '#') : nullptr;
-            const char * p    = a && b > a ? a + 1 : name;
-            const char * e    = a && b > a ? b : name + strlen(name);
-            uint64_t     h    = 1469598103934665603ull;
-            for (; p < e; ++p) {
-                h = (h ^ (unsigned char) *p) * 1099511628211ull;
-            }
-            h = (h ^ (uint64_t) x->op) * 1099511628211ull;
-            h = (h ^ (uint64_t) (e - (a && b > a ? a + 1 : name))) * 1099511628211ull;
-            s.emplace_back(x, h);
-        };
+    // The map's occurrence order. llama.cpp now gives every topology the same stable uid (a hash of ops and names),
+    // so a new graph of that topology has the same walk order and only its tensor pointers change.
+    auto walk = [&](std::vector<ggml_tensor *> & occ) {
+        occ.clear();
+        occ.reserve(5 * (size_t) g->n_nodes);
         for (int i = 0; i < g->n_nodes; i++) {
             ggml_tensor * node = g->nodes[i];
-            add(node);
+            occ.push_back(node);
             for (int src = 0; src < GGML_MAX_SRC && node->src[src]; ++src) {
-                add(node->src[src]);
+                occ.push_back(node->src[src]);
                 for (ggml_tensor * v = node->src[src]->view_src; v; v = v->view_src) {
-                    add(v);
+                    occ.push_back(v);
                 }
             }
         }
+    };
+    auto update_values = [&](named_map & m, const std::vector<ggml_tensor *> & occ) {
+        if (m.slots.size() != occ.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < occ.size(); ++i) {
+            if (m.slots[i]) {
+                *m.slots[i] = occ[i];
+            }
+        }
+        return true;
+    };
+    auto build_map = [&](const std::vector<ggml_tensor *> & occ) {
+        named_map out;
+        std::unordered_set<const ggml_tensor *>                  seen;
+        std::vector<std::pair<std::string_view, ggml_tensor *>> named;
+        seen.reserve(occ.size());
+        named.reserve(occ.size());
+        for (ggml_tensor * x : occ) {
+            if (seen.insert(x).second) {
+                named.emplace_back(base_name(x->name), x);
+            }
+        }
+        std::stable_sort(named.begin(), named.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+        std::unordered_map<const ggml_tensor *, ggml_tensor **> slot_of;
+        slot_of.reserve(named.size());
+        for (auto & n : named) {
+            if (out.t.empty() || out.t.rbegin()->first.compare(n.first) != 0) {
+                out.t.emplace_hint(out.t.end(), std::string(n.first), n.second);
+                slot_of[n.second] = &out.t.rbegin()->second;
+            } else {
+                // The old map kept the first occurrence of a duplicate base name. Leave the other occurrences
+                // without a slot so a topology hit does not overwrite it.
+                slot_of[n.second] = nullptr;
+            }
+        }
+        out.slots.resize(occ.size());
+        for (size_t i = 0; i < occ.size(); ++i) {
+            out.slots[i] = slot_of[occ[i]];
+        }
+        return out;
     };
     // stable_uid survives the scheduler's per-call split of a reused graph; uid does not
     const uint64_t gid = g->stable_uid ? g->stable_uid : g->uid;
     // Keep the current graph's map before handing its slot to another graph. Swapping the maps in place would leave
     // the slot's key pointing at the other graph's map, so the next lookup of that key would return the wrong graph.
     auto remember_uid = [&]() {
-        if (!uid || t.empty()) {
+        if (!uid || cur.t.empty()) {
             return;
         }
         for (auto & r : recent_uid) {
             if (r.first == uid) {
-                r.second = std::move(t);
-                t.clear();
+                r.second = std::move(cur);
+                cur = {};
                 return;
             }
         }
         if (recent_uid.size() >= 4) {
             recent_uid.erase(recent_uid.begin());
         }
-        recent_uid.emplace_back(uid, std::move(t));
-        t.clear();
+        recent_uid.emplace_back(uid, std::move(cur));
+        cur = {};
     };
     auto remember_key = [&]() {
-        if (key.empty() || t.empty()) {
+        if (key.empty() || cur.t.empty()) {
             return;
         }
         for (auto & r : recent) {
             if (r.first == key) {
-                r.second = std::move(t);
-                t.clear();
+                r.second = std::move(cur);
+                cur = {};
                 return;
             }
         }
         if (recent.size() >= 4) {
             recent.erase(recent.begin());
         }
-        recent.emplace_back(std::move(key), std::move(t));
+        recent.emplace_back(std::move(key), std::move(cur));
         key.clear();
-        t.clear();
+        cur = {};
     };
     bool hit = false;
-    std::vector<std::pair<const ggml_tensor *, uint64_t>> nsig;
-    bool nsig_built = false;
+    std::vector<ggml_tensor *> occ;
     if (gid) {
         if (uid == gid) {
-            hit = true;
-            st  = ST_UID;
+            const int64_t t0 = prof ? ggml_time_us() : 0;
+            walk(occ);
+            scan_us += (prof ? ggml_time_us() : 0) - t0;
+            if (update_values(cur, occ)) {
+                key.clear();
+                hit = true;
+                st  = ST_UID;
+            }
         } else {
+            const int64_t t0 = prof ? ggml_time_us() : 0;
+            walk(occ);
+            scan_us += (prof ? ggml_time_us() : 0) - t0;
             for (auto it = recent_uid.begin(); it != recent_uid.end(); ++it) {
-                if (it->first == gid) {
-                    auto found = std::move(it->second);
-                    recent_uid.erase(it);
-                    remember_uid();
-                    t = std::move(found);
-                    sig.clear();  // the recent maps do not carry a signature
+                if (it->first != gid) {
+                    continue;
+                }
+                auto found = std::move(it->second);
+                recent_uid.erase(it);
+                remember_uid();
+                cur = std::move(found);
+                if (update_values(cur, occ)) {
                     uid = gid;
+                    key.clear();
                     hit = true;
                     st  = ST_RECENT;
-                    break;
                 }
-            }
-        }
-        if (!hit) {
-            build_sig(nsig);
-            nsig_built = true;
-            if (!sig.empty() && nsig == sig) {  // a rebuild of the mapped graph: same tensors, same names
-                hit = true;
-                st  = ST_TOPO;
-                uid = gid;
-                key.clear();
+                break;
             }
         }
         if (!hit) {
             if (uid) {  // keep the current map for an alternation back to this graph
                 remember_uid();
-                sig.clear();
             }
             uid = gid;
             key.clear();
@@ -167,7 +197,7 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
                     recent.erase(it);
                     remember_key();
                     key = std::move(found_key);
-                    t   = std::move(found);
+                    cur = std::move(found);
                     hit = true;
                     st  = ST_KEY;
                     break;
@@ -177,47 +207,25 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
         if (!hit) {
             if (!key.empty()) {
                 remember_key();
-                sig.clear();
             }
             uid = 0;
         }
     }
     if (!hit) {
-        // each tensor once (in the order met: the first of a name wins), sorted by name into the map
-        std::unordered_set<const ggml_tensor *>                  seen;
-        std::vector<std::pair<std::string_view, ggml_tensor *>> named;
-        seen.reserve(4 * (size_t) g->n_nodes);
-        named.reserve(4 * (size_t) g->n_nodes);
-        auto add = [&](ggml_tensor * x) {
-            if (seen.insert(x).second) {
-                named.emplace_back(base_name(x->name), x);
-            }
-        };
-        for (int i = 0; i < g->n_nodes; i++) {
-            ggml_tensor * node = g->nodes[i];
-            add(node);
-            for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
-                add(node->src[s]);
-                for (ggml_tensor * v = node->src[s]->view_src; v; v = v->view_src) {  // the cache tensors behind views
-                    add(v);
-                }
-            }
+        const int64_t t0 = prof ? ggml_time_us() : 0;
+        if (occ.empty()) {
+            walk(occ);
         }
-        std::stable_sort(named.begin(), named.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
-        t.clear();
-        for (auto & n : named) {
-            if (t.empty() || t.rbegin()->first.compare(n.first) != 0) {
-                t.emplace_hint(t.end(), std::string(n.first), n.second);
-            }
-        }
-        if (nsig_built && gid) {
-            sig = std::move(nsig);  // the walk above already hashed this graph
-        } else {
-            build_sig(sig);
-        }
+        cur = build_map(occ);
         if (!gid) {
             build_key();
         }
+        map_us += (prof ? ggml_time_us() : 0) - t0;
+    }
+    if (prof && g->n_nodes > 1000) {
+        const int64_t total_us = ggml_time_us() - prof_t0;
+        fprintf(stderr, "graph names: nodes %d state %d walk %.3f, compare %.3f, map %.3f, total %.3f ms\n",
+                g->n_nodes, (int) st, scan_us / 1e3, cmp_us / 1e3, map_us / 1e3, total_us / 1e3);
     }
     if (stats) {
         static uint64_t n = 0, cnt[5] = {0, 0, 0, 0, 0};
@@ -231,12 +239,12 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
                     (unsigned long long) g->stable_uid);
         }
     }
-    return t;
+    return cur.t;
 }
 
 ggml_tensor * graph_names::find(const std::string & name) const {
-    auto it = t.find(name);
-    return it == t.end() ? nullptr : it->second;
+    auto it = cur.t.find(name);
+    return it == cur.t.end() ? nullptr : it->second;
 }
 
 ggml_tensor * graph_names::at(const std::string & name) const {
