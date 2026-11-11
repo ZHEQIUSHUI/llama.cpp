@@ -389,8 +389,10 @@ size_t seqstate::size(bool slim) const {
 
 size_t seqstate::write(uint8_t * dst, size_t n, bool slim) {
     materialize(cur);
-    for (auto & p : kept) {
-        materialize(p);
+    if (!slim) {
+        for (auto & p : kept) {
+            materialize(p);
+        }
     }
     const size_t total = size(slim);
     if (!total || n < total) {
