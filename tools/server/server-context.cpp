@@ -5915,10 +5915,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
-            if (has_audio_input && ggml_backend_reg_by_name("AXERA") != nullptr) {
-                // Prompt-cache matching sees all media tokens as LLAMA_TOKEN_NULL, so it can
-                // mistake a different audio clip for a cached prefix and reuse the old
-                // encoder's KV state. Keep the AXERA audio path out of prompt-cache reuse.
+            char model_arch[64] = {};
+            const bool is_qwen3 = llama_model_meta_val_str(ctx_server.model_tgt, "general.architecture", model_arch, sizeof(model_arch)) >= 0 &&
+                    strcmp(model_arch, "qwen3") == 0;
+            if (has_audio_input && is_qwen3 && ggml_backend_reg_by_name("AXERA") != nullptr) {
+                // The prompt cache restores llama's KV snapshot, but the AXERA Qwen3-ASR audio
+                // encoder keeps private buffers outside that snapshot. Restoring a prompt after
+                // switching audio lengths leaves stale encoder state and the model emits EOS.
                 task.params.cache_prompt = false;
             }
 
