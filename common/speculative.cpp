@@ -1697,13 +1697,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return false;
         }
 
-        const int32_t n_tokens = batch_in.size();
+        // A prompt batch may mix text tokens and media embeddings (the server puts media chunks into the prompt
+        // batch); the draft context takes one kind per batch, so each stretch of one kind goes on its own, in order,
+        // as when the chunks were decoded separately. A stretch's first row takes the pending row the previous
+        // stretch left.
+        int32_t k0 = 0;
+        for (int32_t k = 1; k <= batch_in.size(); ++k) {
+            if (k == batch_in.size() ||
+                (batch_in.tokens[k].id == LLAMA_TOKEN_NULL) != (batch_in.tokens[k0].id == LLAMA_TOKEN_NULL)) {
+                if (!process_rows(batch_in, k0, k)) {
+                    return false;
+                }
+                k0 = k;
+            }
+        }
+        return true;
+    }
+
+    // the rows [k0, k1) of the target's batch, all token ids or all embeddings
+    bool process_rows(const common_batch & batch_in, int32_t k0, int32_t k1) {
+        const int32_t n_tokens = k1 - k0;
 
         // remember the first and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
 
-        for (int k = 0; k < n_tokens; ++k) {
+        for (int k = k0; k < k1; ++k) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (batch_in.tokens[k].seq_id == seq_id) {
                     i_batch_end[seq_id] = k;
@@ -1764,13 +1783,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 return true;
             }
 
-            for (int k = 0; k < n_tokens; ++k) {
+            for (int k = k0; k < k1; ++k) {
                 const auto & t = batch_in.tokens[k];
 
                 const llama_seq_id seq_id = t.seq_id;
 
                 // vision tokens carry an embedding instead of an id
-                const bool out_last = align_batch && n_tokens <= params.n_max + 1 && k == n_tokens - 1;
+                const bool out_last = align_batch && n_tokens <= params.n_max + 1 && k == k1 - 1;
                 const int32_t idx = t.id != LLAMA_TOKEN_NULL
                     ? batch.add(t.id, t.pos[0], seq_id, out_last)
                     : batch.add_embd(t.embd, t.pos.data(), seq_id, out_last);
@@ -1809,7 +1828,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
+                            head, (int) rc, (int) batch_in.tokens[k0].pos[0]);
                     ok = false;
                     break;
                 }
