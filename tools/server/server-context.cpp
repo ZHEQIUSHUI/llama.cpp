@@ -3552,7 +3552,10 @@ private:
             inp.instruct     = instructions.c_str();
             inp.lang         = language.c_str();
             inp.top_k        = sampling.top_k;
-            inp.top_p        = sampling.top_p;
+            // The AXERA Qwen3-TTS frame kernel samples the code predictor with top-k only.
+            // top_p still applies to the backbone sampler above; clamp only the helper input.
+            static const bool has_axera_backend = ggml_backend_reg_by_name("AXERA") != nullptr;
+            inp.top_p        = has_axera_backend ? 1.0f : sampling.top_p;
             inp.seed         = sampling.seed;
             inp.out_type     = task.tts.response_format == "pcm"
                     ? MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM16
