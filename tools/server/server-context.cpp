@@ -2140,6 +2140,19 @@ private:
             }
         }
 
+        // A chat_template.jinja next to the model file replaces the template in the GGUF when none is given on the
+        // command line: a release ships its fixed template there (the stock Qwen template rejects the mid-conversation
+        // system messages agent clients send). LLAMA_SERVER_SIBLING_TEMPLATE=0 keeps the GGUF's.
+        if (params_base.chat_template.empty() && !params_base.model.path.empty()) {
+            const char * e = getenv("LLAMA_SERVER_SIBLING_TEMPLATE");
+            const auto   p = std::filesystem::path(params_base.model.path).parent_path() / "chat_template.jinja";
+            std::ifstream fin(p, std::ios::binary);
+            if ((!e || atoi(e) != 0) && fin) {
+                params_base.chat_template.assign(std::istreambuf_iterator<char>(fin), std::istreambuf_iterator<char>());
+                SRV_INF("%s: using the chat template next to the model: %s\n", __func__, p.string().c_str());
+            }
+        }
+
         // populate chat template params
         {
             common_chat_templates_ptr chat_templates;
