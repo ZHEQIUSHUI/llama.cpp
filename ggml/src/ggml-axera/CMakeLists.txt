@@ -16,6 +16,7 @@ ggml_add_backend_library(ggml-axera
                          core/params.cpp
                          core/npu_sampling.cpp
                          core/argmax_state.cpp
+                         core/seqstate.cpp
                          ops/ops.cpp
                          models/model.cpp
                          models/qwen35_moe/qwen35_moe.cpp
