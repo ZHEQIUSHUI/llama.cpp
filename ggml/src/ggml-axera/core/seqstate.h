@@ -41,7 +41,7 @@ struct seq_caps {
 
 // a restart point a page run leaves behind: the state before `cell` (a page's first cell inside the run) into dst;
 // a model that still holds that state in a spare set sets `deferred` instead of copying (seq_snap_fetch copies it
-// later; it stays valid until the model's next seq_run_pages)
+// later without consuming it; it stays valid until the model's next seq_run_pages)
 struct seq_snap {
     int64_t   cell     = -1;
     uint8_t * dst      = nullptr;

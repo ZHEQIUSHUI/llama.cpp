@@ -1668,7 +1668,6 @@ bool qwen35_moe_sgl::seq_snap_fetch(uint8_t * dst) {
         o += c->size;
     }
     GGML_ASSERT(o == state_image_b);
-    deferred_valid = false;
     return true;
 }
 

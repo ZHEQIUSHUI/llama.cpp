@@ -391,12 +391,6 @@ size_t seqstate::size(bool slim) const {
 }
 
 size_t seqstate::write(uint8_t * dst, size_t n, bool slim) {
-    materialize(cur);
-    if (!slim) {
-        for (auto & p : kept) {
-            materialize(p);
-        }
-    }
     const size_t total = size(slim);
     if (!total || n < total) {
         return 0;
@@ -431,20 +425,31 @@ size_t seqstate::write(uint8_t * dst, size_t n, bool slim) {
         memcpy(o, &b, sizeof(b));
         o += sizeof(b);
         if (!p.zero) {
-            memcpy(o, p.image.data(), caps.image_bytes);
+            if (p.deferred) {  // straight from the model's spare set into the blob: one copy, not two
+                if (!m.seq_snap_fetch(o)) {
+                    return false;
+                }
+            } else {
+                memcpy(o, p.image.data(), caps.image_bytes);
+            }
             o += caps.image_bytes;
         }
         memcpy(o, p.x.data(), p.x.size() * sizeof(uint16_t));
         o += p.x.size() * sizeof(uint16_t);
         memcpy(o, p.p.data(), p.p.size() * sizeof(int32_t));
         o += p.p.size() * sizeof(int32_t);
+        return true;
     };
     if (cur.cell >= 0) {
-        put(cur);
+        if (!put(cur)) {
+            return 0;
+        }
     }
     if (!slim) {
         for (const auto & p : kept) {
-            put(p);
+            if (!put(p)) {
+                return 0;
+            }
         }
     }
     return (size_t) (o - dst);
