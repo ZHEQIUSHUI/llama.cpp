@@ -2645,7 +2645,9 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
     // mixed path (ubatch.is_mixed()): set_rows the token rows into a copy of the embd rows, with its own inputs as select branches must not share tensors
     // TODO: use inp->tokens and inp->embd once ggml_build_forward_select allows it
-    const bool has_mixed = cparams.mixed_batch && llm_arch_supports_mixed_batch(arch) &&
+    // (a context without the mixed path, e.g. a backend that gathers the token rows itself, still builds it for a
+    // batch that really mixes: its graph is not reused for the other kinds, see allow_reuse)
+    const bool has_mixed = (cparams.mixed_batch || ubatch.is_mixed()) && llm_arch_supports_mixed_batch(arch) &&
                            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
 
     const int64_t n_tok_rows = has_mixed ? llm_graph_n_tok_rows(ubatch) : 0;
