@@ -5916,12 +5916,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->logit_bias_eog,
                     data);
             char model_arch[64] = {};
-            const bool is_qwen3 = llama_model_meta_val_str(ctx_server.model_tgt, "general.architecture", model_arch, sizeof(model_arch)) >= 0 &&
-                    strcmp(model_arch, "qwen3") == 0;
-            if (has_audio_input && is_qwen3 && ggml_backend_reg_by_name("AXERA") != nullptr) {
+            const bool is_qwen3_asr_arch = llama_model_meta_val_str(ctx_server.model_tgt, "general.architecture", model_arch, sizeof(model_arch)) >= 0 &&
+                    (strcmp(model_arch, "qwen3vl") == 0 || strcmp(model_arch, "qwen3") == 0);
+            if (has_audio_input && is_qwen3_asr_arch && ggml_backend_reg_by_name("AXERA") != nullptr) {
                 // The prompt cache restores llama's KV snapshot, but the AXERA Qwen3-ASR audio
-                // encoder keeps private buffers outside that snapshot. Restoring a prompt after
-                // switching audio lengths leaves stale encoder state and the model emits EOS.
+                // encoder keeps private paged state outside that snapshot. Restoring a prompt
+                // after switching audio lengths leaves stale encoder state and the model emits EOS.
                 task.params.cache_prompt = false;
             }
 
