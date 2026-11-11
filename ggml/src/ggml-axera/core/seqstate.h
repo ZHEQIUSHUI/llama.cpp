@@ -16,6 +16,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <new>
+#include <utility>
 #include <vector>
 
 namespace axera {
@@ -82,6 +84,21 @@ struct seq_config {
     int  force_miss   = 0;      // (tests) force the n-th batch that needs a restart point to report SEQ_MISS instead
 };
 
+// A vector's resize value-initializes a byte image. A restart point often receives every byte from the model, so that
+// zero fill is pure cost (one image is tens to hundreds of MiB).
+template <typename T> struct uninitialized_allocator {
+    using value_type = T;
+    uninitialized_allocator() = default;
+    template <typename U> uninitialized_allocator(const uninitialized_allocator<U> &) {}
+    T * allocate(size_t n) { return static_cast<T *>(::operator new(n * sizeof(T))); }
+    void deallocate(T * p, size_t) { ::operator delete(p); }
+    template <typename U> void construct(U * p) { ::new ((void *) p) U; }
+    template <typename U, typename... A> void construct(U * p, A &&... a) { ::new ((void *) p) U(std::forward<A>(a)...); }
+    template <typename U> void destroy(U * p) { p->~U(); }
+    template <typename U> bool operator==(const uninitialized_allocator<U> &) const { return true; }
+    template <typename U> bool operator!=(const uninitialized_allocator<U> &) const { return false; }
+};
+
 class seqstate {
   public:
     seqstate(seq_model & m, const seq_config & cfg) : m(m), cfg(cfg), caps(m.seq_get_caps()) {}
@@ -108,7 +125,7 @@ class seqstate {
         bool                  prompt = false;  // a prompt ended in this page: kept when the sequence moves on
         bool                  deferred = false;  // the image is still in the model (seq_snap_fetch)
         int                   rows   = 0;      // inputs recorded from `cell`
-        std::vector<uint8_t>  image;
+        std::vector<uint8_t, uninitialized_allocator<uint8_t>> image;
         std::vector<uint16_t> x;
         std::vector<int32_t>  p;
     };

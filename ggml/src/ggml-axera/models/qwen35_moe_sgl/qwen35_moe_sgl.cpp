@@ -2412,7 +2412,6 @@ void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const flo
             for (int s = s0; s < live; s += PG) {
                 const int     v    = std::min(PG, live - s);
                 const int64_t c    = cell + s;
-                const bool  big_tail = big_run && s == full;
                 call &      pcf  = pre_attn[par][il];
                 call &      pct  = pre_tail[par][il];
                 const bool  tail_call = pct.k != nullptr && v <= 128;
