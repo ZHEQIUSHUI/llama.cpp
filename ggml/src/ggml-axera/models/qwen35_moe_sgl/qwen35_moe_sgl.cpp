@@ -1330,6 +1330,9 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     state_image_b = 0;
     for (int k = 0; k < 4; ++k) {
         state_image_b += B(STATE_BANK[k])->size;
+        // The prefill calls are bound to these two allocations for the whole run; states_swap only moves the
+        // unique_ptrs between B() and the spare set, so parity -> allocation stays fixed and a deferred image can be
+        // taken from the set the kernel read even after later swaps.
         state_set[k][0] = B(STATE_BANK[k]).get();
         state_set[k][1] = (k == 0 ? ST2 : k == 1 ? CQ2 : k == 2 ? CK2 : CV2).get();
     }
