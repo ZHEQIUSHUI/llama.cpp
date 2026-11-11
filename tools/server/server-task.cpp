@@ -711,18 +711,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
 }
 
 json server_task_result_cmpl_final::to_json_oaicompat_asr() {
-    json event = json {
-        {"type",  "transcript.text.done"},
-        {"text",  oaicompat_msg.content},
-        {"usage", json {
-            {"type",         "tokens"},
-            {"input_tokens",  n_prompt_tokens},
-            {"output_tokens", n_decoded},
-            {"total_tokens",  n_decoded + n_prompt_tokens},
-            {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
-        }},
+    return json {
+        {"text", oaicompat_msg.content},
     };
-    return event;
 }
 
 json server_task_result_cmpl_final::to_json_anthropic() {
