@@ -220,6 +220,7 @@ class qwen35_moe_sgl final : public model, public seq_model {
     size_t       state_size(uint32_t flags) const override;
     size_t       state_write(void * dst, size_t size, uint32_t flags) override;
     size_t       state_read(const void * src, size_t size, uint32_t flags) override;
+    int          last_state_status() const override { return last_seq_status; }
 
     seq_caps seq_get_caps() const override;
     void     seq_state_save(uint8_t * dst) override;
@@ -278,6 +279,7 @@ class qwen35_moe_sgl final : public model, public seq_model {
     bool      fh_loaded = false;
     bool      fh_ok     = false;
     std::unique_ptr<seqstate> seq;
+    int                       last_seq_status = 0;
     bool                      state_dirty = false;  // the recurrent-state pools have been used (zero must memset)
     bool                      deferred_valid = false;  // the second state set holds a requested page-start image
     int                       ver_rows = 0;
@@ -1341,6 +1343,10 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     cfg.check = [] {
         const char * e = getenv("GGML_AXERA_SEQ_CHECK");
         return e && atoi(e) != 0;
+    }();
+    cfg.force_miss = [] {
+        const char * e = getenv("GGML_AXERA_SEQ_FORCE_MISS");
+        return e ? std::max(0, atoi(e)) : 0;
     }();
     seq = std::make_unique<seqstate>(*this, cfg);
     size_t bb = 0;
@@ -2772,8 +2778,10 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     out_h         = hf.data();
     this->out_rows = &hfrow;
     decode_h      = hd;
+    last_seq_status = 0;
     const seq_status sst = seq->feed(c0, T, feed_x, pb.data());
     if (sst != SEQ_OK) {
+        last_seq_status = (int) sst;
         if (sst == SEQ_MISS) {
             GGML_LOG_WARN("axera qwen35_moe_sgl: batch from cell %lld has no restart point (%s); the slot must replay\n",
                           (long long) c0, seq->why());

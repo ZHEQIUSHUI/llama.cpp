@@ -79,6 +79,7 @@ struct seq_config {
     int  kept_max     = 1;      // restart points kept besides the current page's (the pages where prompts ended)
     int  verify_chain = 0;      // a continuing batch of up to this many rows runs as chained verify calls (0: off)
     bool check        = false;  // check the invariants after every call (GGML_AXERA_SEQ_CHECK)
+    int  force_miss   = 0;      // (tests) force the n-th batch that needs a restart point to report SEQ_MISS instead
 };
 
 class seqstate {
@@ -125,6 +126,7 @@ class seqstate {
     std::vector<point> spare;  // buffers to reuse
     int64_t           ver_c0 = -1;  // a pending verification: its first cell, rows
     int               ver_T  = 0;
+    int               fallbacks = 0;  // batches that needed a restart point (GGML_AXERA_SEQ_FORCE_MISS)
     const char *      last_path = "";
     const char *      last_why  = "";
     std::vector<uint16_t> xs;  // scratch: a replay's rows

@@ -433,6 +433,19 @@ void scenarios() {
         std::vector<int32_t>  p(4, 0);
         R.M.out.assign(1, 0);
         REQUIRE(S.feed(20, 1, x.data(), p.data()) == SEQ_MISS, "a rewind to a page nobody kept must miss");
+
+        // the test switch turns one fallback into a miss; the next sequence from cell 0 still works
+        runner F;
+        F.rng.seed(2);
+        F.M.caps = { 16, W, sizeof(image), 4096, 4, 0, true };
+        F.M.kv.assign(4096, 0);
+        F.M.rng = &F.rng;
+        F.cfg   = { 1, 0, true, 1 };
+        seqstate FS(F.M, F.cfg);
+        F.S = &FS;
+        F.feed(0, 40, "prompt before a forced miss");
+        REQUIRE(FS.feed(10, 1, x.data(), p.data()) == SEQ_MISS, "GGML_AXERA_SEQ_FORCE_MISS did not miss");
+        F.feed(0, 41, "after a forced miss");
     }
 }
 

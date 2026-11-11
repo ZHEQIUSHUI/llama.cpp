@@ -26,6 +26,8 @@
 #include <string>
 #include <unordered_map>
 
+static int llama_backend_state_status(ggml_backend_t backend);
+
 //
 // llama_context
 //
@@ -2387,7 +2389,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             switch (status) {
                 case GGML_STATUS_ABORTED:      return  2;
                 case GGML_STATUS_ALLOC_FAILED: return -2;
-                case GGML_STATUS_FAILED:       return -3;
+                case GGML_STATUS_FAILED: {
+                    // axera::SEQ_MISS: the adapter has no page-start image for this batch
+                    constexpr int seq_status_miss = 1;
+                    for (auto & backend : backends) {
+                        if (llama_backend_state_status(backend.get()) == seq_status_miss) {
+                            return LLAMA_DECODE_RET_SEQ_MISS;
+                        }
+                    }
+                    return -3;
+                }
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
         }
@@ -4150,6 +4161,12 @@ static void * llama_backend_state_proc(ggml_backend_t backend, const char * name
     return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
 }
 
+// a backend that keeps its sequence state outside llama.cpp's caches can report why the last graph failed
+static int llama_backend_state_status(ggml_backend_t backend) {
+    auto * status_fn = (int (*)(ggml_backend_t)) llama_backend_state_proc(backend, "ggml_backend_last_state_status");
+    return status_fn ? status_fn(backend) : 0;
+}
+
 void llama_context::state_write_backends(llama_io_write_i & io, llama_state_seq_flags flags) {
     uint32_t count = 0;
     for (auto & backend : backends) {
@@ -5202,7 +5219,9 @@ int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
     const int ret = ctx->decode(batch);
-    if (ret != 0 && ret != 1) {
+    if (ret == LLAMA_DECODE_RET_SEQ_MISS) {
+        LLAMA_LOG_WARN("%s: the sequence state is missing, ret = %d (the caller may replay the prompt)\n", __func__, ret);
+    } else if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
 

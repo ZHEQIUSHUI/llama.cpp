@@ -219,6 +219,9 @@ seq_status seqstate::feed(int64_t c0, int T, const uint16_t * x, const int32_t *
             return run_pages(s0, 0, T, x, p4, true);
         }
     }
+    if (cfg.force_miss > 0 && ++fallbacks == cfg.force_miss) {
+        return fail(SEQ_MISS, "forced miss (GGML_AXERA_SEQ_FORCE_MISS)");
+    }
     if (!find(s0, k)) {
         state_cell = state_cell == c0 ? state_cell : -1;  // (find dropped what the cut made stale)
         return fail(SEQ_MISS, "no restart point for the batch's page");

@@ -336,6 +336,13 @@ static size_t ggml_backend_axera_state_read(ggml_backend_t backend, const void *
     return ctx && ctx->model ? ctx->model->state_read(src, size, flags) : 0;
 }
 
+// llama.cpp asks after a failed graph whether the failure was a sequence-state miss (a prompt whose page-start image
+// is gone). The server turns that into "discard the slot's cache and replay the prompt", not an HTTP 500.
+static int ggml_backend_axera_last_state_status(ggml_backend_t backend) {
+    auto * ctx = (ggml_backend_axera_context *) backend->context;
+    return ctx && ctx->model ? ctx->model->last_state_status() : 0;
+}
+
 // llama.cpp tells each context's sequence count: the largest is kept (a padded prefill chunk needs one sequence)
 static std::atomic<uint32_t> g_axera_n_seq_max{ 0 };
 
@@ -481,6 +488,9 @@ static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_state_read") == 0) {
         return (void *) ggml_backend_axera_state_read;
+    }
+    if (strcmp(name, "ggml_backend_last_state_status") == 0) {
+        return (void *) ggml_backend_axera_last_state_status;
     }
     if (strcmp(name, "ggml_backend_pin_host_weights") == 0) {
         return (void *) ggml_backend_axera_pin_host_weights;

@@ -69,6 +69,10 @@ struct composite final : model {
     size_t state_read(const void * src, size_t size, uint32_t flags) override {
         return llm ? llm->state_read(src, size, flags) : 0;
     }
+
+    int last_state_status() const override {
+        return llm ? llm->last_state_status() : 0;
+    }
 };
 
 }  // namespace

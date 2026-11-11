@@ -1003,6 +1003,10 @@ extern "C" {
     //    2 - aborted     (processed ubatches will remain in the context's memory)
     //   -1 - invalid input batch
     // < -1 - fatal error (processed ubatches will remain in the context's memory)
+    // llama_decode() returns this when an adapter's private sequence state has no restart point for the batch. The
+    // caller can discard the slot's cached prompt and evaluate the whole prompt again.
+    #define LLAMA_DECODE_RET_SEQ_MISS (-4)
+
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);

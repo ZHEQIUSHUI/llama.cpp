@@ -1505,6 +1505,12 @@ private:
 
     server_metrics metrics;
 
+    enum class decode_result {
+        ok,
+        retry,
+        replay, // the adapter lost the sequence state: the slots replay their prompts from cell 0
+    };
+
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
     // note: kept out of server_metrics, which is copied as-is into the task result
     int64_t  t_decode_start  = 0; // start of the last submitted decode
@@ -3923,12 +3929,16 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch.render(off, n_tokens);
-                bool ok = decode(n_batch, off);
+                const decode_result res = decode(n_batch, off);
+                if (res == decode_result::replay) {
+                    batch.clear();
+                    return;
+                }
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
 
-                if (ok) {
+                if (res == decode_result::ok) {
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
 
@@ -4895,9 +4905,9 @@ private:
         return true;
     }
 
-    // returns true = success ; false = retry with smaller batch size
+    // ok = success; retry = retry with a smaller batch size; replay = the prompt must start over from cell 0
     // throw std::runtime_error on fatal error
-    bool decode(int32_t & n_batch, int32_t off) {
+    decode_result decode(int32_t & n_batch, int32_t off) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         metrics_pre_decode();
@@ -4909,7 +4919,7 @@ private:
                 GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
             }
 
-            return true; // nothing to decode
+            return decode_result::ok; // nothing to decode
         } else {
             n_empty_consecutive = 0;
         }
@@ -4941,6 +4951,31 @@ private:
         if (ret != 0) {
             {
                 std::string err;
+
+                if (ret == LLAMA_DECODE_RET_SEQ_MISS) {
+                    SRV_WRN("%s", "the model lost the sequence state for this batch; clearing the slot cache and replaying the prompt\n");
+                    // only the slots in this failed sub-batch: the rest of the logical batch is in the context too, but
+                    // their prompts are still sound and clearing them would throw away work for no reason
+                    std::vector<bool> cleared(slots.size(), false);
+                    for (int i = off; i < off + batch.view.size(); ++i) {
+                        const int id_slot = batch.tokens[i].id_slot;
+                        if (id_slot < 0 || (size_t) id_slot >= slots.size() || cleared[id_slot]) {
+                            continue;
+                        }
+                        cleared[id_slot] = true;
+                        server_slot & slot = slots[id_slot];
+                        slot.prompt_clear();
+                        slot.state       = SLOT_STATE_STARTED;
+                        slot.i_batch     = -1;
+                        slot.has_next_token = true;
+                        slot.stats = {}; // the replay is a new prompt: timings must start from zero again
+                        slot.spec_draft.clear();
+                        slot.spec_draft_q.clear();
+                        slot.spec_i_batch.clear();
+                        slot.spec_prompt.clear();
+                    }
+                    return decode_result::replay; // rebuild the batch from the tasks' full prompts
+                }
 
                 if (n_batch == 1 && ret == 1) {
                     // TODO: try to terminate only the largest active slot/sequence and continue with the rest
@@ -4985,7 +5020,7 @@ private:
 
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
 
-            return false; // retry with the updated n_batch
+            return decode_result::retry; // retry with the updated n_batch
         } else {
             // success, apply batch metrics
             metrics_post_decode(off, batch.view.size(), has_output);
@@ -5062,7 +5097,7 @@ private:
             }
         }
 
-        return true;
+        return decode_result::ok;
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off) {

@@ -23,6 +23,9 @@ struct model {
     virtual size_t state_size(uint32_t flags) const { (void) flags; return 0; }
     virtual size_t state_write(void * dst, size_t size, uint32_t flags) { (void) dst; (void) size; (void) flags; return 0; }
     virtual size_t state_read(const void * src, size_t size, uint32_t flags) { (void) src; (void) size; (void) flags; return 0; }
+    // The state machine's result for the graph that just failed (axera::seq_status; 0: no miss). llama.cpp turns a
+    // seq miss into a retryable decode result so the server can discard the stale prompt and replay from cell 0.
+    virtual int last_state_status() const { return 0; }
     // the whole graph (llama.cpp's model graph: up to the logits); a graph the model does not run fails
     virtual ggml_status compute(ggml_cgraph * g) = 0;
     // one-time host work for a graph that a later compute will run (llama.cpp can hand the next graph over before
