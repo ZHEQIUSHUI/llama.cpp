@@ -4725,7 +4725,14 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        // On the Axera NPU every extra prompt batch pays a graph rebuild and a restart of the prefill
+                        // kernels, and a checkpoint copies hundreds of MiB: keep only the user-message checkpoints
+                        // there (a regenerate replays the last user message). LLAMA_SERVER_CKPT_TAIL=1/0 overrides.
+                        static const bool ckpt_tail = [] {
+                            const char * e = getenv("LLAMA_SERVER_CKPT_TAIL");
+                            return e ? atoi(e) != 0 : ggml_backend_reg_by_name("AXERA") == nullptr;
+                        }();
+                        if (do_checkpoint && ckpt_tail) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
