@@ -19,6 +19,7 @@
 
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
+    SERVER_TASK_TYPE_TTS,
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
     SERVER_TASK_TYPE_DECISION,
@@ -160,6 +161,27 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;
+
+    // used by SERVER_TASK_TYPE_TTS
+    struct tts_params {
+        std::string prompt;
+        std::string voice;
+        std::string instructions;
+        std::string language;
+        std::string ref_text;
+        raw_buffer  ref_audio;
+        bool        has_ref_audio = false;
+        std::string response_format = "wav";
+
+        bool     top_k_set = false;
+        int32_t  top_k = 0;
+        bool     top_p_set = false;
+        float    top_p = 0.0f;
+        bool     seed_set = false;
+        uint32_t seed = LLAMA_DEFAULT_SEED;
+        int32_t  max_frames = 512;
+    };
+    tts_params tts;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -517,6 +539,20 @@ struct server_task_result_embd : server_task_result {
     json to_json_non_oaicompat();
 
     json to_json_oaicompat();
+};
+
+struct server_task_result_tts : server_task_result {
+    raw_buffer  data;
+    std::string content_type;
+    int32_t     n_frames = 0;
+    int32_t     sample_rate = 0;
+    int64_t     n_samples = 0;
+    double      t_prompt_s = 0.0;
+    double      t_gen_s = 0.0;
+    double      t_vocoder_s = 0.0;
+    double      t_total_s = 0.0;
+
+    virtual json to_json() override;
 };
 
 struct server_task_result_rerank : server_task_result {

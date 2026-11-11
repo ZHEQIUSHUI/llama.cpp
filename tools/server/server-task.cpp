@@ -1482,6 +1482,23 @@ json server_task_result_embd::to_json_oaicompat() {
 }
 
 //
+// server_task_result_tts
+//
+json server_task_result_tts::to_json() {
+    return json {
+        {"frames",     n_frames},
+        {"sample_rate", sample_rate},
+        {"samples",    n_samples},
+        {"timings", {
+            {"prompt_s",  t_prompt_s},
+            {"gen_s",     t_gen_s},
+            {"vocoder_s", t_vocoder_s},
+            {"total_s",   t_total_s},
+        }},
+    };
+}
+
+//
 // server_task_result_rerank
 //
 json server_task_result_rerank::to_json() {

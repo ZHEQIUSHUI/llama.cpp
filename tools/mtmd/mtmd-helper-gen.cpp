@@ -78,6 +78,21 @@ static llama_token find_special_token(const llama_vocab * vocab, const std::stri
     return LLAMA_TOKEN_NULL;
 }
 
+static bool write_pcm16(std::vector<char> & buf, const std::vector<float> & pcm) {
+    if (pcm.size() > ((size_t) UINT32_MAX - 36) / 2) {
+        return false;
+    }
+    auto put = [&](const void * p, size_t n) {
+        const char * c = (const char *) p;
+        buf.insert(buf.end(), c, c + n);
+    };
+    for (float v : pcm) {
+        int16_t s = (int16_t) (std::max(-1.0f, std::min(1.0f, v)) * 32767.0f);
+        put(&s, 2);
+    }
+    return true;
+}
+
 static bool write_wav16(std::vector<char> & buf, const std::vector<float> & pcm, int32_t rate) {
     // RIFF chunk sizes are 32-bit; refuse to emit a file with a truncated header
     if (pcm.size() > ((size_t) UINT32_MAX - 36) / 2) {
@@ -97,11 +112,7 @@ static bool write_wav16(std::vector<char> & buf, const std::vector<float> & pcm,
     put(&fmt, 2); put(&ch, 2); put(&rate32, 4);
     put(&byte_rate, 4); put(&align, 2); put(&bits, 2);
     put("data", 4); put(&data_sz, 4);
-    for (float v : pcm) {
-        int16_t s = (int16_t) (std::max(-1.0f, std::min(1.0f, v)) * 32767.0f);
-        put(&s, 2);
-    }
-    return true;
+    return write_pcm16(buf, pcm);
 }
 
 class mtmd_gen_audio_pipeline {
@@ -559,8 +570,11 @@ public:
         }
 
         out_buf.clear();
-        if (!write_wav16(out_buf, audio_pcm, info.sample_rate)) {
-            LOG_ERR("mtmd_helper_gen_audio: output too large for WAV\n");
+        const bool ok = out_type == MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM16
+                ? write_pcm16(out_buf, audio_pcm)
+                : write_wav16(out_buf, audio_pcm, info.sample_rate);
+        if (!ok) {
+            LOG_ERR("mtmd_helper_gen_audio: output too large\n");
             return 1;
         }
         *out_data     = out_buf.data();
@@ -994,8 +1008,11 @@ public:
         }
 
         out_buf.clear();
-        if (!write_wav16(out_buf, audio_pcm, info.sample_rate)) {
-            LOG_ERR("mtmd_helper_gen_audio: output too large for WAV\n");
+        const bool ok = out_type == MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM16
+                ? write_pcm16(out_buf, audio_pcm)
+                : write_wav16(out_buf, audio_pcm, info.sample_rate);
+        if (!ok) {
+            LOG_ERR("mtmd_helper_gen_audio: output too large\n");
             return 1;
         }
         *out_data     = out_buf.data();
@@ -1320,11 +1337,13 @@ static std::unique_ptr<mtmd_gen_audio_pipeline> make_pipeline(llama_context * lc
 
 struct mtmd_helper_gen_audio {
     std::unique_ptr<mtmd_gen_audio_pipeline> pipeline;
+    llama_context * lctx = nullptr;
 };
 
 mtmd_helper_gen_audio * mtmd_helper_gen_audio_init(struct llama_context * lctx, struct mtmd_context * mctx) {
     auto * ctx = new mtmd_helper_gen_audio();
     ctx->pipeline = make_pipeline(lctx, mctx);
+    ctx->lctx = lctx;
     return ctx;
 }
 
@@ -1373,4 +1392,103 @@ int32_t mtmd_helper_gen_audio_get_output(mtmd_helper_gen_audio * ctx, int32_t * 
         return 1;
     }
     return ctx->pipeline->get_output(out_sample_rate, out_data, out_data_len, out_n_samples);
+}
+
+int32_t mtmd_helper_gen_audio_run(mtmd_helper_gen_audio * ctx,
+                                  const mtmd_helper_gen_audio_inp * inp,
+                                  int32_t n_batch, int32_t max_frames,
+                                  mtmd_helper_gen_audio_sample_fn sample, void * sample_user_data,
+                                  const char ** out_data, size_t * out_data_len,
+                                  mtmd_helper_gen_audio_run_result * out_result) {
+    if (!ctx->pipeline || n_batch <= 0 || max_frames <= 0 || sample == nullptr) {
+        LOG_ERR("mtmd_helper_gen_audio: invalid run parameters\n");
+        return 1;
+    }
+    if (mtmd_helper_gen_audio_set_input(ctx, inp) != 0) {
+        LOG_ERR("mtmd_helper_gen_audio: set_input failed\n");
+        return 1;
+    }
+
+    const int64_t t_prompt_start_us = ggml_time_us();
+
+    for (;;) {
+        const int32_t ret = mtmd_helper_gen_audio_step_prompt(ctx, n_batch);
+        if (ret < 0) {
+            LOG_ERR("mtmd_helper_gen_audio: prompt processing failed\n");
+            return 1;
+        }
+        if (ret == 0) {
+            break;
+        }
+    }
+
+    llama_token sampled = sample(sample_user_data);
+    const float * h_state = llama_get_embeddings_ith(ctx->lctx, -1);
+    if (h_state == nullptr) {
+        LOG_ERR("mtmd_helper_gen_audio: backbone did not produce an embedding\n");
+        return 1;
+    }
+
+    const int64_t t_gen_start_us = ggml_time_us();
+    int64_t t_last_report_us = t_gen_start_us;
+    int32_t n_frames = 0;
+    bool stop = false;
+    while (!stop && n_frames < max_frames) {
+        const float * h_next = nullptr;
+        if (mtmd_helper_gen_audio_step_gen(ctx, sampled, h_state, &h_next, &stop) != 0) {
+            LOG_ERR("mtmd_helper_gen_audio: step_gen failed at frame %d\n", n_frames);
+            return 1;
+        }
+        if (!h_next) {
+            break;
+        }
+
+        n_frames++;
+        h_state = h_next;
+        sampled = sample(sample_user_data);
+
+        const int64_t t_now_us = ggml_time_us();
+        if (t_now_us - t_last_report_us >= 2000000) {
+            t_last_report_us = t_now_us;
+            const double t_elapsed_s = (t_now_us - t_gen_start_us) / 1e6;
+            LOG_INF("frames generated: %d, speed: %.2f frames/s\n",
+                    n_frames, t_elapsed_s > 0 ? n_frames / t_elapsed_s : 0.0);
+        }
+    }
+    const double t_gen_s = (ggml_time_us() - t_gen_start_us) / 1e6;
+
+    int32_t sample_rate = 0;
+    size_t data_len = 0;
+    int64_t n_samples = 0;
+    const int64_t t_wav_start_us = ggml_time_us();
+    if (mtmd_helper_gen_audio_get_output(ctx, &sample_rate, out_data, &data_len, &n_samples) != 0) {
+        LOG_ERR("mtmd_helper_gen_audio: get_output failed\n");
+        return 1;
+    }
+    const double t_vocoder_s = (ggml_time_us() - t_wav_start_us) / 1e6;
+    const double t_prompt_s = (t_gen_start_us - t_prompt_start_us) / 1e6;
+    const double t_total_s = t_prompt_s + t_gen_s + t_vocoder_s;
+    const double audio_s = sample_rate > 0 ? (double) n_samples / sample_rate : 0.0;
+
+    LOG_INF("generated %d frames, %zu bytes of audio (%d Hz)\n", n_frames, data_len, sample_rate);
+    LOG_INF("timings: prompt eval %.2fs + generation %.2fs + vocoder %.2fs = total %.2fs\n",
+            t_prompt_s, t_gen_s, t_vocoder_s, t_total_s);
+    LOG_INF("         output audio = %.2fs (audio time = %.2fx process time)\n",
+            audio_s, t_total_s > 0 ? audio_s / t_total_s : 0.0);
+
+    if (out_data_len) {
+        *out_data_len = data_len;
+    }
+    if (out_result) {
+        *out_result = {
+            n_frames,
+            sample_rate,
+            n_samples,
+            t_prompt_s,
+            t_gen_s,
+            t_vocoder_s,
+            t_total_s,
+        };
+    }
+    return 0;
 }

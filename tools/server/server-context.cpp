@@ -9,6 +9,7 @@
 #include "server-stream.h"
 
 #include "build-info.h"
+#include "base64.hpp"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
@@ -21,6 +22,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstddef>
 #include <cinttypes>
 #include <cstdlib>
@@ -41,6 +43,18 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+struct server_tts_sampler_ctx {
+    common_sampler * smpl = nullptr;
+    llama_context  * lctx = nullptr;
+};
+
+static llama_token server_tts_sample(void * user_data) {
+    auto * ctx = static_cast<server_tts_sampler_ctx *>(user_data);
+    const llama_token sampled = common_sampler_sample(ctx->smpl, ctx->lctx, -1);
+    common_sampler_accept(ctx->smpl, sampled, true);
+    return sampled;
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -1484,6 +1498,9 @@ private:
 
     common_speculative_ptr spec;
 
+    // only used by SERVER_TASK_TYPE_TTS, on the main loop thread
+    std::unique_ptr<mtmd_helper::gen_audio> tts_gen;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1552,6 +1569,7 @@ private:
     }
 
     void destroy() {
+        tts_gen.reset();
         spec.reset();
         spec_init.reset();
 
@@ -1814,6 +1832,12 @@ private:
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            if (mtmd_gen_audio_get_info(mctx).type == MTMD_GEN_AUDIO_TYPE_QWEN3TTS) {
+                tts_gen = std::make_unique<mtmd_helper::gen_audio>(ctx_tgt, mctx);
+            } else {
+                tts_gen.reset();
+            }
 
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
@@ -3413,6 +3437,156 @@ private:
         return n_read;
     }
 
+    void process_tts_task(server_task && task) {
+        const int id_task = task.id;
+
+        auto clear_tts_state = [&]() {
+            llama_synchronize(ctx_tgt);
+            for (auto & slot : slots) {
+                if (slot.prompt.n_tokens() > 0) {
+                    slot.prompt_clear();
+                }
+            }
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, -1, -1);
+        };
+        auto fail = [&](const std::string & message, error_type type) {
+            clear_tts_state();
+            queue_tasks.pop_deferred_task(-1);
+            send_error(id_task, message, type);
+        };
+
+        clear_tts_state();
+
+        try {
+            if (!tts_gen) {
+                return fail("audio generation is not available for this model", ERROR_TYPE_NOT_SUPPORTED);
+            }
+
+            char model_type_buf[64] = {};
+            if (llama_model_meta_val_str(model_tgt, "qwen3tts.tts_model_type", model_type_buf, sizeof(model_type_buf)) < 0) {
+                snprintf(model_type_buf, sizeof(model_type_buf), "base");
+            }
+            const std::string model_type = model_type_buf;
+
+            const std::string voice = task.tts.voice.empty() ? params_base.tts_speaker : task.tts.voice;
+            const std::string instructions = task.tts.instructions.empty() ? params_base.tts_instruct : task.tts.instructions;
+            const std::string language = task.tts.language.empty() ? params_base.tts_lang : task.tts.language;
+            const std::string ref_text = task.tts.ref_text.empty() ? params_base.tts_ref_text : task.tts.ref_text;
+
+            if (model_type == "base") {
+                if (!voice.empty()) {
+                    return fail("voice is only supported by CustomVoice models", ERROR_TYPE_INVALID_REQUEST);
+                }
+                if (!instructions.empty()) {
+                    return fail("instructions are not supported by Base models", ERROR_TYPE_INVALID_REQUEST);
+                }
+            } else if (model_type == "custom_voice" || model_type == "voice_design") {
+                if (task.tts.has_ref_audio || !params_base.tts_speaker_file.empty()) {
+                    return fail("ref_audio is only supported by Base models", ERROR_TYPE_INVALID_REQUEST);
+                }
+                if (!ref_text.empty()) {
+                    return fail("ref_text is only supported by Base models", ERROR_TYPE_INVALID_REQUEST);
+                }
+                if (model_type == "custom_voice") {
+                    if (voice.empty()) {
+                        return fail("CustomVoice models require voice", ERROR_TYPE_INVALID_REQUEST);
+                    }
+                } else {
+                    if (!voice.empty()) {
+                        return fail("voice is only supported by CustomVoice models", ERROR_TYPE_INVALID_REQUEST);
+                    }
+                    if (instructions.empty()) {
+                        return fail("VoiceDesign models require instructions", ERROR_TYPE_INVALID_REQUEST);
+                    }
+                }
+            } else {
+                return fail("unsupported Qwen3-TTS model type '" + model_type + "'", ERROR_TYPE_INVALID_REQUEST);
+            }
+
+            mtmd::bitmap_ptr speaker;
+            if (model_type == "base" && (task.tts.has_ref_audio || !params_base.tts_speaker_file.empty())) {
+                mtmd_helper_bitmap_wrapper wrapper{};
+                if (task.tts.has_ref_audio) {
+                    wrapper = mtmd_helper_bitmap_init_from_buf(mctx, task.tts.ref_audio.data(), task.tts.ref_audio.size(),
+                                                               false, init_opt);
+                } else {
+                    wrapper = mtmd_helper_bitmap_init_from_file(mctx, params_base.tts_speaker_file.c_str(), false, init_opt);
+                }
+                if (!wrapper.bitmap) {
+                    return fail("failed to decode the reference audio", ERROR_TYPE_INVALID_REQUEST);
+                }
+                speaker.reset(wrapper.bitmap);
+            }
+
+            common_params_sampling sampling = params_base.sampling;
+            const uint64_t user_config = sampling.user_sampling_config;
+            if (!(user_config & COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT)) {
+                sampling.penalty_repeat = 1.05f;
+            }
+            if (!(user_config & COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_LAST_N)) {
+                sampling.penalty_last_n = -1;
+            }
+            if (task.tts.top_k_set) {
+                sampling.top_k = task.tts.top_k;
+            }
+            if (task.tts.top_p_set) {
+                sampling.top_p = task.tts.top_p;
+            }
+            if (task.tts.seed_set) {
+                sampling.seed = task.tts.seed;
+            }
+
+            common_sampler_ptr smpl(common_sampler_init(model_tgt, sampling));
+            if (!smpl) {
+                return fail("failed to initialize the sampler", ERROR_TYPE_SERVER);
+            }
+
+            mtmd_helper_gen_audio_inp inp{};
+            inp.seq_id       = 0;
+            inp.prompt       = task.tts.prompt.c_str();
+            inp.prompt_len   = task.tts.prompt.size();
+            inp.speaker_ref  = speaker.get();
+            inp.ref_text     = ref_text.c_str();
+            inp.ref_text_len = ref_text.size();
+            inp.speaker      = voice.c_str();
+            inp.instruct     = instructions.c_str();
+            inp.lang         = language.c_str();
+            inp.top_k        = sampling.top_k;
+            inp.top_p        = sampling.top_p;
+            inp.seed         = sampling.seed;
+            inp.out_type     = task.tts.response_format == "pcm"
+                    ? MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM16
+                    : MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+
+            const char * data = nullptr;
+            size_t data_len = 0;
+            mtmd_helper_gen_audio_run_result run_result{};
+            server_tts_sampler_ctx sample_ctx{smpl.get(), ctx_tgt};
+            if (tts_gen->run(&inp, params_base.n_batch, task.tts.max_frames, server_tts_sample, &sample_ctx,
+                             &data, &data_len, &run_result) != 0) {
+                return fail("audio generation failed", ERROR_TYPE_SERVER);
+            }
+
+            auto out = std::make_unique<server_task_result_tts>();
+            out->id           = id_task;
+            out->data.assign((const uint8_t *) data, (const uint8_t *) data + data_len);
+            out->content_type = task.tts.response_format == "pcm" ? "audio/pcm" : "audio/wav";
+            out->n_frames     = run_result.n_frames;
+            out->sample_rate  = run_result.sample_rate;
+            out->n_samples    = run_result.n_samples;
+            out->t_prompt_s   = run_result.t_prompt_s;
+            out->t_gen_s      = run_result.t_gen_s;
+            out->t_vocoder_s  = run_result.t_vocoder_s;
+            out->t_total_s    = run_result.t_total_s;
+
+            clear_tts_state();
+            queue_tasks.pop_deferred_task(-1);
+            queue_results.send(std::move(out));
+        } catch (const std::exception & e) {
+            fail(std::string("audio generation failed: ") + e.what(), ERROR_TYPE_SERVER);
+        }
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -3422,6 +3596,21 @@ private:
         }
 
         switch (task.type) {
+            case SERVER_TASK_TYPE_TTS:
+                {
+                    bool busy = false;
+                    for (const auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            SRV_DBG("a slot is busy, defer TTS task, id_task = %d\n", task.id);
+                            queue_tasks.defer(std::move(task));
+                            busy = true;
+                            break;
+                        }
+                    }
+                    if (!busy) {
+                        process_tts_task(std::move(task));
+                    }
+                } break;
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
@@ -5574,6 +5763,11 @@ server_context_meta server_context::get_meta() const {
     auto eos_token_str = eos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx_tgt, eos_id, true) : "";
 
     const char * ftype_name = llama_ftype_name(llama_model_ftype(impl->model_tgt));
+    const int tts_gen_audio_type = impl->mctx ? (int) mtmd_gen_audio_get_info(impl->mctx).type : (int) MTMD_GEN_AUDIO_TYPE_NONE;
+    char tts_model_type[64] = {};
+    llama_model_meta_val_str(impl->model_tgt, "qwen3tts.tts_model_type", tts_model_type, sizeof(tts_model_type));
+    const std::string tts_type = tts_model_type[0] ? tts_model_type
+            : tts_gen_audio_type == MTMD_GEN_AUDIO_TYPE_QWEN3TTS ? "base" : "";
 
     return server_context_meta {
         /* build_info              */ std::string(llama_build_info()),
@@ -5586,6 +5780,8 @@ server_context_meta server_context::get_meta() const {
         /* has_inp_image           */ impl->chat_params.allow_image,
         /* has_inp_audio           */ impl->chat_params.allow_audio,
         /* has_inp_video           */ impl->chat_params.allow_video,
+        /* tts_gen_audio_type      */ tts_gen_audio_type,
+        /* tts_model_type          */ tts_type,
         /* json_ui_settings        */ impl->json_ui_settings,
         /* slot_n_ctx              */ impl->n_ctx_slot(),
         /* pooling_type            */ llama_pooling_type(impl->ctx_tgt),
@@ -6435,6 +6631,158 @@ void server_routes::init_routes() {
             files,
             TASK_RESPONSE_TYPE_OAI_ASR,
             session);
+    };
+
+    this->post_audio_speech = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (!meta->has_mtmd) {
+            res->error(format_error_response(
+                "Audio generation requires an mmproj loaded with --mmproj.", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        if (meta->tts_gen_audio_type == MTMD_GEN_AUDIO_TYPE_NONE) {
+            res->error(format_error_response(
+                "The loaded mmproj does not support audio generation.", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        if (meta->tts_gen_audio_type != MTMD_GEN_AUDIO_TYPE_QWEN3TTS) {
+            res->error(format_error_response(
+                "This audio generation model is not supported by /v1/audio/speech.", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        if (params.n_parallel != 1) {
+            res->error(format_error_response(
+                "Audio generation requires --parallel 1 (one sequence).", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const json body = json::parse(req.body);
+        if (!body.is_object()) {
+            throw std::invalid_argument("request body must be a JSON object");
+        }
+
+        auto opt_string = [&](const char * key) -> std::string {
+            if (!body.contains(key) || body.at(key).is_null()) {
+                return {};
+            }
+            if (!body.at(key).is_string()) {
+                throw std::invalid_argument(string_format("\"%s\" must be a string", key));
+            }
+            return body.at(key).get<std::string>();
+        };
+
+        server_task task(SERVER_TASK_TYPE_TTS);
+        task.tts.prompt = opt_string("input");
+        if (task.tts.prompt.empty()) {
+            throw std::invalid_argument("missing required field \"input\"");
+        }
+        task.tts.voice        = opt_string("voice");
+        task.tts.instructions = opt_string("instructions");
+        task.tts.language     = opt_string("language");
+        task.tts.ref_text     = opt_string("ref_text");
+
+        task.tts.response_format = opt_string("response_format");
+        if (task.tts.response_format.empty()) {
+            task.tts.response_format = "wav";
+        }
+        if (task.tts.response_format != "wav" && task.tts.response_format != "pcm") {
+            throw std::invalid_argument("unsupported response_format: only \"wav\" and \"pcm\" are supported");
+        }
+
+        if (body.contains("ref_audio") && !body.at("ref_audio").is_null()) {
+            if (!body.at("ref_audio").is_string()) {
+                throw std::invalid_argument("\"ref_audio\" must be a base64-encoded WAV string");
+            }
+            std::string encoded = body.at("ref_audio").get<std::string>();
+            const size_t data_uri = encoded.find(";base64,");
+            if (data_uri != std::string::npos) {
+                encoded = encoded.substr(data_uri + 8);
+            }
+            try {
+                const std::string decoded = base64::decode(encoded);
+                task.tts.ref_audio.assign(decoded.begin(), decoded.end());
+            } catch (const std::exception & e) {
+                throw std::invalid_argument(std::string("invalid ref_audio base64: ") + e.what());
+            }
+            if (task.tts.ref_audio.empty()) {
+                throw std::invalid_argument("\"ref_audio\" decoded to an empty buffer");
+            }
+            task.tts.has_ref_audio = true;
+        }
+
+        if (body.contains("top_k") && !body.at("top_k").is_null()) {
+            if (!body.at("top_k").is_number_integer()) {
+                throw std::invalid_argument("\"top_k\" must be an integer");
+            }
+            task.tts.top_k = body.at("top_k").get<int32_t>();
+            if (task.tts.top_k < 0) {
+                throw std::invalid_argument("\"top_k\" must be >= 0");
+            }
+            task.tts.top_k_set = true;
+        }
+        if (body.contains("top_p") && !body.at("top_p").is_null()) {
+            if (!body.at("top_p").is_number()) {
+                throw std::invalid_argument("\"top_p\" must be a number");
+            }
+            task.tts.top_p = body.at("top_p").get<float>();
+            if (!std::isfinite(task.tts.top_p) || task.tts.top_p <= 0.0f || task.tts.top_p > 1.0f) {
+                throw std::invalid_argument("\"top_p\" must be in (0, 1]");
+            }
+            task.tts.top_p_set = true;
+        }
+        if (body.contains("seed") && !body.at("seed").is_null()) {
+            if (!body.at("seed").is_number_integer()) {
+                throw std::invalid_argument("\"seed\" must be an integer");
+            }
+            const int64_t seed = body.at("seed").get<int64_t>();
+            if (seed < 0 || seed > (int64_t) UINT32_MAX) {
+                throw std::invalid_argument("\"seed\" must be in the uint32 range");
+            }
+            task.tts.seed = (uint32_t) seed;
+            task.tts.seed_set = true;
+        }
+        if (body.contains("max_frames") && !body.at("max_frames").is_null()) {
+            if (!body.at("max_frames").is_number_integer()) {
+                throw std::invalid_argument("\"max_frames\" must be an integer");
+            }
+            task.tts.max_frames = body.at("max_frames").get<int32_t>();
+            if (task.tts.max_frames <= 0) {
+                throw std::invalid_argument("\"max_frames\" must be > 0");
+            }
+        }
+
+        task.id = res->rd.get_new_id();
+        res->rd.post_task(std::move(task));
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * tts = dynamic_cast<server_task_result_tts *>(result.get());
+        GGML_ASSERT(tts != nullptr);
+
+        res->status = 200;
+        res->content_type = tts->content_type;
+        res->data.assign((const char *) tts->data.data(), tts->data.size());
+        res->headers["X-TTS-Frames"] = std::to_string(tts->n_frames);
+        res->headers["X-TTS-Sample-Rate"] = std::to_string(tts->sample_rate);
+        res->headers["X-TTS-Audio-Seconds"] = string_format("%.3f", tts->sample_rate > 0
+                ? (double) tts->n_samples / tts->sample_rate : 0.0);
+        res->headers["X-TTS-Prompt-Seconds"] = string_format("%.3f", tts->t_prompt_s);
+        res->headers["X-TTS-Gen-Seconds"] = string_format("%.3f", tts->t_gen_s);
+        res->headers["X-TTS-Vocoder-Seconds"] = string_format("%.3f", tts->t_vocoder_s);
+
+        SRV_INF("audio speech: %d frames, %.2fs audio, prompt %.2fs + generation %.2fs + vocoder %.2fs\n",
+                tts->n_frames, tts->sample_rate > 0 ? (double) tts->n_samples / tts->sample_rate : 0.0,
+                tts->t_prompt_s, tts->t_gen_s, tts->t_vocoder_s);
+        return res;
     };
 
     this->post_anthropic_messages = [this](const server_http_req & req) {

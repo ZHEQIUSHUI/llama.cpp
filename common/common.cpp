@@ -1289,6 +1289,18 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
+    // Qwen3-TTS reads the backbone hidden state while generating; enable the embedding
+    // output without requiring every server user to pass --embedding.
+    {
+        char arch[64] = {};
+        if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) >= 0 &&
+            std::strcmp(arch, "qwen3tts") == 0 && !params.embedding) {
+            params.embedding = true;
+            cparams.embeddings = true;
+            COM_WRN("%s", "qwen3tts model reads the backbone embeddings, enabling embedding mode\n");
+        }
+    }
+
     // these decision models return a score for each token via the embeddings output
     // TODO: maybe improve this in the future
     const auto decision_type = common_get_decision_type(model);

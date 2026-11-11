@@ -200,7 +200,8 @@ struct mtmd_helper_gen_audio;
 typedef struct mtmd_helper_gen_audio mtmd_helper_gen_audio;
 
 enum mtmd_helper_gen_audio_outtype {
-    MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM, // raw PCM
+    MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM,   // raw PCM, float32
+    MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM16, // raw PCM, 16-bit little-endian mono
     MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV, // WAV PCM 16-bit LE, mono
 };
 struct mtmd_helper_gen_audio_inp {
@@ -261,6 +262,32 @@ MTMD_API int32_t mtmd_helper_gen_audio_get_output(
                         size_t * out_data_len,
                         int64_t * out_n_samples);
 
+// called once at the start and after every generated frame; the caller must use its own sampler
+typedef llama_token (*mtmd_helper_gen_audio_sample_fn)(void * user_data);
+
+struct mtmd_helper_gen_audio_run_result {
+    int32_t n_frames;
+    int32_t sample_rate;
+    int64_t n_samples;
+    double t_prompt_s;
+    double t_gen_s;
+    double t_vocoder_s;
+    double t_total_s;
+};
+
+// runs the whole prompt / generation / vocoder pipeline for one input
+// out_data is valid until the next set_input(), run() or reset() call
+MTMD_API int32_t mtmd_helper_gen_audio_run(
+                        mtmd_helper_gen_audio * ctx,
+                        const struct mtmd_helper_gen_audio_inp * inp,
+                        int32_t n_batch,
+                        int32_t max_frames,
+                        mtmd_helper_gen_audio_sample_fn sample,
+                        void * sample_user_data,
+                        const char ** out_data,
+                        size_t * out_data_len,
+                        struct mtmd_helper_gen_audio_run_result * out_result);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
@@ -303,6 +330,13 @@ struct gen_audio {
     }
     int32_t get_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples = nullptr) {
         return mtmd_helper_gen_audio_get_output(ctx.get(), out_sample_rate, out_data, out_data_len, out_n_samples);
+    }
+    int32_t run(const struct mtmd_helper_gen_audio_inp * inp, int32_t n_batch, int32_t max_frames,
+                mtmd_helper_gen_audio_sample_fn sample, void * sample_user_data,
+                const char ** out_data, size_t * out_data_len,
+                struct mtmd_helper_gen_audio_run_result * out_result) {
+        return mtmd_helper_gen_audio_run(ctx.get(), inp, n_batch, max_frames, sample, sample_user_data,
+                                         out_data, out_data_len, out_result);
     }
 };
 
