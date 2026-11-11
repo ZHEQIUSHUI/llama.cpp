@@ -20,6 +20,8 @@ struct graph_names {
         std::map<std::string, ggml_tensor *> t;
         // map value of each traversal occurrence, into t: a topology hit updates these in place
         std::vector<ggml_tensor **>         slots;
+        // the scheduler's per-split uid of the graph the values were last refreshed from
+        uint64_t                            graph_uid = 0;
     };
 
     uint64_t                             uid = 0;  // ggml_cgraph.uid, when non-zero (the exact graph identity)

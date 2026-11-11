@@ -104,6 +104,7 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
         for (size_t i = 0; i < occ.size(); ++i) {
             out.slots[i] = slot_of[occ[i]];
         }
+        out.graph_uid = g->uid;
         return out;
     };
     // stable_uid survives the scheduler's per-call split of a reused graph; uid does not
@@ -149,13 +150,22 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
     std::vector<ggml_tensor *> occ;
     if (gid) {
         if (uid == gid) {
-            const int64_t t0 = prof ? ggml_time_us() : 0;
-            walk(occ);
-            scan_us += (prof ? ggml_time_us() : 0) - t0;
-            if (update_values(cur, occ)) {
+            if (cur.graph_uid == g->uid) {
+                // The scheduler reused the graph: its tensor pointers did not change. A rebuilt graph of the same
+                // topology gets a fresh cgraph.uid and pays the walk below to refresh them.
                 key.clear();
                 hit = true;
                 st  = ST_UID;
+            } else {
+                const int64_t t0 = prof ? ggml_time_us() : 0;
+                walk(occ);
+                scan_us += (prof ? ggml_time_us() : 0) - t0;
+                if (update_values(cur, occ)) {
+                    cur.graph_uid = g->uid;
+                    key.clear();
+                    hit = true;
+                    st  = ST_UID;
+                }
             }
         } else {
             const int64_t t0 = prof ? ggml_time_us() : 0;
@@ -170,6 +180,7 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
                 remember_uid();
                 cur = std::move(found);
                 if (update_values(cur, occ)) {
+                    cur.graph_uid = g->uid;
                     uid = gid;
                     key.clear();
                     hit = true;
