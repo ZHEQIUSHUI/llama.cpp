@@ -5,11 +5,13 @@
 //
 // The host orders the patches in 2 x 2 merge order (as clip_graph_qwen3vl), resizes the learned position table
 // (bilinear, align corners), makes the 2-D RoPE tables and the key mask: those depend on the image's size only and are
-// kept for the next image of the same size. The layers' weights from the mmproj GGUF, stacked [layers, ...] bf16 in
+// kept for the next image of the same size. A video comes as pairs of frames (the tower's temporal merge): what goes
+// into the kernel's patch rows and patch weight for a still or a pair is core/patch_embed's business. The layers' weights from the mmproj GGUF, stacked [layers, ...] bf16 in
 // CMM once.
 
 #include "../model.h"
 #include "../../ops/ops.h"
+#include "../../core/patch_embed.h"
 
 #include <cmath>
 
@@ -30,6 +32,8 @@ class qwen35_vit_full final : public model {
     const void *                      bound = nullptr;
     int                               gh_ = -1, gw_ = -1;  // the image size of the tables in buf
     std::vector<int>                  py, px;       // the patches in merge order
+    patch_embed                       pemb;         // the patch projection: the kernel's px rows and w_patch
+    int                               w_frames = 0; // the frames per call w_patch is filled for
 
     axera_cmm & io(const char * n, bool out = false) {
         auto & c = buf[n];
@@ -39,6 +43,7 @@ class qwen35_vit_full final : public model {
         return c;
     }
     void weights(int L, int H);
+    void patch_weight(int frames);
     void tables(int gh, int gw, int n, const ggml_tensor * pe, int H);
 };
 
@@ -85,16 +90,32 @@ void qwen35_vit_full::weights(int L, int H) {
         to_bf16(w, (ggml_bf16_t *) io(in)->vir);
         io(in)->flush();
     }
-    // the patch projection: w0 + w1 (both temporal frames are the image), [H][3][PS][PS] f32 -> bf16 [H, CP]
+    // the patch projection [H][3][PS][PS] x 2 frames: w_patch itself is filled per frame count (patch_weight)
     const ggml_tensor * w0 = names.at("v.patch_embd.weight"), *w1 = names.at("v.patch_embd.weight.1");
-    GGML_ASSERT(w0->type == GGML_TYPE_F32 && w1->type == GGML_TYPE_F32 &&
-                (size_t) ggml_nelements(w0) * sizeof(ggml_bf16_t) == k.in_bytes("w_patch"));
-    auto * d = (ggml_bf16_t *) io("w_patch")->vir;
-    for (int64_t i = 0; i < ggml_nelements(w0); ++i) {
-        d[i] = ggml_fp32_to_bf16(((const float *) w0->data)[i] + ((const float *) w1->data)[i]);
+    const int           CP = (int) (ggml_nelements(w0) / H);
+    const int           PW = (int) (k.in_bytes("px") / sizeof(ggml_bf16_t) / N);
+    GGML_ASSERT(w0->type == GGML_TYPE_F32 && w1->type == GGML_TYPE_F32 && ggml_nelements(w0) == ggml_nelements(w1) &&
+                (size_t) H * PW * sizeof(ggml_bf16_t) == k.in_bytes("w_patch"));
+    const bool ok = pemb.init((const float *) w0->data, (const float *) w1->data, H, CP, PW,
+                              [](int64_t n, const std::function<void(int64_t)> & fn) { axera_host_pool().run(n, fn); });
+    GGML_ASSERT(ok && "axera qwen35_vit_full: the kernel's px row is neither one nor two frames wide");
+    w_frames = 0;
+}
+
+void qwen35_vit_full::patch_weight(int frames) {
+    if (frames == w_frames) {
+        return;
     }
+    axera_timer                tm(frames == 2 ? "vit patch weight (frame pairs)" : "vit patch weight (stills)");
+    const std::vector<float> & w = pemb.weight(frames);
+    GGML_ASSERT(w.size() * sizeof(ggml_bf16_t) == k.in_bytes("w_patch"));
+    ggml_fp32_to_bf16_row(w.data(), (ggml_bf16_t *) io("w_patch")->vir, (int64_t) w.size());
     io("w_patch")->flush();
-    (void) H;
+    w_frames = frames;
+    if (frames == 2) {
+        GGML_LOG_INFO("axera qwen35_vit_full: video frame pairs through %d-wide patch rows (basis residual %.1e)\n", pemb.width(),
+                      pemb.pair_residual());
+    }
 }
 
 // the tables of an image of gh x gw patches (n real): merge order, positions, RoPE, key mask
@@ -182,11 +203,13 @@ ggml_status qwen35_vit_full::compute(ggml_cgraph * g) {
         QB = (int) km.pShape[1];
         BC = (int) km.pShape[2];
         HD = 2 * (int) cm.pShape[1];
-        GGML_ASSERT(km.pShape[0] * BC == N && k.in_bytes("px") == (size_t) N * CP * sizeof(ggml_bf16_t));
+        GGML_ASSERT(km.pShape[0] * BC == N && (k.in_bytes("px") == (size_t) N * CP * sizeof(ggml_bf16_t) ||
+                                               k.in_bytes("px") == (size_t) N * 2 * CP * sizeof(ggml_bf16_t)));
     }
-    if (raw->ne[3] != 1 || gw % 2 || gh % 2 || n > N) {
-        GGML_LOG_ERROR("axera qwen35_vit_full: %d frame(s) of %d x %d patches: still images of even patch counts, at most %d "
-                       "patches (mtmd --image-max-tokens)\n", (int) raw->ne[3], gw, gh, N);
+    const int frames = (int) raw->ne[3];  // 1: a still image, 2: a pair of video frames
+    if (frames < 1 || frames > 2 || gw % 2 || gh % 2 || n > N) {
+        GGML_LOG_ERROR("axera qwen35_vit_full: %d frame(s) of %d x %d patches: one image or a pair of video frames, even patch "
+                       "counts, at most %d patches (mtmd --image-max-tokens)\n", frames, gw, gh, N);
         return GGML_STATUS_FAILED;
     }
     const ggml_tensor * w0 = names.at("v.blk.0.ln1.weight");
@@ -200,23 +223,40 @@ ggml_status qwen35_vit_full::compute(ggml_cgraph * g) {
         gh_ = gh;
         gw_ = gw;
     }
+    patch_weight(frames);
     {
-        axera_timer   tm("vit patches (cpu)");
+        axera_timer   tm(frames == 2 ? "vit patches (cpu, frame pairs)" : "vit patches (cpu)");
         const float * img = (const float *) raw->data;
         const int64_t W = raw->ne[0], HI = raw->ne[1];
+        const int     PW = pemb.width();
+        const bool    plain = frames == 1 && PW == CP;  // the pixels are the row
         auto *        pxb = (ggml_bf16_t *) io("px")->vir;
         axera_host_pool().run(N, [&](int64_t i) {
-            ggml_bf16_t * d = pxb + i * CP;
+            ggml_bf16_t * d = pxb + i * PW;
             if (i >= n) {
-                std::fill(d, d + CP, ggml_fp32_to_bf16(0.0f));
+                std::fill(d, d + PW, ggml_fp32_to_bf16(0.0f));
                 return;
             }
-            for (int c = 0; c < 3; ++c) {
-                for (int ky = 0; ky < PS; ++ky) {
-                    const float * row = img + c * W * HI + (int64_t) (py[i] * PS + ky) * W + px[i] * PS;
-                    ggml_fp32_to_bf16_row(row, d + (c * PS + ky) * PS, PS);
+            if (plain) {
+                for (int c = 0; c < 3; ++c) {
+                    for (int ky = 0; ky < PS; ++ky) {
+                        const float * row = img + c * W * HI + (int64_t) (py[i] * PS + ky) * W + px[i] * PS;
+                        ggml_fp32_to_bf16_row(row, d + (c * PS + ky) * PS, PS);
+                    }
+                }
+                return;
+            }
+            std::vector<float> p((size_t) 2 * CP + PW);  // the patch in both frames, its row
+            for (int f = 0; f < frames; ++f) {
+                for (int c = 0; c < 3; ++c) {
+                    for (int ky = 0; ky < PS; ++ky) {
+                        const float * row = img + (f * 3 + c) * W * HI + (int64_t) (py[i] * PS + ky) * W + px[i] * PS;
+                        memcpy(p.data() + (size_t) f * CP + (c * PS + ky) * PS, row, PS * sizeof(float));
+                    }
                 }
             }
+            pemb.row(p.data(), frames == 2 ? p.data() + CP : nullptr, p.data() + 2 * CP);
+            ggml_fp32_to_bf16_row(p.data() + 2 * CP, d, PW);
         });
         io("px")->flush();
     }
