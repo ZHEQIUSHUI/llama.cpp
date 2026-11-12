@@ -22,6 +22,7 @@
 #include "../../core/mx.h"
 #include "../../core/quant.h"
 #include "../../ops/ops.h"
+#include "../../core/seqstate.h"
 
 #include <cmath>
 #include <regex>
@@ -40,6 +41,7 @@ class qwen3 final : public model {
   public:
     explicit qwen3(const manifest & m) : man(m), prm(m) {}
     ggml_status compute(ggml_cgraph * g) override;
+    int         last_state_status() const override { return last_status; }
 
   private:
     const manifest & man;
@@ -58,6 +60,7 @@ class qwen3 final : public model {
     std::vector<ggml_bf16_t> page_x;
     std::vector<int32_t>     page_p;
     output_head              head;
+    int                      last_status = 0;  // axera::seq_status of the last graph (SEQ_MISS: the server replays)
 
     void      init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
     axera_cmm bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d, const rope & rp);
@@ -409,6 +412,7 @@ void qwen3::decode(int64_t c, int t, const ggml_bf16_t * x, const int32_t * p4, 
 }
 
 ggml_status qwen3::compute(ggml_cgraph * g) {
+    last_status = 0;  // a new graph
     const auto &  t       = names.of(g);
     ggml_tensor * norm0   = names.find("attn_norm-0");
     ggml_tensor * logits  = graph_head(names);
@@ -509,7 +513,13 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
         const int64_t s0 = c0 - c0 % PG;
         const int     k  = (int) (c0 - s0);
         if (k > 0 && (page_cell != s0 || (int) (page_x.size() / H) < k)) {
-            GGML_LOG_ERROR("axera qwen3: a batch from cell %lld, inside a page whose inputs are not kept\n", (long long) c0);
+            // Only the current page's inputs are kept, and the prefill kernel starts at a page's first cell. A prompt
+            // that shares just a few cells with an earlier one (e.g. the chat template's prefix after an audio
+            // request) lands in a page that is gone: report a miss so that the server evaluates the whole prompt
+            // again instead of failing the request.
+            GGML_LOG_WARN("axera qwen3: a batch from cell %lld, inside a page whose inputs are not kept; the slot must replay\n",
+                          (long long) c0);
+            last_status = SEQ_MISS;
             return GGML_STATUS_FAILED;
         }
         page_x.resize((size_t) k * H);  // (a kept prefix, e.g. the server's prompt cache: the cells after it are gone)
