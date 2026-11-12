@@ -135,6 +135,11 @@ void server_queue::terminate() {
     condition_tasks.notify_all();
 }
 
+bool server_queue::is_running() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    return running;
+}
+
 bool server_queue::process_new_tasks(bool is_yielding) {
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_tasks);
@@ -554,6 +559,16 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
             // timeout, check stop condition
             if (should_stop()) {
                 return nullptr;
+            }
+            if (!queue_tasks.is_running()) {
+                // The main loop has stopped (the server is shutting down), so no result will ever arrive. Waiting
+                // on would keep this HTTP thread alive, and the shutdown joins the HTTP threads: answer instead.
+                auto err      = std::make_unique<server_task_result_error>();
+                err->id       = id_tasks.empty() ? -1 : *id_tasks.begin();
+                err->err_type = ERROR_TYPE_UNAVAILABLE;
+                err->err_msg  = "the server is shutting down";
+                stop();
+                return err;
             }
         } else {
             if (result->is_error()) {

@@ -77,6 +77,9 @@ public:
     // end the start_loop routine
     void terminate();
 
+    // false once terminate() was called: the main loop processes no more tasks
+    bool is_running();
+
     /**
      * Main loop consists of these steps:
      * - Wait until a new task arrives
