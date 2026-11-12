@@ -4656,6 +4656,12 @@ private:
                             break;
                         }
 
+                        // a chunk that fits a batch goes into it with the text (below)
+                        if (media_in_batch() &&
+                            (int) mtmd_input_chunk_get_n_tokens(input_tokens.find_chunk(cur_token_idx).get()) <= n_batch) {
+                            break;
+                        }
+
                         // process the mtmd chunk
                         // note: it submits its own decode, potentially be async
                         //       so the timing is queued and flushed on the next sync
@@ -4699,7 +4705,35 @@ private:
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
-                            break; // end of text chunk
+                            if (!media_in_batch()) {
+                                break; // end of text chunk
+                            }
+                            // a media chunk: its embedding rows into this batch, or the next batch starts with it
+                            const auto & chunk   = input_tokens.find_chunk(slot.prompt.n_tokens());
+                            const int    n_chunk = (int) mtmd_input_chunk_get_n_tokens(chunk.get());
+                            if (batch.size() + n_chunk > n_batch) {
+                                break;
+                            }
+                            float * embd = slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+                            if (!embd) {
+                                // encode on the worker thread, so we can still handle metrics tasks
+                                int32_t    res = 0;
+                                const auto idx = slot.prompt.n_tokens();
+                                queue_tasks.yield_to_queue([&]() {
+                                    res = encode_mtmd_chunk(slot, slot.mbatch, idx);
+                                });
+                                embd = res == 0 ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+                            }
+                            if (!embd || !add_mtmd_chunk(slot, chunk.get(), embd, batch)) {
+                                SLT_ERR(slot, "%s", "failed to process mtmd chunk\n");
+                                // the batch must not keep the entries of a released slot
+                                batch.truncate(n_tokens_prev);
+                                send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                                slot.release();
+                                return;
+                            }
+                            slot.prompt.tokens.push_back_placeholder(chunk.get());
+                            continue;
                         }
 
                         // stop at the end of the shared prefix, the children are started from this state
@@ -4847,6 +4881,18 @@ private:
         }
     }
 
+    // A causal model's media chunks go into the prompt batch next to the text tokens, so a prompt of many images or a
+    // video is one batch instead of a decode per chunk. On the Axera NPU each separate batch restarts the prefill
+    // kernels from a page start (a 10 s video was 43 batches, 23 s of prompt). Off elsewhere, where the standalone
+    // decode is what upstream tests. LLAMA_SERVER_MEDIA_IN_BATCH=1/0 overrides.
+    bool media_in_batch() const {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_SERVER_MEDIA_IN_BATCH");
+            return e ? atoi(e) != 0 : ggml_backend_reg_by_name("AXERA") != nullptr;
+        }();
+        return on && !use_mixed_batch();  // (use_mixed_batch() adds the whole prompt at once already)
+    }
+
     // see https://github.com/ggml-org/llama.cpp/pull/29969
     // TODO @ngxson : maybe remove this once we use "mixed" batch everywhere
     bool use_mixed_batch() const {
@@ -4926,7 +4972,8 @@ private:
 
         // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
         // this case is not currently used by any models, but may need to be supported in the future
-        if (spec && batch.has_embd()) {
+        // (an MTP draft runs on the target model itself: no draft model)
+        if (spec && batch.has_embd() && model_dft) {
             if (llama_model_n_embd_inp(model_dft) != llama_model_n_embd_inp(model_tgt)) {
                 SRV_ERR("%s", "unsupported batch.has_embd + spec case\n");
                 throw std::runtime_error("unsupported batch.has_embd + spec case");
