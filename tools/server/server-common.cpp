@@ -1160,6 +1160,8 @@ server_tokens process_mtmd_prompt(
         const mtmd_helper_init_opt & init_opt,
         bool is_placeholder,
         const llama_vocab * vocab) {
+    static const bool perf1112 = getenv("PERF1112_PROF") != nullptr;
+    const int64_t perf_t0 = perf1112 ? ggml_time_us() : 0;
     if (files.empty() && !is_placeholder && vocab && prompt.find(mtmd_default_marker()) == std::string::npos) {
         // Chat requests without media still arrive here whenever the server has an mmproj loaded. They are ordinary
         // text prompts, so use the prefix cache instead of paying mtmd_tokenize() for the whole history every turn.
@@ -1179,6 +1181,7 @@ server_tokens process_mtmd_prompt(
             videos.emplace_back(out.video_ctx);
         }
     }
+    const int64_t perf_t1 = perf1112 ? ggml_time_us() : 0;
     // process prompt
     std::vector<server_tokens> inputs;
     // multimodal
@@ -1197,6 +1200,11 @@ server_tokens process_mtmd_prompt(
                                       bitmaps_c_ptr.size());
     if (tokenized != 0) {
         throw std::runtime_error("Failed to tokenize prompt");
+    }
+    const int64_t perf_t2 = perf1112 ? ggml_time_us() : 0;
+    if (perf1112) {
+        fprintf(stderr, "PERF1112 mtmd: files=%zu decode %.2f ms, tokenize %.2f ms\n",
+                files.size(), (perf_t1 - perf_t0) / 1e3, (perf_t2 - perf_t1) / 1e3);
     }
     auto result = server_tokens(chunks, true);
     return result;
@@ -1464,6 +1472,8 @@ json oaicompat_chat_params_parse(
     std::vector<raw_buffer> & out_files,
     common_chat_session & out_session)
 {
+    static const bool perf1112 = getenv("PERF1112_PROF") != nullptr;
+    const int64_t perf_t0 = perf1112 ? ggml_time_us() : 0;
     json llama_params;
 
     auto tools = json_value(body, "tools", json());
@@ -1549,9 +1559,12 @@ json oaicompat_chat_params_parse(
 
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
 
+    const int64_t perf_t1 = perf1112 ? ggml_time_us() : 0;
     common_chat_templates_inputs inputs;
     inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
+    const int64_t perf_t2 = perf1112 ? ggml_time_us() : 0;
     inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
+    const int64_t perf_t3 = perf1112 ? ggml_time_us() : 0;
     inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar                = grammar;
@@ -1623,6 +1636,12 @@ json oaicompat_chat_params_parse(
     common_chat_session_params session_params;
     session_params.echo = json_value(body, "echo", false);
     out_session = common_chat_session(opt.tmpls.get(), vocab, inputs, session_params);
+    const int64_t perf_t4 = perf1112 ? ggml_time_us() : 0;
+    if (perf1112) {
+        fprintf(stderr, "PERF1112 template: total %.2f ms (fields %.2f, messages %.2f, tools %.2f, render %.2f)\n",
+                (perf_t4 - perf_t0) / 1e3, (perf_t1 - perf_t0) / 1e3, (perf_t2 - perf_t1) / 1e3,
+                (perf_t3 - perf_t2) / 1e3, (perf_t4 - perf_t3) / 1e3);
+    }
 
     llama_params["prompt"] = out_session.prompt().str();
 
