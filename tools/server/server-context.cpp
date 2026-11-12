@@ -2257,7 +2257,7 @@ private:
         return nullptr;
     }
 
-    server_slot * get_available_slot(const server_task & task) {
+    server_slot * get_available_slot(server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -2358,8 +2358,9 @@ private:
                 }
 
                 prompt_cache->update();
+                task.perf_cache_us = ggml_time_us() - t_start;
 
-                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                SRV_TRC("prompt cache update took %.2f ms\n", task.perf_cache_us / 1000.0);
             }
         }
 
@@ -4236,6 +4237,17 @@ private:
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
+                        static const bool perf1112 = getenv("PERF1112_PROF") != nullptr;
+                        if (perf1112 && slot.task->perf_http_us) {
+                            const int64_t now = ggml_time_us();
+                            SLT_TRC(slot, "PERF1112 start: http_to_start = %.2f ms (template %.2f, tokenize %.2f, "
+                                    "queue %.2f, cache %.2f)\n",
+                                    (now - slot.task->perf_http_us) / 1e3,
+                                    (slot.task->perf_template_us - slot.task->perf_http_us) / 1e3,
+                                    (slot.task->perf_tokenized_us - slot.task->perf_template_us) / 1e3,
+                                    (now - slot.task->perf_tokenized_us) / 1e3,
+                                    slot.task->perf_cache_us / 1e3);
+                        }
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
@@ -5242,6 +5254,12 @@ private:
                 slot.stats.update_prompt_last();
                 slot.t_print_last = t_now;
                 slot.n_gen_last = 0;
+                static const bool perf1112 = getenv("PERF1112_PROF") != nullptr;
+                if (perf1112 && slot.task->perf_http_us) {
+                    SLT_TRC(slot, "PERF1112 first: http_to_first = %.2f ms (prefill %.2f, prefill_start_to_http %.2f)\n",
+                            (t_now - slot.task->perf_http_us) / 1e3, slot.stats.t_prompt_ms(),
+                            (slot.stats.t_start - slot.task->perf_http_us) / 1e3);
+                }
             }
 
             slot.stats.update_gen_last();
@@ -5650,7 +5668,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const json & data,
             const std::vector<raw_buffer> & files,
             task_response_type res_type,
-            const common_chat_session & chat_session) {
+            const common_chat_session & chat_session,
+            int64_t perf_http_us,
+            int64_t perf_template_us) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     auto res = create_response();
@@ -5684,11 +5704,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
+            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files,
+                                                 ctx_server.init_opt, false, ctx_server.vocab));
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
         }
+        const int64_t perf_tokenized_us = ggml_time_us();
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
@@ -5696,6 +5718,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             server_task task = server_task(type);
 
             task.id = rd.get_new_id();
+            task.perf_http_us      = perf_http_us;
+            task.perf_template_us  = perf_template_us;
+            task.perf_tokenized_us = perf_tokenized_us;
 
             task.tokens = std::move(inputs[i]);
             task.params = server_schema::eval_llama_cmpl_schema(
@@ -6296,14 +6321,19 @@ void server_routes::init_routes() {
 
     this->post_completions = [this](const server_http_req & req) {
         auto res = create_response();
+        const int64_t perf_http_us = ggml_time_us();
         std::vector<raw_buffer> files; // dummy
         const json body = json::parse(req.body);
+        const int64_t perf_template_us = ggml_time_us();
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body,
             files,
-            TASK_RESPONSE_TYPE_NONE);
+            TASK_RESPONSE_TYPE_NONE,
+            {},
+            perf_http_us,
+            perf_template_us);
     };
 
     this->post_completions_oai = [this](const server_http_req & req) {
@@ -6320,6 +6350,7 @@ void server_routes::init_routes() {
 
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
+        const int64_t perf_http_us = ggml_time_us();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
         common_chat_session session;
@@ -6329,13 +6360,16 @@ void server_routes::init_routes() {
             meta->chat_params,
             files,
             session);
+        const int64_t perf_template_us = ggml_time_us();
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_CHAT,
-            session);
+            session,
+            perf_http_us,
+            perf_template_us);
     };
 
     this->post_chat_completions_tok = [this](const server_http_req & req) {

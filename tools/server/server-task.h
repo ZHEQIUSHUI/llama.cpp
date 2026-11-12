@@ -142,6 +142,12 @@ struct task_result_state {
 struct server_task {
     int id = -1; // to be filled by server_queue
 
+    // PERF1112_PROF=1: request timestamps (us) used only by the server-side timeline log. Zero when not set.
+    int64_t perf_http_us      = 0; // the HTTP handler received the request
+    int64_t perf_template_us  = 0; // the chat template / body conversion finished
+    int64_t perf_tokenized_us = 0; // the prompt was tokenized and queued
+    int64_t perf_cache_us     = 0; // time spent saving/loading the prompt cache in get_available_slot()
+
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
 
