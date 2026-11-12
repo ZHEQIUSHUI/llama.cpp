@@ -796,9 +796,13 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
                    : 0;
     seq_config cfg;
     cfg.kept_max = 1;
-    cfg.verify_chain = [] {
+    // The 27B verify kernel materializes one 4-row snapshot per call; chaining several calls for a 5..32-row tail
+    // changes the numerics (and the kernel count) of a path that used to be one prefill page, which flips greedy
+    // continuations in long degraded chats. Keep the pre-migration path selection by default; the environment
+    // variable still opts into a longer chain.
+    cfg.verify_chain = [vr = ver_rows] {
         const char * e = getenv("GGML_AXERA_VERIFY_CHAIN");
-        return e ? atoi(e) : 32;
+        return e ? atoi(e) : vr;
     }();
     cfg.check = [] {
         const char * e = getenv("GGML_AXERA_SEQ_CHECK");
