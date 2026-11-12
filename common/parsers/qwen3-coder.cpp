@@ -3,11 +3,50 @@
 common_chat_params common_chat_params_init_qwen3_coder(const common_chat_template &          tmpl,
                                                               const autoparser::generation_params & inputs) {
     common_chat_params data;
-
     const std::string GEN_PREFIX = "<|im_start|>assistant\n";
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+    const std::optional<json> tools_override = inputs.tools.is_array() && !inputs.tools.empty()
+        ? std::optional<json>(inputs.tools) : std::nullopt;
+    static const bool render_fast = [] {
+        const char * e = getenv("LLAMA_CHAT_RENDER_FAST");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!render_fast || inputs.has_continuation()) {
+        data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, inputs.messages, tools_override);
+        data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, inputs.messages, tools_override);
+    } else {
+        // The generic helper renders the complete prompt once without and once with the generation prompt. The
+        // prompt used by the request is one of those two, so render the other one and derive the suffix instead.
+        // This keeps all three strings byte-identical while removing one full Jinja render per request.
+        data.prompt = common_chat_template_direct_apply_impl(tmpl, inputs, inputs.messages, tools_override);
+
+        autoparser::generation_params other = inputs;
+        other.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+        other.add_generation_prompt = !inputs.add_generation_prompt;
+        const std::string other_prompt = common_chat_template_direct_apply_impl(
+            tmpl, other, inputs.messages, tools_override).str();
+        const std::string prompt = data.prompt.str();
+        const std::string & no_gen_prompt = inputs.add_generation_prompt ? other_prompt : prompt;
+        const std::string & gen_prompt = inputs.add_generation_prompt ? prompt : other_prompt;
+        size_t prefix_len = 0;
+        const size_t min_size = std::min(no_gen_prompt.size(), gen_prompt.size());
+        while (prefix_len < min_size && no_gen_prompt[prefix_len] == gen_prompt[prefix_len]) {
+            ++prefix_len;
+        }
+        data.generation_prompt = gen_prompt.substr(prefix_len);
+
+        static const bool render_check = getenv("PERF1112_RENDER_CHECK") != nullptr;
+        if (render_check) {
+            const auto slow_prompt = common_chat_template_direct_apply_impl(tmpl, inputs, inputs.messages, tools_override);
+            const auto slow_generation_prompt = common_chat_template_generation_prompt_impl(
+                tmpl, inputs, inputs.messages, tools_override);
+            if (slow_prompt.str() != data.prompt.str() || slow_generation_prompt != data.generation_prompt) {
+                GGML_ABORT("fast chat render changed the prompt");
+            }
+            fprintf(stderr, "PERF1112 render-check: identical (prompt %zu bytes, generation %zu bytes)\n",
+                    data.prompt.str().size(), data.generation_prompt.size());
+        }
+    }
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
 
     auto supports_reasoning = tmpl.source().find("<think>") != std::string::npos;
@@ -173,7 +212,6 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
         // Content only parser
         return generation_prompt + (reasoning << p.content(p.rest()));
     });
-
     if (include_grammar) {
         data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
 
