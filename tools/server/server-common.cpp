@@ -1685,6 +1685,8 @@ json oaicompat_chat_params_parse(
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
+            // Template kwargs are merged after the resolved flag, so stale "true" would override "none".
+            inputs.chat_template_kwargs["enable_thinking"] = json(false).dump();
             inputs.chat_template_kwargs.erase("reasoning_effort");
         } else if (!reasoning_effort.empty()) {
             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
