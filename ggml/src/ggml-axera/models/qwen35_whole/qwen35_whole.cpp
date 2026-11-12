@@ -18,12 +18,14 @@
 
 #include "../model.h"
 #include "../../core/params.h"
+#include "../../core/seqstate.h"
 #include "../../ops/ops.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <regex>
 #include <set>
 
@@ -42,43 +44,41 @@ struct whole_state_header {
     char     magic[8];
     uint32_t version;
     uint32_t kind;
-    uint32_t has_target;
     uint32_t has_mtp;
+    uint32_t partial;
     int64_t  state_cell;
-    int64_t  snap_cell;
-    int64_t  ksnap_cell;
     int64_t  mtp_cell;
-    uint32_t snap_prompt;
     uint32_t ncall;
     uint32_t pna;
     uint32_t nkv_pages;
     uint64_t kv_page_b;
     uint64_t kv_n;
-    uint64_t st_b;
-    uint64_t cq_b;
-    uint64_t ck_b;
-    uint64_t cv_b;
-    uint64_t snap_n;
-    uint64_t ksnap_n;
-    uint64_t page_x_n;
-    uint64_t page_p_n;
-    uint64_t kpage_x_n;
-    uint64_t kpage_p_n;
+    uint64_t seq_n;
     uint64_t mtp_page0;
     uint64_t mtp_pages;
     uint64_t mtp_page_b;
     uint64_t mtp_n;
-    uint32_t partial;
     uint32_t reserved;
 };
 
-class qwen35_whole final : public model {
+class qwen35_whole final : public model, public seq_model {
   public:
     explicit qwen35_whole(const manifest & m) : man(m), prm(m) {}
     ggml_status compute(ggml_cgraph * g) override;
     size_t       state_size(uint32_t flags) const override;
     size_t       state_write(void * dst, size_t size, uint32_t flags) override;
     size_t       state_read(const void * src, size_t size, uint32_t flags) override;
+    int          last_state_status() const override { return last_seq_status; }
+
+    seq_caps seq_get_caps() const override;
+    void     seq_state_save(uint8_t * dst) override;
+    void     seq_state_load(const uint8_t * src) override;
+    bool     seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t * p4, int batch0, seq_snap * snap) override;
+    bool     seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p4, int batch_row) override;
+    void     seq_rows(int batch_row0, int n, uint16_t * dst) override;
+    bool     seq_run_verify(int64_t c, int n, const uint16_t * x, const int32_t * p4, int batch_row0) override;
+    void     seq_verify_keep(int k) override;
+    void     seq_verify_peek(int k, uint8_t * dst) override;
 
   private:
     const manifest & man;
@@ -105,17 +105,10 @@ class qwen35_whole final : public model {
     int       kv_pages = 0;
     int64_t   kv_cells = 0;
     size_t    kv_alloc = 0;  // the bytes of one layer's pool
-    // the recurrent state at the first cell of the current page (snap_cell), and the inputs of that page's cells so far
-    std::vector<uint8_t>     snap;
-    int64_t                  snap_cell = -1;
-    std::vector<ggml_bf16_t> page_x;  // [cells][H] from snap_cell
-    // a second restart point kept: the page where the last prompt ended (a server's next turn restarts inside it)
-    std::vector<uint8_t>     ksnap;
-    int64_t                  ksnap_cell  = -1;
-    bool                     snap_prompt = false;  // the current restart point is that page's
-    std::vector<ggml_bf16_t> kpage_x;
-    std::vector<int32_t>     kpage_p;
-    std::vector<int32_t>     page_p;  // their M-RoPE positions [cells][4]
+    size_t    state_image_b = 0;  // one image of ST + CQ + CK + CV
+    int       ver_rows = 0;
+    bool      state_zero = true;
+    std::unique_ptr<seqstate> seq;
 
     std::vector<call>              dec;
     axera_cmm                      A, COS, SIN, CS, PN, MASK;
@@ -136,10 +129,15 @@ class qwen35_whole final : public model {
     std::vector<std::array<axera_cmm, 4>> snaps[2];
     std::vector<float>                    h_buf;      // the target graph's hidden rows
     std::vector<float>                    mtp_h_buf;  // the MTP graph's hidden rows
+    std::vector<ggml_bf16_t>              src_rows;
     axera_cmm                             VX, VCS, VPN, VMASK, VNT;
     int     cur_set = -1;              // the snapshot set holding the current state, -1: the pools
-    int64_t ver_c0  = -1;              // the last verification's first cell, rows, snapshot set
-    int     ver_T = 0, ver_set = -1;
+    int     ver_set = -1;
+    const ggml_bf16_t * batch_rows = nullptr;
+    const kv_view *     batch_kv   = nullptr;
+    const rope *        batch_rope = nullptr;
+    float *             out_h      = nullptr;
+    int                 last_seq_status = 0;
     // the MTP block (draft context graphs): its kernels' IO, its KV cache
     call      mtp1, mtpp, mtppkv, mtp8;  // mtp8: role mtp.m8 (optional), up to 8 consecutive rows per call
     axera_cmm ME, MH, MCS, MPN, MMASK, MOUT, MRAW, PE, PH, PCS, PPN, PMASK, PNBLK, POUT2, PRAW, MKV;
@@ -165,16 +163,11 @@ class qwen35_whole final : public model {
     void bind_state();
     void state_home();
     void state_at(int set, int row);
-    ggml_status verify(const kv_view & kv, const rope & rp, const ggml_bf16_t * xb, const int32_t * pb, int T, float * h);
+    ggml_status verify(int64_t c0, int row0, int T, const ggml_bf16_t * xb, float * h);
     ggml_status compute_mtp(ggml_cgraph * g);
     axera_cmm bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d, const rope & rp);
-    void      zero_state();
-    void      save_state(int64_t cell);
-    void      load_state();
-    void      swap_kept();
-    bool      restart_point(int64_t s0, int k);
-    void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0);
-    int64_t   state_cell() const { return snap_cell < 0 ? 0 : snap_cell + (int64_t) (page_x.size() / std::max(1, H)); }
+    void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
+                      seq_snap * snap);
 };
 
 // rows of an [N, K] weight of the GGUF in the kernels' MX layout: MXFP8 codes [K] or MXFP4 codes [K / 2], and scales
@@ -525,9 +518,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     CQ = axera_cmm_alloc((size_t) ng * cq_b);
     CK = axera_cmm_alloc((size_t) ng * cq_b);
     CV = axera_cmm_alloc((size_t) ng * cv_b);
-    snap.assign((size_t) ng * (st_b + 2 * cq_b + cv_b), 0);
-    snap_cell = -1;
-    page_x.clear();
+    state_image_b = ST->size + CQ->size + CK->size + CV->size;
 
     // decode: x / out A, cs = cos | sin, pn = cell | blocks | the K row of the cell (page * 2 * 256 + offset)
     const uint32_t csb = dk.in_bytes("cs");
@@ -643,7 +634,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
         }
     }
     cur_set = -1;
-    ver_c0  = -1;
+    ver_set = -1;
     // a call's state outputs st<j> / cq<j> / ck<j> / cv<j> (layer j of the group from layer l0): bound to where[]
     auto state_outs = [&](call & c, int l0) {
         for (size_t i = 0; i < c.k->desc->out.size(); ++i) {
@@ -788,6 +779,23 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
         c.out.push_back(axera_io(POUT[k & 1], pk.desc->out[0].bytes));
     }
 
+    ver_rows = ver.empty() ? 0 : (int) (VX->size / (H * sizeof(ggml_bf16_t)));
+    seq_config cfg;
+    cfg.kept_max = 1;
+    cfg.verify_chain = [this] {
+        const char * e = getenv("GGML_AXERA_VERIFY_CHAIN");
+        return e ? atoi(e) : ver_rows;  // the pre-migration path only verified batches up to the kernel's rows
+    }();
+    cfg.check = [] {
+        const char * e = getenv("GGML_AXERA_SEQ_CHECK");
+        return e && atoi(e) != 0;
+    }();
+    cfg.force_miss = [] {
+        const char * e = getenv("GGML_AXERA_SEQ_FORCE_MISS");
+        return e ? std::max(0, atoi(e)) : 0;
+    }();
+    seq = std::make_unique<seqstate>(*this, cfg);
+
     std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> live;
     for (auto & c : dec) {
         live.push_back(&c.in);
@@ -843,71 +851,166 @@ void qwen35_whole::state_at(int set, int row) {
     bind_state();
 }
 
-void qwen35_whole::zero_state() {
-    axera_timer tl("state zero");
-    state_home();
-    for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
-        memset((*p)->vir, 0, (*p)->size);
-        (*p)->flush();
-    }
-    snap_cell   = -1;
-    ksnap_cell  = -1;
-    snap_prompt = false;
-    page_x.clear();
-    page_p.clear();
+seq_caps qwen35_whole::seq_get_caps() const {
+    seq_caps c;
+    c.page            = PG;
+    c.width           = H;
+    c.image_bytes     = state_image_b;
+    c.cells           = kv_cells;
+    c.verify_rows     = ver_rows;
+    // The verify kernel writes its entry state in place, so a fully rejected batch has no zero-row image to keep.
+    c.verify_min_keep = ver_rows > 0 ? 1 : 0;
+    c.decode_at_zero  = true;  // the old path ran the decode group at cell 0 after zeroing the pools
+    return c;
 }
 
-void qwen35_whole::swap_kept() {
-    std::swap(snap, ksnap);
-    std::swap(snap_cell, ksnap_cell);
-    std::swap(page_x, kpage_x);
-    std::swap(page_p, kpage_p);
-}
-
-// the restart point of the page from s0 with its first k inputs (the current one, or the kept one made current)
-bool qwen35_whole::restart_point(int64_t s0, int k) {
-    if (snap_cell == s0 && (int) (page_x.size() / H) >= k) {
-        return true;
-    }
-    if (ksnap_cell == s0 && (int) (kpage_x.size() / H) >= k) {
-        swap_kept();
-        snap_prompt = true;
-        return true;
-    }
-    return false;
-}
-
-// the recurrent state (before cell `cell`, the first of its page) and the page's inputs from there
-void qwen35_whole::save_state(int64_t cell) {
-    GGML_ASSERT(cell % PG == 0);
+void qwen35_whole::seq_state_save(uint8_t * dst) {
     axera_timer tl("state save");
-    if (snap_prompt && snap_cell >= 0) {  // the last prompt's page: kept
-        swap_kept();
-    }
-    snap_prompt = false;
-    snap.resize(ksnap.size() ? ksnap.size() : snap.size());
     size_t o = 0;
-    for (int k = 0; k < 4; ++k) {  // from where the state is, in the pools' layout
-        for (const place & w : where[k]) {
-            w.b->invalidate(w.p, part(k));
-            memcpy(snap.data() + o, w.p, part(k));
-            o += part(k);
+    if (cur_set < 0) {
+        for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
+            (*p)->invalidate((*p)->vir, (*p)->size);
+            memcpy(dst + o, (*p)->vir, (*p)->size);
+            o += (*p)->size;
+        }
+    } else {  // a verification snapshot: its rows are not contiguous in the pools' order
+        for (int k = 0; k < 4; ++k) {
+            for (const place & w : where[k]) {
+                w.b->invalidate(w.p, part(k));
+                memcpy(dst + o, w.p, part(k));
+                o += part(k);
+            }
         }
     }
-    snap_cell = cell;
-    page_x.clear();
-    page_p.clear();
+    GGML_ASSERT(o == state_image_b);
+    state_zero = false;
 }
 
-void qwen35_whole::load_state() {
+// src == nullptr: the zero state of a new sequence (and of the dummy warm-up batch's cleanup).
+void qwen35_whole::seq_state_load(const uint8_t * src) {
     axera_timer tl("state load");
-    state_home();
-    size_t o = 0;
-    for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
-        memcpy((*p)->vir, snap.data() + o, (*p)->size);
-        (*p)->flush();
-        o += (*p)->size;
+    const bool had_snapshot = cur_set >= 0;
+    ver_set = -1;
+    if (!src) {
+        if (!state_zero || had_snapshot) {
+            axera_timer tz("state zero");
+            for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
+                memset((*p)->vir, 0, (*p)->size);
+                (*p)->flush();
+            }
+        }
+        state_zero = true;
+        if (MKV && mtp_page_b && mtp_cell > 0) {
+            const size_t pages = std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG));
+            if (pages) {
+                memset(MKV->vir, 0, pages * mtp_page_b);
+                MKV->flush(MKV->vir, pages * mtp_page_b);
+            }
+        }
+        mtp_cell = 0;
+    } else {
+        size_t o = 0;
+        for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
+            memcpy((*p)->vir, src + o, (*p)->size);
+            (*p)->flush();
+            o += (*p)->size;
+        }
+        GGML_ASSERT(o == state_image_b);
+        state_zero = false;
     }
+    for (int k = 0; k < 4; ++k) {
+        for (size_t g = 0; g < where[k].size(); ++g) {
+            where[k][g] = { pool(k).get(), (char *) pool(k)->vir + g * part(k) };
+        }
+    }
+    cur_set = -1;
+    bind_state();
+}
+
+bool qwen35_whole::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t * p4, int batch0, seq_snap * snap) {
+    state_home();  // the prefill kernels read the pools
+    const ggml_bf16_t * xb = (const ggml_bf16_t *) x;
+    if (!xb) {
+        GGML_ASSERT(batch0 == 0);
+        src_rows.resize((size_t) n * H);
+        seq_rows(0, n, (uint16_t *) src_rows.data());
+        xb = src_rows.data();
+    }
+    prefill(c0, n, xb, p4, h_buf, batch0, snap);
+    return true;
+}
+
+bool qwen35_whole::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p4, int batch_row) {
+    (void) p4;  // the row's M-RoPE positions come from the graph's rope view (batch_rope)
+    GGML_ASSERT(batch_row == 0);
+    memcpy(A->vir, x, H * sizeof(ggml_bf16_t));
+    A->flush(A->vir, H * sizeof(ggml_bf16_t));
+    batch_rope->rows(0, 1, COS.get(), SIN.get());
+    const int nblk = batch_kv->mask_row(0, (ggml_bf16_t *) MASK->vir);
+    GGML_ASSERT(nblk > 0 && nblk <= NBLK);
+    MASK->flush(MASK->vir, (size_t) nblk * PG * sizeof(ggml_bf16_t));
+    const size_t half = (ROT / 2) * sizeof(ggml_bf16_t);
+    memcpy(CS->vir, COS->vir, half);
+    memcpy((char *) CS->vir + half, SIN->vir, half);
+    CS->flush();
+    ((int32_t *) PN->vir)[0] = (int32_t) c;
+    ((int32_t *) PN->vir)[1] = nblk;
+    ((int32_t *) PN->vir)[2] = (int32_t) ((c / PG) * 2 * PG + c % PG);
+    GGML_ASSERT(((int32_t *) PN->vir)[2] >= 0 && ((int32_t *) PN->vir)[2] < kv_pages * 2 * PG);
+    PN->flush();
+    {
+        axera_timer tl("layers (decode)");
+        for (auto & c : dec) {
+            c.k->run(c.in, c.out, "decode group");
+        }
+    }
+    A->invalidate(A->vir, H * sizeof(ggml_bf16_t));
+    ggml_bf16_to_fp32_row((const ggml_bf16_t *) A->vir, out_h, H);
+    state_zero = false;
+    return true;
+}
+
+void qwen35_whole::seq_rows(int batch_row0, int n, uint16_t * dst) {
+    if (n <= 0) {
+        return;
+    }
+    if (batch_rows) {
+        memcpy(dst, batch_rows + (size_t) batch_row0 * H, (size_t) n * H * sizeof(uint16_t));
+    } else {
+        memset(dst, 0, (size_t) n * H * sizeof(uint16_t));
+    }
+}
+
+bool qwen35_whole::seq_run_verify(int64_t c, int n, const uint16_t * x, const int32_t * p4, int batch_row0) {
+    (void) p4;  // the rows' M-RoPE positions come from the graph's rope view (batch_rope)
+    const uint16_t * xr = x;
+    if (!xr) {
+        src_rows.resize((size_t) n * H);
+        seq_rows(batch_row0, n, (uint16_t *) src_rows.data());
+        xr = (const uint16_t *) src_rows.data();
+    }
+    return verify(c, batch_row0, n, (const ggml_bf16_t *) xr, out_h) == GGML_STATUS_SUCCESS;
+}
+
+void qwen35_whole::seq_verify_keep(int k) {
+    GGML_ASSERT(ver_set >= 0 && k > 0 && k <= ver_rows);
+    state_at(ver_set, k - 1);
+}
+
+void qwen35_whole::seq_verify_peek(int k, uint8_t * dst) {
+    GGML_ASSERT(ver_set >= 0 && k > 0 && k <= ver_rows);
+    const int per = G / 4 * 3;  // delta-net layers per group
+    size_t    o   = 0;
+    for (int kind = 0; kind < 4; ++kind) {
+        for (size_t g = 0; g < where[kind].size(); ++g) {
+            const axera_cmm & sn = snaps[ver_set][state_group[g]][kind];
+            char *            p  = (char *) sn->vir + ((size_t) (k - 1) * per + state_local[g]) * part(kind);
+            sn->invalidate(p, part(kind));
+            memcpy(dst + o, p, part(kind));
+            o += part(kind);
+        }
+    }
+    GGML_ASSERT(o == state_image_b);
 }
 
 // llama.cpp's sequence state (prompt cache / context checkpoint). The private CMM pools are not the cache tensors
@@ -916,35 +1019,24 @@ void qwen35_whole::load_state() {
 // Only the pages up to the current cell are copied, plus the current page: a later prompt can overwrite the pages
 // after the checkpoint, and a restore rewrites the checkpoint's page from its restart point.
 size_t qwen35_whole::state_size(uint32_t flags) const {
-    if (KVC.empty() || !ST) {
+    if (KVC.empty() || !ST || !seq) {
         return 0;
     }
-    const bool   partial     = flags & state_flags_partial_only;
-    const int    pna         = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
-    const int64_t cur_cell   = state_cell();
-    const bool   has_target  = cur_cell > 0 || snap_cell >= 0 || !page_x.empty();
-    const size_t nkv_pages   = has_target ? std::min<size_t>((size_t) kv_pages, (size_t) ((cur_cell + PG - 1) / PG)) : 0;
-    size_t       mtp_pages   = 0;
+    const bool   partial   = flags & state_flags_partial_only;
+    const size_t seq_n     = seq->size(partial);
+    if (!seq_n) {
+        return 0;
+    }
+    const int     pna        = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
+    const int64_t state_cell = std::max<int64_t>(0, seq->cell());
+    const size_t  nkv_pages  = partial ? 0 :
+        std::min<size_t>((size_t) kv_pages, (size_t) ((state_cell + PG - 1) / PG));
+    size_t mtp_pages = 0;
     if (MKV && mtp_page_b && mtp_cell > 0) {
-        if (partial) {
-            mtp_pages = 1;
-        } else {
-            mtp_pages = std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG));
-        }
+        mtp_pages = partial ? 1 : std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG));
     }
-    const bool   has_mtp     = mtp_pages > 0;
-    if (!has_target && !has_mtp) {
-        return 0;
-    }
-    size_t n = sizeof(whole_state_header);
-    if (has_target) {
-        if (!partial) {
-            n += (size_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
-        }
-        n += ST->size + CQ->size + CK->size + CV->size;
-        n += snap.size() + ksnap.size() + page_x.size() * sizeof(ggml_bf16_t) + page_p.size() * sizeof(int32_t) +
-             kpage_x.size() * sizeof(ggml_bf16_t) + kpage_p.size() * sizeof(int32_t);
-    }
+    size_t n = sizeof(whole_state_header) + seq_n;
+    n += (size_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
     n += mtp_pages * mtp_page_b;
     return n;
 }
@@ -957,11 +1049,10 @@ size_t qwen35_whole::state_write(void * dst, size_t size, uint32_t flags) {
     }
     const bool   partial   = flags & state_flags_partial_only;
     const int    pna       = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
-    const int64_t cur_cell = state_cell();
-    const bool   has_target = cur_cell > 0 || snap_cell >= 0 || !page_x.empty();
-    const size_t nkv_pages = has_target ? std::min<size_t>((size_t) kv_pages, (size_t) ((cur_cell + PG - 1) / PG)) : 0;
-    size_t       mtp_pages = 0;
-    size_t       mtp_page0 = 0;
+    const size_t seq_n     = seq->size(partial);
+    const size_t nkv_pages = partial ? 0 :
+        std::min<size_t>((size_t) kv_pages, (size_t) ((std::max<int64_t>(0, seq->cell()) + PG - 1) / PG));
+    size_t mtp_pages = 0, mtp_page0 = 0;
     if (MKV && mtp_page_b && mtp_cell > 0) {
         if (partial) {
             mtp_pages = 1;
@@ -970,76 +1061,45 @@ size_t qwen35_whole::state_write(void * dst, size_t size, uint32_t flags) {
             mtp_pages = std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG));
         }
     }
-    if (has_target) {
-        state_home();  // a verification leaves the current state in a snapshot row
-    }
 
     whole_state_header h;
     memset(&h, 0, sizeof(h));
-    memcpy(h.magic, "AXW35S1", sizeof(h.magic) - 1);
-    h.version     = 2;
+    memcpy(h.magic, "AXW35S2", sizeof(h.magic) - 1);
+    h.version     = 3;
     h.kind        = 1;
-    h.has_target  = has_target;
     h.has_mtp     = mtp_pages > 0;
-    h.state_cell  = cur_cell;
-    h.snap_cell   = snap_cell;
-    h.ksnap_cell  = ksnap_cell;
+    h.partial     = partial;
+    h.state_cell  = seq->cell();
     h.mtp_cell    = mtp_cell;
-    h.snap_prompt = snap_prompt;
     h.ncall       = (uint32_t) KVC.size();
     h.pna         = (uint32_t) pna;
     h.nkv_pages   = partial ? 0 : (uint32_t) nkv_pages;
     h.kv_page_b   = kv_b / NBLK;
     h.kv_n        = partial ? 0 : (uint64_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
-    h.st_b        = ST->size;
-    h.cq_b        = CQ->size;
-    h.ck_b        = CK->size;
-    h.cv_b        = CV->size;
-    h.snap_n      = snap.size();
-    h.ksnap_n     = ksnap.size();
-    h.page_x_n    = page_x.size() * sizeof(ggml_bf16_t);
-    h.page_p_n    = page_p.size() * sizeof(int32_t);
-    h.kpage_x_n   = kpage_x.size() * sizeof(ggml_bf16_t);
-    h.kpage_p_n   = kpage_p.size() * sizeof(int32_t);
+    h.seq_n       = seq_n;
     h.mtp_page0   = mtp_page0;
     h.mtp_pages   = mtp_pages;
     h.mtp_page_b  = mtp_page_b;
     h.mtp_n       = mtp_pages * mtp_page_b;
-    h.partial     = partial;
 
     char * p = (char *) dst;
     memcpy(p, &h, sizeof(h));
     p += sizeof(h);
-    if (has_target) {
-        if (!partial) {
-            const size_t page_n = nkv_pages * (kv_b / NBLK);
-            for (const axera_cmm & c : KVC) {
-                for (int j = 0; j < pna; ++j) {
-                    char * src = (char *) c->vir + (size_t) j * kv_alloc;
-                    c->invalidate(src, page_n);
-                    memcpy(p, src, page_n);
-                    p += page_n;
-                }
+    if (!partial) {
+        const size_t page_n = nkv_pages * (kv_b / NBLK);
+        for (const axera_cmm & c : KVC) {
+            for (int j = 0; j < pna; ++j) {
+                char * src = (char *) c->vir + (size_t) j * kv_alloc;
+                c->invalidate(src, page_n);
+                memcpy(p, src, page_n);
+                p += page_n;
             }
         }
-        for (const axera_cmm * b : { &ST, &CQ, &CK, &CV }) {
-            (*b)->invalidate((*b)->vir, (*b)->size);
-            memcpy(p, (*b)->vir, (*b)->size);
-            p += (*b)->size;
-        }
-        const auto put = [&](const void * src, size_t n) {
-            if (n) {
-                memcpy(p, src, n);
-                p += n;
-            }
-        };
-        put(snap.data(), h.snap_n);
-        put(ksnap.data(), h.ksnap_n);
-        put(page_x.data(), h.page_x_n);
-        put(page_p.data(), h.page_p_n);
-        put(kpage_x.data(), h.kpage_x_n);
-        put(kpage_p.data(), h.kpage_p_n);
     }
+    if (seq->write((uint8_t *) p, seq_n, partial) != seq_n) {
+        return 0;
+    }
+    p += seq_n;
     if (h.mtp_n) {
         char * src = (char *) MKV->vir + mtp_page0 * mtp_page_b;
         MKV->invalidate(src, h.mtp_n);
@@ -1057,20 +1117,16 @@ size_t qwen35_whole::state_read(const void * src, size_t size, uint32_t flags) {
     const bool partial = flags & state_flags_partial_only;
     whole_state_header h;
     memcpy(&h, src, sizeof(h));
-    if (memcmp(h.magic, "AXW35S1", sizeof(h.magic) - 1) != 0 || h.version != 2 || h.kind != 1 ||
-        h.partial != partial) {
+    if (memcmp(h.magic, "AXW35S2", sizeof(h.magic) - 1) != 0 || h.version != 3 || h.kind != 1 ||
+        h.partial != partial || !h.seq_n) {
         return 0;
     }
     const int pna = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
-    if (h.has_target && (KVC.size() != h.ncall || pna != (int) h.pna || h.kv_page_b != kv_b / NBLK ||
-                         (partial ? h.nkv_pages != 0 || h.kv_n != 0 :
-                          h.nkv_pages > (uint32_t) kv_pages ||
-                              h.kv_n != (uint64_t) h.ncall * h.pna * h.nkv_pages * h.kv_page_b) ||
-                         h.st_b != ST->size || h.cq_b != CQ->size ||
-                         h.ck_b != CK->size || h.cv_b != CV->size ||
-                         h.page_x_n % (H * sizeof(ggml_bf16_t)) || h.page_p_n % (4 * sizeof(int32_t)) ||
-                         h.kpage_x_n % (H * sizeof(ggml_bf16_t)) || h.kpage_p_n % (4 * sizeof(int32_t)) ||
-                         h.state_cell < 0 || h.state_cell > kv_cells)) {
+    if (KVC.size() != h.ncall || pna != (int) h.pna || h.kv_page_b != kv_b / NBLK ||
+        (partial ? h.nkv_pages != 0 || h.kv_n != 0 :
+                   h.nkv_pages > (uint32_t) kv_pages ||
+                       h.kv_n != (uint64_t) h.ncall * h.pna * h.nkv_pages * h.kv_page_b) ||
+        h.state_cell < -1 || h.state_cell > kv_cells) {
         return 0;
     }
     const bool mtp_valid = h.mtp_n == 0 ? h.mtp_pages == 0 && !h.has_mtp :
@@ -1082,66 +1138,27 @@ size_t qwen35_whole::state_read(const void * src, size_t size, uint32_t flags) {
     if (!mtp_valid) {
         return 0;
     }
-    size_t need = sizeof(h);
-    if (h.has_target) {
-        need += h.kv_n + h.st_b + h.cq_b + h.ck_b + h.cv_b + h.snap_n + h.ksnap_n + h.page_x_n + h.page_p_n +
-                h.kpage_x_n + h.kpage_p_n;
-    }
-    need += h.mtp_n;
+    const size_t need = sizeof(h) + h.kv_n + h.seq_n + h.mtp_n;
     if (size < need) {
         return 0;
     }
 
     const char * p = (const char *) src + sizeof(h);
-    if (h.has_target) {
-        if (!h.partial) {
-            const size_t page_n = h.nkv_pages * h.kv_page_b;
-            for (const axera_cmm & c : KVC) {
-                for (int j = 0; j < (int) h.pna; ++j) {
-                    char * d = (char *) c->vir + (size_t) j * kv_alloc;
-                    memcpy(d, p, page_n);
-                    c->flush(d, page_n);
-                    p += page_n;
-                }
+    if (!partial) {
+        const size_t page_n = h.nkv_pages * h.kv_page_b;
+        for (const axera_cmm & c : KVC) {
+            for (int j = 0; j < (int) h.pna; ++j) {
+                char * d = (char *) c->vir + (size_t) j * kv_alloc;
+                memcpy(d, p, page_n);
+                c->flush(d, page_n);
+                p += page_n;
             }
         }
-        for (const axera_cmm * b : { &ST, &CQ, &CK, &CV }) {
-            memcpy((*b)->vir, p, (*b)->size);
-            (*b)->flush((*b)->vir, (*b)->size);
-            p += (*b)->size;
-        }
-        const auto get = [&](void * dst, size_t n) {
-            if (n) {
-                memcpy(dst, p, n);
-                p += n;
-            }
-        };
-        snap.resize(h.snap_n);
-        ksnap.resize(h.ksnap_n);
-        page_x.resize(h.page_x_n / sizeof(ggml_bf16_t));
-        page_p.resize(h.page_p_n / sizeof(int32_t));
-        kpage_x.resize(h.kpage_x_n / sizeof(ggml_bf16_t));
-        kpage_p.resize(h.kpage_p_n / sizeof(int32_t));
-        get(snap.data(), h.snap_n);
-        get(ksnap.data(), h.ksnap_n);
-        get(page_x.data(), h.page_x_n);
-        get(page_p.data(), h.page_p_n);
-        get(kpage_x.data(), h.kpage_x_n);
-        get(kpage_p.data(), h.kpage_p_n);
-        snap_cell   = h.snap_cell;
-        ksnap_cell  = h.ksnap_cell;
-        snap_prompt = h.snap_prompt;
-        cur_set     = -1;
-        ver_c0      = -1;
-        ver_T       = 0;
-        ver_set     = -1;
-        for (int k = 0; k < 4; ++k) {
-            for (size_t g = 0; g < where[k].size(); ++g) {
-                where[k][g] = { pool(k).get(), (char *) pool(k)->vir + g * part(k) };
-            }
-        }
-        bind_state();
     }
+    if (seq->read((const uint8_t *) p, h.seq_n) != h.seq_n) {
+        return 0;
+    }
+    p += h.seq_n;
     if (h.mtp_n) {
         char * dst = (char *) MKV->vir + (size_t) h.mtp_page0 * mtp_page_b;
         memcpy(dst, p, h.mtp_n);
@@ -1149,12 +1166,14 @@ size_t qwen35_whole::state_read(const void * src, size_t size, uint32_t flags) {
         p += h.mtp_n;
     }
     mtp_cell = h.mtp_cell;
+    state_zero = false;
     return (size_t) (p - (const char *) src);
 }
 
 // prefill pages from cell c0 (a page's first): n rows x [n][H] bf16 and their M-RoPE positions p4 [n][4]; the hidden
 // states of the rows from out0 on into h
-void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0) {
+void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
+                           seq_snap * snap) {
     GGML_ASSERT(c0 % PG == 0);
     GGML_ASSERT(c0 >= 0 && n >= 0 && c0 + n <= man.context);
     GGML_ASSERT(c0 + n <= kv_cells);  // (the pools' pages)
@@ -1166,8 +1185,8 @@ void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32
     for (int r0 = 0; r0 < n; r0 += PG) {
         const int     v    = std::min(PG, n - r0);
         const int64_t cell = c0 + r0;
-        if (v < PG) {  // a partial last page: the state before it is the restart point of a later batch
-            save_state(cell);
+        if (v < PG && snap && snap->cell == cell) {  // the state before the run's last (partial) page
+            seq_state_save(snap->dst);
         }
         memcpy(PX->vir, x + (size_t) r0 * H, (size_t) v * H * sizeof(ggml_bf16_t));
         memset((ggml_bf16_t *) PX->vir + (size_t) v * H, 0, (size_t) (PG - v) * H * sizeof(ggml_bf16_t));
@@ -1201,24 +1220,14 @@ void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32
             const int r = std::max(0, out0 - r0) + (int) i;
             ggml_bf16_to_fp32_row((const ggml_bf16_t *) po->vir + (size_t) r * H, h.data() + (size_t) (r0 + r - out0) * H, H);
         });
-        if (v < PG) {  // the page's inputs so far: a later batch restarts the page with them
-            page_x.assign(x + (size_t) r0 * H, x + (size_t) (r0 + v) * H);
-            page_p.assign(p4 + (size_t) r0 * 4, p4 + (size_t) (r0 + v) * 4);
-        } else if (r0 + PG == n) {  // a full last page: the next page starts clean
-            save_state(cell + PG);
-        }
     }
 }
 
-// T (2 - 4) consecutive tokens from cell c0 > 0 (x rows xb, M-RoPE positions pb) through the verification groups, their
-// hidden states into h: rows T..3 padded (the last row's positions and mask, later cells: KV rows nobody reads); the
-// state after each row in the other snapshot set, the current state the last row's
-ggml_status qwen35_whole::verify(const kv_view & kv, const rope & rp, const ggml_bf16_t * xb, const int32_t * pb, int T,
-                               float * h) {
-    const int64_t c0 = kv.cell_of(0);
-    if (c0 % PG == 0) {  // a page's first cell: the state there is the restart point
-        save_state(c0);
-    }
+// T (2 - ver_rows) consecutive tokens from cell c0 > 0 through the verification groups, their hidden states into h at the
+// batch rows: rows T..3 padded (the last row's positions and mask, later cells: KV rows nobody reads); the state after
+// each row in the other snapshot set, the current state the last row's
+ggml_status qwen35_whole::verify(int64_t c0, int row0, int T, const ggml_bf16_t * xb, float * h) {
+    GGML_ASSERT(batch_kv && batch_rope && T >= 1 && T <= ver_rows);
     memset(VX->vir, 0, VX->size);
     memcpy(VX->vir, xb, (size_t) T * H * sizeof(ggml_bf16_t));
     VX->flush();
@@ -1228,10 +1237,10 @@ ggml_status qwen35_whole::verify(const kv_view & kv, const rope & rp, const ggml
     for (int r = 0; r < 4; ++r) {
         const int     rr = std::min(r, T - 1);
         const int64_t c  = c0 + r;
-        rp.rows(rr, 1, COS.get(), SIN.get());
+        batch_rope->rows(row0 + rr, 1, COS.get(), SIN.get());
         memcpy(cs + r * 2 * half, COS->vir, half);
         memcpy(cs + r * 2 * half + half, SIN->vir, half);
-        const int nblk = kv.mask_row(rr, (ggml_bf16_t *) VMASK->vir + (size_t) r * man.context);
+        const int nblk = batch_kv->mask_row(row0 + rr, (ggml_bf16_t *) VMASK->vir + (size_t) r * man.context);
         pn[3 * r]      = (int32_t) c;
         pn[3 * r + 1]  = std::max(nblk, (int) (c / PG + 1));
         pn[3 * r + 2]  = (int32_t) ((c / PG) * 2 * PG + c % PG);
@@ -1254,19 +1263,9 @@ ggml_status qwen35_whole::verify(const kv_view & kv, const rope & rp, const ggml
     }
     VX->invalidate(VX->vir, (size_t) T * H * sizeof(ggml_bf16_t));
     for (int r = 0; r < T; ++r) {
-        ggml_bf16_to_fp32_row((const ggml_bf16_t *) VX->vir + (size_t) r * H, h + (size_t) r * H, H);
-    }
-    for (int r = 0; r < T; ++r) {
-        if (r > 0 && (c0 + r) % PG == 0) {  // a page's first cell inside the batch: the state before it
-            state_at(set, r - 1);
-            save_state(c0 + r);
-        }
-        page_x.insert(page_x.end(), xb + (size_t) r * H, xb + (size_t) (r + 1) * H);
-        page_p.insert(page_p.end(), pb + (size_t) r * 4, pb + (size_t) (r + 1) * 4);
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) VX->vir + (size_t) r * H, h + (size_t) (row0 + r) * H, H);
     }
     state_at(set, T - 1);
-    ver_c0  = c0;
-    ver_T   = T;
     ver_set = set;
     return GGML_STATUS_SUCCESS;
 }
@@ -1344,26 +1343,6 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
     std::vector<float> & h = h_buf;
     axera_timer        tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
     const int64_t      c0 = kv.cell_of(0);
-    if (ver_c0 >= 0 && c0 > ver_c0 && c0 < ver_c0 + ver_T) {
-        // the last verification's rows from c0 on rejected: its state after row c0 - 1, its inputs up to there
-        state_at(ver_set, (int) (c0 - ver_c0 - 1));
-        if (snap_cell > c0 && ksnap_cell >= 0 && ksnap_cell <= c0 && c0 < ksnap_cell + PG) {
-            swap_kept();  // (a page start inside the rejected rows: the kept one, the page of c0)
-            snap_prompt = true;
-        }
-        if (snap_cell > c0) {  // (no restart point of c0's page kept)
-            snap_cell = -1;
-            page_x.clear();
-            page_p.clear();
-        } else if (snap_cell >= 0) {
-            page_x.resize((size_t) (c0 - snap_cell) * H);
-            page_p.resize((size_t) (c0 - snap_cell) * 4);
-        }
-    }
-    ver_c0 = -1;
-    if (c0 == 0) {  // a new sequence
-        zero_state();
-    }
     std::vector<ggml_bf16_t> xb((size_t) T * H);
     {
         axera_timer tin("input rows");
@@ -1371,66 +1350,22 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
             ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]), xb.data() + (size_t) r * H, H);
         });
     }
-    if (T > 1 && T <= 4 && !ver.empty() && c0 > 0 && c0 + 4 <= kv_cells) {
-        axera_timer tv("verify (all groups)");
-        const ggml_status st = verify(kv, rp, xb.data(), pb.data(), T, h.data());
-        if (st != GGML_STATUS_SUCCESS) {
-            return st;
+    batch_rows      = xb.data();
+    batch_kv        = &kv;
+    batch_rope      = &rp;
+    out_h           = h.data();
+    last_seq_status = 0;
+    const seq_status sst = seq->feed(c0, T, (const uint16_t *) xb.data(), pb.data());
+    if (sst != SEQ_OK) {
+        last_seq_status = (int) sst;
+        if (sst == SEQ_MISS) {
+            GGML_LOG_WARN("axera qwen35_whole: batch from cell %lld has no restart point (%s); the slot must replay\n",
+                          (long long) c0, seq->why());
+        } else {
+            GGML_LOG_ERROR("axera qwen35_whole: sequence state rejected a batch from cell %lld: %s\n",
+                           (long long) c0, seq->why());
         }
-    } else if (T > 1) {
-        state_home();
-        // from the batch's page start: the page's earlier inputs (and the state saved there) before the batch's
-        const int64_t s0 = c0 - c0 % PG;
-        const int     k  = (int) (c0 - s0);
-        if (k > 0 && !restart_point(s0, k)) {
-            GGML_LOG_ERROR("axera qwen35_whole: a prompt from cell %lld, inside a page whose state is not kept\n", (long long) c0);
-            return GGML_STATUS_FAILED;
-        }
-        page_x.resize((size_t) k * H);  // (a kept prefix, e.g. the server's prompt cache: the cells after it are gone)
-        page_p.resize((size_t) k * 4);
-        std::vector<ggml_bf16_t> xs;
-        std::vector<int32_t>     ps;
-        if (k > 0) {
-            load_state();
-            xs = page_x;
-            ps = page_p;
-        }
-        xs.insert(xs.end(), xb.begin(), xb.end());
-        ps.insert(ps.end(), pb.begin(), pb.end());
-        axera_timer tp("prefill (all pages)");
-        prefill(s0, k + T, xs.data(), ps.data(), h, k);
-        snap_prompt = true;  // (its page's restart point outlives the decode's next pages)
-    } else {
-        // one token through the decode groups; at a page's first cell the state there is the restart point
-        GGML_ASSERT(c0 >= 0 && c0 < kv_cells);
-        if (c0 % PG == 0) {
-            save_state(c0);
-        }
-        memcpy(A->vir, xb.data(), H * sizeof(ggml_bf16_t));
-        A->flush(A->vir, H * sizeof(ggml_bf16_t));
-        rp.rows(0, 1, COS.get(), SIN.get());
-        const int nblk = kv.mask_row(0, (ggml_bf16_t *) MASK->vir);
-        GGML_ASSERT(nblk > 0 && nblk <= NBLK);
-        MASK->flush(MASK->vir, (size_t) nblk * PG * sizeof(ggml_bf16_t));
-        const size_t half = (ROT / 2) * sizeof(ggml_bf16_t);
-        memcpy(CS->vir, COS->vir, half);
-        memcpy((char *) CS->vir + half, SIN->vir, half);
-        CS->flush();
-        ((int32_t *) PN->vir)[0] = (int32_t) c0;
-        ((int32_t *) PN->vir)[1] = nblk;
-        ((int32_t *) PN->vir)[2] = (int32_t) ((c0 / PG) * 2 * PG + c0 % PG);
-        GGML_ASSERT(((int32_t *) PN->vir)[2] >= 0 && ((int32_t *) PN->vir)[2] < kv_pages * 2 * PG);
-        PN->flush();
-        {
-            axera_timer tl("layers (decode)");
-            for (auto & c : dec) {
-                c.k->run(c.in, c.out, "decode group");
-            }
-        }
-        A->invalidate(A->vir, H * sizeof(ggml_bf16_t));
-        ggml_bf16_to_fp32_row((const ggml_bf16_t *) A->vir, h.data(), H);
-        page_x.insert(page_x.end(), xb.begin(), xb.end());
-        page_p.insert(page_p.end(), pb.begin(), pb.end());
+        return GGML_STATUS_FAILED;
     }
     ggml_tensor * hn = names.find("h_nextn");  // the MTP block's input: every row's final norm
     if (hn && (hn->flags & GGML_TENSOR_FLAG_COMPUTE)) {
