@@ -1499,7 +1499,30 @@ json oaicompat_chat_params_parse(
     auto tools = json_value(body, "tools", json());
     auto has_tools = tools.is_array() && !tools.empty();
     auto stream = json_value(body, "stream", false);
-    auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
+    std::string tool_choice = "auto";
+    std::string forced_tool_name;
+    {
+        const json raw = json_value(body, "tool_choice", json("auto"));
+        if (raw.is_string()) {
+            tool_choice = raw.get<std::string>();
+        } else if (raw.is_object()) {
+            const std::string type = json_value(raw, "type", std::string());
+            if (type == "function") {
+                forced_tool_name = json_value(raw, "name", std::string());
+                if (forced_tool_name.empty() && raw.contains("function")) {
+                    forced_tool_name = json_value(raw.at("function"), "name", std::string());
+                }
+            } else if (type == "tool") {
+                forced_tool_name = json_value(raw, "name", std::string());
+            }
+            if (forced_tool_name.empty()) {
+                throw std::invalid_argument("tool_choice object must select a function by name");
+            }
+            tool_choice = "required";
+        } else {
+            throw std::invalid_argument("tool_choice must be a string or object");
+        }
+    }
 
     if (!opt.use_jinja) {
         if (has_tools) {
@@ -1580,6 +1603,24 @@ json oaicompat_chat_params_parse(
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
 
     const int64_t perf_t1 = perf1112 ? ggml_time_us() : 0;
+    if (!forced_tool_name.empty()) {
+        if (!tools.is_array()) {
+            throw std::invalid_argument("tool_choice selects a function but tools is not an array");
+        }
+        json filtered = json::array();
+        for (const json & tool : tools) {
+            const json & fn = tool.value("function", json::object());
+            if (json_value(fn, "name", std::string()) == forced_tool_name) {
+                filtered.push_back(tool);
+            }
+        }
+        if (filtered.empty()) {
+            throw std::invalid_argument("tool_choice selects an unknown function: " + forced_tool_name);
+        }
+        tools = std::move(filtered);
+        has_tools = true;
+    }
+
     common_chat_templates_inputs inputs;
     inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
     const int64_t perf_t2 = perf1112 ? ggml_time_us() : 0;

@@ -580,7 +580,15 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
             if (type == "auto") {
                 oai_body["tool_choice"] = "auto";
             } else if (type == "any" || type == "tool") {
-                oai_body["tool_choice"] = "required";
+                std::string name = json_value(tc, "name", std::string());
+                if (!name.empty()) {
+                    oai_body["tool_choice"] = json {
+                        {"type", "function"},
+                        {"function", json {{"name", name}}},
+                    };
+                } else {
+                    oai_body["tool_choice"] = "required";
+                }
             }
         }
     }
