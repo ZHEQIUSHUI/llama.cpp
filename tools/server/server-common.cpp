@@ -1507,18 +1507,27 @@ json oaicompat_chat_params_parse(
             tool_choice = raw.get<std::string>();
         } else if (raw.is_object()) {
             const std::string type = json_value(raw, "type", std::string());
-            if (type == "function") {
+            if (type == "auto" || type == "none" || type == "required") {
+                tool_choice = type;
+            } else if (type == "any") {
+                tool_choice = "required";
+            } else if (type == "function") {
                 forced_tool_name = json_value(raw, "name", std::string());
                 if (forced_tool_name.empty() && raw.contains("function")) {
                     forced_tool_name = json_value(raw.at("function"), "name", std::string());
                 }
             } else if (type == "tool") {
                 forced_tool_name = json_value(raw, "name", std::string());
+            } else {
+                // e.g. Responses "allowed_tools" or a newer client type: keep serving with "auto"
+                SRV_WRN("unsupported tool_choice type '%s', using \"auto\"\n", type.c_str());
             }
-            if (forced_tool_name.empty()) {
+            if ((type == "function" || type == "tool") && forced_tool_name.empty()) {
                 throw std::invalid_argument("tool_choice object must select a function by name");
             }
-            tool_choice = "required";
+            if (!forced_tool_name.empty()) {
+                tool_choice = "required";
+            }
         } else {
             throw std::invalid_argument("tool_choice must be a string or object");
         }
@@ -1609,7 +1618,7 @@ json oaicompat_chat_params_parse(
         }
         json filtered = json::array();
         for (const json & tool : tools) {
-            const json & fn = tool.value("function", json::object());
+            const json fn = tool.is_object() ? tool.value("function", json::object()) : json::object();
             if (json_value(fn, "name", std::string()) == forced_tool_name) {
                 filtered.push_back(tool);
             }
