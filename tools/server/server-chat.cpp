@@ -232,25 +232,33 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 exists_and_is_string(item, "type") &&
                 item.at("type") == "reasoning") {
                 // #responses_create-input-input_item_list-item-reasoning
+                // OpenAI clients may send only a summary, or no visible reasoning at all.
+                // Encrypted reasoning must not make replay fail because the server cannot decrypt it.
+                std::string reasoning_text;
+                for (const char * key : {"content", "summary"}) {
+                    if (!exists_and_is_array(item, key)) {
+                        continue;
+                    }
+                    for (const json & part : item.at(key)) {
+                        reasoning_text += json_value(part, "text", std::string());
+                    }
+                    if (!reasoning_text.empty()) {
+                        break;
+                    }
+                }
 
-                if (!exists_and_is_array(item, "content")) {
-                    throw std::invalid_argument("item['content'] is not an array");
-                }
-                if (item.at("content").empty()) {
-                    throw std::invalid_argument("item['content'] is empty");
-                }
-                if (!exists_and_is_string(item.at("content")[0], "text")) {
-                    throw std::invalid_argument("item['content']['text'] is not a string");
+                if (reasoning_text.empty()) {
+                    continue;
                 }
 
                 if (merge_prev) {
                     auto & prev_msg = chatcmpl_messages.back();
-                    prev_msg["reasoning_content"] = item.at("content")[0].at("text");
+                    prev_msg["reasoning_content"] = reasoning_text;
                 } else {
                     chatcmpl_messages.push_back(json {
                         {"role", "assistant"},
                         {"content", json::array()},
-                        {"reasoning_content", item.at("content")[0].at("text")},
+                        {"reasoning_content", reasoning_text},
                     });
                 }
             } else {
