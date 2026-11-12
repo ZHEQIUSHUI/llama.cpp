@@ -360,6 +360,180 @@ static std::string chat_add_and_format(mtmd_cli_context & ctx, common_chat_msg &
     return formatted;
 }
 
+// A causal model can take the media embeddings next to the text tokens in one llama batch. On the Axera NPU every
+// separate batch restarts the prefill kernels, so a video's frames (each its own text+image chunk pair) pay that cost
+// once per frame. LLAMA_MTMD_MEDIA_IN_BATCH=1/0 overrides; off elsewhere, where the standalone decode is what the
+// upstream tests exercise.
+static bool mtmd_media_in_batch(const mtmd_cli_context & ctx) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_MTMD_MEDIA_IN_BATCH");
+        return e ? atoi(e) != 0 : ggml_backend_reg_by_name("AXERA") != nullptr;
+    }();
+    return on && llama_get_memory(ctx.lctx) != nullptr && llama_get_causal_attn(ctx.lctx);
+}
+
+// one encoded media chunk into a batch that already holds text tokens (the positions mirror
+// mtmd_helper_decode_image_chunk())
+static bool batch_add_media(mtmd_context * mctx, llama_context * lctx, llama_batch_ext * batch,
+                            llama_seq_id seq_id, const mtmd_input_chunk * chunk, const float * embd,
+                            llama_pos pos_0) {
+    const auto * image    = mtmd_input_chunk_get_tokens_image(chunk);
+    const bool   is_mrope = mtmd_decode_use_mrope(mctx);
+    const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+    const size_t n_embd   = llama_model_n_embd_inp(llama_get_model(lctx));
+
+    for (size_t i = 0; i < n_tokens; i++) {
+        llama_pos pos[GGML_MROPE_SECTIONS] = { pos_0 + (llama_pos) i, pos_0 + (llama_pos) i,
+                                              pos_0 + (llama_pos) i, pos_0 + (llama_pos) i };
+        if (is_mrope && image) {
+            const mtmd_decoder_pos rel = mtmd_image_tokens_get_decoder_pos(image, pos_0, i);
+            pos[0] = rel.t;
+            pos[1] = rel.y;
+            pos[2] = rel.x;
+            pos[3] = rel.z;
+        }
+        const llama_embd e = { embd + i * n_embd, 1, n_embd };
+        const int32_t idx = llama_batch_ext_add_embd(batch, seq_id, e);
+        if (idx < 0 || !llama_batch_ext_set_pos(batch, idx, pos)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Encode every media chunk first, then evaluate the whole prompt as one llama batch. Returns 0 on success, 1 when the
+// caller should use the per-chunk path (a chunk does not fit, or a non-causal model), -1 on a fatal error.
+static int eval_chunks_mixed(mtmd_cli_context & ctx, const mtmd_input_chunks * chunks, llama_pos * new_n_past) {
+    const size_t  n_chunks = mtmd_input_chunks_size(chunks);
+    const int32_t n_batch  = llama_n_batch(ctx.lctx);
+    const int32_t seq_id   = 0;
+
+    // The encoder batch may hold media chunks that are separated by text chunks (a video's frame timestamps), so the
+    // grouping scans past text. The outputs stay alive until the llama batch has copied them.
+    std::vector<mtmd::batch_ptr> mbatchs;
+    std::unordered_map<const mtmd_input_chunk *, float *> embd_of;
+    std::vector<bool> encoded(n_chunks, false);
+    const int64_t t_enc0 = ggml_time_us();
+    for (size_t i = 0; i < n_chunks; i++) {
+        const auto * chunk = mtmd_input_chunks_get(chunks, i);
+        if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_TEXT || encoded[i]) {
+            continue;
+        }
+        if (mtmd_decode_use_non_causal(ctx.ctx_vision.get(), chunk)) {
+            return 1;
+        }
+        mtmd::batch_ptr mb(mtmd_batch_init(ctx.ctx_vision.get()));
+        if (mtmd_batch_add_chunk(mb.get(), chunk) != 0) {
+            return 1;
+        }
+        encoded[i] = true;
+        std::vector<size_t> added = { i };
+        for (size_t j = i + 1; j < n_chunks; j++) {
+            const auto * next = mtmd_input_chunks_get(chunks, j);
+            if (encoded[j] || mtmd_input_chunk_get_type(next) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+                continue;
+            }
+            if (mtmd_batch_add_chunk(mb.get(), next) != 0) {
+                break; // the batch is full: the remaining chunks go into the next one
+            }
+            encoded[j] = true;
+            added.push_back(j);
+        }
+        if (mtmd_batch_encode(mb.get()) != 0) {
+            return 1;
+        }
+        for (size_t j : added) {
+            const auto * cur = mtmd_input_chunks_get(chunks, j);
+            float * embd = mtmd_batch_get_output_embd(mb.get(), cur);
+            if (!embd) {
+                return 1;
+            }
+            embd_of[cur] = embd;
+        }
+        mbatchs.push_back(std::move(mb));
+    }
+    const int64_t t_enc1 = ggml_time_us();
+
+    llama_batch_ext_ptr batch(llama_batch_ext_init(ctx.lctx));
+    llama_pos n_past  = *new_n_past;
+    int32_t   batch_n = 0;
+    auto flush = [&](bool logits_last) -> int {
+        if (batch_n == 0) {
+            return 0;
+        }
+        if (logits_last && !llama_batch_ext_set_output_logits(batch.get(), batch_n - 1, true)) {
+            return -1;
+        }
+        const int ret = llama_process(ctx.lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        if (ret != 0) {
+            LOG_ERR("%s: llama_process failed: %d\n", __func__, ret);
+            return -1;
+        }
+        llama_batch_ext_clear(batch.get());
+        batch_n = 0;
+        return 0;
+    };
+
+    const int64_t t_llm0 = ggml_time_us();
+    for (size_t i = 0; i < n_chunks; i++) {
+        const auto * chunk    = mtmd_input_chunks_get(chunks, i);
+        const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        const bool   is_last  = i + 1 == n_chunks;
+
+        if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            size_t n_text = 0;
+            const llama_token * toks = mtmd_input_chunk_get_tokens_text(chunk, &n_text);
+            for (size_t k = 0; k < n_text; k++) {
+                if (batch_n >= n_batch && flush(false) != 0) {
+                    return -1;
+                }
+                const int32_t idx = llama_batch_ext_add_token(batch.get(), seq_id, toks[k]);
+                llama_pos pos = n_past++;
+                if (idx < 0 || !llama_batch_ext_set_pos(batch.get(), idx, &pos)) {
+                    return -1;
+                }
+                batch_n++;
+            }
+        } else {
+            if (mtmd_decode_use_non_causal(ctx.ctx_vision.get(), chunk)) {
+                return 1;
+            }
+            const auto it = embd_of.find(chunk);
+            if (it == embd_of.end()) {
+                return 1;
+            }
+            if ((int64_t) n_tokens > (int64_t) n_batch) {
+                // the helper splits an oversized encoder chunk itself, but it does not produce output logits
+                if (is_last || batch_n > 0) {
+                    return 1;
+                }
+                llama_pos new_past = n_past;
+                if (mtmd_helper_decode_image_chunk(ctx.ctx_vision.get(), ctx.lctx, chunk, it->second, n_past,
+                        seq_id, n_batch, &new_past, nullptr, nullptr) != 0) {
+                    return -1;
+                }
+                n_past = new_past;
+                continue;
+            }
+            if (batch_n + (int32_t) n_tokens > n_batch && flush(false) != 0) {
+                return -1;
+            }
+            if (!batch_add_media(ctx.ctx_vision.get(), ctx.lctx, batch.get(), seq_id, chunk, it->second, n_past)) {
+                return -1;
+            }
+            batch_n += (int32_t) n_tokens;
+            n_past += mtmd_input_chunk_get_n_pos(chunk);
+        }
+    }
+    if (flush(true) != 0) {
+        return -1;
+    }
+    *new_n_past = n_past;
+    LOG_INF("mtmd media in batch: %zu chunks, encoded in %.1f ms, llm in %.1f ms\n",
+            n_chunks, (t_enc1 - t_enc0) / 1e3, (ggml_time_us() - t_llm0) / 1e3);
+    return 0;
+}
+
 static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     inject_test_response_marker();
 
@@ -418,6 +592,20 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
 
     ctx.bitmaps.entries.clear();
     ctx.videos.clear();
+
+    if (mtmd_media_in_batch(ctx)) {
+        llama_pos new_n_past = ctx.n_past;
+        const int mixed = eval_chunks_mixed(ctx, chunks.ptr.get(), &new_n_past);
+        if (mixed == 0) {
+            ctx.n_past = new_n_past;
+            LOG("\n");
+            return 0;
+        }
+        if (mixed < 0) {
+            return 1;
+        }
+        LOG_WRN("%s: falling back to the per-chunk path\n", __func__);
+    }
 
     // batch encode all media chunks, then decode each
     size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());

@@ -17,6 +17,8 @@
 #include <type_traits>
 #include <chrono>
 #include <thread>
+#include <mutex>
+#include <algorithm>
 
 #ifdef _WIN32
 // windows.h defines min and max as macros, which breaks std::min and std::max
@@ -948,6 +950,202 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
     return prompt_tokens;
 }
 
+// Tokenizing an agent's growing chat history again on every turn is pure repeated work: the rendered prompt keeps the
+// previous turn as a prefix and only the tail is new. Keep the last two tokenizations and reuse their tokens up to a
+// token boundary before the common prefix, tokenizing only the rest. The splice is only taken when the tail's first
+// tokens reproduce the cached ones exactly, so the result is the same sequence common_tokenize() would produce.
+struct tokenize_cache_entry {
+    std::string          text;
+    std::vector<llama_token> tokens;
+    std::vector<size_t>  offsets; // byte offset of each token, plus the text size
+    bool                 add_special = false;
+    bool                 parse_special = false;
+    bool                 offsets_ok = false;
+    size_t               offsets_valid_bytes  = 0; // offsets[0..offsets_valid_tokens] are usable
+    size_t               offsets_valid_tokens = 0;
+    uint64_t             stamp = 0;
+};
+
+static bool tokenize_cache_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_TOKENIZE_CACHE");
+        return e ? atoi(e) != 0 : ggml_backend_reg_by_name("AXERA") != nullptr;
+    }();
+    return on;
+}
+
+static bool tokenize_cache_debug() {
+    static const bool on = getenv("LLAMA_TOKENIZE_CACHE_CHECK") != nullptr;
+    return on;
+}
+
+static bool build_token_offsets(const llama_vocab * vocab, tokenize_cache_entry & e) {
+    if (e.offsets_ok) {
+        return true;
+    }
+    e.offsets.resize(e.tokens.size() + 1);
+    size_t pos = 0;
+    for (size_t i = 0; i < e.tokens.size(); i++) {
+        const std::string piece = common_token_to_piece(vocab, e.tokens[i], true);
+        if (piece.empty()) {
+            // a token the tokenizer added on its own (BOS) or a control token that has no text form
+            e.offsets[i] = pos;
+            continue;
+        }
+        if (piece.size() > e.text.size() - pos || e.text.compare(pos, piece.size(), piece) != 0) {
+            // A generated assistant reply can tokenize in a way that does not reproduce its text exactly. The offsets
+            // before it are still valid, and a cache hit only ever needs the prefix up to the common part.
+            e.offsets_valid_tokens = i;
+            e.offsets_valid_bytes  = pos;
+            if (tokenize_cache_debug()) {
+                fprintf(stderr, "tokenize cache: token %zu has a non-text piece at byte %zu (usable prefix %zu bytes)\n",
+                        i, pos, pos);
+            }
+            return false;
+        }
+        e.offsets[i] = pos;
+        pos += piece.size();
+    }
+    e.offsets[e.tokens.size()] = pos;
+    e.offsets_valid_tokens = e.tokens.size();
+    e.offsets_valid_bytes  = pos;
+    e.offsets_ok = pos == e.text.size();
+    return e.offsets_ok;
+}
+
+static llama_tokens tokenize_string_cached(const llama_vocab * vocab, const std::string & text,
+                                           bool add_special, bool parse_special) {
+    if (!tokenize_cache_enabled() || !add_special || !parse_special || text.size() < 1024) {
+        if (tokenize_cache_debug()) {
+            fprintf(stderr, "tokenize cache: bypass (enabled %d, special %d/%d, text %zu bytes)\n",
+                    (int) tokenize_cache_enabled(), (int) add_special, (int) parse_special, text.size());
+        }
+        return common_tokenize(vocab, text, add_special, parse_special);
+    }
+    static std::mutex mu;
+    static std::vector<tokenize_cache_entry> entries;
+    static uint64_t stamp = 0;
+
+    tokenize_cache_entry cached;
+    bool have_cached = false;
+    size_t lcp = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        tokenize_cache_entry * best = nullptr;
+        for (auto & e : entries) {
+            if (e.add_special != add_special || e.parse_special != parse_special || e.text.empty()) {
+                continue;
+            }
+            size_t n = std::min(e.text.size(), text.size());
+            size_t i = 0;
+            while (i < n && e.text[i] == text[i]) {
+                i++;
+            }
+            if (i > lcp) {
+                lcp  = i;
+                best = &e;
+            }
+        }
+        if (best) {
+            best->stamp = ++stamp;
+            // The splice below backs off 256 bytes from the common prefix, so a cached entry whose offsets break
+            // later in the text can still serve the unchanged prefix.
+            const size_t need = lcp > 256 ? lcp - 256 : 0;
+            if (!build_token_offsets(vocab, *best) && best->offsets_valid_bytes < need) {
+                best = nullptr;
+            }
+        }
+        if (best) {
+            // Another request may replace this slot while the tail is tokenized. Keep the data local so no lock is
+            // held across llama_tokenize(), which can take milliseconds on a long agent prompt.
+            cached = *best;
+            have_cached = true;
+        }
+    }
+
+    llama_tokens out;
+    bool spliced = false;
+    if (have_cached && lcp > 512 && cached.text.size() <= text.size()) {
+        // back off a few tokens so a merge across the split cannot change the boundary token
+        size_t i0 = 0;
+        const size_t keep = 256;
+        if (lcp > keep) {
+            const size_t want = lcp - keep;
+            size_t lo = 0, hi = cached.offsets_valid_tokens;
+            while (lo < hi) {
+                const size_t mid = (lo + hi) / 2;
+                if (cached.offsets[mid] <= want) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            i0 = lo > 0 ? lo - 1 : 0;
+        }
+        if (i0 > 0 && i0 < cached.offsets_valid_tokens) {
+            const size_t split = cached.offsets[i0];
+            llama_tokens tail = common_tokenize(vocab, text.substr(split), false, parse_special);
+            // Only the tokens that lie entirely before the common prefix must match the cached ones. Tokens after the
+            // edit come from the new text by construction; demanding that the whole old tail match would reject every
+            // run that edits an earlier message, which is exactly the agent's usual case.
+            size_t n_common = 0;
+            while (i0 + n_common < cached.offsets_valid_tokens && cached.offsets[i0 + n_common + 1] <= lcp) {
+                ++n_common;
+            }
+            bool same = tail.size() >= n_common;
+            for (size_t k = 0; same && k < n_common; k++) {
+                same = tail[k] == cached.tokens[i0 + k];
+            }
+            if (same) {
+                out.assign(cached.tokens.begin(), cached.tokens.begin() + i0);
+                out.insert(out.end(), tail.begin(), tail.end());
+                spliced = true;
+            }
+        }
+    }
+    if (spliced) {
+        static const bool check = getenv("LLAMA_TOKENIZE_CACHE_CHECK") != nullptr;
+        if (check) {
+            llama_tokens full = common_tokenize(vocab, text, add_special, parse_special);
+            if (full != out) {
+                fprintf(stderr, "tokenize cache: MISMATCH (%zu vs %zu tokens), using the full result\n", out.size(), full.size());
+                out  = std::move(full);
+                spliced = false;
+            }
+        }
+    }
+    if (tokenize_cache_debug()) {
+        fprintf(stderr, "tokenize cache: text %zu bytes, lcp %zu, cached %d, spliced %d, tokens %zu\n",
+                text.size(), lcp, (int) have_cached, (int) spliced, out.size());
+    }
+    if (!spliced) {
+        out = common_tokenize(vocab, text, add_special, parse_special);
+    }
+
+    // remember this tokenization for the next turn; two entries cover the active slot and a previous prompt
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        tokenize_cache_entry * slot = nullptr;
+        if (entries.size() < 2) {
+            entries.emplace_back();
+            slot = &entries.back();
+        } else {
+            slot = &*std::min_element(entries.begin(), entries.end(),
+                                      [](const auto & a, const auto & b) { return a.stamp < b.stamp; });
+        }
+        slot->text          = text;
+        slot->tokens        = out;
+        slot->offsets.clear();
+        slot->offsets_ok    = false;
+        slot->offsets_valid_bytes  = 0;
+        slot->offsets_valid_tokens = 0;
+        slot->add_special   = add_special;
+        slot->parse_special = parse_special;
+        slot->stamp         = ++stamp;
+    }
+    return out;
+}
+
 size_t validate_utf8(const std::string& text) {
     size_t len = text.size();
     if (len == 0) return 0;
@@ -980,7 +1178,16 @@ server_tokens process_mtmd_prompt(
         const std::string & prompt,
         const std::vector<raw_buffer> & files,
         const mtmd_helper_init_opt & init_opt,
-        bool is_placeholder) {
+        bool is_placeholder,
+        const llama_vocab * vocab) {
+    static const bool perf1112 = getenv("PERF1112_PROF") != nullptr;
+    const int64_t perf_t0 = perf1112 ? ggml_time_us() : 0;
+    if (files.empty() && !is_placeholder && vocab && prompt.find(mtmd_default_marker()) == std::string::npos) {
+        // Chat requests without media still arrive here whenever the server has an mmproj loaded. They are ordinary
+        // text prompts, so use the prefix cache instead of paying mtmd_tokenize() for the whole history every turn.
+        return server_tokens(tokenize_string_cached(vocab, prompt, true, true), false);
+    }
+
     // these will be freed upon going out of scope
     mtmd::bitmaps bitmaps;
     std::vector<mtmd_helper::video_ptr> videos;
@@ -994,6 +1201,7 @@ server_tokens process_mtmd_prompt(
             videos.emplace_back(out.video_ctx);
         }
     }
+    const int64_t perf_t1 = perf1112 ? ggml_time_us() : 0;
     // process prompt
     std::vector<server_tokens> inputs;
     // multimodal
@@ -1013,6 +1221,11 @@ server_tokens process_mtmd_prompt(
     if (tokenized != 0) {
         throw std::runtime_error("Failed to tokenize prompt");
     }
+    const int64_t perf_t2 = perf1112 ? ggml_time_us() : 0;
+    if (perf1112) {
+        fprintf(stderr, "PERF1112 mtmd: files=%zu decode %.2f ms, tokenize %.2f ms\n",
+                files.size(), (perf_t1 - perf_t0) / 1e3, (perf_t2 - perf_t1) / 1e3);
+    }
     auto result = server_tokens(chunks, true);
     return result;
 }
@@ -1030,8 +1243,11 @@ server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_context *
     constexpr char JSON_STRING_PROMPT_KEY[] = "prompt_string";
     constexpr char JSON_MTMD_DATA_KEY[] = "multimodal_data";
     const bool has_mtmd = mctx != nullptr;
-    if (json_prompt.is_string() || json_is_array_of_mixed_numbers_strings(json_prompt)) {
-        // string or mixed
+    if (json_prompt.is_string()) {
+        // A string has no media chunks even when mctx is loaded; only the object form below carries multimodal_data.
+        return server_tokens(tokenize_string_cached(vocab, json_prompt.get<std::string>(), add_special, parse_special), false);
+    } else if (json_is_array_of_mixed_numbers_strings(json_prompt)) {
+        // mixed
         llama_tokens tmp = tokenize_mixed(vocab, json_prompt, add_special, parse_special);
         return server_tokens(tmp, false);
     } else if (json_is_array_of_numbers(json_prompt)) {
@@ -1049,7 +1265,7 @@ server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_context *
             for (const auto & entry : json_prompt.at(JSON_MTMD_DATA_KEY)) {
                 files.push_back(base64_decode(entry));
             }
-            return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files, init_opt);
+            return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files, init_opt, false, vocab);
         } else {
             // Not multimodal, but contains a subobject.
             llama_tokens tmp = tokenize_mixed(vocab, json_prompt.at(JSON_STRING_PROMPT_KEY), add_special, parse_special);
@@ -1265,7 +1481,7 @@ server_tokens tokenize_oai_content_array(const llama_vocab * vocab, mtmd_context
     if (files.empty()) {
         return server_tokens(common_tokenize(vocab, prompt, add_special, parse_special), false);
     }
-    return process_mtmd_prompt(mctx, prompt, files, init_opt);
+    return process_mtmd_prompt(mctx, prompt, files, init_opt, false, vocab);
 }
 
 // used by /chat/completions endpoint
@@ -1276,6 +1492,8 @@ json oaicompat_chat_params_parse(
     std::vector<raw_buffer> & out_files,
     common_chat_session & out_session)
 {
+    static const bool perf1112 = getenv("PERF1112_PROF") != nullptr;
+    const int64_t perf_t0 = perf1112 ? ggml_time_us() : 0;
     json llama_params;
 
     auto tools = json_value(body, "tools", json());
@@ -1361,9 +1579,12 @@ json oaicompat_chat_params_parse(
 
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
 
+    const int64_t perf_t1 = perf1112 ? ggml_time_us() : 0;
     common_chat_templates_inputs inputs;
     inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
+    const int64_t perf_t2 = perf1112 ? ggml_time_us() : 0;
     inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
+    const int64_t perf_t3 = perf1112 ? ggml_time_us() : 0;
     inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar                = grammar;
@@ -1435,6 +1656,12 @@ json oaicompat_chat_params_parse(
     common_chat_session_params session_params;
     session_params.echo = json_value(body, "echo", false);
     out_session = common_chat_session(opt.tmpls.get(), vocab, inputs, session_params);
+    const int64_t perf_t4 = perf1112 ? ggml_time_us() : 0;
+    if (perf1112) {
+        fprintf(stderr, "PERF1112 template: total %.2f ms (fields %.2f, messages %.2f, tools %.2f, render %.2f)\n",
+                (perf_t4 - perf_t0) / 1e3, (perf_t1 - perf_t0) / 1e3, (perf_t2 - perf_t1) / 1e3,
+                (perf_t3 - perf_t2) / 1e3, (perf_t4 - perf_t3) / 1e3);
+    }
 
     llama_params["prompt"] = out_session.prompt().str();
 

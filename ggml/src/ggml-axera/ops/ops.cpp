@@ -168,25 +168,36 @@ const std::map<std::string, ggml_tensor *> & graph_names::of(const ggml_cgraph *
                 }
             }
         } else {
-            const int64_t t0 = prof ? ggml_time_us() : 0;
-            walk(occ);
-            scan_us += (prof ? ggml_time_us() : 0) - t0;
-            for (auto it = recent_uid.begin(); it != recent_uid.end(); ++it) {
-                if (it->first != gid) {
-                    continue;
-                }
+            // Alternating graphs (a speculative target and its draft) come back with the same cgraph.uid as long as
+            // llama.cpp reuses them; their tensor pointers have not changed then, so the expensive walk is not needed.
+            auto it = std::find_if(recent_uid.begin(), recent_uid.end(),
+                                   [&](const auto & r) { return r.first == gid; });
+            if (it != recent_uid.end() && it->second.graph_uid == g->uid) {
                 auto found = std::move(it->second);
                 recent_uid.erase(it);
                 remember_uid();
                 cur = std::move(found);
-                if (update_values(cur, occ)) {
-                    cur.graph_uid = g->uid;
-                    uid = gid;
-                    key.clear();
-                    hit = true;
-                    st  = ST_RECENT;
+                uid = gid;
+                key.clear();
+                hit = true;
+                st  = ST_RECENT;
+            } else {
+                const int64_t t0 = prof ? ggml_time_us() : 0;
+                walk(occ);
+                scan_us += (prof ? ggml_time_us() : 0) - t0;
+                if (it != recent_uid.end()) {
+                    auto found = std::move(it->second);
+                    recent_uid.erase(it);
+                    remember_uid();
+                    cur = std::move(found);
+                    if (update_values(cur, occ)) {
+                        cur.graph_uid = g->uid;
+                        uid = gid;
+                        key.clear();
+                        hit = true;
+                        st  = ST_RECENT;
+                    }
                 }
-                break;
             }
         }
         if (!hit) {
