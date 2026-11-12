@@ -297,7 +297,8 @@ server_tokens process_mtmd_prompt(
                                         const std::string & prompt,
                                         const std::vector<raw_buffer> & files,
                                         const mtmd_helper_init_opt & init_opt,
-                                        bool is_placeholder = false);
+                                        bool is_placeholder = false,
+                                        const llama_vocab * vocab = nullptr);
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
