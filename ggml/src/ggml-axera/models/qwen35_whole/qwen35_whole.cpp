@@ -1212,6 +1212,7 @@ void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32
             for (auto & c : pres) {
                 c.k->run(c.in, c.out, "prefill");
             }
+            state_zero = false;
         }
         axera_timer       to("prefill out rows");
         const axera_cmm & po = POUT[(ncall - 1) & 1];
