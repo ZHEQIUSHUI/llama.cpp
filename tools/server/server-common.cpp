@@ -961,6 +961,8 @@ struct tokenize_cache_entry {
     bool                 add_special = false;
     bool                 parse_special = false;
     bool                 offsets_ok = false;
+    size_t               offsets_valid_bytes  = 0; // offsets[0..offsets_valid_tokens] are usable
+    size_t               offsets_valid_tokens = 0;
     uint64_t             stamp = 0;
 };
 
@@ -991,8 +993,13 @@ static bool build_token_offsets(const llama_vocab * vocab, tokenize_cache_entry 
             continue;
         }
         if (piece.size() > e.text.size() - pos || e.text.compare(pos, piece.size(), piece) != 0) {
+            // A generated assistant reply can tokenize in a way that does not reproduce its text exactly. The offsets
+            // before it are still valid, and a cache hit only ever needs the prefix up to the common part.
+            e.offsets_valid_tokens = i;
+            e.offsets_valid_bytes  = pos;
             if (tokenize_cache_debug()) {
-                fprintf(stderr, "tokenize cache: token %zu has a non-text piece at byte %zu, cache disabled for this entry\n", i, pos);
+                fprintf(stderr, "tokenize cache: token %zu has a non-text piece at byte %zu (usable prefix %zu bytes)\n",
+                        i, pos, pos);
             }
             return false;
         }
@@ -1000,6 +1007,8 @@ static bool build_token_offsets(const llama_vocab * vocab, tokenize_cache_entry 
         pos += piece.size();
     }
     e.offsets[e.tokens.size()] = pos;
+    e.offsets_valid_tokens = e.tokens.size();
+    e.offsets_valid_bytes  = pos;
     e.offsets_ok = pos == e.text.size();
     return e.offsets_ok;
 }
@@ -1039,7 +1048,10 @@ static llama_tokens tokenize_string_cached(const llama_vocab * vocab, const std:
         }
         if (best) {
             best->stamp = ++stamp;
-            if (!build_token_offsets(vocab, *best)) {
+            // The splice below backs off 256 bytes from the common prefix, so a cached entry whose offsets break
+            // later in the text can still serve the unchanged prefix.
+            const size_t need = lcp > 256 ? lcp - 256 : 0;
+            if (!build_token_offsets(vocab, *best) && best->offsets_valid_bytes < need) {
                 best = nullptr;
             }
         }
@@ -1059,7 +1071,7 @@ static llama_tokens tokenize_string_cached(const llama_vocab * vocab, const std:
         const size_t keep = 256;
         if (lcp > keep) {
             const size_t want = lcp - keep;
-            size_t lo = 0, hi = cached.tokens.size();
+            size_t lo = 0, hi = cached.offsets_valid_tokens;
             while (lo < hi) {
                 const size_t mid = (lo + hi) / 2;
                 if (cached.offsets[mid] <= want) {
@@ -1070,12 +1082,18 @@ static llama_tokens tokenize_string_cached(const llama_vocab * vocab, const std:
             }
             i0 = lo > 0 ? lo - 1 : 0;
         }
-        if (i0 > 0 && i0 < cached.tokens.size()) {
+        if (i0 > 0 && i0 < cached.offsets_valid_tokens) {
             const size_t split = cached.offsets[i0];
             llama_tokens tail = common_tokenize(vocab, text.substr(split), false, parse_special);
-            const size_t n_old = cached.tokens.size() - i0;
-            bool same = tail.size() >= n_old;
-            for (size_t k = 0; same && k < n_old && k < tail.size(); k++) {
+            // Only the tokens that lie entirely before the common prefix must match the cached ones. Tokens after the
+            // edit come from the new text by construction; demanding that the whole old tail match would reject every
+            // run that edits an earlier message, which is exactly the agent's usual case.
+            size_t n_common = 0;
+            while (i0 + n_common < cached.offsets_valid_tokens && cached.offsets[i0 + n_common + 1] <= lcp) {
+                ++n_common;
+            }
+            bool same = tail.size() >= n_common;
+            for (size_t k = 0; same && k < n_common; k++) {
                 same = tail[k] == cached.tokens[i0 + k];
             }
             if (same) {
@@ -1119,6 +1137,8 @@ static llama_tokens tokenize_string_cached(const llama_vocab * vocab, const std:
         slot->tokens        = out;
         slot->offsets.clear();
         slot->offsets_ok    = false;
+        slot->offsets_valid_bytes  = 0;
+        slot->offsets_valid_tokens = 0;
         slot->add_special   = add_special;
         slot->parse_special = parse_special;
         slot->stamp         = ++stamp;
