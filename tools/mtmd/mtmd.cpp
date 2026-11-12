@@ -25,8 +25,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
+
+#include "ggml-backend.h"
 
 // remember to bump this if the serialization format changes
 #define MTMD_SERIALIZATION_VERSION 3
@@ -470,6 +477,59 @@ struct mtmd_batch {
     }
 };
 
+struct mtmd_embd_cache_entry {
+    std::shared_ptr<std::vector<float>> data;
+    uint64_t stamp = 0;
+};
+
+struct mtmd_embd_cache {
+    std::mutex mutex;
+    size_t limit_bytes = 0;
+    size_t used_bytes = 0;
+    uint64_t tick = 0;
+    std::unordered_map<std::string, mtmd_embd_cache_entry> entries;
+
+    std::shared_ptr<std::vector<float>> get(const std::string & key) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = entries.find(key);
+        if (it == entries.end()) {
+            return nullptr;
+        }
+        it->second.stamp = ++tick;
+        return it->second.data;
+    }
+
+    void put(const std::string & key, const float * data, size_t size) {
+        if (limit_bytes == 0 || key.empty() || size == 0 || size > limit_bytes) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = entries.find(key);
+        if (it != entries.end()) {
+            if (it->second.data->size() == size) {
+                it->second.stamp = ++tick;
+                return;
+            }
+            used_bytes -= it->second.data->size() * sizeof(float);
+            entries.erase(it);
+        }
+        size_t bytes = size * sizeof(float);
+        while (used_bytes + bytes > limit_bytes && !entries.empty()) {
+            auto oldest = entries.begin();
+            for (auto cur = std::next(entries.begin()); cur != entries.end(); ++cur) {
+                if (cur->second.stamp < oldest->second.stamp) {
+                    oldest = cur;
+                }
+            }
+            used_bytes -= oldest->second.data->size() * sizeof(float);
+            entries.erase(oldest);
+        }
+        auto copy = std::make_shared<std::vector<float>>(data, data + size);
+        used_bytes += bytes;
+        entries.emplace(key, mtmd_embd_cache_entry{std::move(copy), ++tick});
+    }
+};
+
 // slice template, used by some llava-uhd models to correctly place the special tokens around image embeddings
 // models not having it (llava-1.6) will process embeddings without any special tokens in-between
 enum mtmd_slice_tmpl {
@@ -569,6 +629,10 @@ struct mtmd_context {
     // batching
     int32_t batch_max_tokens;
 
+    // Encoding the same image or video again is pure NPU work; media IDs are content hashes, so the result can be
+    // reused safely. The cache is bounded and disabled by default on non-Axera builds to keep CPU behavior unchanged.
+    mtmd_embd_cache embd_cache;
+
     // TODO @ngxson : add timings
 
     mtmd_context(const char * mmproj_fname,
@@ -583,6 +647,15 @@ struct mtmd_context {
         text_model      (text_model),
         batch_max_tokens(ctx_params.batch_max_tokens)
     {
+        const char * cache_mib_env = getenv("LLAMA_MTMD_EMBED_CACHE_MIB");
+        size_t cache_mib = cache_mib_env
+            ? (size_t) std::max(0, atoi(cache_mib_env))
+            : (ggml_backend_reg_by_name("AXERA") != nullptr ? 256 : 0);
+        embd_cache.limit_bytes = cache_mib * 1024 * 1024;
+        if (embd_cache.limit_bytes > 0) {
+            LOG_INF("%s: embedding cache enabled, limit = %zu MiB\n", __func__, cache_mib);
+        }
+
         if (ctx_params.image_marker != nullptr) {
             throw std::runtime_error("custom image_marker is not supported anymore, use media_marker instead");
         }
@@ -2305,26 +2378,18 @@ int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk * chunk)
     return 3; // "cannot batch" error code
 }
 
-static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
-    if (batch->entries.empty()) {
-        LOG_ERR("%s: batch is empty\n", __func__);
-        return 1;
-    }
-    for (const auto * chunk : batch->entries) {
-        if (chunk->is_placeholder()) {
-            LOG_ERR("%s: chunk is placeholder\n", __func__);
-            return 1;
-        }
-    }
-
+static int32_t mtmd_batch_encode_entries(
+        mtmd_context * ctx,
+        const std::vector<const mtmd_input_chunk *> & entries,
+        std::vector<float> & output_embd) {
     // represent the whole batch as one single chunk
-    mtmd::input_chunk_ptr batch_chunk(mtmd_input_chunk_copy(batch->entries[0]));
+    mtmd::input_chunk_ptr batch_chunk(mtmd_input_chunk_copy(entries[0]));
     if (batch_chunk->tokens_image) {
         auto & b0_f32 = batch_chunk->tokens_image->batch_f32;
         // copy all entries from other chunks into the first chunk's batch_f32
         // note: skip first entry because it's already in batch_chunk
-        for (size_t ic = 1; ic < batch->entries.size(); ic++) {
-            auto & chunk = batch->entries[ic];
+        for (size_t ic = 1; ic < entries.size(); ic++) {
+            auto & chunk = entries[ic];
             GGML_ASSERT(chunk->tokens_image);
             auto b1_f32 = chunk->tokens_image->batch_f32.clone();
             for (size_t i = 0; i < b1_f32.entries.size(); i++) {
@@ -2335,8 +2400,8 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
         auto & b0_f32 = batch_chunk->tokens_audio->batch_f32;
         // copy all entries from other chunks into the first chunk's batch_f32
         // note: skip first entry because it's already in batch_chunk
-        for (size_t ic = 1; ic < batch->entries.size(); ic++) {
-            auto & chunk = batch->entries[ic];
+        for (size_t ic = 1; ic < entries.size(); ic++) {
+            auto & chunk = entries[ic];
             GGML_ASSERT(chunk->tokens_audio);
             auto b1_f32 = chunk->tokens_audio->batch_f32.clone();
             for (size_t i = 0; i < b1_f32.entries.size(); i++) {
@@ -2349,12 +2414,144 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
     }
 
     LOG_DBG("%s: encoding batch with %zu entries and total %zu tokens\n",
-            __func__, batch->entries.size(), mtmd_input_chunk_get_n_tokens(batch_chunk.get()));
-    int32_t res = mtmd_encode_chunk_impl(
-        batch->ctx,
-        batch_chunk.get(),
-        batch->output_embd);
-    return res;
+            __func__, entries.size(), mtmd_input_chunk_get_n_tokens(batch_chunk.get()));
+    return mtmd_encode_chunk_impl(ctx, batch_chunk.get(), output_embd);
+}
+
+static uint64_t mtmd_hash_bytes(uint64_t hash, const void * data, size_t size) {
+    // FNV-1a: the id alone is not unique for models that split one image into several chunks (llava-uhd and similar),
+    // so mix the actual preprocessed pixels into the key to avoid serving a sibling tile's embedding.
+    const unsigned char * bytes = static_cast<const unsigned char *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static std::string mtmd_chunk_cache_key(const mtmd_input_chunk * chunk) {
+    if (chunk == nullptr || chunk->type != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        return {};
+    }
+    const char * id = mtmd_input_chunk_get_id(chunk);
+    if (id == nullptr || id[0] == '\0') {
+        return {};
+    }
+    uint64_t hash = 1469598103934665603ULL;
+    for (const auto & entry : chunk->tokens_image->batch_f32.entries) {
+        if (entry.is_placeholder()) {
+            return {};
+        }
+        const auto size = entry.get_size();
+        hash = mtmd_hash_bytes(hash, &size, sizeof(size));
+        const auto & buf = entry.get_ro_buf();
+        hash = mtmd_hash_bytes(hash, buf.data(), buf.size() * sizeof(float));
+    }
+    char suffix[32];
+    snprintf(suffix, sizeof(suffix), ":%zu:%016llx", mtmd_input_chunk_get_n_tokens(chunk),
+             (unsigned long long) hash);
+    return std::string("image:") + id + suffix;
+}
+
+static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
+    if (batch->entries.empty()) {
+        LOG_ERR("%s: batch is empty\n", __func__);
+        return 1;
+    }
+    for (const auto * chunk : batch->entries) {
+        if (chunk->is_placeholder()) {
+            LOG_ERR("%s: chunk is placeholder\n", __func__);
+            return 1;
+        }
+    }
+
+    static const bool perf = getenv("PERF1112_PROF") != nullptr;
+    const int64_t t_start = perf ? ggml_time_us() : 0;
+    const size_t n_embd = batch->ctx->n_embd_out();
+    const size_t n_entries = batch->entries.size();
+    std::vector<std::shared_ptr<std::vector<float>>> cached(n_entries);
+    std::vector<const mtmd_input_chunk *> to_encode;
+    size_t n_hit_chunks = 0;
+    size_t n_hit_tokens = 0;
+    size_t n_tokens_total = 0;
+
+    for (size_t i = 0; i < n_entries; ++i) {
+        const auto * chunk = batch->entries[i];
+        const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        n_tokens_total += n_tokens;
+        if (batch->ctx->embd_cache.limit_bytes > 0) {
+            cached[i] = batch->ctx->embd_cache.get(mtmd_chunk_cache_key(chunk));
+            if (cached[i] && cached[i]->size() != n_tokens * n_embd) {
+                cached[i].reset();
+            }
+        }
+        if (cached[i]) {
+            ++n_hit_chunks;
+            n_hit_tokens += n_tokens;
+        } else {
+            to_encode.push_back(chunk);
+        }
+    }
+
+    static const bool cache_check = getenv("LLAMA_MTMD_EMBED_CACHE_CHECK") != nullptr;
+    if (cache_check && to_encode.empty()) {
+        std::vector<float> fresh;
+        if (mtmd_batch_encode_entries(batch->ctx, batch->entries, fresh) != 0) {
+            return 1;
+        }
+        double max_abs = 0.0;
+        double max_rel = 0.0;
+        size_t offset = 0;
+        for (size_t i = 0; i < n_entries; ++i) {
+            const size_t n_floats = mtmd_input_chunk_get_n_tokens(batch->entries[i]) * n_embd;
+            for (size_t j = 0; j < n_floats; ++j) {
+                const double a = cached[i]->data()[j];
+                const double b = fresh[offset + j];
+                const double diff = std::abs(a - b);
+                max_abs = std::max(max_abs, diff);
+                max_rel = std::max(max_rel, diff / std::max(1e-12, std::abs(b)));
+            }
+            offset += n_floats;
+        }
+        fprintf(stderr, "PERF1112 mtmd-cache-check: chunks=%zu max_abs=%.9g max_rel=%.9g\n",
+                n_entries, max_abs, max_rel);
+    }
+
+    std::vector<float> encoded;
+    int32_t res = 0;
+    if (!to_encode.empty()) {
+        res = mtmd_batch_encode_entries(batch->ctx, to_encode, encoded);
+        if (res != 0) {
+            return res;
+        }
+    }
+
+    batch->output_embd.resize(n_tokens_total * n_embd);
+    size_t out_offset = 0;
+    size_t enc_offset = 0;
+    for (size_t i = 0; i < n_entries; ++i) {
+        const auto * chunk = batch->entries[i];
+        const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        const size_t n_floats = n_tokens * n_embd;
+        if (cached[i]) {
+            std::copy(cached[i]->begin(), cached[i]->end(), batch->output_embd.begin() + out_offset);
+        } else {
+            std::copy(encoded.begin() + enc_offset, encoded.begin() + enc_offset + n_floats,
+                      batch->output_embd.begin() + out_offset);
+            batch->ctx->embd_cache.put(mtmd_chunk_cache_key(chunk), encoded.data() + enc_offset, n_floats);
+            enc_offset += n_floats;
+        }
+        out_offset += n_floats;
+    }
+
+    if (perf) {
+        const size_t n_cached = batch->ctx->embd_cache.used_bytes;
+        fprintf(stderr, "PERF1112 mtmd-batch: chunks=%zu hit=%zu hit_tokens=%zu encode_chunks=%zu "
+                "took=%.2f ms cache=%.1f MiB\n",
+                n_entries, n_hit_chunks, n_hit_tokens, to_encode.size(),
+                (ggml_time_us() - t_start) / 1e3, n_cached / (1024.0 * 1024.0));
+    }
+    return 0;
 }
 
 int32_t mtmd_batch_encode(mtmd_batch * batch) {
