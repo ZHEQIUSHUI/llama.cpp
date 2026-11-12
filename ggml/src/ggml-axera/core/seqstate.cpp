@@ -214,7 +214,10 @@ seq_status seqstate::feed(int64_t c0, int T, const uint16_t * x, const int32_t *
             return run_decode(c0, x, p4);
         }
         const int vr = caps.verify_rows;
-        if (vr > 0 && c0 > 0 && T > 1 && (T <= vr || T <= cfg.verify_chain) && c0 + T + vr <= caps.cells) {
+        // one verify call writes all `vr` snapshot rows even when the batch is shorter; a chain's last call needs its
+        // rows after the batch's tail. Keep the pre-migration condition for both adapters near the context's end.
+        const int need = T <= vr ? vr : T + vr;
+        if (vr > 0 && c0 > 0 && T > 1 && (T <= vr || T <= cfg.verify_chain) && c0 + need <= caps.cells) {
             return run_verify(c0, T, x, p4);
         }
         if (k == 0) {
