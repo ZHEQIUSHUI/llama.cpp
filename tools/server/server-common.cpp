@@ -1689,6 +1689,18 @@ json oaicompat_chat_params_parse(
             inputs.chat_template_kwargs["enable_thinking"] = json(false).dump();
             inputs.chat_template_kwargs.erase("reasoning_effort");
         } else if (!reasoning_effort.empty()) {
+            // Qwen3.8 templates use xhigh/medium/low and reject OpenAI's high/minimal names.
+            // Map the standard levels only when the template declares this exact enum.
+            const std::string tmpl_src = common_chat_templates_source(opt.tmpls.get());
+            if (tmpl_src.find("Unexpected reasoning effort") != std::string::npos &&
+                tmpl_src.find("'xhigh'") != std::string::npos &&
+                tmpl_src.find("'low'") != std::string::npos) {
+                if (reasoning_effort == "high" || reasoning_effort == "xhigh") {
+                    reasoning_effort = "xhigh";
+                } else if (reasoning_effort == "minimal") {
+                    reasoning_effort = "low";
+                }
+            }
             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         }
     }
