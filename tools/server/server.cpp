@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <clocale>
+#include <cstdlib>
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
@@ -23,14 +24,22 @@
 #endif
 
 static std::function<void(int)> shutdown_handler;
-static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+static std::atomic<int> n_interrupts{0};
 
 static inline void signal_handler(int signal) {
-    if (is_terminating.test_and_set()) {
-        // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
-        // this is for better developer experience, we can remove when the server is stable enough
-        fprintf(stderr, "Received second interrupt, terminating immediately.\n");
-        exit(1);
+    const int n = ++n_interrupts;
+    if (n == 2) {
+        // exit() here runs the static destructors on top of whatever the interrupted thread holds: a backend that is
+        // in the middle of a graph (an NPU call holding its lock) then waits on itself forever. The first interrupt
+        // already stops the server after the batch in progress, so the second one only says so.
+        fprintf(stderr, "Received second interrupt: the server stops after the batch in progress "
+                        "(interrupt once more to exit at once, without cleanup).\n");
+        return;
+    }
+    if (n > 2) {
+        // in case it hangs, a third interrupt still terminates the server, without running any destructors
+        fprintf(stderr, "Received third interrupt, terminating immediately.\n");
+        std::_Exit(1);
     }
 
     shutdown_handler(signal);
