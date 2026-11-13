@@ -107,6 +107,41 @@ static std::vector<float> resample_linear(const std::vector<float> & in, int sr_
     return out;
 }
 
+// Same default band-limited sinc interpolator as torchaudio.functional.resample
+// (sinc_interp_hann, lowpass_filter_width=6, rolloff=0.99).
+static std::vector<float> resample_sinc(const std::vector<float> & in, int sr_in, int sr_out) {
+    if (sr_in == sr_out || in.empty()) return in;
+    const int gcd = std::gcd(sr_in, sr_out);
+    const int orig = sr_in / gcd, dst = sr_out / gcd;
+    const float base = std::min(orig, dst) * 0.99f;
+    const int width = (int) std::ceil(6.0 * orig / base);
+    const int tap = 2 * width + orig;
+    std::vector<float> kernel((size_t) dst * tap);
+    for (int phase = 0; phase < dst; phase++) {
+        for (int k = 0; k < tap; k++) {
+            float t = -phase / (float) dst + (k - width) / (float) orig;
+            t = std::max(-6.0f, std::min(6.0f, t * base));
+            const float window = std::cos(t * (float) M_PI / 6.0f / 2.0f);
+            t *= (float) M_PI;
+            const float sinc = t == 0.0f ? 1.0f : std::sin(t) / t;
+            kernel[(size_t) phase * tap + k] = sinc * window * window * base / orig;
+        }
+    }
+
+    std::vector<float> pad((size_t) in.size() + 2 * width + orig, 0.0f);
+    std::copy(in.begin(), in.end(), pad.begin() + width);
+    const size_t out_len = (size_t) std::ceil((double) dst * in.size() / orig);
+    std::vector<float> out(out_len);
+    for (size_t j = 0; j < out_len; j++) {
+        const float * k = kernel.data() + (size_t) (j % dst) * tap;
+        const float * x = pad.data() + (j / dst) * orig;
+        double sum = 0.0;
+        for (int i = 0; i < tap; i++) sum += (double) k[i] * x[i];
+        out[j] = (float) sum;
+    }
+    return out;
+}
+
 static std::vector<float> load_f32(const std::string & path, size_t expected = 0) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) { fprintf(stderr, "cannot open %s\n", path.c_str()); std::exit(1); }
@@ -124,9 +159,10 @@ struct ort_session {
     std::vector<const char *> in_c, out_c;
 
     ort_session() = default;
-    ort_session(Ort::Env & env, const std::string & path) {
+    ort_session(Ort::Env & env, const std::string & path,
+                GraphOptimizationLevel level = GraphOptimizationLevel::ORT_ENABLE_ALL) {
         Ort::SessionOptions opt;
-        opt.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        opt.SetGraphOptimizationLevel(level);
         opt.SetIntraOpNumThreads(16);
         session = Ort::Session(env, path.c_str(), opt);
         for (size_t i = 0; i < session.GetInputCount(); i++) {
@@ -199,13 +235,15 @@ static std::vector<float> whisper_mel(const std::vector<float> & pcm16, int & n_
 
     n_frames = (int) (pcm16.size() / hop);
     std::vector<float> mel((size_t) 128 * n_frames);
-    std::vector<float> frame(n_fft);
+    std::vector<float> frame(n_fft), frame_mel(128);
     float vmax = -1e30f;
     for (int i = 0; i < n_frames; i++) {
         std::copy(x.begin() + (size_t) i * hop, x.begin() + (size_t) i * hop + n_fft, frame.begin());
-        float * dst = mel.data() + (size_t) i * 128;
-        mtmd_audio_log_mel_frame(cache, frame.data(), n_fft, 128, dst);
-        for (int j = 0; j < 128; j++) vmax = std::max(vmax, dst[j]);
+        mtmd_audio_log_mel_frame(cache, frame.data(), n_fft, 128, frame_mel.data());
+        for (int j = 0; j < 128; j++) {
+            mel[(size_t) j * n_frames + i] = frame_mel[j];
+            vmax = std::max(vmax, frame_mel[j]);
+        }
     }
     vmax -= 8.0f;
     for (auto & v : mel) v = (std::max(v, vmax) + 4.0f) / 4.0f;
@@ -237,7 +275,10 @@ static std::vector<float> kaldi_fbank80(const std::vector<float> & pcm16, int & 
         for (int j = frame_len; j < n_fft; j++) frame[j] = 0.0f;
         float * dst = feat.data() + (size_t) i * 80;
         mtmd_audio_log_mel_frame(cache, frame.data(), n_fft, 80, dst);
-        for (int j = 0; j < 80; j++) { dst[j] *= 2.302585092994046f; mean[j] += dst[j]; }
+        for (int j = 0; j < 80; j++) {
+            dst[j] = std::max(dst[j] * 2.302585092994046f, std::log(1.1920928955078125e-7f));
+            mean[j] += dst[j];
+        }
     }
     for (int j = 0; j < 80; j++) mean[j] /= std::max(1, n_frames);
     for (int i = 0; i < n_frames; i++) for (int j = 0; j < 80; j++) feat[(size_t) i * 80 + j] -= (float) mean[j];
@@ -249,9 +290,11 @@ static std::vector<float> flow_mel24(const std::vector<float> & pcm24, int & n_f
     mtmd_audio_cache cache;
     cache.fill_sin_cos_table(1920);
     cache.hann_window = t.flow_hann;
-    cache.filters.n_mel = 80;
+    const int n_bins = 1920 / 2 + 1;
+    cache.filters.n_mel = n_bins;
     cache.filters.n_fft = 1920;
-    cache.filters.data = t.flow_mel;
+    cache.filters.data.assign((size_t) n_bins * n_bins, 0.0f);
+    for (int i = 0; i < n_bins; i++) cache.filters.data[(size_t) i * n_bins + i] = 1.0f;
 
     const int n_fft = 1920, hop = 480, pad = (n_fft - hop) / 2;
     std::vector<float> x(pcm24.size() + 2 * pad);
@@ -261,15 +304,21 @@ static std::vector<float> flow_mel24(const std::vector<float> & pcm24, int & n_f
 
     n_frames = (int) (pcm24.size() / hop);
     std::vector<float> feat((size_t) n_frames * 80);
-    std::vector<float> frame(n_fft);
+    std::vector<float> frame(n_fft), log_power(n_bins), magnitude(n_bins);
     const float floor_log = std::log(1e-5f);
     for (int i = 0; i < n_frames; i++) {
         std::copy(x.begin() + (size_t) i * hop, x.begin() + (size_t) i * hop + n_fft, frame.begin());
         float * dst = feat.data() + (size_t) i * 80;
-        mtmd_audio_log_mel_frame(cache, frame.data(), n_fft, 80, dst);
-        for (int j = 0; j < 80; j++) {
-            // helper: log10(power); official: log(max(sqrt(power), 1e-5)).
-            dst[j] = std::max(0.5f * 2.302585092994046f * dst[j], floor_log);
+        mtmd_audio_log_mel_frame(cache, frame.data(), n_fft, n_bins, log_power.data());
+        for (int k = 0; k < n_bins; k++) {
+            const float power = std::exp(2.302585092994046f * log_power[k]);
+            magnitude[k] = std::sqrt(power + 1e-9f);
+        }
+        for (int m = 0; m < 80; m++) {
+            double sum = 0.0;
+            const float * filter = t.flow_mel.data() + (size_t) m * n_bins;
+            for (int k = 0; k < n_bins; k++) sum += (double) filter[k] * magnitude[k];
+            dst[m] = std::max(std::log((float) sum), floor_log);
         }
     }
     return feat;
@@ -425,15 +474,18 @@ int main(int argc, char ** argv) {
 
     wav_data wav;
     if (!read_wav(a.prompt_wav.c_str(), wav)) return 1;
-    auto pcm16 = resample_linear(wav.pcm, wav.sample_rate, 16000);
-    auto pcm24 = resample_linear(wav.pcm, wav.sample_rate, 24000);
+    auto pcm16 = resample_sinc(wav.pcm, wav.sample_rate, 16000);
+    auto pcm24 = resample_sinc(wav.pcm, wav.sample_rate, 24000);
 
     Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "cosyvoice3");
     Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-    auto make_session = [&](const std::string & path) {
-        return std::make_unique<ort_session>(env, path);
+    auto make_session = [&](const std::string & path,
+                            GraphOptimizationLevel level = GraphOptimizationLevel::ORT_ENABLE_ALL) {
+        return std::make_unique<ort_session>(env, path, level);
     };
-    auto campplus = make_session(a.campplus);
+    // ORT >= 1.23 fuses this graph in a way that changes the FP32 result by
+    // ~1%; the reference path keeps its unoptimized computation.
+    auto campplus = make_session(a.campplus, GraphOptimizationLevel::ORT_DISABLE_ALL);
     auto tokenizer = make_session(a.tokenizer);
     auto flow_enc = make_session(a.flow_encoder);
     auto estimator = make_session(a.flow_estimator);
@@ -476,6 +528,8 @@ int main(int argc, char ** argv) {
         dump(".ptok.i32", prompt_tok.data(), prompt_tok.size() * 4);
         dump(".embedding.f32", embedding.data(), embedding.size() * 4);
         dump(".flowfeat.f32", prompt_feat.data(), prompt_feat.size() * 4);
+        dump(".pcm16.f32", pcm16.data(), pcm16.size() * 4);
+        dump(".pcm24.f32", pcm24.data(), pcm24.size() * 4);
         FILE * f = fopen((a.dump_feats + ".shape.txt").c_str(), "w");
         fprintf(f, "fbank %d 80\nwmel 128 %d\nptok %zu\nflowfeat %d 80\n", fbank_frames, wmel_frames, prompt_tok.size(), flow_frames);
         fclose(f);
