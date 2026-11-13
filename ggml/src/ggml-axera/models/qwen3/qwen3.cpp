@@ -48,7 +48,7 @@ class qwen3 final : public model {
     params           prm;
     graph_names      names;
     const void *     bound = nullptr;
-    int              L = 0, H = 0, NBLK = 0, AX = 1;  // AX: position axes (1 RoPE, 3 M-RoPE)
+    int              L = 0, H = 0, NBLK = 0, AX = 1, PHASES = 4;  // AX: position axes (1 RoPE, 3 M-RoPE)
 
     axera_cmm                        KV;
     std::map<std::string, axera_cmm> banks;
@@ -105,7 +105,7 @@ axera_cmm qwen3::bank(const std::map<std::string, ggml_tensor *> & t, const io_d
     };
     for (int b = 0; b < nb; ++b) {
         axera_mapped_drop_guard drop(read, !keep_pages);
-        const int il  = 4 * b + phase;
+        const int il  = PHASES * b + phase;
         uint8_t * dst = (uint8_t *) c->vir + (size_t) b * bb;
         auto      put = [&](const std::vector<float> & v, float scale = 1.0f) {
             GGML_ASSERT(v.size() * (d.dtype == 3 ? sizeof(float) : sizeof(ggml_bf16_t)) == bb);
@@ -190,7 +190,8 @@ axera_cmm qwen3::bank(const std::map<std::string, ggml_tensor *> & t, const io_d
 void qwen3::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_) {
     L = L_;
     H = H_;
-    GGML_ASSERT(L % 4 == 0);
+    PHASES = man.phases;
+    GGML_ASSERT((PHASES == 2 || PHASES == 4) && L % PHASES == 0);
     const kernel & pk = man.get("prefill");
     const kernel * dk = man.kernels.count("decode") ? &man.get("decode") : nullptr;  // (pooled embeddings: none)
     const io_desc * kv = nullptr;
@@ -251,7 +252,7 @@ void qwen3::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tens
         if (d.name.rfind("k_", 0) != 0 || it == banks.end()) {
             GGML_ABORT("axera qwen3: decode: unexpected input %s\n", d.name.c_str());
         }
-        const size_t nb = (size_t) L / 4;  // blocks of one phase in the bank
+        const size_t nb = (size_t) L / PHASES;  // blocks of one phase in the bank
         GGML_ASSERT(nb > 0 && it->second->size % nb == 0);
         const size_t bb = it->second->size / nb;
         const size_t off = (size_t) gi * d.bytes;
