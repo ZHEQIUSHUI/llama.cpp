@@ -19,6 +19,10 @@
 #include <unordered_map>
 #include <utility>
 
+#if defined(VOXCPM2_HAVE_AXERA)
+#include "ggml-axera/models/voxcpm2/vox_acoustic.h"
+#endif
+
 namespace {
 
 constexpr int   kAudioStartToken       = 101;
@@ -725,7 +729,11 @@ bool VoxCPM2Runtime::init(const std::string & base_lm_path,
 
     LOG_INF("VoxCPM2Runtime: custom component backend=%s\n", ggml_backend_name(backend));
 
-    if (!base_lm.init(base_lm_path, n_gpu_layers)) {
+    int base_layers = n_gpu_layers;
+    if (const char * e = std::getenv("VOXCPM2_BASE_CPU"); e && e[0] != '\0' && e[0] != '0') {
+        base_layers = 0;
+    }
+    if (!base_lm.init(base_lm_path, base_layers)) {
         return fail("failed to initialize BaseLM");
     }
     if (!token_embeddings.load(base_lm_path)) {
@@ -764,6 +772,36 @@ bool VoxCPM2Runtime::init(const std::string & base_lm_path,
     if (!audio_vae.init_from_gguf(acoustic_path, backend)) {
         return fail("failed to initialize AudioVAE");
     }
+#if defined(VOXCPM2_HAVE_AXERA)
+    {
+        const char * npu_env = std::getenv("VOXCPM2_ACOUSTIC_NPU");
+        const bool   want_npu = npu_env == nullptr || (npu_env[0] != '\0' && npu_env[0] != '0');
+        if (want_npu && loc_dit.store && loc_enc.store && audio_vae.store && projections.store) {
+            std::map<std::string, ggml_tensor *> tensors;
+            for (const auto * store : { loc_dit.store.get(), loc_enc.store.get(), audio_vae.store.get(),
+                                        projections.store.get() }) {
+                for (const auto & kv : store->tensors) {
+                    tensors[kv.first] = kv.second;
+                }
+            }
+            std::vector<float> factors;
+            if (!loc_dit.store->get_f32_array("voxcpm.rope.long_factor", factors)) {
+                LOG_WRN("VoxCPM2Runtime: rope factors missing; acoustic NPU disabled\n");
+            } else {
+                std::string err;
+                acoustic_npu = axera::vox_acoustic_open(tensors, factors, &err);
+                if (!acoustic_npu) {
+                    LOG_ERR("VoxCPM2Runtime: acoustic NPU unavailable: %s\n", err.c_str());
+                    if (npu_env != nullptr) {
+                        return fail("acoustic NPU requested but unavailable: " + err);
+                    }
+                } else {
+                    LOG_INF("VoxCPM2Runtime: acoustic NPU enabled (dit + locenc + audiovae)\n");
+                }
+            }
+        }
+    }
+#endif
 
     cfm_solver.config.cfg_rate = loc_dit.config.cfg_rate;
     rng.seed(0);
@@ -883,6 +921,11 @@ void VoxCPM2Runtime::reset_state() {
     state_ready       = false;
     base_lm.clear_kv_cache();
     residual_lm.clear_kv();
+#if defined(VOXCPM2_HAVE_AXERA)
+    if (acoustic_npu) {
+        axera::vox_acoustic_vae_reset(static_cast<axera::vox_acoustic *>(acoustic_npu));
+    }
+#endif
 }
 
 bool VoxCPM2Runtime::prefill_tokens(const std::vector<int32_t> & token_ids) {
@@ -1276,6 +1319,121 @@ bool VoxCPM2Runtime::ensure_decode_front_half_graph(int n_timesteps, float cfg_v
     return true;
 }
 
+#if defined(VOXCPM2_HAVE_AXERA)
+// NPU acoustic front: the LocDiT estimator (both CFG branches and the blend) runs as one
+// four-core AXModel per Euler evaluation; the Euler update, LocEnc patch encoding, the
+// enc_to_lm projection and the stop head stay on the host.  The stop head is two small
+// matmuls, so it is not worth another kernel launch.
+bool VoxCPM2Runtime::run_decode_front_half_npu(const std::vector<float> &    noise,
+                                               const VoxCPM2GenerateParams & params,
+                                               VoxCPM2DecodeStepResult &     result) {
+    const int fdim  = feat_dim();
+    const int psize = patch_size();
+    if (fdim != 64 || psize != 4) {
+        return fail("NPU acoustic front needs feat_dim 64 / patch_size 4");
+    }
+    if (noise.size() != static_cast<size_t>(fdim) * psize) {
+        return fail("decode noise size does not match feat_dim * patch_size");
+    }
+    if (params.cfg_value != 2.0f) {
+        LOG_WRN("VoxCPM2Runtime: NPU LocDiT bakes the model CFG rate 2.0; request asks %.3f\n", params.cfg_value);
+    }
+    if (!cfm_solver.config.use_cfg_zero_star) {
+        return fail("NPU LocDiT implements the model's cfg-zero-star blend only");
+    }
+
+    std::vector<float> x = noise;
+    if (params.temperature != 1.0f) {
+        for (float & v : x) {
+            v *= params.temperature;
+        }
+    }
+
+    const std::vector<float> t_span =
+        UnifiedCFMSolver::build_timesteps(params.inference_timesteps, cfm_solver.config.sway_sampling_coef);
+    if (t_span.size() < 2) {
+        return fail("NPU LocDiT needs at least one Euler step");
+    }
+    float       t  = t_span[0];
+    float       dt = t_span[0] - t_span[1];
+    const int   zero_init_steps =
+        params.inference_timesteps > 1 ? std::max(1, static_cast<int>(t_span.size() * 0.04f)) : 0;
+    std::vector<float> vel(static_cast<size_t>(fdim) * psize, 0.0f);
+
+    for (int step = 1; step <= params.inference_timesteps; ++step) {
+        if (step <= zero_init_steps) {
+            std::fill(vel.begin(), vel.end(), 0.0f);
+        } else {
+            VoxProfScope prof(&g_prof.front_dit_ms);
+            if (!axera::vox_acoustic_dit(static_cast<axera::vox_acoustic *>(acoustic_npu), x.data(), lm_hidden.data(),
+                                         residual_hidden.data(), prefix_feat_cond.data(), t, vel.data())) {
+                return fail("LocDiT NPU evaluation failed");
+            }
+        }
+        for (size_t i = 0; i < x.size(); ++i) {
+            x[i] -= vel[i] * dt;
+        }
+        t -= dt;
+        if (step < params.inference_timesteps) {
+            dt = t - t_span[static_cast<size_t>(step + 1)];
+        }
+    }
+
+    result.latent_patch = x;
+    trace_dump("step" + std::to_string(audio_frame_count) + "_patch", result.latent_patch);
+
+    std::vector<float> locenc_hidden(static_cast<size_t>(loc_enc.config.transformer.hidden_size));
+    {
+        VoxProfScope prof(&g_prof.front_locenc_ms);
+        if (!axera::vox_acoustic_locenc(static_cast<axera::vox_acoustic *>(acoustic_npu), x.data(),
+                                        locenc_hidden.data())) {
+            return fail("LocEnc NPU evaluation failed");
+        }
+        result.current_embed = run_enc_to_lm(locenc_hidden, 1);
+    }
+    if (result.current_embed.size() != static_cast<size_t>(base_lm.n_embd)) {
+        return fail("enc_to_lm did not return a BaseLM hidden state");
+    }
+    trace_dump("step" + std::to_string(audio_frame_count) + "_embed", result.current_embed);
+
+    {
+        VoxProfScope prof(&g_prof.front_stop_ms);
+        GgmlContextGuard ctx_guard(kSmallGraphMem, true);
+        ggml_context *   ctx = ctx_guard.get();
+        if (!ctx) {
+            return fail("failed to create stop-predictor context");
+        }
+        ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, base_lm.n_embd);
+        ggml_set_input(input);
+        ggml_tensor * output = stop_predictor.forward(ctx, input);
+        ggml_cgraph * graph  = ggml_new_graph_custom(ctx, kSmallGraphNodes, false);
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+        BackendBufferGuard buffer(ggml_backend_alloc_ctx_tensors(ctx, backend));
+        if (!buffer.buffer) {
+            return fail("failed to allocate stop-predictor tensors");
+        }
+        ggml_backend_tensor_set(input, lm_hidden.data(), 0, lm_hidden.size() * sizeof(float));
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+            return fail("stop-predictor graph compute failed");
+        }
+        std::vector<float> stop_logits = tensor_to_vector(output);
+        if (stop_logits.size() >= 2) {
+            result.continue_logit = stop_logits[0];
+            result.stop_logit     = stop_logits[1];
+            result.should_stop    = stop_logits[1] > stop_logits[0];
+            if (std::getenv("VOXCPM2_DEBUG_STOP")) {
+                LOG_INF("STOP step=%d logits=[%.6f, %.6f] argmax=%d\n", current_position,
+                        result.continue_logit, result.stop_logit, result.should_stop ? 1 : 0);
+            }
+        }
+    }
+
+    result.position = current_position;
+    return true;
+}
+#endif  // VOXCPM2_HAVE_AXERA
+
 bool VoxCPM2Runtime::run_decode_front_half(const std::vector<float> &    noise,
                                            const VoxCPM2GenerateParams & params,
                                            VoxCPM2DecodeStepResult &     result) {
@@ -1284,6 +1442,11 @@ bool VoxCPM2Runtime::run_decode_front_half(const std::vector<float> &    noise,
         return fail("decode noise size does not match feat_dim * patch_size");
     }
 
+#if defined(VOXCPM2_HAVE_AXERA)
+    if (acoustic_npu) {
+        return run_decode_front_half_npu(noise, params, result);
+    }
+#endif
     if (!ensure_decode_front_half_graph(params.inference_timesteps, params.cfg_value)) {
         return false;
     }
@@ -1518,6 +1681,21 @@ std::vector<float> VoxCPM2Runtime::decode_pool_range_to_waveform(int start_patch
         }
     }
 
+#if defined(VOXCPM2_HAVE_AXERA)
+    if (acoustic_npu && fdim == 64 && psize == 4 && (target_sr <= 0 || target_sr == 48000)) {
+        axera::vox_acoustic * a = static_cast<axera::vox_acoustic *>(acoustic_npu);
+        axera::vox_acoustic_vae_reset(a);
+        std::vector<float> result(static_cast<size_t>(n_patches) * 7680);
+        for (int p = 0; p < n_patches; ++p) {
+            const std::vector<float> & patch = output_pool[static_cast<size_t>(start_patch + p)];
+            if (!axera::vox_acoustic_vae(a, patch.data(), result.data() + static_cast<size_t>(p) * 7680)) {
+                fail("AudioVAE NPU decode failed");
+                return {};
+            }
+        }
+        return result;
+    }
+#endif
     GgmlContextGuard ctx_guard(kLargeGraphMem, true);
     ggml_context *   ctx = ctx_guard.get();
     if (!ctx) {
@@ -1581,6 +1759,17 @@ std::vector<float> VoxCPM2Runtime::decode_patch_streaming(const std::vector<floa
         fail("streaming decode received an invalid latent patch");
         return {};
     }
+
+#if defined(VOXCPM2_HAVE_AXERA)
+    if (acoustic_npu && fdim == 64 && psize == 4 && (target_sr <= 0 || target_sr == 48000)) {
+        std::vector<float> pcm(7680);
+        if (!axera::vox_acoustic_vae(static_cast<axera::vox_acoustic *>(acoustic_npu), patch.data(), pcm.data())) {
+            fail("AudioVAE NPU streaming decode failed");
+            return {};
+        }
+        return pcm;
+    }
+#endif
 
     std::vector<float> latents(static_cast<size_t>(psize) * static_cast<size_t>(fdim), 0.0f);
     for (int t = 0; t < psize; ++t) {
@@ -2211,6 +2400,12 @@ bool VoxCPM2Runtime::generate_with_continuation_streaming(const std::string &   
 void VoxCPM2Runtime::free() {
     cached_front_half.free_graph();
     reset_state();
+#if defined(VOXCPM2_HAVE_AXERA)
+    if (acoustic_npu) {
+        axera::vox_acoustic_close(static_cast<axera::vox_acoustic *>(acoustic_npu));
+        acoustic_npu = nullptr;
+    }
+#endif
     audio_vae.free();
     stop_predictor.free();
     projections.free();

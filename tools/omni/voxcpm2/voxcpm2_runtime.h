@@ -206,6 +206,7 @@ struct VoxCPM2Runtime {
     std::unordered_map<int32_t, std::vector<int32_t>> cjk_split_map;
     std::unordered_map<int32_t, std::vector<int32_t>> cjk_prefix_single_split_map;
     std::unordered_set<int32_t>                       cjk_token_ids;
+    void *                                            acoustic_npu = nullptr;  // axera::vox_acoustic (NPU build)
 
     // Cached decode-front-half graph (CFM solve + LocEnc + stop predictor).
     // Built once per (timesteps, cfg_value) pair and reused across decode steps.
@@ -244,6 +245,9 @@ struct VoxCPM2Runtime {
     bool                 run_decode_front_half(const std::vector<float> &    noise,
                                                const VoxCPM2GenerateParams & params,
                                                VoxCPM2DecodeStepResult &     result);
+    bool                 run_decode_front_half_npu(const std::vector<float> &    noise,
+                                                   const VoxCPM2GenerateParams & params,
+                                                   VoxCPM2DecodeStepResult &     result);
     bool                 ensure_decode_front_half_graph(int n_timesteps, float cfg_value);
     bool                 build_text_tokenizer_metadata(const std::string & base_lm_path);
     bool                 build_reference_prefill_inputs(const std::vector<int32_t> & text_token_ids,

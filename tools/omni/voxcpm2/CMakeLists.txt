@@ -15,6 +15,10 @@ target_include_directories(${CORE_TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${P
 target_include_directories(${CORE_TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 target_link_libraries(${CORE_TARGET} PUBLIC llama llama-common ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${CORE_TARGET} PUBLIC cxx_std_17)
+if (GGML_AXERA)
+    target_compile_definitions(${CORE_TARGET} PRIVATE VOXCPM2_HAVE_AXERA=1)
+    target_link_libraries(${CORE_TARGET} PUBLIC ggml-axera)
+endif()
 
 set(TARGET voxcpm2-cli)
 add_executable(${TARGET} voxcpm2_cli.cpp)
