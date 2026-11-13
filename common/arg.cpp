@@ -4512,6 +4512,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.tts_ref_text = value;
         }
     ).set_examples({LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--voxcpm2-base-lm"}, "FNAME",
+        "VoxCPM2 BaseLM GGUF (enables the VoxCPM2 TTS path)",
+        [](common_params & params, const std::string & value) {
+            params.voxcpm2_base_lm = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--voxcpm2-acoustic"}, "FNAME",
+        "VoxCPM2 acoustic GGUF (ResidualLM/LocEnc/LocDiT/AudioVAE)",
+        [](common_params & params, const std::string & value) {
+            params.voxcpm2_acoustic = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_SERVER}));
 
     //
     // diffusion params
