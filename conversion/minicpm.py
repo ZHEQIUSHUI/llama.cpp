@@ -204,6 +204,23 @@ class MiniCPMV4_6VisionModel(MmprojModel):
         return super().filter_tensors(item)
 
 
+# MiniCPM-OCR 1.0 uses the same Qwen3.5 text tower and the MiniCPM-V 4.6 SigLIP vision
+# tower. Its 4x preprocessor skips the intermediate vit_merger and keeps the final 2x2
+# merger, which is exactly the V4.6 4x path above.
+@ModelBase.register("MiniCPMOcrForConditionalGeneration")
+@ModelBase.example("openbmb/MiniCPM-OCR-1.0")
+class MiniCPMOcrTextModel(MiniCPMV4_6TextModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35
+    no_mtp = True  # the OCR checkpoint has mtp_num_hidden_layers = 0
+
+
+@ModelBase.register("MiniCPMOcrForConditionalGeneration")
+@ModelBase.example("openbmb/MiniCPM-OCR-1.0")
+class MiniCPMOcrVisionModel(MiniCPMV4_6VisionModel):
+    projector_type = gguf.VisionProjectorType.MINICPMV4_6
+    default_scale_resolution = 448
+
+
 # MiniCPM-V 4.7 shares the v4.6 stack: the same Qwen3.5 text tower (MoE variant when the checkpoint says so) and the same SigLIP + vit_merger + merger vision tower.
 
 @ModelBase.register("MiniCPMV4_7ForConditionalGeneration")
