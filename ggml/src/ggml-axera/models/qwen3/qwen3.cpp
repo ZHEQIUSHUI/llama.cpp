@@ -92,6 +92,9 @@ axera_cmm qwen3::bank(const std::map<std::string, ggml_tensor *> & t, const io_d
     const int         nb    = (int) d.shape[0];  // blocks (the cos / sin tables: one)
     GGML_ASSERT(d.bytes % nb == 0);
     axera_cmm    c  = axera_cmm_alloc(d.bytes);
+    // Convert in ordinary memory and copy the finished bank once.  Writing
+    // every element through the CMM mapping is much slower for an 8B bank.
+    std::vector<uint8_t> staging(d.bytes);
     const size_t bb = d.bytes / nb;  // bytes per block
     const bool keep_pages = axera_keep_pages();
     std::vector<const ggml_tensor *> read;  // the GGUF tensors of one block: their mapped pages dropped right after it
@@ -106,7 +109,7 @@ axera_cmm qwen3::bank(const std::map<std::string, ggml_tensor *> & t, const io_d
     for (int b = 0; b < nb; ++b) {
         axera_mapped_drop_guard drop(read, !keep_pages);
         const int il  = PHASES * b + phase;
-        uint8_t * dst = (uint8_t *) c->vir + (size_t) b * bb;
+        uint8_t * dst = staging.data() + (size_t) b * bb;
         auto      put = [&](const std::vector<float> & v, float scale = 1.0f) {
             GGML_ASSERT(v.size() * (d.dtype == 3 ? sizeof(float) : sizeof(ggml_bf16_t)) == bb);
             for (size_t i = 0; i < v.size(); ++i) {
@@ -178,6 +181,7 @@ axera_cmm qwen3::bank(const std::map<std::string, ggml_tensor *> & t, const io_d
             }
         }
     }
+    memcpy(c->vir, staging.data(), staging.size());
     c->flush();
     if (keep_pages) {
         for (const ggml_tensor * w : read) {
