@@ -1,7 +1,7 @@
 // Axera NPU backend: the MiniCPM-OCR-1.0 SigLIP vision encoder in one four-core kernel.
 //
-// One call runs 27 layers and the final 2 x 2 merger for up to N patches (the kernel is built for
-// N = 1024; mtmd hands over one slice at a time).  The learned position table uses the processor's
+// One call runs 27 layers and the final 2 x 2 merger for up to N patches (the release kernel is built
+// for N = 1536; mtmd hands over one slice at a time).  The learned position table uses the processor's
 // nearest bucket (floor(70 * i / size)), there is no RoPE, and the q/k/v projections are stacked into
 // the qkv layout of q35_vit's existing layer functions.  Weights come from the mmproj GGUF.
 
