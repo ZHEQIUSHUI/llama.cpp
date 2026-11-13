@@ -4632,7 +4632,9 @@ private:
                             // a pure append reuses the live state at the end of the cached prompt: the recurrent state
                             // is already at the right position, so rewinding through a checkpoint and replaying the tail
                             // would only copy the checkpoint payload (hundreds of MiB on Axera) for an identical result.
-                            const bool state_at_prompt_tip = n_swa == 0 && n_past == (int) slot.prompt.n_tokens();
+                            // an identical prompt has no new token: its last token is evaluated again [TAG_PROMPT_LOGITS],
+                            // which needs a state from before that token, so the tip state cannot be used as is
+                            const bool state_at_prompt_tip = n_swa == 0 && has_new_tokens && n_past == (int) slot.prompt.n_tokens();
 
                             // a continuation can still be short of the live tip: the generated tokens of the previous
                             // request are in the slot state but the client may encode the same text differently (or
