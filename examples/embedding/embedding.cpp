@@ -107,8 +107,15 @@ int main(int argc, char ** argv) {
 
     params.embedding = true;
 
-    // get max number of sequences per batch
-    const int n_seq_max = llama_max_parallel_sequences();
+    // get max number of sequences per batch; a backend may cap it (ggml-axera runs a single sequence, so every
+    //   prompt is then encoded in its own batch)
+    int n_seq_max = llama_max_parallel_sequences();
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        auto * limit_fn = (uint32_t (*)()) ggml_backend_reg_get_proc_address(ggml_backend_reg_get(i), "ggml_backend_get_n_seq_max_limit");
+        if (limit_fn) {
+            n_seq_max = std::min(n_seq_max, (int) limit_fn());
+        }
+    }
 
     // if the number of prompts that would be encoded is known in advance, it's more efficient to specify the
     //   --parallel argument accordingly. for convenience, if not specified, we fallback to unified KV cache
@@ -139,7 +146,7 @@ int main(int argc, char ** argv) {
     auto * model = llama_init->model();
     auto * ctx = llama_init->context();
 
-    if (model == NULL) {
+    if (model == NULL || ctx == NULL) {
         LOG_ERR("%s: unable to load model\n", __func__);
         return 1;
     }
