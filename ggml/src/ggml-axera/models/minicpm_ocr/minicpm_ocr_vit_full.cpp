@@ -6,6 +6,7 @@
 // the qkv layout of q35_vit's existing layer functions.  Weights come from the mmproj GGUF.
 
 #include "../model.h"
+#include "../../core/patch_embed.h"
 #include "../../ops/ops.h"
 
 #include <cmath>
@@ -26,6 +27,7 @@ class minicpm_ocr_vit_full final : public model {
     std::map<std::string, axera_cmm> buf;
     const void *                     bound = nullptr;
     int                              N = 0, QB = 0, BC = 0;
+    patch_embed                      pemb;
 
     axera_cmm & io(const char * n, bool out = false) {
         auto & c = buf[n];
@@ -100,9 +102,20 @@ void minicpm_ocr_vit_full::weights(int L, int H, int CP) {
         io(in)->flush();
     }
     const ggml_tensor * wp = names.at("v.patch_embd.weight");
-    GGML_ASSERT((size_t) ggml_nelements(wp) == (size_t) H * CP &&
-                (size_t) H * CP * sizeof(ggml_bf16_t) == k.in_bytes("w_patch"));
-    to_bf16(wp, (ggml_bf16_t *) io("w_patch")->vir);
+    GGML_ASSERT((size_t) ggml_nelements(wp) == (size_t) H * CP);
+    std::vector<float> pw((size_t) H * CP), zero((size_t) H * CP, 0.0f);
+    if (wp->type == GGML_TYPE_F32) {
+        memcpy(pw.data(), wp->data, pw.size() * sizeof(float));
+    } else if (wp->type == GGML_TYPE_BF16) {
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) wp->data, pw.data(), (int64_t) pw.size());
+    } else {
+        ggml_get_type_traits(wp->type)->to_float(wp->data, pw.data(), (int64_t) pw.size());
+    }
+    const int PW = (int) (k.in_bytes("w_patch") / sizeof(ggml_bf16_t) / H);
+    GGML_ASSERT(pemb.init(pw.data(), zero.data(), H, CP, PW));
+    const std::vector<float> & ws = pemb.weight_still();
+    GGML_ASSERT(ws.size() * sizeof(ggml_bf16_t) == k.in_bytes("w_patch"));
+    ggml_fp32_to_bf16_row(ws.data(), (ggml_bf16_t *) io("w_patch")->vir, (int64_t) ws.size());
     io("w_patch")->flush();
 }
 
@@ -183,20 +196,26 @@ ggml_status minicpm_ocr_vit_full::compute(ggml_cgraph * g) {
         const float * img = (const float *) raw->data;
         const int64_t W = raw->ne[0], HI = raw->ne[1];
         auto *        pxb = (ggml_bf16_t *) io("px")->vir;
+        const int     PW = pemb.width();
         axera_host_pool().run(N, [&](int64_t i) {
-            ggml_bf16_t * d = pxb + i * CP;
+            ggml_bf16_t * d = pxb + i * PW;
             if (i >= n) {
-                std::fill(d, d + CP, ggml_fp32_to_bf16(0.0f));
+                std::fill(d, d + PW, ggml_fp32_to_bf16(0.0f));
                 return;
             }
             const int y = (int) ((i / (2 * gw)) * 2 + (i % 4) / 2);
             const int x = (int) (((i / 4) % (gw / 2)) * 2 + i % 2);
+            thread_local std::vector<float> p, row;
+            p.resize(CP);
+            row.resize(PW);
             for (int c = 0; c < 3; ++c) {
                 for (int ky = 0; ky < PS; ++ky) {
-                    const float * row = img + c * W * HI + (int64_t) (y * PS + ky) * W + x * PS;
-                    ggml_fp32_to_bf16_row(row, d + (c * PS + ky) * PS, PS);
+                    const float * src = img + c * W * HI + (int64_t) (y * PS + ky) * W + x * PS;
+                    memcpy(p.data() + (c * PS + ky) * PS, src, PS * sizeof(float));
                 }
             }
+            pemb.row(p.data(), nullptr, row.data());
+            ggml_fp32_to_bf16_row(row.data(), d, PW);
         });
         io("px")->flush();
     }

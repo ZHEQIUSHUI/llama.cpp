@@ -85,8 +85,10 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
         llm = make_qwen35_dense(m);
     } else if (m.model == "qwen38_27b") {
         llm = make_qwen38_27b(m);
-    } else if (m.model == "qwen35_whole" || m.model == "minicpm_ocr") {
+    } else if (m.model == "qwen35_whole") {
         llm = make_qwen35_whole(m);
+    } else if (m.model == "minicpm_ocr") {
+        llm = make_minicpm_ocr_text(m);
     } else if (m.model == "qwen35_35b_a3b") {
         llm = make_qwen35_35b_a3b(m);
     } else if (m.model == "qwen35_moe_sgl") {
