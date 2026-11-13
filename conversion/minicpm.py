@@ -220,6 +220,13 @@ class MiniCPMOcrVisionModel(MiniCPMV4_6VisionModel):
     projector_type = gguf.VisionProjectorType.MINICPMV4_6
     default_scale_resolution = 448
 
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        # MiniCPMOcrImageProcessor aligns slices to patch_size * (2 for 4x, 4 for 16x).
+        self.gguf_writer.add_uint32(
+            "clip.vision.minicpmv_slice_align_merge",
+            2 if self.downsample_mode == "4x" else 4)
+
 
 # MiniCPM-V 4.7 shares the v4.6 stack: the same Qwen3.5 text tower (MoE variant when the checkpoint says so) and the same SigLIP + vit_merger + merger vision tower.
 

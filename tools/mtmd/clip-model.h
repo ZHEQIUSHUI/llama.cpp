@@ -199,6 +199,7 @@ struct clip_hparams {
     int minicpmv_version = 0;
     int32_t minicpmv_query_num = 0;         // MiniCPM-V query number
     int32_t insert_layer_id   = 0;          // MiniCPM-V 4.6 ViT merger insertion layer
+    int32_t minicpmv_slice_align_merge = 0; // 0 = model default; OCR 4x uses n_merge (2)
 
     // custom value provided by user, can be undefined if not set
     int32_t custom_image_min_tokens = -1;

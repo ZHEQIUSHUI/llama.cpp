@@ -169,9 +169,11 @@ struct mtmd_image_preprocessor_minicpmv : mtmd_image_preprocessor_llava_uhd {
     slice_instructions get_slice_instructions(const clip_image_size & original_size) const override;
 
 protected:
-    // always patch_size * 4, even in 4x mode (the 2x2 vit_merger slot stays)
+    // MiniCPM-V defaults to patch_size * 4; the OCR image processor aligns to
+    // its actual downsample factor (2 for 4x mode), carried in the GGUF.
     int get_slice_align() const override {
-        return hparams.patch_size * 4;
+        const int merge = hparams.minicpmv_slice_align_merge > 0 ? hparams.minicpmv_slice_align_merge : 4;
+        return hparams.patch_size * merge;
     }
 
     // Python's round() breaks ties to even, unlike std::round
