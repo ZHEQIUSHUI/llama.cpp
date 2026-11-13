@@ -45,6 +45,8 @@ std::shared_ptr<model> make_qwen35_moe_sgl(const manifest & m);  // Qwen3.5/3.6-
 std::shared_ptr<model> make_qwen3(const manifest & m);  // Qwen3 text decoders (Embedding, ASR text, TTS talker)
 std::shared_ptr<model> make_qwen35_vit(const manifest & m);  // the mmproj vision encoder (roles vit.*)
 std::shared_ptr<model> make_qwen35_vit_full(const manifest & m);  // the same in one call (role vit)
+std::shared_ptr<model> make_minicpm_ocr_vit_full(const manifest & m);  // MiniCPM-OCR SigLIP tower (role vit)
+bool minicpm_ocr_vit_graph(const ggml_cgraph * g);
 std::shared_ptr<model> make_qwen3_asr(const manifest & m);  // the Qwen3-ASR audio encoder (roles audio.*)
 // the Qwen3-TTS generation graphs: code predictor frames, codec decoder, speaker encoder (roles cp.*, gen.*)
 std::shared_ptr<model> make_qwen3_tts(const manifest & m);

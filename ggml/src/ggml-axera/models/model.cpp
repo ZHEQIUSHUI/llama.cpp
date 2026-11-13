@@ -50,7 +50,7 @@ struct composite final : model {
         if (g != last || g->n_nodes != n) {
             last = g;
             n    = g->n_nodes;
-            cur  = vit && vit_graph(g)                 ? vit.get() :
+            cur  = vit && (vit_graph(g) || minicpm_ocr_vit_graph(g)) ? vit.get() :
                    audio && qwen3_asr_graph(g)         ? audio.get() :
                    gen && !llm_graph(g)                ? gen.get() :
                                                          llm.get();
@@ -85,7 +85,7 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
         llm = make_qwen35_dense(m);
     } else if (m.model == "qwen38_27b") {
         llm = make_qwen38_27b(m);
-    } else if (m.model == "qwen35_whole") {
+    } else if (m.model == "qwen35_whole" || m.model == "minicpm_ocr") {
         llm = make_qwen35_whole(m);
     } else if (m.model == "qwen35_35b_a3b") {
         llm = make_qwen35_35b_a3b(m);
@@ -108,7 +108,8 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
     }
     auto c   = std::make_shared<composite>();
     c->llm   = llm;
-    c->vit   = vision1 ? make_qwen35_vit_full(m) : vision ? make_qwen35_vit(m) : nullptr;
+    c->vit   = vision1 ? (m.model == "minicpm_ocr" ? make_minicpm_ocr_vit_full(m) : make_qwen35_vit_full(m)) :
+               vision ? make_qwen35_vit(m) : nullptr;
     c->audio = audio ? make_qwen3_asr(m) : nullptr;
     c->gen   = gen ? make_qwen3_tts(m) : nullptr;
     return c;
