@@ -79,6 +79,7 @@ struct manifest {
     std::string dir, model;
     int64_t     context = 0;
     int         cores   = 0;
+    int         phases  = 4;  // prefill weight-bank groups (Qwen3: 4 by default, 2 for the 8B bank)
     std::map<std::string, std::map<std::string, param_desc>> params;  // layer kind -> parameter -> description
     std::map<std::string, kernel_desc>                       kernels;  // role -> description
 
