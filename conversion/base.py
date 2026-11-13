@@ -2122,6 +2122,10 @@ class TextModel(ModelBase):
             # ref: https://huggingface.co/IFM/K2-Horizon-36B
             res = "k2-horizon"
 
+        if chkhsh == "51447ac49e5bc244d9e249baff15cafa378c4e0ef1e6ecb056fcf384dbb68034":
+            # Fun-CosyVoice3: Qwen2 BPE plus the model-specific special-token table
+            res = "qwen2"
+
         if res is None:
             logger.warning("\n")
             logger.warning("**************************************************************************************")
