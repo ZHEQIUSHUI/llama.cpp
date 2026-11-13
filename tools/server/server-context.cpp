@@ -6950,6 +6950,9 @@ void server_routes::init_routes() {
             if (!task.tts.has_ref_audio) {
                 throw std::invalid_argument("ref_audio is required for CosyVoice3 zero-shot cloning");
             }
+            if (task.tts.ref_text.empty()) {
+                throw std::invalid_argument("ref_text is required for CosyVoice3 zero-shot cloning");
+            }
             if (task.tts.response_format != "wav") {
                 throw std::invalid_argument("CosyVoice3 supports response_format=\"wav\" only");
             }
