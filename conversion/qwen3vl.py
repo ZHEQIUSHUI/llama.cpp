@@ -395,6 +395,12 @@ class Qwen3ASRTextModel(Qwen3VLTextModel):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_num_deepstack_layers(0)
+        thinker_config = self.hparams.get("thinker_config", self.hparams)
+        classify_num = thinker_config.get("classify_num")
+        if classify_num is not None:
+            # ForcedAligner replaces the text vocabulary head with a timestamp classifier. The input embedding
+            # still has the full tokenizer vocabulary, so record the output width separately.
+            self.gguf_writer.add_embedding_length_out(int(classify_num))
         if "mrope_section" not in self.rope_parameters:
             # the transformers checkpoints (-hf) have plain RoPE: audio and text positions advance together (t = h =
             # w), where any split of the M-RoPE sections is plain RoPE; Qwen3-VL's split over the rotary pairs
