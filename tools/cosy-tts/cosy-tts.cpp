@@ -988,10 +988,13 @@ int main(int argc, char ** argv) {
                 memcpy(nmu.data() + (size_t) c * npu_flow_cap, mu.data() + (size_t) c * T, T * 4);
                 memcpy(ncond.data() + (size_t) c * npu_flow_cap, cond.data() + (size_t) c * T, T * 4);
                 memcpy(nx.data() + plane + (size_t) c * npu_flow_cap, x.data() + (size_t) c * T, T * 4);
+                memset(nmu.data() + plane + (size_t) c * npu_flow_cap, 0, T * 4);
+                memset(ncond.data() + plane + (size_t) c * npu_flow_cap, 0, T * 4);
             }
             memcpy(nmask.data(), mask.data(), T * 4);
             memcpy(nmask.data() + npu_flow_cap, mask.data(), T * 4);
             memcpy(nspks.data(), spks.data(), 80 * 4);
+            memset(nspks.data() + 80, 0, 80 * 4);
             nt[0] = nt[1] = (float) t_cur;
             if (!flow_npu->set_input("x", nx.data(), nx.size() * 4) ||
                 !flow_npu->set_input("mask", nmask.data(), nmask.size() * 4) ||
