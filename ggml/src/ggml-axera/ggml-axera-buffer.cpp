@@ -240,7 +240,8 @@ ggml_backend_buffer_type_t ggml_backend_axera_lazy_buffer_type(void) {
 // the buffer type of the llama.cpp caches: lazy host memory for an adapter that does not use them, else CMM
 ggml_backend_buffer_type_t ggml_backend_axera_kv_buffer_type(void) {
     const axera::manifest * m = axera::kernels();
-    return m && (m->model == "qwen38_27b" || m->model == "qwen35_whole" || m->model == "qwen35_moe_sgl") ? ggml_backend_axera_lazy_buffer_type() :
+    return m && (m->model == "qwen38_27b" || m->model == "qwen35_whole" || m->model == "qwen35_moe_sgl" ||
+                    m->model == "cpm5") ? ggml_backend_axera_lazy_buffer_type() :
                                                                              ggml_backend_axera_buffer_type();
 }
 
