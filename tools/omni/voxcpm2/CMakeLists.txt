@@ -29,13 +29,3 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()
-
-set(SERVER_TARGET llama-tts-server)
-add_executable(${SERVER_TARGET} voxcpm2_server.cpp)
-target_include_directories(${SERVER_TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
-target_link_libraries(${SERVER_TARGET} PRIVATE ${CORE_TARGET} cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
-target_compile_features(${SERVER_TARGET} PRIVATE cxx_std_17)
-
-if(LLAMA_TOOLS_INSTALL)
-    install(TARGETS ${SERVER_TARGET} RUNTIME)
-endif()

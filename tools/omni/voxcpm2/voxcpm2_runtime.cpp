@@ -779,7 +779,7 @@ bool VoxCPM2Runtime::init(const std::string & base_lm_path,
         if (want_npu && loc_dit.store && loc_enc.store && audio_vae.store && projections.store) {
             std::map<std::string, ggml_tensor *> tensors;
             for (const auto * store : { loc_dit.store.get(), loc_enc.store.get(), audio_vae.store.get(),
-                                        projections.store.get() }) {
+                                        projections.store.get(), residual_lm.store.get() }) {
                 for (const auto & kv : store->tensors) {
                     tensors[kv.first] = kv.second;
                 }
@@ -1060,6 +1060,7 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
     if (residual_fusion_input.empty()) {
         return fail("residual fusion prefill failed");
     }
+    trace_dump("prefill_fusion", residual_fusion_input);
 
     // Store for debug/dump
 
@@ -1070,7 +1071,24 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
     // cache writes are pure graph sinks that do not perturb that value.
     {
         VoxProfScope prof_res(&g_prof.residual_ms);
-        residual_hidden = residual_lm.prefill_kv(residual_fusion_input, seq_len);
+#if defined(VOXCPM2_HAVE_AXERA)
+        if (acoustic_npu && axera::vox_acoustic_has_residual(static_cast<axera::vox_acoustic *>(acoustic_npu))) {
+            axera::vox_acoustic * a = static_cast<axera::vox_acoustic *>(acoustic_npu);
+            axera::vox_acoustic_res_reset(a);
+            std::vector<float> last(static_cast<size_t>(hidden));
+            for (int i = 0; i < seq_len; ++i) {
+                if (!axera::vox_acoustic_res_step(
+                        a, residual_fusion_input.data() + static_cast<size_t>(i) * hidden, last.data())) {
+                    return fail("ResidualLM NPU prefill failed");
+                }
+                trace_dump("res_pre_" + std::to_string(i), last);
+            }
+            residual_hidden = std::move(last);
+        } else
+#endif
+        {
+            residual_hidden = residual_lm.prefill_kv(residual_fusion_input, seq_len);
+        }
     }
     if (residual_hidden.size() != static_cast<size_t>(hidden)) {
         return fail("ResidualLM KV cache prefill failed");
@@ -1606,8 +1624,21 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
     }
     {
         VoxProfScope prof_res(&g_prof.residual_ms);
-        residual_hidden = residual_lm.forward_step(fusion, current_position);
+#if defined(VOXCPM2_HAVE_AXERA)
+        if (acoustic_npu && axera::vox_acoustic_has_residual(static_cast<axera::vox_acoustic *>(acoustic_npu))) {
+            residual_hidden.assign(static_cast<size_t>(hidden), 0.0f);
+            if (!axera::vox_acoustic_res_step(static_cast<axera::vox_acoustic *>(acoustic_npu), fusion.data(),
+                                              residual_hidden.data())) {
+                fail("ResidualLM NPU decode failed");
+                return {};
+            }
+        } else
+#endif
+        {
+            residual_hidden = residual_lm.forward_step(fusion, current_position);
+        }
     }
+    trace_dump("step" + std::to_string(audio_frame_count) + "_fusion", fusion);
     trace_dump("step" + std::to_string(audio_frame_count) + "_res", residual_hidden);
     if (residual_hidden.size() != static_cast<size_t>(hidden)) {
         fail("ResidualLM forward_step failed");
@@ -1851,6 +1882,30 @@ std::vector<float> VoxCPM2Runtime::encode_reference_audio(const std::vector<floa
     const size_t patch_len = static_cast<size_t>(audio_patch_len);
     const size_t aligned   = ((audio.size() + patch_len - 1) / patch_len) * patch_len;
     audio.resize(aligned, 0.0f);
+    trace_dump("audio_vae_encoder_input", audio);
+
+#if defined(VOXCPM2_HAVE_AXERA)
+    if (acoustic_npu) {
+        auto * a = static_cast<axera::vox_acoustic *>(acoustic_npu);
+        if (!axera::vox_acoustic_has_vae_encoder(a)) {
+            fail("acoustic manifest has no AudioVAE encoder kernel");
+            return {};
+        }
+        const size_t patches = audio.size() / patch_len;
+        std::vector<float> result(patches * static_cast<size_t>(patch_size()) * feat_dim());
+        axera::vox_acoustic_vae_encode_reset(a);
+        for (size_t p = 0; p < patches; ++p) {
+            if (!axera::vox_acoustic_vae_encode_patch(
+                    a, audio.data() + p * patch_len,
+                    result.data() + p * static_cast<size_t>(patch_size()) * feat_dim())) {
+                fail("AudioVAE encoder NPU kernel failed");
+                return {};
+            }
+        }
+        trace_dump("audio_vae_encoder_latent", result);
+        return result;
+    }
+#endif
 
     GgmlContextGuard ctx_guard(kLargeGraphMem, true);
     ggml_context *   ctx = ctx_guard.get();

@@ -284,6 +284,8 @@ void voxcpm2_base::init(const std::map<std::string, ggml_tensor *> & t, const gg
                 dk.in_bytes("x") == (size_t) H * sizeof(ggml_bf16_t));
 
     KV      = axera_cmm_alloc(kv->bytes);
+    std::memset(KV->vir, 0, KV->size);
+    KV->flush();
     PX      = axera_cmm_alloc(pk.in_bytes("x"));
     POUT    = axera_cmm_alloc(pk.out_bytes("output"));
     POS     = axera_cmm_alloc(pk.in_bytes("position_ids"));

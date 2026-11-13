@@ -33,4 +33,17 @@ bool vox_acoustic_locenc(vox_acoustic * a, const float * x, float * hidden);
 bool vox_acoustic_vae(vox_acoustic * a, const float * patch, float * pcm);
 void vox_acoustic_vae_reset(vox_acoustic * a);
 
+// AudioVAE reference encoder: one fixed 2560-sample (four latent frame) patch
+// per call and one four-row latent patch.  The causal state carries across
+// calls until vox_acoustic_vae_encode_reset().
+bool vox_acoustic_has_vae_encoder(vox_acoustic * a);
+bool vox_acoustic_vae_encode_patch(vox_acoustic * a, const float * samples, float * latent);
+void vox_acoustic_vae_encode_reset(vox_acoustic * a);
+
+// The eight-layer ResidualLM decoder, one token per call, with its own paged BF16 KV.
+// The manifest may omit the acoustic.residual role; these calls then return false.
+bool vox_acoustic_has_residual(vox_acoustic * a);
+bool vox_acoustic_res_step(vox_acoustic * a, const float * x, float * out);
+void vox_acoustic_res_reset(vox_acoustic * a);
+
 }  // namespace axera
