@@ -465,16 +465,16 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     ncall = na / pna;
     GGML_ASSERT((pst.shape[0] == png || pst.shape[0] == ng || pst.shape[0] == L / 4 || pst.shape[0] == pna) &&
                 pcq.shape[0] == pst.shape[0] && pcv.shape[0] == pst.shape[0]);
-    // The common state bank (b0 [3 * pna]) is phase-major inside one call; calls follow one another. A call's
-    // [3 * pna] rows are then one contiguous slice of the pool, which is what the prefill calls bind below. A build
-    // with one bank per phase (b0 / b1 / b2, each [blocks]) keeps the phase-major pool instead.
-    const bool common_state = pst.shape[0] == png || pst.shape[0] == ng;
     for (int il = 0; il < L; ++il) {
         if (t.count("blk." + std::to_string(il) + ".ssm_a") == 0) {
             continue;
         }
         const int b = il / 4, p = il % 4;
-        ord[il] = common_state ? (b / pna) * png + p * pna + b % pna : p * (L / 4) + b;
+        // The merged prefill graph (qwen38_27b/forward) stacks one state per delta-net layer in block order:
+        // block b contributes its three layers p=0,1,2 contiguously. The old whole-model prefill kernels were
+        // phase-major, but reading that layout here sends decode the recurrent state of another layer.
+        GGML_ASSERT(pst.shape[0] == ng);
+        ord[il] = b * 3 + p;
     }
     state_group.assign(ng, -1);
     state_local.assign(ng, -1);
