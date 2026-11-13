@@ -186,6 +186,7 @@ struct server_task {
         std::string ref_text;
         raw_buffer  ref_audio;
         bool        has_ref_audio = false;
+        bool        cosyvoice3 = false;
         std::string response_format = "wav";
 
         bool     top_k_set = false;

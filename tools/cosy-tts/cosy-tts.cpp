@@ -1,9 +1,11 @@
 // Fun-CosyVoice3-0.5B-2512 end-to-end runner.
 //
 // The Qwen2 backbone is evaluated through llama.cpp (CPU or the AXERA backend).
-// The reference-audio encoders, flow-matching decoder and HiFT vocoder use the
-// official ONNX graphs through ONNX Runtime on the host.  The speech token
-// table/head are stored in a small auxiliary GGUF next to the backbone GGUF.
+// The reference-audio encoders use the official ONNX graphs through ONNX
+// Runtime on the host.  The flow-matching decoder and HiFT vocoder use the
+// official ONNX graphs by default, or fixed-shape AXERA models with
+// --flow-npu/--hift-npu.  The speech token table/head are stored in a small
+// auxiliary GGUF next to the backbone GGUF.
 
 #include "llama.h"
 #include "llama-ext.h"
@@ -12,6 +14,10 @@
 #include "mtmd-audio.h"
 
 #include "onnxruntime_cxx_api.h"
+#ifdef COSY_TTS_HAVE_AXERA
+#include "ax_engine_api.h"
+#include "ax_sys_api.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -20,8 +26,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <numeric>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -150,6 +156,56 @@ static std::vector<float> load_f32(const std::string & path, size_t expected = 0
     std::vector<float> v(n); f.seekg(0); f.read((char *) v.data(), n * sizeof(float)); return v;
 }
 
+// Read the int32 vector written by ref/run_reference.py's --codes file, or the
+// raw little-endian int32 form emitted by --dump-codes.
+static bool load_codes(const std::string & path, std::vector<int> & out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { fprintf(stderr, "cannot open codes %s\n", path.c_str()); return false; }
+    std::vector<char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (buf.size() >= 10 && !memcmp(buf.data(), "\x93NUMPY", 6)) {
+        const int major = (uint8_t) buf[6];
+        size_t header_len = 0, header_off = 0;
+        if (major == 1) {
+            header_len = (uint8_t) buf[8] | ((size_t) (uint8_t) buf[9] << 8);
+            header_off = 10;
+        } else if (major == 2 || major == 3) {
+            header_len = (size_t) (uint8_t) buf[8] | ((size_t) (uint8_t) buf[9] << 8) |
+                         ((size_t) (uint8_t) buf[10] << 16) | ((size_t) (uint8_t) buf[11] << 24);
+            header_off = 12;
+        } else {
+            fprintf(stderr, "%s: unsupported npy version %d\n", path.c_str(), major);
+            return false;
+        }
+        if (header_off + header_len > buf.size()) { fprintf(stderr, "%s: truncated npy header\n", path.c_str()); return false; }
+        std::string hdr(buf.data() + header_off, header_len);
+        const bool i64 = hdr.find("'<i8'") != std::string::npos || hdr.find("\"<i8\"") != std::string::npos;
+        const bool i32 = hdr.find("'<i4'") != std::string::npos || hdr.find("\"<i4\"") != std::string::npos;
+        if (!i64 && !i32) { fprintf(stderr, "%s: codes npy must be int32 or int64\n", path.c_str()); return false; }
+        const size_t elem = i64 ? 8 : 4;
+        const size_t data_off = header_off + header_len;
+        if ((buf.size() - data_off) % elem) { fprintf(stderr, "%s: malformed npy payload\n", path.c_str()); return false; }
+        const size_t n = (buf.size() - data_off) / elem;
+        out.resize(n);
+        for (size_t i = 0; i < n; i++) {
+            if (i64) {
+                int64_t v = 0;
+                memcpy(&v, buf.data() + data_off + i * elem, sizeof(v));
+                out[i] = (int) v;
+            } else {
+                int32_t v = 0;
+                memcpy(&v, buf.data() + data_off + i * elem, sizeof(v));
+                out[i] = v;
+            }
+        }
+        return true;
+    }
+    if (buf.size() % 4) { fprintf(stderr, "%s: raw codes must be int32\n", path.c_str()); return false; }
+    const size_t n = buf.size() / 4;
+    out.resize(n);
+    for (size_t i = 0; i < n; i++) memcpy(&out[i], buf.data() + i * 4, 4);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // ONNX Runtime helpers
 
@@ -190,6 +246,112 @@ struct ort_alloc {
         return Ort::Value::CreateTensor<T>(info, data.data(), data.size(), shape.data(), shape.size());
     }
 };
+
+// ---------------------------------------------------------------------------
+// Load a compiled AXModel whose weights and IO layout are fixed at build time.
+
+#ifdef COSY_TTS_HAVE_AXERA
+struct npu_model {
+    AX_ENGINE_HANDLE handle = nullptr;
+    AX_ENGINE_IO_INFO_T * info = nullptr;
+    std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
+
+    npu_model() = default;
+    npu_model(const npu_model &) = delete;
+    npu_model & operator=(const npu_model &) = delete;
+
+    bool load(const std::string & path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) { fprintf(stderr, "cannot open axmodel %s\n", path.c_str()); return false; }
+        std::vector<char> blob((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (blob.empty() || AX_ENGINE_CreateHandle(&handle, blob.data(), (AX_U32) blob.size()) != 0 ||
+            AX_ENGINE_CreateContext(handle) != 0 || AX_ENGINE_GetIOInfo(handle, &info) != 0) {
+            fprintf(stderr, "failed to load axmodel %s\n", path.c_str());
+            return false;
+        }
+        in.resize(info->nInputSize);
+        out.resize(info->nOutputSize);
+        auto alloc = [](AX_ENGINE_IO_BUFFER_T & b, AX_U32 size) {
+            if (AX_SYS_MemAllocCached(&b.phyAddr, &b.pVirAddr, size, 4096, (const AX_S8 *) "cosy-tts") != 0) {
+                return false;
+            }
+            b.nSize = size;
+            memset(b.pVirAddr, 0, size);
+            return true;
+        };
+        for (AX_U32 i = 0; i < info->nInputSize; i++) {
+            if (!alloc(in[i], info->pInputs[i].nSize)) { fprintf(stderr, "input CMM alloc failed\n"); return false; }
+        }
+        for (AX_U32 i = 0; i < info->nOutputSize; i++) {
+            if (!alloc(out[i], info->pOutputs[i].nSize)) { fprintf(stderr, "output CMM alloc failed\n"); return false; }
+        }
+        for (AX_U32 i = 0; i < info->nInputSize; i++) {
+            const auto & m = info->pInputs[i];
+            fprintf(stderr, "[npu] in  %-10s %u bytes dtype=%d\n", m.pName, m.nSize, (int) m.eDataType);
+        }
+        for (AX_U32 i = 0; i < info->nOutputSize; i++) {
+            const auto & m = info->pOutputs[i];
+            fprintf(stderr, "[npu] out %-10s %u bytes dtype=%d\n", m.pName, m.nSize, (int) m.eDataType);
+        }
+        return true;
+    }
+
+    int input_index(const char * name) const {
+        for (AX_U32 i = 0; i < info->nInputSize; i++) if (!strcmp(info->pInputs[i].pName, name)) return (int) i;
+        return -1;
+    }
+
+    bool set_input(const char * name, const void * data, size_t bytes) {
+        const int i = input_index(name);
+        if (i < 0 || bytes > in[i].nSize) {
+            fprintf(stderr, "bad NPU input %s (%zu bytes, max %u)\n", name, bytes, i < 0 ? 0u : in[i].nSize);
+            return false;
+        }
+        if (bytes < in[i].nSize) memset((char *) in[i].pVirAddr + bytes, 0, in[i].nSize - bytes);
+        memcpy(in[i].pVirAddr, data, bytes);
+        AX_SYS_MflushCache(in[i].phyAddr, in[i].pVirAddr, in[i].nSize);
+        return true;
+    }
+
+    bool run() {
+        AX_ENGINE_IO_T io{};
+        io.pInputs = in.data();
+        io.nInputSize = (AX_U32) in.size();
+        io.pOutputs = out.data();
+        io.nOutputSize = (AX_U32) out.size();
+        const int rc = AX_ENGINE_RunSync(handle, &io);
+        if (rc != 0) { fprintf(stderr, "AX_ENGINE_RunSync failed 0x%x\n", rc); return false; }
+        for (auto & b : out) AX_SYS_MinvalidateCache(b.phyAddr, b.pVirAddr, b.nSize);
+        return true;
+    }
+
+    const float * output_f32(size_t expected) const {
+        if (info->nOutputSize != 1 || info->pOutputs[0].eDataType != AX_ENGINE_DT_FLOAT32 ||
+            out[0].nSize != expected * sizeof(float)) {
+            fprintf(stderr, "NPU output mismatch: outputs=%u dtype=%d bytes=%u expected=%zu\n",
+                    info->nOutputSize, (int) info->pOutputs[0].eDataType, out[0].nSize, expected * sizeof(float));
+            return nullptr;
+        }
+        return (const float *) out[0].pVirAddr;
+    }
+
+    ~npu_model() {
+        for (auto & b : in)  if (b.pVirAddr) AX_SYS_MemFree(b.phyAddr, b.pVirAddr);
+        for (auto & b : out) if (b.pVirAddr) AX_SYS_MemFree(b.phyAddr, b.pVirAddr);
+        if (handle) AX_ENGINE_DestroyHandle(handle);
+    }
+};
+#else
+struct npu_model {
+    bool load(const std::string &) {
+        fprintf(stderr, "this build has no AXERA support; rebuild with GGML_AXERA and GGML_AXERA_BSP_DIR\n");
+        return false;
+    }
+    bool set_input(const char *, const void *, size_t) { return false; }
+    bool run() { return false; }
+    const float * output_f32(size_t) const { return nullptr; }
+};
+#endif
 
 // ---------------------------------------------------------------------------
 // CosyVoice3 feature front ends.  Both use the same public mtmd FFT/mel helper
@@ -355,40 +517,96 @@ static bool load_aux(const std::string & path, aux_weights & w) {
 }
 
 // ---------------------------------------------------------------------------
-// Sampling: nucleus(top_p=0.8, top_k=25) with repetition-aware resampling.
+// Sampling: exact CPU torch semantics for CosyVoice3's RAS.  torch's CPU
+// generator is MT19937 with a 53-bit double uniform draw; multinomial uses a
+// float cumulative distribution and a half-open binary search.  Matching both
+// is required for the same seed to produce the official token sequence.
+
+struct torch_rng {
+    static constexpr int N = 624, M = 397;
+    static constexpr uint32_t MATRIX_A = 0x9908b0dfu, UMASK = 0x80000000u, LMASK = 0x7fffffffu;
+    uint32_t state[N];
+    int left = 1, next = 0;
+
+    explicit torch_rng(uint32_t seed) {
+        state[0] = seed;
+        for (int j = 1; j < N; j++) state[j] = 1812433253u * (state[j - 1] ^ (state[j - 1] >> 30)) + (uint32_t) j;
+    }
+    static uint32_t twist(uint32_t u, uint32_t v) {
+        return (((u & UMASK) | (v & LMASK)) >> 1) ^ ((v & 1u) ? MATRIX_A : 0u);
+    }
+    void next_state() {
+        uint32_t * p = state;
+        left = N; next = 0;
+        for (int j = N - M + 1; --j; p++) *p = p[M] ^ twist(p[0], p[1]);
+        for (int j = M; --j; p++) *p = p[M - N] ^ twist(p[0], p[1]);
+        *p = p[M - N] ^ twist(p[0], state[0]);
+    }
+    uint32_t random() {
+        if (--left == 0) next_state();
+        uint32_t y = state[next++];
+        y ^= y >> 11; y ^= (y << 7) & 0x9d2c5680u; y ^= (y << 15) & 0xefc60000u; y ^= y >> 18;
+        return y;
+    }
+    uint64_t random64() { return ((uint64_t) random() << 32) | random(); }
+    double uniform() { return (double) (random64() & ((1ull << 53) - 1)) / (double) (1ull << 53); }
+};
 
 struct sampler {
-    std::mt19937 rng;
+    torch_rng rng;
     explicit sampler(uint32_t seed) : rng(seed) {}
 
-    int sample(std::vector<float> logits, const std::vector<int> & decoded, bool ignore_eos, int eos, int min_len) {
-        if (ignore_eos && eos >= 0 && eos < (int) logits.size()) logits[eos] = -1e30f;
-        float mx = *std::max_element(logits.begin(), logits.end());
-        double sum = 0;
-        for (auto & v : logits) { v = std::exp(v - mx); sum += v; }
-        for (auto & v : logits) v /= (float) sum;
-
-        std::vector<int> idx(logits.size());
-        std::iota(idx.begin(), idx.end(), 0);
-        std::partial_sort(idx.begin(), idx.begin() + std::min<size_t>(25, idx.size()), idx.end(),
-                          [&](int a, int b) { return logits[a] > logits[b]; });
-        std::vector<double> p;
-        double cum = 0;
-        for (int j = 0; j < (int) idx.size() && j < 25; j++) {
-            p.push_back(logits[idx[j]]);
-            cum += logits[idx[j]];
-            if (cum >= 0.8) break;
+    static std::vector<float> softmax(const std::vector<float> & logits) {
+        const float mx = *std::max_element(logits.begin(), logits.end());
+        std::vector<float> p(logits.size());
+        float sum = 0;
+        for (size_t i = 0; i < logits.size(); i++) {
+            p[i] = std::isfinite(logits[i]) ? std::exp(logits[i] - mx) : 0.0f;
+            sum += p[i];
         }
-        std::discrete_distribution<int> dist(p.begin(), p.end());
-        int top = idx[dist(rng)];
+        if (sum > 0) for (float & v : p) v /= sum;
+        return p;
+    }
+
+    int multinomial(const std::vector<float> & probs) {
+        std::vector<float> cum(probs.size());
+        float sum = 0;
+        for (size_t i = 0; i < probs.size(); i++) { sum += std::max(0.0f, probs[i]); cum[i] = sum; }
+        if (!(sum > 0)) return 0;
+        for (float & v : cum) v /= sum;
+        cum.back() = 1.0f;
+        const double u = rng.uniform();
+        int left = 0, right = (int) probs.size();
+        while (right - left > 0) {
+            const int mid = left + (right - left) / 2;
+            if ((double) cum[mid] < u) left = mid + 1; else right = mid;
+        }
+        return std::min(left, (int) probs.size() - 1);
+    }
+
+    int sample(std::vector<float> logits, const std::vector<int> & decoded, bool ignore_eos, int eos) {
+        if (ignore_eos && eos >= 0 && eos < (int) logits.size()) logits[eos] = -std::numeric_limits<float>::infinity();
+        const std::vector<float> probs = softmax(logits);
+        std::vector<int> idx(probs.size());
+        std::iota(idx.begin(), idx.end(), 0);
+        std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return probs[a] > probs[b]; });
+
+        std::vector<float> nucleus;
+        float cum = 0;
+        for (size_t i = 0; i < idx.size(); i++) {
+            if (!(cum < 0.8f) || nucleus.size() >= 25) break;
+            cum += probs[idx[i]];
+            nucleus.push_back(probs[idx[i]]);
+        }
+        if (nucleus.empty()) nucleus.push_back(probs[idx[0]]);
+        int top = idx[multinomial(nucleus)];
 
         int rep = 0;
         for (int i = std::max(0, (int) decoded.size() - 10); i < (int) decoded.size(); i++) rep += decoded[i] == top;
         if (rep >= 1) {
-            std::discrete_distribution<int> all(logits.begin(), logits.end());
-            top = all(rng);
+            logits[top] = -std::numeric_limits<float>::infinity();
+            top = multinomial(softmax(logits));
         }
-        (void) min_len;
         return top;
     }
 };
@@ -399,11 +617,12 @@ struct sampler {
 struct args {
     std::string model, aux, tables;
     std::string campplus, tokenizer, flow_encoder, flow_estimator, hift;
+    std::string flow_npu, hift_npu;
     std::string text, prompt_text, prompt_wav, out = "out.wav";
     int ngl = 0, ctx = 4096, threads = 16;
     uint32_t seed = 1986;
     bool dump_codes = false;
-    std::string parity_in, parity_out, dump_feats;
+    std::string parity_in, parity_out, dump_feats, codes_in, dump_mel;
 };
 
 static bool parse_args(int argc, char ** argv, args & a) {
@@ -418,6 +637,8 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (k == "--flow-encoder") a.flow_encoder = val();
         else if (k == "--flow-estimator") a.flow_estimator = val();
         else if (k == "--hift") a.hift = val();
+        else if (k == "--flow-npu") a.flow_npu = val();
+        else if (k == "--hift-npu") a.hift_npu = val();
         else if (k == "-p" || k == "--text") a.text = val();
         else if (k == "--prompt-text") a.prompt_text = val();
         else if (k == "--prompt-wav") a.prompt_wav = val();
@@ -430,11 +651,29 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (k == "--parity-in") a.parity_in = val();
         else if (k == "--parity-out") a.parity_out = val();
         else if (k == "--dump-feats") a.dump_feats = val();
+        else if (k == "--codes") a.codes_in = val();
+        else if (k == "--dump-mel") a.dump_mel = val();
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && !a.aux.empty() && !a.tables.empty() && !a.text.empty() && !a.prompt_wav.empty() &&
            !a.campplus.empty() && !a.tokenizer.empty() && !a.flow_encoder.empty() &&
-           !a.flow_estimator.empty() && !a.hift.empty();
+           (!a.flow_npu.empty() || !a.flow_estimator.empty()) && (!a.hift_npu.empty() || !a.hift.empty());
+}
+
+static bool axera_engine_init_once() {
+#ifdef COSY_TTS_HAVE_AXERA
+    static const int rc = [] {
+        if (AX_SYS_Init() != 0) return 1;
+        AX_ENGINE_NPU_ATTR_T attr{};
+        attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+        return AX_ENGINE_Init(&attr) == 0 ? 0 : 2;
+    }();
+    if (rc) fprintf(stderr, "AXERA engine init failed (%d)\n", rc);
+    return rc == 0;
+#else
+    fprintf(stderr, "this build has no AXERA support; rebuild with GGML_AXERA and GGML_AXERA_BSP_DIR\n");
+    return false;
+#endif
 }
 
 static int decode_embd(llama_context * ctx, const float * embd, int n_tokens, int n_embd, int pos0, bool logits_last) {
@@ -459,7 +698,8 @@ int main(int argc, char ** argv) {
             "usage: %s -m llm.gguf --aux aux.gguf --tables DIR --campplus campplus.onnx\n"
             "  --tokenizer speech_tokenizer_v3.onnx --flow-encoder flow_encoder.onnx\n"
             "  --flow-estimator flow.decoder.estimator.fp32.onnx --hift hift.onnx\n"
-            "  -p TEXT --prompt-text TEXT --prompt-wav ref.wav -o out.wav [-ngl N] [--dump-codes]\n", argv[0]);
+            "  -p TEXT --prompt-text TEXT --prompt-wav ref.wav -o out.wav [-ngl N] [--dump-codes]\n"
+            "  (or --flow-npu flow.axmodel --hift-npu hift.axmodel instead of the ONNX stages)\n", argv[0]);
         return 1;
     }
 
@@ -488,8 +728,22 @@ int main(int argc, char ** argv) {
     auto campplus = make_session(a.campplus, GraphOptimizationLevel::ORT_DISABLE_ALL);
     auto tokenizer = make_session(a.tokenizer);
     auto flow_enc = make_session(a.flow_encoder);
-    auto estimator = make_session(a.flow_estimator);
-    auto hift = make_session(a.hift);
+    std::unique_ptr<ort_session> estimator, hift;
+    std::unique_ptr<npu_model> flow_npu, hift_npu;
+    if (!a.flow_npu.empty()) {
+        if (!axera_engine_init_once()) return 1;
+        flow_npu = std::make_unique<npu_model>();
+        if (!flow_npu->load(a.flow_npu)) return 1;
+    } else {
+        estimator = make_session(a.flow_estimator);
+    }
+    if (!a.hift_npu.empty()) {
+        if (!axera_engine_init_once()) return 1;
+        hift_npu = std::make_unique<npu_model>();
+        if (!hift_npu->load(a.hift_npu)) return 1;
+    } else {
+        hift = make_session(a.hift);
+    }
 
     // ---- reference audio front ends -------------------------------------
     int fbank_frames = 0, wmel_frames = 0, flow_frames = 0;
@@ -622,27 +876,32 @@ int main(int argc, char ** argv) {
             out[j] = (float) s;
         }
     };
-    sampler smp(a.seed);
     std::vector<int> codes;
-    const int min_len = (int) text_tok.size() * 2;
-    const int max_len = (int) text_tok.size() * 20;
-    int n_past = n_prompt_rows;
     auto t_gen0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < max_len; i++) {
-        compute_logits(h, logits);
-        int tok = smp.sample(logits, codes, i < min_len, 6561, min_len);
-        if (i >= min_len && tok >= 6561) break;
-        if (tok < 0 || tok >= 6561) break;
-        codes.push_back(tok);
-        if (i + 1 >= max_len) break;
-        std::vector<float> emb(speech_row(tok), speech_row(tok) + n_embd);
-        if (decode_embd(ctx, emb.data(), 1, n_embd, n_past, true) != 0) {
-            fprintf(stderr, "decode step %d failed\n", i); return 1;
+    if (!a.codes_in.empty()) {
+        if (!load_codes(a.codes_in, codes)) return 1;
+        fprintf(stderr, "[llm] injected %zu speech tokens from %s\n", codes.size(), a.codes_in.c_str());
+    } else {
+        sampler smp(a.seed);
+        const int min_len = (int) text_tok.size() * 2;
+        const int max_len = (int) text_tok.size() * 20;
+        int n_past = n_prompt_rows;
+        for (int i = 0; i < max_len; i++) {
+            compute_logits(h, logits);
+            int tok = smp.sample(logits, codes, i < min_len, 6561);
+            if (i >= min_len && tok >= 6561) break;
+            if (tok < 0 || tok >= 6561) break;
+            codes.push_back(tok);
+            if (i + 1 >= max_len) break;
+            std::vector<float> emb(speech_row(tok), speech_row(tok) + n_embd);
+            if (decode_embd(ctx, emb.data(), 1, n_embd, n_past, true) != 0) {
+                fprintf(stderr, "decode step %d failed\n", i); return 1;
+            }
+            n_past++;
+            hidden = llama_get_embeddings_ith(ctx, -1);
+            if (!hidden) { fprintf(stderr, "no hidden at step %d\n", i); return 1; }
+            std::copy(hidden, hidden + n_embd, h.begin());
         }
-        n_past++;
-        hidden = llama_get_embeddings_ith(ctx, -1);
-        if (!hidden) { fprintf(stderr, "no hidden at step %d\n", i); return 1; }
-        std::copy(hidden, hidden + n_embd, h.begin());
     }
     auto t_gen1 = std::chrono::steady_clock::now();
     if (codes.empty()) { fprintf(stderr, "no speech tokens generated\n"); return 1; }
@@ -688,6 +947,11 @@ int main(int argc, char ** argv) {
 
     // ---- Euler flow matching -------------------------------------------
     const int steps = 10;
+    const int npu_flow_cap = 512;
+    if (flow_npu && T > npu_flow_cap) {
+        fprintf(stderr, "flow length %d exceeds the fixed NPU capacity %d; shorten the text or use the CPU flow\\n", T, npu_flow_cap);
+        return 1;
+    }
     std::vector<double> ts(steps + 1);
     for (int i = 0; i <= steps; i++) ts[i] = 1.0 - std::cos(0.5 * M_PI * (double) i / steps);
     std::vector<float> x((size_t) 80 * T);
@@ -714,18 +978,46 @@ int main(int argc, char ** argv) {
         memset(spks_in.data() + 80, 0, 80 * 4);
         t_in[0] = t_in[1] = (float) t_cur;
 
-        std::vector<Ort::Value> es_in;
-        es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, x_in.data(), x_in.size(), x_shape.data(), x_shape.size()));
-        es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mask_in.data(), mask_in.size(), mask2_shape.data(), mask2_shape.size()));
-        es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mu_in.data(), mu_in.size(), x_shape.data(), x_shape.size()));
-        es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, t_in.data(), 2, t2_shape.data(), t2_shape.size()));
-        es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, spks_in.data(), spks_in.size(), spks2_shape.data(), spks2_shape.size()));
-        es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, cond_in.data(), cond_in.size(), x_shape.data(), x_shape.size()));
-        auto es_out = estimator->run(std::move(es_in));
-        const float * d = es_out[0].GetTensorData<float>();
+        const float * d = nullptr;
+        std::vector<Ort::Value> es_out;
+        if (flow_npu) {
+            const size_t plane = (size_t) 80 * npu_flow_cap;
+            std::vector<float> nx(2 * plane), nmu(2 * plane), ncond(2 * plane), nmask(2 * npu_flow_cap), nspks(2 * 80), nt(2);
+            for (int c = 0; c < 80; c++) {
+                memcpy(nx.data() + (size_t) c * npu_flow_cap, x.data() + (size_t) c * T, T * 4);
+                memcpy(nmu.data() + (size_t) c * npu_flow_cap, mu.data() + (size_t) c * T, T * 4);
+                memcpy(ncond.data() + (size_t) c * npu_flow_cap, cond.data() + (size_t) c * T, T * 4);
+                memcpy(nx.data() + plane + (size_t) c * npu_flow_cap, x.data() + (size_t) c * T, T * 4);
+            }
+            memcpy(nmask.data(), mask.data(), T * 4);
+            memcpy(nmask.data() + npu_flow_cap, mask.data(), T * 4);
+            memcpy(nspks.data(), spks.data(), 80 * 4);
+            nt[0] = nt[1] = (float) t_cur;
+            if (!flow_npu->set_input("x", nx.data(), nx.size() * 4) ||
+                !flow_npu->set_input("mask", nmask.data(), nmask.size() * 4) ||
+                !flow_npu->set_input("mu", nmu.data(), nmu.size() * 4) ||
+                !flow_npu->set_input("t", nt.data(), nt.size() * 4) ||
+                !flow_npu->set_input("spks", nspks.data(), nspks.size() * 4) ||
+                !flow_npu->set_input("cond", ncond.data(), ncond.size() * 4) || !flow_npu->run()) {
+                return 1;
+            }
+            d = flow_npu->output_f32(2 * plane);
+            if (!d) return 1;
+        } else {
+            std::vector<Ort::Value> es_in;
+            es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, x_in.data(), x_in.size(), x_shape.data(), x_shape.size()));
+            es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mask_in.data(), mask_in.size(), mask2_shape.data(), mask2_shape.size()));
+            es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mu_in.data(), mu_in.size(), x_shape.data(), x_shape.size()));
+            es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, t_in.data(), 2, t2_shape.data(), t2_shape.size()));
+            es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, spks_in.data(), spks_in.size(), spks2_shape.data(), spks2_shape.size()));
+            es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, cond_in.data(), cond_in.size(), x_shape.data(), x_shape.size()));
+            es_out = estimator->run(std::move(es_in));
+            d = es_out[0].GetTensorData<float>();
+        }
+        const int dstride = flow_npu ? npu_flow_cap : T;
         for (int c = 0; c < 80; c++) {
             for (int t = 0; t < T; t++) {
-                float dphi = 1.7f * d[(size_t) c * T + t] - 0.7f * d[(size_t) (80 + c) * T + t];
+                float dphi = 1.7f * d[(size_t) c * dstride + t] - 0.7f * d[(size_t) (80 + c) * dstride + t];
                 x[(size_t) c * T + t] += (float) dt * dphi;
             }
         }
@@ -739,15 +1031,37 @@ int main(int argc, char ** argv) {
     std::vector<float> mel((size_t) 80 * Tgen);
     for (int c = 0; c < 80; c++)
         memcpy(mel.data() + (size_t) c * Tgen, x.data() + (size_t) c * T + prompt_mel, (size_t) Tgen * 4);
-    std::vector<int64_t> hmel_shape{1, 80, Tgen};
-    std::vector<Ort::Value> hi_in;
-    hi_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mel.data(), mel.size(), hmel_shape.data(), hmel_shape.size()));
-    auto hi_out = hift->run(std::move(hi_in));
-    auto audio_shape = shape_of(hi_out[0]);
-    const float * audio = hi_out[0].GetTensorData<float>();
-    size_t n_samples = 1;
-    for (auto d : audio_shape) n_samples *= (size_t) d;
-    std::vector<float> pcm(audio, audio + n_samples);
+    if (!a.dump_mel.empty()) {
+        FILE * f = fopen(a.dump_mel.c_str(), "wb");
+        if (!f) { fprintf(stderr, "cannot write %s\n", a.dump_mel.c_str()); return 1; }
+        fwrite(mel.data(), 4, mel.size(), f);
+        fclose(f);
+        fprintf(stderr, "[flow] wrote %s (%d x %d)\n", a.dump_mel.c_str(), 80, Tgen);
+    }
+    std::vector<float> pcm;
+    if (hift_npu) {
+        const int cap = 512;
+        if (Tgen > cap) {
+            fprintf(stderr, "mel length %d exceeds the fixed NPU capacity %d\\n", Tgen, cap);
+            return 1;
+        }
+        std::vector<float> hmel((size_t) 80 * cap);
+        for (int c = 0; c < 80; c++) memcpy(hmel.data() + (size_t) c * cap, mel.data() + (size_t) c * Tgen, Tgen * 4);
+        if (!hift_npu->set_input("mel", hmel.data(), hmel.size() * 4) || !hift_npu->run()) return 1;
+        const float * audio = hift_npu->output_f32((size_t) cap * 480);
+        if (!audio) return 1;
+        pcm.assign(audio, audio + (size_t) Tgen * 480);
+    } else {
+        std::vector<int64_t> hmel_shape{1, 80, Tgen};
+        std::vector<Ort::Value> hi_in;
+        hi_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mel.data(), mel.size(), hmel_shape.data(), hmel_shape.size()));
+        auto hi_out = hift->run(std::move(hi_in));
+        auto audio_shape = shape_of(hi_out[0]);
+        const float * audio = hi_out[0].GetTensorData<float>();
+        size_t n_samples = 1;
+        for (auto d : audio_shape) n_samples *= (size_t) d;
+        pcm.assign(audio, audio + n_samples);
+    }
     auto t_hift = std::chrono::steady_clock::now();
 
     if (!write_wav(a.out.c_str(), pcm, 24000)) { fprintf(stderr, "failed to write %s\n", a.out.c_str()); return 1; }
@@ -758,7 +1072,7 @@ int main(int argc, char ** argv) {
             sec(t0, t_front), 0.0,
             sec(t_front, t_prefill), sec(t_gen0, t_gen1), codes.size() / std::max(1e-9, sec(t_gen0, t_gen1)),
             sec(t_gen1, t_flowenc), sec(t_flowenc, t_flow), sec(t_flow, t_hift), sec(t_all0, t_hift));
-    fprintf(stderr, "[audio] %.3fs %zu samples, codes=%zu, T=%d Tgen=%d\n", n_samples / 24000.0, n_samples, codes.size(), T, Tgen);
+    fprintf(stderr, "[audio] %.3fs %zu samples, codes=%zu, T=%d Tgen=%d\n", pcm.size() / 24000.0, pcm.size(), codes.size(), T, Tgen);
     fprintf(stderr, "[out] %s\n", a.out.c_str());
 
     llama_free(ctx);

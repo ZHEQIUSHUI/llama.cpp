@@ -10,6 +10,10 @@
 #include <cstring>
 #include <string>
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
 /**
  * Please note that this is NOT a production-ready binary.
  * It is a playground for trying TTS support in llama.cpp.
@@ -39,6 +43,28 @@ static void print_usage(int, char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+    // CosyVoice3 uses its own frontend/flow/HiFT runner instead of the mtmd
+    // audio-generation interface.  Keep the public CLI unchanged and forward
+    // invocations that carry the auxiliary GGUF option to the sibling binary.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--aux") == 0) {
+#if !defined(_WIN32)
+            std::string self = argv[0];
+            const size_t slash = self.find_last_of('/');
+            std::string sibling = slash == std::string::npos ? "cosy-tts" : self.substr(0, slash + 1) + "cosy-tts";
+            if (access(sibling.c_str(), X_OK) == 0) {
+                execv(sibling.c_str(), argv);
+            }
+            execvp("cosy-tts", argv);
+            fprintf(stderr, "failed to exec cosy-tts for the CosyVoice3 model\n");
+            return 1;
+#else
+            fprintf(stderr, "CosyVoice3 dispatch is not supported on this platform\n");
+            return 1;
+#endif
+        }
+    }
+
     common_params params;
 
     common_init();

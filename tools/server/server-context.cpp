@@ -21,6 +21,8 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <climits>
 #include <cmath>
 #include <cstddef>
@@ -32,6 +34,12 @@
 #include <random>
 #include <utility>
 #include <fstream>
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -55,6 +63,125 @@ static llama_token server_tts_sample(void * user_data) {
     common_sampler_accept(ctx->smpl, sampled, true);
     return sampled;
 }
+
+static bool server_cosy_tts_enabled() {
+    const char * cmd = std::getenv("COSY_TTS_CMD");
+    return cmd != nullptr && cmd[0] != '\0';
+}
+
+#if !defined(_WIN32)
+static std::vector<std::string> server_split_words(const std::string & text) {
+    std::vector<std::string> words;
+    size_t i = 0;
+    while (i < text.size()) {
+        while (i < text.size() && std::isspace((unsigned char) text[i])) i++;
+        const size_t begin = i;
+        while (i < text.size() && !std::isspace((unsigned char) text[i])) i++;
+        if (i > begin) words.emplace_back(text.substr(begin, i - begin));
+    }
+    return words;
+}
+
+static uint32_t server_u32le(const uint8_t * p) {
+    return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
+}
+
+static bool server_run_cosy_tts(const server_task::tts_params & tts, raw_buffer & data,
+        int & sample_rate, int64_t & n_samples, std::string & error) {
+    const char * cmd = std::getenv("COSY_TTS_CMD");
+    std::vector<std::string> words = server_split_words(cmd ? cmd : "");
+    if (words.empty()) {
+        error = "COSY_TTS_CMD is empty";
+        return false;
+    }
+
+    char ref_path[] = "/tmp/cosy_ref_XXXXXX";
+    char out_path[] = "/tmp/cosy_out_XXXXXX";
+    const int ref_fd = mkstemp(ref_path);
+    const int out_fd = mkstemp(out_path);
+    if (ref_fd < 0 || out_fd < 0) {
+        if (ref_fd >= 0) close(ref_fd);
+        if (out_fd >= 0) close(out_fd);
+        error = "failed to create temporary files";
+        return false;
+    }
+    close(out_fd);
+    size_t written = 0;
+    while (written < tts.ref_audio.size()) {
+        const ssize_t n = write(ref_fd, tts.ref_audio.data() + written, tts.ref_audio.size() - written);
+        if (n <= 0) break;
+        written += (size_t) n;
+    }
+    close(ref_fd);
+    if (written != tts.ref_audio.size()) {
+        unlink(ref_path);
+        unlink(out_path);
+        error = "failed to write the reference audio";
+        return false;
+    }
+
+    words.emplace_back("-p");
+    words.emplace_back(tts.prompt);
+    words.emplace_back("--prompt-text");
+    words.emplace_back(tts.ref_text);
+    words.emplace_back("--prompt-wav");
+    words.emplace_back(ref_path);
+    words.emplace_back("-o");
+    words.emplace_back(out_path);
+
+    std::vector<char *> argv;
+    argv.reserve(words.size() + 1);
+    for (auto & w : words) argv.push_back(const_cast<char *>(w.c_str()));
+    argv.push_back(nullptr);
+
+    const std::string log_path = std::string(out_path) + ".log";
+    const pid_t pid = fork();
+    if (pid < 0) {
+        unlink(ref_path);
+        unlink(out_path);
+        error = "fork failed";
+        return false;
+    }
+    if (pid == 0) {
+        const int fd = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd >= 0) {
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            close(fd);
+        }
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    unlink(ref_path);
+
+    bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (ok) {
+        std::ifstream in(out_path, std::ios::binary);
+        data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        ok = data.size() >= 44 && !memcmp(data.data(), "RIFF", 4) && !memcmp(data.data() + 8, "WAVE", 4);
+    }
+    if (ok) {
+        const uint8_t * p = data.data();
+        const int channels = (int) (p[22] | (p[23] << 8));
+        sample_rate = (int) server_u32le(p + 24);
+        const int bits = (int) (p[34] | (p[35] << 8));
+        const uint32_t payload = server_u32le(p + 40);
+        const int frame_bytes = channels * bits / 8;
+        n_samples = frame_bytes > 0 ? payload / frame_bytes : 0;
+    } else {
+        std::ifstream log(log_path);
+        std::string tail((std::istreambuf_iterator<char>(log)), std::istreambuf_iterator<char>());
+        if (tail.size() > 2000) tail = tail.substr(tail.size() - 2000);
+        error = "cosy-tts failed";
+        if (!tail.empty()) error += ": " + tail;
+    }
+    unlink(out_path);
+    unlink(log_path.c_str());
+    return ok;
+}
+#endif
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -3459,6 +3586,32 @@ private:
         clear_tts_state();
 
         try {
+            if (task.tts.cosyvoice3) {
+#if !defined(_WIN32)
+                const int64_t t0 = ggml_time_us();
+                raw_buffer data;
+                int sample_rate = 0;
+                int64_t n_samples = 0;
+                std::string error;
+                if (!server_run_cosy_tts(task.tts, data, sample_rate, n_samples, error)) {
+                    return fail(error, ERROR_TYPE_SERVER);
+                }
+                auto out = std::make_unique<server_task_result_tts>();
+                out->id           = id_task;
+                out->data         = std::move(data);
+                out->content_type = "audio/wav";
+                out->sample_rate  = sample_rate;
+                out->n_samples    = n_samples;
+                out->t_total_s    = (ggml_time_us() - t0) / 1e6;
+                clear_tts_state();
+                queue_tasks.pop_deferred_task(-1);
+                queue_results.send(std::move(out));
+                return;
+#else
+                return fail("CosyVoice3 subprocess dispatch is not supported on this platform", ERROR_TYPE_NOT_SUPPORTED);
+#endif
+            }
+
             if (!tts_gen) {
                 return fail("audio generation is not available for this model", ERROR_TYPE_NOT_SUPPORTED);
             }
@@ -6703,18 +6856,19 @@ void server_routes::init_routes() {
 
     this->post_audio_speech = [this](const server_http_req & req) {
         auto res = create_response();
+        const bool cosyvoice3 = !meta->has_mtmd && server_cosy_tts_enabled();
 
-        if (!meta->has_mtmd) {
+        if (!meta->has_mtmd && !cosyvoice3) {
             res->error(format_error_response(
                 "Audio generation requires an mmproj loaded with --mmproj.", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
-        if (meta->tts_gen_audio_type == MTMD_GEN_AUDIO_TYPE_NONE) {
+        if (!cosyvoice3 && meta->tts_gen_audio_type == MTMD_GEN_AUDIO_TYPE_NONE) {
             res->error(format_error_response(
                 "The loaded mmproj does not support audio generation.", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
-        if (meta->tts_gen_audio_type != MTMD_GEN_AUDIO_TYPE_QWEN3TTS) {
+        if (!cosyvoice3 && meta->tts_gen_audio_type != MTMD_GEN_AUDIO_TYPE_QWEN3TTS) {
             res->error(format_error_response(
                 "This audio generation model is not supported by /v1/audio/speech.", ERROR_TYPE_NOT_SUPPORTED));
             return res;
@@ -6741,6 +6895,7 @@ void server_routes::init_routes() {
         };
 
         server_task task(SERVER_TASK_TYPE_TTS);
+        task.tts.cosyvoice3 = cosyvoice3;
         task.tts.prompt = opt_string("input");
         if (task.tts.prompt.empty()) {
             throw std::invalid_argument("missing required field \"input\"");
@@ -6777,6 +6932,27 @@ void server_routes::init_routes() {
                 throw std::invalid_argument("\"ref_audio\" decoded to an empty buffer");
             }
             task.tts.has_ref_audio = true;
+        }
+
+        if (cosyvoice3) {
+            if (!task.tts.instructions.empty()) {
+                throw std::invalid_argument("instructions are not supported by CosyVoice3");
+            }
+            if (!task.tts.language.empty()) {
+                throw std::invalid_argument("language is not supported by CosyVoice3");
+            }
+            if (body.contains("speed") && !body.at("speed").is_null()) {
+                throw std::invalid_argument("speed is not supported by CosyVoice3");
+            }
+            if (!task.tts.voice.empty() && task.tts.voice != "default") {
+                throw std::invalid_argument("voice must be \"default\" for CosyVoice3");
+            }
+            if (!task.tts.has_ref_audio) {
+                throw std::invalid_argument("ref_audio is required for CosyVoice3 zero-shot cloning");
+            }
+            if (task.tts.response_format != "wav") {
+                throw std::invalid_argument("CosyVoice3 supports response_format=\"wav\" only");
+            }
         }
 
         if (body.contains("top_k") && !body.at("top_k").is_null()) {
