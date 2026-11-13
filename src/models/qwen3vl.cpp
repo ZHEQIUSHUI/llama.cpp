@@ -20,6 +20,9 @@ void llama_model_qwen3vl::load_arch_tensors(llama_model_loader &) {
     if (arch == LLM_ARCH_QWEN3TTS) {
         // [TAG_LLAMA_N_VOCAB_OUT]
         n_vocab_out = 3072;
+    } else if (hparams.n_embd_out_impl > 0) {
+        // Qwen3-ForcedAligner keeps the tokenizer vocabulary for its input embedding but has a classifier output.
+        n_vocab_out = hparams.n_embd_out_impl;
     }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
