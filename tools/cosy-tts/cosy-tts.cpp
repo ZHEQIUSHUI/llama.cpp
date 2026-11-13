@@ -793,6 +793,7 @@ int main(int argc, char ** argv) {
     auto t_front = std::chrono::steady_clock::now();
 
     // ---- Qwen2 backbone -------------------------------------------------
+    auto t_load0 = std::chrono::steady_clock::now();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = a.ngl;
     llama_model * model = llama_model_load_from_file(a.model.c_str(), mp);
@@ -806,6 +807,7 @@ int main(int argc, char ** argv) {
     cp.embeddings = true;
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "failed to create llama context\n"); return 1; }
+    auto t_load1 = std::chrono::steady_clock::now();
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_embd = llama_model_n_embd(model);
     if (n_embd != aux.n_embd) { fprintf(stderr, "embedding dim mismatch %d vs %d\n", n_embd, aux.n_embd); return 1; }
@@ -1086,8 +1088,8 @@ int main(int argc, char ** argv) {
     auto sec = [](auto a0, auto a1) { return std::chrono::duration<double>(a1 - a0).count(); };
     fprintf(stderr,
             "[timing] frontend %.3fs llm_load %.3fs prefill %.3fs gen %.3fs (%.1f tok/s) flow_enc %.3fs flow %.3fs hift %.3fs total %.3fs\n",
-            sec(t0, t_front), 0.0,
-            sec(t_front, t_prefill), sec(t_gen0, t_gen1), codes.size() / std::max(1e-9, sec(t_gen0, t_gen1)),
+            sec(t0, t_front), sec(t_load0, t_load1),
+            sec(t_load1, t_prefill), sec(t_gen0, t_gen1), codes.size() / std::max(1e-9, sec(t_gen0, t_gen1)),
             sec(t_gen1, t_flowenc), sec(t_flowenc, t_flow), sec(t_flow, t_hift), sec(t_all0, t_hift));
     fprintf(stderr, "[audio] %.3fs %zu samples, codes=%zu, T=%d Tgen=%d\n", pcm.size() / 24000.0, pcm.size(), codes.size(), T, Tgen);
     fprintf(stderr, "[out] %s\n", a.out.c_str());
