@@ -158,15 +158,34 @@ axera_cmm cpm5::bank(const std::map<std::string, ggml_tensor *> & t, const io_de
             const ggml_tensor * w = T(il, g);
             const int64_t       K = w->ne[0];
             GGML_ASSERT((size_t) ggml_nrows(w) * (scales ? K / AXERA_MX_GROUP : K) == bb);
+            // llama.cpp's GGUF stores q/k in the interleaved RoPE layout
+            // (convert_hf_to_gguf's permute()); the kernels rotate the HF
+            // half-split layout, so map every GGUF row back to its HF output
+            // channel.  v/o are not permuted.
+            int64_t n_head = 0;
+            if (strcmp(g, "attn_q.weight") == 0) {
+                n_head = 16;
+            } else if (strcmp(g, "attn_k.weight") == 0) {
+                n_head = 2;
+            }
+            const int64_t m = n_head ? w->ne[1] / n_head / 2 : 0;  // head_dim / 2
+            auto          row_hf = [&](int64_t r) -> int64_t {
+                if (!n_head) {
+                    return r;
+                }
+                const int64_t h = r / (2 * m), rem = r % (2 * m);
+                return (h * 2 + rem % 2) * m + rem / 2;
+            };
             axera_for_rows_f32(w, [&](int64_t r, const float * row) {
                 thread_local std::vector<uint8_t> q, s;
                 q.resize(K);
                 s.resize(K / AXERA_MX_GROUP);
                 axera_quantize_row_mxfp8_f32(row, q.data(), s.data(), K);
+                const int64_t rh = row_hf(r);
                 if (scales) {
-                    memcpy(dst + r * (K / AXERA_MX_GROUP), s.data(), s.size());
+                    memcpy(dst + rh * (K / AXERA_MX_GROUP), s.data(), s.size());
                 } else {
-                    memcpy(dst + r * K, q.data(), q.size());
+                    memcpy(dst + rh * K, q.data(), q.size());
                 }
             });
         };
