@@ -12,6 +12,7 @@ add_library(${CORE_TARGET} STATIC
     voxcpm2_wav.cpp
 )
 target_include_directories(${CORE_TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/common)
+target_include_directories(${CORE_TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 target_link_libraries(${CORE_TARGET} PUBLIC llama llama-common ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${CORE_TARGET} PUBLIC cxx_std_17)
 

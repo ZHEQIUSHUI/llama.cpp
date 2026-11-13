@@ -2,12 +2,14 @@
 
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
+#include "ggml-impl.h"
 #include "gguf.h"
 #include "log.h"
 
 #define GGML_KQ_MASK_PAD 256
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -23,6 +25,71 @@ constexpr int   kAudioStartToken       = 101;
 constexpr int   kRefAudioStartToken    = 103;
 constexpr int   kRefAudioEndToken      = 104;
 constexpr float kDefaultEmbeddingScale = 12.0f;
+
+// Environment-gated coarse stage timing for the packaged benchmark.  It is a
+// diagnostic only: no code path or numerical result depends on it.
+struct VoxStageProf {
+    bool   enabled = false;
+    double start_ms = 0.0;
+    double prefill_ms = 0.0;
+    double encode_ms = 0.0;
+    double base_ms = 0.0;
+    double front_ms = 0.0;
+    double front_dit_ms = 0.0;
+    double front_locenc_ms = 0.0;
+    double front_stop_ms = 0.0;
+    double fsq_ms = 0.0;
+    double fusion_ms = 0.0;
+    double residual_ms = 0.0;
+    double vae_ms = 0.0;
+    double first_ms = -1.0;
+    int    steps = 0;
+};
+
+static VoxStageProf g_prof;
+
+static double vox_now_ms() {
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
+}
+
+static void vox_prof_begin() {
+    const char * env = std::getenv("VOXCPM2_PROF");
+    g_prof = VoxStageProf{};
+    g_prof.enabled = env != nullptr && env[0] != '\0' && env[0] != '0';
+    g_prof.start_ms = vox_now_ms();
+}
+
+static void vox_prof_report(const char * mode) {
+    if (!g_prof.enabled) {
+        return;
+    }
+    const double total_ms = vox_now_ms() - g_prof.start_ms;
+    LOG_INF("VOXPROF mode=%s total_ms=%.3f prefill_ms=%.3f encode_ms=%.3f base_ms=%.3f "
+            "front_ms=%.3f front_dit_ms=%.3f front_locenc_ms=%.3f front_stop_ms=%.3f "
+            "fsq_ms=%.3f fusion_ms=%.3f residual_ms=%.3f vae_ms=%.3f "
+            "steps=%d first_ms=%.3f\n",
+            mode, total_ms, g_prof.prefill_ms, g_prof.encode_ms, g_prof.base_ms, g_prof.front_ms,
+            g_prof.front_dit_ms, g_prof.front_locenc_ms, g_prof.front_stop_ms,
+            g_prof.fsq_ms, g_prof.fusion_ms, g_prof.residual_ms, g_prof.vae_ms,
+            g_prof.steps, g_prof.first_ms >= 0.0 ? g_prof.first_ms : total_ms);
+}
+
+struct VoxProfScope {
+    double * slot;
+    double   start;
+    explicit VoxProfScope(double * s) : slot(s), start(g_prof.enabled ? vox_now_ms() : 0.0) {}
+    ~VoxProfScope() {
+        if (g_prof.enabled) {
+            *slot += vox_now_ms() - start;
+        }
+    }
+};
+
+struct VoxProfReport {
+    const char * mode;
+    ~VoxProfReport() { vox_prof_report(mode); }
+};
 
 // Graph context sizes (mem_size in no_alloc mode: tensor metadata only, not activation data).
 // Actual data buffers are allocated separately via ggml_backend_alloc_ctx_tensors / ggml_gallocr.
@@ -648,15 +715,10 @@ bool VoxCPM2Runtime::init(const std::string & base_lm_path,
 
     ggml_backend_load_all();
 
-    if (use_gpu_backend) {
-        backend = ggml_backend_init_best();
-        if (!backend) {
-            LOG_WRN("VoxCPM2Runtime: no GPU backend found, falling back to CPU\n");
-        }
-    }
-    if (!backend) {
-        backend = ggml_backend_init_by_name("cpu", nullptr);
-    }
+    // The acoustic components are still CPU graphs. Do not let a registered accelerator backend claim them before
+    // their kernels exist; the BaseLM reaches the accelerator through llama.cpp's own backend.
+    (void) use_gpu_backend;
+    backend = ggml_backend_init_by_name("cpu", nullptr);
     if (!backend) {
         return fail("failed to initialize ggml backend");
     }
@@ -832,6 +894,7 @@ bool VoxCPM2Runtime::prefill_tokens(const std::vector<int32_t> & token_ids) {
 }
 
 bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
+    VoxProfScope prof_prefill(&g_prof.prefill_ms);
     clear_error();
     if (!is_initialized) {
         return fail("runtime is not initialized");
@@ -917,7 +980,11 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
 
     std::vector<float> blended = base_hidden;
     if (has_feat) {
-        std::vector<float> fsq_hidden = run_fsq(base_hidden, seq_len);
+        std::vector<float> fsq_hidden;
+        {
+            VoxProfScope prof_fsq(&g_prof.fsq_ms);
+            fsq_hidden = run_fsq(base_hidden, seq_len);
+        }
         if (fsq_hidden.empty()) {
             return fail("FSQ prefill forward failed");
         }
@@ -942,7 +1009,11 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
 
     // Store for debug/dump
 
-    std::vector<float> residual_fusion_input = run_residual_fusion(blended, feat_embed_masked, seq_len);
+    std::vector<float> residual_fusion_input;
+    {
+        VoxProfScope prof_fusion(&g_prof.fusion_ms);
+        residual_fusion_input = run_residual_fusion(blended, feat_embed_masked, seq_len);
+    }
     if (residual_fusion_input.empty()) {
         return fail("residual fusion prefill failed");
     }
@@ -954,7 +1025,10 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
     // so decode step 0 attends to exactly the K/V that produced the prefill output.
     // prefill_kv() now returns the last hidden state of the prefill forward and the
     // cache writes are pure graph sinks that do not perturb that value.
-    residual_hidden = residual_lm.prefill_kv(residual_fusion_input, seq_len);
+    {
+        VoxProfScope prof_res(&g_prof.residual_ms);
+        residual_hidden = residual_lm.prefill_kv(residual_fusion_input, seq_len);
+    }
     if (residual_hidden.size() != static_cast<size_t>(hidden)) {
         return fail("ResidualLM KV cache prefill failed");
     }
@@ -1235,7 +1309,44 @@ bool VoxCPM2Runtime::run_decode_front_half(const std::vector<float> &    noise,
     ggml_backend_tensor_set(cached_front_half.cond_input, prefix_feat_cond.data(), 0,
                             prefix_feat_cond.size() * sizeof(float));
 
-    if (ggml_backend_graph_compute(backend, cached_front_half.graph) != GGML_STATUS_SUCCESS) {
+    // Diagnostic: VOXCPM2_FRONT_SPLIT=1 computes the already-built graph in three contiguous node ranges, so the board
+    // can attribute the front time to the CFM/DiT part, LocEnc, and the stop head.  The default path is one compute.
+    bool front_split = false;
+    if (const char * e = getenv("VOXCPM2_FRONT_SPLIT")) {
+        front_split = e[0] != '\0' && e[0] != '0';
+    }
+    if (front_split) {
+        auto node_index = [&](const ggml_tensor * t) {
+            for (int i = 0; i < cached_front_half.graph->n_nodes; ++i) {
+                if (cached_front_half.graph->nodes[i] == t) return i;
+            }
+            return -1;
+        };
+        const int i_patch = node_index(cached_front_half.patch_output);
+        const int i_embed = node_index(cached_front_half.embed_output);
+        const int i_stop  = node_index(cached_front_half.stop_output);
+        if (i_patch < 0 || i_embed <= i_patch || i_stop <= i_embed) {
+            LOG_WRN("VOXCPM2_FRONT_SPLIT: unexpected node order patch=%d embed=%d stop=%d\n", i_patch, i_embed, i_stop);
+            if (ggml_backend_graph_compute(backend, cached_front_half.graph) != GGML_STATUS_SUCCESS) {
+                return fail("decode_front_half graph compute failed");
+            }
+        } else {
+            auto run_range = [&](int a, int b, double * slot) -> bool {
+                ggml_cgraph sub = *cached_front_half.graph;
+                sub.nodes       = cached_front_half.graph->nodes + a;
+                sub.n_nodes     = b - a + 1;
+                const double t0 = vox_now_ms();
+                const bool   ok = ggml_backend_graph_compute(backend, &sub) == GGML_STATUS_SUCCESS;
+                *slot += vox_now_ms() - t0;
+                return ok;
+            };
+            if (!run_range(0, i_patch, &g_prof.front_dit_ms) ||
+                !run_range(i_patch + 1, i_embed, &g_prof.front_locenc_ms) ||
+                !run_range(i_embed + 1, i_stop, &g_prof.front_stop_ms)) {
+                return fail("decode_front_half split graph compute failed");
+            }
+        }
+    } else if (ggml_backend_graph_compute(backend, cached_front_half.graph) != GGML_STATUS_SUCCESS) {
         return fail("decode_front_half graph compute failed");
     }
 
@@ -1277,8 +1388,11 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         return result;
     }
 
-    if (!run_decode_front_half(noise, params, result)) {
-        return result;
+    {
+        VoxProfScope prof_front(&g_prof.front_ms);
+        if (!run_decode_front_half(noise, params, result)) {
+            return result;
+        }
     }
     if (!finite_vector(result.latent_patch) || !finite_vector(result.current_embed)) {
         fail("decode_step produced non-finite patch or embedding");
@@ -1293,9 +1407,12 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         }
     }
 
-    if (!base_lm.decode_step(base_input.data(), current_position)) {
-        fail("BaseLM decode_step failed");
-        return {};
+    {
+        VoxProfScope prof_base(&g_prof.base_ms);
+        if (!base_lm.decode_step(base_input.data(), current_position)) {
+            fail("BaseLM decode_step failed");
+            return {};
+        }
     }
 
     std::vector<float> base_hidden = base_lm.get_last_hidden();
@@ -1304,7 +1421,10 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         return {};
     }
 
-    lm_hidden = run_fsq(base_hidden, 1);
+    {
+        VoxProfScope prof_fsq(&g_prof.fsq_ms);
+        lm_hidden = run_fsq(base_hidden, 1);
+    }
     trace_dump("step" + std::to_string(audio_frame_count) + "_base", base_hidden);
     trace_dump("step" + std::to_string(audio_frame_count) + "_lm", lm_hidden);
     if (lm_hidden.size() != static_cast<size_t>(hidden)) {
@@ -1312,12 +1432,19 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         return {};
     }
 
-    std::vector<float> fusion = run_residual_fusion(lm_hidden, result.current_embed, 1);
+    std::vector<float> fusion;
+    {
+        VoxProfScope prof_fusion(&g_prof.fusion_ms);
+        fusion = run_residual_fusion(lm_hidden, result.current_embed, 1);
+    }
     if (fusion.size() != static_cast<size_t>(hidden)) {
         fail("residual fusion decode failed");
         return {};
     }
-    residual_hidden = residual_lm.forward_step(fusion, current_position);
+    {
+        VoxProfScope prof_res(&g_prof.residual_ms);
+        residual_hidden = residual_lm.forward_step(fusion, current_position);
+    }
     trace_dump("step" + std::to_string(audio_frame_count) + "_res", residual_hidden);
     if (residual_hidden.size() != static_cast<size_t>(hidden)) {
         fail("ResidualLM forward_step failed");
@@ -1328,6 +1455,7 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
     output_pool.push_back(result.latent_patch);
     ++audio_frame_count;
     ++current_position;
+    ++g_prof.steps;
     state_ready = true;
     return result;
 }
@@ -1349,6 +1477,7 @@ void VoxCPM2Runtime::decode_loop(const VoxCPM2GenerateParams &                  
 }
 
 std::vector<float> VoxCPM2Runtime::decode_pool_range_to_waveform(int start_patch, int end_patch, int target_sr) {
+    VoxProfScope prof_vae(&g_prof.vae_ms);
     clear_error();
     if (!is_initialized) {
         fail("runtime is not initialized");
@@ -1439,6 +1568,7 @@ std::vector<float> VoxCPM2Runtime::decode_to_waveform(int target_sr) {
 }
 
 std::vector<float> VoxCPM2Runtime::decode_patch_streaming(const std::vector<float> & patch, int target_sr) {
+    VoxProfScope prof_vae(&g_prof.vae_ms);
     clear_error();
     if (!is_initialized) {
         fail("runtime is not initialized");
@@ -1511,6 +1641,7 @@ std::vector<float> VoxCPM2Runtime::decode_patch_streaming(const std::vector<floa
 }
 
 std::vector<float> VoxCPM2Runtime::encode_reference_audio(const std::vector<float> & reference_wav, int sample_rate) {
+    VoxProfScope prof_encode(&g_prof.encode_ms);
     clear_error();
     if (!is_initialized) {
         fail("runtime is not initialized");
@@ -1780,6 +1911,8 @@ bool VoxCPM2Runtime::build_continuation_prefill_inputs(const std::vector<int32_t
 
 std::vector<float> VoxCPM2Runtime::generate_tokens(const std::vector<int32_t> &  token_ids,
                                                    const VoxCPM2GenerateParams & params) {
+    vox_prof_begin();
+    VoxProfReport prof_report{"tokens"};
     clear_error();
     if (params.seed != 0) {
         rng.seed(params.seed);
@@ -1823,6 +1956,8 @@ std::vector<float> VoxCPM2Runtime::generate(const std::string & text, const VoxC
 std::vector<float> VoxCPM2Runtime::generate_with_clone(const std::string &           text,
                                                        const std::vector<float> &    reference_wav,
                                                        const VoxCPM2GenerateParams & params) {
+    vox_prof_begin();
+    VoxProfReport prof_report{"clone"};
     std::vector<int32_t> token_ids = tokenize_text(text, false, true);
     if (token_ids.empty()) {
         if (last_error_msg.empty()) {
@@ -1858,6 +1993,8 @@ std::vector<float> VoxCPM2Runtime::generate_with_continuation(const std::string 
                                                              const std::string &           prompt_text,
                                                              const std::vector<float> &    prompt_wav,
                                                              const VoxCPM2GenerateParams & params) {
+    vox_prof_begin();
+    VoxProfReport prof_report{"continuation"};
     // Continuation-mode voice cloning (Python voxcpm2.py:589-623 / 668-676).
     // Tokenize the CONCATENATED string (prompt_text + target_text) ONCE so that
     // CJK multi-char expansion applies to the joined string — do NOT tokenize the
@@ -1942,6 +2079,9 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
             break;
         }
 
+        if (g_prof.enabled && g_prof.first_ms < 0.0) {
+            g_prof.first_ms = vox_now_ms() - g_prof.start_ms;
+        }
         const bool is_final = params.stop_on_predictor && i > params.min_steps && step.should_stop;
         if (callback && (!chunk.empty() || is_final)) {
             if (!callback(chunk, is_final)) {
@@ -1967,6 +2107,8 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
 bool VoxCPM2Runtime::generate_tokens_streaming(const std::vector<int32_t> &      token_ids,
                                                const VoxCPM2AudioChunkCallback & callback,
                                                const VoxCPM2GenerateParams &     params) {
+    vox_prof_begin();
+    VoxProfReport prof_report{"stream"};
     clear_error();
     if (params.seed != 0) {
         rng.seed(params.seed);
@@ -1999,6 +2141,8 @@ bool VoxCPM2Runtime::generate_with_clone_streaming(const std::string &          
                                                    const std::vector<float> &        reference_wav,
                                                    const VoxCPM2AudioChunkCallback & callback,
                                                    const VoxCPM2GenerateParams &     params) {
+    vox_prof_begin();
+    VoxProfReport prof_report{"clone_stream"};
     clear_error();
     std::vector<int32_t> token_ids = tokenize_text(text, false, true);
     if (token_ids.empty()) {
@@ -2032,6 +2176,8 @@ bool VoxCPM2Runtime::generate_with_continuation_streaming(const std::string &   
                                                           const std::vector<float> &        prompt_wav,
                                                           const VoxCPM2AudioChunkCallback & callback,
                                                           const VoxCPM2GenerateParams &     params) {
+    vox_prof_begin();
+    VoxProfReport prof_report{"continuation_stream"};
     clear_error();
     // Same tokenize-once rule as generate_with_continuation (CJK expansion on joined string).
     const std::string    joined_text = prompt_text + target_text;

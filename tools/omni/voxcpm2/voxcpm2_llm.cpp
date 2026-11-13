@@ -39,7 +39,7 @@ bool MiniCPMLM::init(const std::string & path, int n_gpu_layers) {
 
     // Create context
     struct llama_context_params cparams_local = llama_context_default_params();
-    cparams_local.n_ctx       = 32768;
+    cparams_local.n_ctx       = 8192;
     cparams_local.n_batch     = 1024;
     cparams_local.embeddings  = true;
     cparams_local.offload_kqv = true;
