@@ -206,6 +206,25 @@ static bool load_codes(const std::string & path, std::vector<int> & out) {
     return true;
 }
 
+static std::vector<int> filter_flow_silent_tokens(const std::vector<int> & codes) {
+    static const int silent[] = {1, 2, 28, 29, 55, 248, 494, 2241, 2242, 2322, 2323};
+    std::vector<int> out;
+    out.reserve(codes.size());
+    int run = 0;
+    for (int tok : codes) {
+        bool is_silent = false;
+        for (int s : silent) is_silent = is_silent || tok == s;
+        if (is_silent) {
+            run++;
+            if (run > 5) continue;
+        } else {
+            run = 0;
+        }
+        out.push_back(tok);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // ONNX Runtime helpers
 
@@ -920,7 +939,12 @@ int main(int argc, char ** argv) {
     }
 
     // ---- flow encoder ---------------------------------------------------
-    std::vector<int32_t> gen_tok(codes.begin(), codes.end());
+    const std::vector<int> flow_codes = filter_flow_silent_tokens(codes);
+    if (flow_codes.size() != codes.size()) {
+        fprintf(stderr, "[flow] filtered %zu silent speech tokens (%zu -> %zu)\n",
+                codes.size() - flow_codes.size(), codes.size(), flow_codes.size());
+    }
+    std::vector<int32_t> gen_tok(flow_codes.begin(), flow_codes.end());
     std::vector<int64_t> tok_shape{1, (int64_t) gen_tok.size()};
     std::vector<int64_t> ptok_shape{1, (int64_t) prompt_tok.size()};
     std::vector<int64_t> pfeat_shape{1, flow_frames, 80};
@@ -938,8 +962,8 @@ int main(int argc, char ** argv) {
     auto mask_shape = shape_of(fe_out[3]);
     if (mu_shape.size() != 3) { fprintf(stderr, "bad flow mu shape\n"); return 1; }
     const int T = (int) mu_shape[2];
-    if (T != 2 * ((int) prompt_tok.size() + (int) codes.size())) {
-        fprintf(stderr, "flow length mismatch T=%d prompt_tok=%zu codes=%zu\n", T, prompt_tok.size(), codes.size());
+    if (T != 2 * ((int) prompt_tok.size() + (int) flow_codes.size())) {
+        fprintf(stderr, "flow length mismatch T=%d prompt_tok=%zu codes=%zu\n", T, prompt_tok.size(), flow_codes.size());
         return 1;
     }
     std::vector<float> mu(T * 80), cond(T * 80), spks(80), mask(T);
@@ -1091,7 +1115,8 @@ int main(int argc, char ** argv) {
             sec(t0, t_front), sec(t_load0, t_load1),
             sec(t_load1, t_prefill), sec(t_gen0, t_gen1), codes.size() / std::max(1e-9, sec(t_gen0, t_gen1)),
             sec(t_gen1, t_flowenc), sec(t_flowenc, t_flow), sec(t_flow, t_hift), sec(t_all0, t_hift));
-    fprintf(stderr, "[audio] %.3fs %zu samples, codes=%zu, T=%d Tgen=%d\n", pcm.size() / 24000.0, pcm.size(), codes.size(), T, Tgen);
+    fprintf(stderr, "[audio] %.3fs %zu samples, codes=%zu flow_codes=%zu, T=%d Tgen=%d\n",
+            pcm.size() / 24000.0, pcm.size(), codes.size(), flow_codes.size(), T, Tgen);
     fprintf(stderr, "[out] %s\n", a.out.c_str());
 
     llama_free(ctx);
