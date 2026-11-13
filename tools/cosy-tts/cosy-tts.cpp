@@ -618,6 +618,7 @@ struct args {
     std::string model, aux, tables;
     std::string campplus, tokenizer, flow_encoder, flow_estimator, hift;
     std::string flow_npu, hift_npu;
+    bool flow_npu_nlc = false;
     std::string text, prompt_text, prompt_wav, out = "out.wav";
     int ngl = 0, ctx = 4096, threads = 16;
     uint32_t seed = 1986;
@@ -639,6 +640,7 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (k == "--hift") a.hift = val();
         else if (k == "--flow-npu") a.flow_npu = val();
         else if (k == "--hift-npu") a.hift_npu = val();
+        else if (k == "--flow-npu-nlc") a.flow_npu_nlc = true;
         else if (k == "-p" || k == "--text") a.text = val();
         else if (k == "--prompt-text") a.prompt_text = val();
         else if (k == "--prompt-wav") a.prompt_wav = val();
@@ -699,7 +701,7 @@ int main(int argc, char ** argv) {
             "  --tokenizer speech_tokenizer_v3.onnx --flow-encoder flow_encoder.onnx\n"
             "  --flow-estimator flow.decoder.estimator.fp32.onnx --hift hift.onnx\n"
             "  -p TEXT --prompt-text TEXT --prompt-wav ref.wav -o out.wav [-ngl N] [--dump-codes]\n"
-            "  (or --flow-npu flow.axmodel --hift-npu hift.axmodel instead of the ONNX stages)\n", argv[0]);
+            "  (or --flow-npu flow.axmodel [--flow-npu-nlc] --hift-npu hift.axmodel instead of the ONNX stages)\n", argv[0]);
         return 1;
     }
 
@@ -983,13 +985,25 @@ int main(int argc, char ** argv) {
         if (flow_npu) {
             const size_t plane = (size_t) 80 * npu_flow_cap;
             std::vector<float> nx(2 * plane), nmu(2 * plane), ncond(2 * plane), nmask(2 * npu_flow_cap), nspks(2 * 80), nt(2);
-            for (int c = 0; c < 80; c++) {
-                memcpy(nx.data() + (size_t) c * npu_flow_cap, x.data() + (size_t) c * T, T * 4);
-                memcpy(nmu.data() + (size_t) c * npu_flow_cap, mu.data() + (size_t) c * T, T * 4);
-                memcpy(ncond.data() + (size_t) c * npu_flow_cap, cond.data() + (size_t) c * T, T * 4);
-                memcpy(nx.data() + plane + (size_t) c * npu_flow_cap, x.data() + (size_t) c * T, T * 4);
-                memset(nmu.data() + plane + (size_t) c * npu_flow_cap, 0, T * 4);
-                memset(ncond.data() + plane + (size_t) c * npu_flow_cap, 0, T * 4);
+            if (a.flow_npu_nlc) {
+                for (int t = 0; t < T; t++) {
+                    for (int c = 0; c < 80; c++) {
+                        const size_t src = (size_t) c * T + t;
+                        nx[(size_t) t * 80 + c] = x[src];
+                        nx[plane + (size_t) t * 80 + c] = x[src];
+                        nmu[(size_t) t * 80 + c] = mu[src];
+                        ncond[(size_t) t * 80 + c] = cond[src];
+                    }
+                }
+            } else {
+                for (int c = 0; c < 80; c++) {
+                    memcpy(nx.data() + (size_t) c * npu_flow_cap, x.data() + (size_t) c * T, T * 4);
+                    memcpy(nmu.data() + (size_t) c * npu_flow_cap, mu.data() + (size_t) c * T, T * 4);
+                    memcpy(ncond.data() + (size_t) c * npu_flow_cap, cond.data() + (size_t) c * T, T * 4);
+                    memcpy(nx.data() + plane + (size_t) c * npu_flow_cap, x.data() + (size_t) c * T, T * 4);
+                    memset(nmu.data() + plane + (size_t) c * npu_flow_cap, 0, T * 4);
+                    memset(ncond.data() + plane + (size_t) c * npu_flow_cap, 0, T * 4);
+                }
             }
             memcpy(nmask.data(), mask.data(), T * 4);
             memcpy(nmask.data() + npu_flow_cap, mask.data(), T * 4);
