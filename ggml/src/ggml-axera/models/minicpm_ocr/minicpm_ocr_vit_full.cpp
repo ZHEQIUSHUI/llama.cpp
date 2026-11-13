@@ -57,7 +57,9 @@ void minicpm_ocr_vit_full::weights(int L, int H, int CP) {
     axera_timer tm("ocr vit weights (load)");
     auto stack = [&](const char * in, const char * suffix) {
         axera_cmm & c = io(in);
-        const size_t per = c->size / L;
+        const size_t abi = k.in_bytes(in);
+        GGML_ASSERT(abi % (size_t) L == 0);
+        const size_t per = abi / L;
         axera_host_pool().run(L, [&](int64_t l) {
             const ggml_tensor * w = names.at("v.blk." + std::to_string(l) + "." + suffix);
             GGML_ASSERT((size_t) ggml_nelements(w) * sizeof(ggml_bf16_t) == per);
@@ -80,7 +82,9 @@ void minicpm_ocr_vit_full::weights(int L, int H, int CP) {
     for (const qkv & x : {qkv{"w_qkv", "attn_q.weight", "attn_k.weight", "attn_v.weight", (size_t) H * H},
                           qkv{"b_qkv", "attn_q.bias", "attn_k.bias", "attn_v.bias", (size_t) H}}) {
         axera_cmm & c = io(x.in);
-        const size_t per = c->size / L;
+        const size_t abi = k.in_bytes(x.in);
+        GGML_ASSERT(abi % (size_t) L == 0);
+        const size_t per = abi / L;
         GGML_ASSERT(per == 3 * x.elem * sizeof(ggml_bf16_t));
         axera_host_pool().run(L, [&](int64_t l) {
             char * d = (char *) c->vir + l * per;
@@ -93,6 +97,7 @@ void minicpm_ocr_vit_full::weights(int L, int H, int CP) {
 
     static const std::pair<const char *, const char *> whole[] = {
         { "b_patch", "v.patch_embd.bias" }, { "post_w", "v.post_ln.weight" }, { "post_b", "v.post_ln.bias" },
+        { "mm_w", "mm.input_norm.weight" }, { "mm_b", "mm.input_norm.bias" },
         { "w0", "mm.up.weight" }, { "b0", "mm.up.bias" }, { "w2", "mm.down.weight" }, { "b2", "mm.down.bias" },
     };
     for (const auto & [in, t] : whole) {
