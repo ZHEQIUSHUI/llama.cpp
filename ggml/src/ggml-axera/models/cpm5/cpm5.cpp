@@ -305,7 +305,10 @@ void cpm5::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tenso
             if (n.rfind("b0_kv", 0) == 0) {
                 const int j = kv_index(n);
                 GGML_ASSERT(j >= 0 && j < L);
-                c.in.push_back(axera_io(KVC[j], (uint32_t) kv_alloc));
+                // The kernel's KV IO keeps its full manifest size; with a smaller -c the
+                // CMM pool holds fewer pages and indices never address the rest (the
+                // qwen38_27b / qwen35_whole split-KV layout).
+                c.in.push_back(axera_io(KVC[j], (uint32_t) kv_b));
                 continue;
             }
             const bool         prefill_call = c.k == &pk;
@@ -317,7 +320,7 @@ void cpm5::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tenso
                 GGML_ASSERT(it != banks.end());
                 b = &it->second;
             }
-            c.in.push_back(axera_io(*b, n.rfind("b0_kv", 0) == 0 ? (uint32_t) kv_alloc : d.bytes));
+            c.in.push_back(axera_io(*b, d.bytes));
         }
         c.out.push_back(axera_io(c.k == &pk ? POUT : DOUT, k.desc->out.at(0).bytes));
     };
