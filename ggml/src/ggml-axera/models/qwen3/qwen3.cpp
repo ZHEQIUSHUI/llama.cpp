@@ -98,6 +98,14 @@ axera_cmm qwen3::bank(const std::map<std::string, ggml_tensor *> & t, const io_d
     const size_t bb = d.bytes / nb;  // bytes per block
     const bool keep_pages = axera_keep_pages();
     std::vector<const ggml_tensor *> read;  // the GGUF tensors of one block: their mapped pages dropped right after it
+    auto weight_is_bf16 = [&](const std::string & wn) {
+        for (const io_desc & x : man.get("prefill").desc->in) {
+            if (x.name == wn) {
+                return x.dtype == GGML_TYPE_BF16;
+            }
+        }
+        return false;
+    };
     auto         T  = [&](int il, const char * g) -> ggml_tensor * {
         const std::string nm = "blk." + std::to_string(il) + "." + g;
         if (!t.count(nm)) {
@@ -158,9 +166,19 @@ axera_cmm qwen3::bank(const std::map<std::string, ggml_tensor *> & t, const io_d
             if (n == "w_norm") {
                 put(f32_of(T(il, "ffn_norm.weight")));
             } else if (n.size() == 2 && W.count(n.substr(1))) {
-                mx8(W.at(n.substr(1)), false);
+                const ggml_tensor * w = T(il, W.at(n.substr(1)));
+                if (d.dtype == GGML_TYPE_BF16) {
+                    put(f32_of(w));
+                } else {
+                    mx8(W.at(n.substr(1)), false);
+                }
             } else if (n.rfind("w_scale", 0) == 0 && W.count(n.substr(7))) {
-                mx8(W.at(n.substr(7)), true);
+                const std::string wn = "b" + std::to_string(phase) + "_mlp_w" + n.substr(7);
+                if (weight_is_bf16(wn)) {
+                    fill(1.0f);
+                } else {
+                    mx8(W.at(n.substr(7)), true);
+                }
             } else {
                 GGML_ABORT("axera qwen3: prefill: unexpected MLP input %s\n", d.name.c_str());
             }
@@ -175,7 +193,16 @@ axera_cmm qwen3::bank(const std::map<std::string, ggml_tensor *> & t, const io_d
             } else if (n == "w_norm_k") {
                 put(f32_of(T(il, "attn_k_norm.weight")));
             } else if (W.count(p) && (n == "w_" + p || n == "w_scale_" + p)) {
-                mx8(W.at(p), n != "w_" + p);
+                const std::string wn = "b" + std::to_string(phase) + "_attn_w_" + p;
+                if (weight_is_bf16(wn)) {
+                    if (n == "w_" + p) {
+                        put(f32_of(T(il, W.at(p))));
+                    } else {
+                        fill(1.0f);
+                    }
+                } else {
+                    mx8(W.at(p), n != "w_" + p);
+                }
             } else {
                 GGML_ABORT("axera qwen3: prefill: unexpected attention input %s\n", d.name.c_str());
             }
