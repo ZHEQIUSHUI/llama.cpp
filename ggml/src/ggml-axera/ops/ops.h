@@ -113,6 +113,7 @@ struct output_head {
     std::vector<int32_t> dids;
     axera_cmm            dq, ds, dy;
     bool                 dargmax = false;  // the draft head returns one (local id, logit) instead of 65536 logits
+    bool                 dqm4 = false;     // the gathered draft rows are MXFP4 (else MXFP8, matching q / s)
     axera_cmm            did, dtop;
     bool                 draft = false;  // the next run's single output row through the draft head
     // one already-normalized row through an argmax draft head (the fused draft chain); the global id

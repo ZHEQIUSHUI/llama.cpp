@@ -397,6 +397,19 @@ void scenarios() {
         }
         R.feed(R.H.len(), 30, "next turn");
         REQUIRE(!strcmp(S.path(), "replay"), "the next turn ran as '%s'", S.path());
+        // a short verify at the end of the context still fits its kernel's snapshot rows (c0 + rows <= cells); it must
+        // not fall back to pages merely because c0 + T + rows would pass the context
+        runner E;
+        E.rng.seed(3);
+        E.M.caps = { 16, W, sizeof(image), 64, 4, 0, true };
+        E.M.kv.assign(64, 0);
+        E.M.rng = &E.rng;
+        E.cfg   = { 1, 4, true };
+        seqstate ES(E.M, E.cfg);
+        E.S = &ES;
+        E.feed(0, 60, "prompt before the context's end");
+        E.feed(60, 2, "verify at the context's end");
+        REQUIRE(!strcmp(ES.path(), "verify"), "the context-tail verify ran as '%s'", ES.path());
         // regenerate: back into the page where that prompt ended, after an answer that crossed pages
         const int64_t pe = R.H.len();
         for (int i = 0; i < 50; ++i) {

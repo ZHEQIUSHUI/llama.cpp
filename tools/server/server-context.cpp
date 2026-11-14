@@ -2684,14 +2684,21 @@ private:
                 slot.spec_structured = slot.prompt_is_structured(slot.task->tokens);
                 static const bool cold_start = getenv("LLAMA_SPEC_COLD_START") == nullptr ||
                                                atoi(getenv("LLAMA_SPEC_COLD_START")) != 0;
-                if (cold_start && !slot.spec_structured) {
+                // Sampled requests can look structured but have low draft acceptance and pay the verified-window
+                // rollback cost for little gain.  Opt-in launchers can start them dormant like prose.
+                static const bool sample_dormant = getenv("LLAMA_SPEC_SAMPLE_DORMANT") != nullptr &&
+                                                   atoi(getenv("LLAMA_SPEC_SAMPLE_DORMANT")) != 0;
+                const bool dormant = !slot.spec_structured || (sample_dormant && slot.use_spec_rejection());
+                if (cold_start && dormant) {
                     slot.spec_gate_init   = true;
                     slot.spec_gate_on     = false;
                     slot.spec_gate_locked = true;
                     slot.spec_nextn_on    = false;
                     llama_set_embeddings_nextn(ctx_tgt, false, false);
                     cold_dormant = true;
-                    SLT_INF(slot, "%s", "adaptive MTP off (non-structured prompt starts dormant)\n");
+                    SLT_INF(slot, "%s", slot.spec_structured
+                        ? "adaptive MTP off (sampled prompt starts dormant)\n"
+                        : "adaptive MTP off (non-structured prompt starts dormant)\n");
                 }
             }
             // Structured prompts start with a short verified window and keep drafting while it pays.  A verified
@@ -4744,7 +4751,9 @@ private:
                             // a pure append reuses the live state at the end of the cached prompt: the recurrent state
                             // is already at the right position, so rewinding through a checkpoint and replaying the tail
                             // would only copy the checkpoint payload (hundreds of MiB on Axera) for an identical result.
-                            const bool state_at_prompt_tip = n_swa == 0 && n_past == (int) slot.prompt.n_tokens();
+                            // an identical prompt has no new token: its last token is evaluated again [TAG_PROMPT_LOGITS],
+                            // which needs a state from before that token, so the tip state cannot be used as is
+                            const bool state_at_prompt_tip = n_swa == 0 && has_new_tokens && n_past == (int) slot.prompt.n_tokens();
 
                             // a continuation can still be short of the live tip: the generated tokens of the previous
                             // request are in the slot state but the client may encode the same text differently (or
