@@ -91,6 +91,8 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
         llm = make_qwen35_35b_a3b(m);
     } else if (m.model == "qwen35_moe_sgl") {
         llm = make_qwen35_moe_sgl(m);
+    } else if (m.model == "hy_mt2") {
+        llm = make_hy_mt2(m);
     } else if (m.model == "qwen3") {
         llm = make_qwen3(m);
     } else {
