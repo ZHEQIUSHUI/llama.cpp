@@ -28,6 +28,7 @@ ggml_add_backend_library(ggml-axera
                          models/minicpm_ocr/minicpm_ocr_vit_full.cpp
                          models/qwen35_35b_a3b/qwen35_35b_a3b.cpp
                          models/qwen35_moe_sgl/qwen35_moe_sgl.cpp
+                         models/hy_mt2/hy_mt2.cpp
                          models/qwen3/qwen3.cpp
                          models/cpm5/cpm5.cpp
                          models/hymt/hymt.cpp
