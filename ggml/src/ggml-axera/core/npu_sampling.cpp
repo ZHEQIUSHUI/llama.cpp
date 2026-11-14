@@ -104,6 +104,24 @@ int npu_configure(bool enabled, int32_t top_k, float top_p, float min_p, float t
                     row.ids.assign(K, 0);
                 }
             }
+        } else if (m && (m->has("decode.group") || m->has("decode"))) {
+            // the merged decode kernel carries the fused head: no separate lm_head.topk role, one output row, and
+            // the top-K candidates are named values/kids instead of values/ids
+            const kernel & g = m->has("decode.group") ? m->get("decode.group") : m->get("decode");
+            if (g.find_input("bias") >= 0 && g.find_input("mul_pos") >= 0 && g.find_input("mul_neg") >= 0 &&
+                g.find_input("temp") >= 0 && g.find_output("values") >= 0 && g.find_output("kids") >= 0 &&
+                g.find_output("vmax") >= 0 && g.find_output("sumexp") >= 0 &&
+                g.out_bytes("values") >= sizeof(float) && g.out_bytes("values") % sizeof(float) == 0 &&
+                g.out_bytes("kids") == g.out_bytes("values") * sizeof(int32_t) / sizeof(float) &&
+                g.out_bytes("vmax") == sizeof(float) && g.out_bytes("sumexp") == sizeof(float)) {
+                s.K = (int32_t) (g.out_bytes("values") / sizeof(float));
+                s.R = 1;
+                s.rows.assign(s.R, npu_candidates{});
+                for (auto & row : s.rows) {
+                    row.values.assign(s.K, 0.0f);
+                    row.ids.assign(s.K, 0);
+                }
+            }
         }
     }
     s.enabled = s.K > 0 && s.R > 0;
