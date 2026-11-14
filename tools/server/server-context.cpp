@@ -21,6 +21,8 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "gguf.h"
+#include "forced-aligner.h"
 
 #include <algorithm>
 #include <climits>
@@ -75,6 +77,36 @@ static llama_token server_tts_sample(void * user_data) {
     const llama_token sampled = common_sampler_sample(ctx->smpl, ctx->lctx, -1);
     common_sampler_accept(ctx->smpl, sampled, true);
     return sampled;
+}
+
+// A forced aligner emits one classifier row per timestamp token.  The server's normal output
+// reserve is sized for one row per slot; size a separate reserve for this non-autoregressive path.
+static int server_model_embedding_length_out(const std::string & path) {
+    gguf_init_params p = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), p);
+    if (!g) {
+        return 0;
+    }
+    int result = 0;
+    for (const char * key : { "qwen3vl.embedding_length_out", "qwen3.embedding_length_out" }) {
+        const int64_t id = gguf_find_key(g, key);
+        if (id < 0) {
+            continue;
+        }
+        const gguf_type type = gguf_get_kv_type(g, id);
+        if (type == GGUF_TYPE_UINT32) {
+            result = (int) gguf_get_val_u32(g, id);
+        } else if (type == GGUF_TYPE_INT32) {
+            result = gguf_get_val_i32(g, id);
+        } else if (type == GGUF_TYPE_UINT64) {
+            result = (int) gguf_get_val_u64(g, id);
+        } else if (type == GGUF_TYPE_INT64) {
+            result = (int) gguf_get_val_i64(g, id);
+        }
+        break;
+    }
+    gguf_free(g);
+    return result;
 }
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -1741,6 +1773,17 @@ private:
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+        // Only the audiovisual classifier path needs many output rows.  Do not
+        // change the output reserve of text embedding / generation models that
+        // happen to carry the same metadata.
+        if (!params_base.mmproj.path.empty() && !params_base.embedding &&
+                server_model_embedding_length_out(params_base.model.path) > 0) {
+            const int base = params_base.n_ctx > 0 ? params_base.n_ctx : 4096;
+            const int align_outputs = std::max(1, std::min(params_base.n_batch, base));
+            params_base.n_outputs_max = align_outputs;
+            params_base.n_outputs_max_per_seq = align_outputs;
+            SRV_INF("forced aligner: output reserve = %d rows\n", align_outputs);
+        }
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -3717,6 +3760,57 @@ private:
         }
     }
 
+    void process_forced_align_task(server_task && task) {
+        const int id_task = task.id;
+        auto clear_align_state = [&]() {
+            llama_synchronize(ctx_tgt);
+            for (auto & slot : slots) {
+                if (slot.prompt.n_tokens() > 0) {
+                    slot.prompt_clear();
+                }
+            }
+            llama_memory_clear(llama_get_memory(ctx_tgt), true);
+        };
+        auto fail = [&](const std::string & message, error_type type) {
+            clear_align_state();
+            queue_tasks.pop_deferred_task(-1);
+            send_error(id_task, message, type);
+        };
+
+        clear_align_state();
+        if (!mctx) {
+            return fail("forced alignment requires an audio projector", ERROR_TYPE_NOT_SUPPORTED);
+        }
+        if (llama_model_n_embd_out(model_tgt) <= 0) {
+            return fail("the loaded model is not a forced aligner", ERROR_TYPE_NOT_SUPPORTED);
+        }
+        if (params_base.n_parallel != 1) {
+            return fail("forced alignment requires --parallel 1", ERROR_TYPE_INVALID_REQUEST);
+        }
+
+        mtmd_forced_aligner::options options;
+        options.transcript = task.forced_align.transcript;
+        options.language = task.forced_align.language;
+        options.segment_ms = task.forced_align.segment_ms;
+        options.max_outputs = params_base.n_outputs_max;
+        const mtmd_forced_aligner::result aligned = mtmd_forced_aligner::run(
+                model_tgt, ctx_tgt, mctx, task.forced_align.audio.data(), task.forced_align.audio.size(), options);
+        clear_align_state();
+        if (!aligned.ok) {
+            const error_type type = aligned.code == 400 ? ERROR_TYPE_INVALID_REQUEST : ERROR_TYPE_SERVER;
+            return fail(aligned.error, type);
+        }
+
+        auto out = std::make_unique<server_task_result_align>();
+        out->id = id_task;
+        out->data = aligned.json;
+        out->input_tokens = aligned.input_tokens;
+        out->audio_tokens = aligned.audio_tokens;
+        out->t_forward_s = aligned.forward_seconds;
+        queue_tasks.pop_deferred_task(-1);
+        queue_results.send(std::move(out));
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -3739,6 +3833,21 @@ private:
                     }
                     if (!busy) {
                         process_tts_task(std::move(task));
+                    }
+                } break;
+            case SERVER_TASK_TYPE_FORCED_ALIGN:
+                {
+                    bool busy = false;
+                    for (const auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            SRV_DBG("a slot is busy, defer forced alignment task, id_task = %d\n", task.id);
+                            queue_tasks.defer(std::move(task));
+                            busy = true;
+                            break;
+                        }
+                    }
+                    if (!busy) {
+                        process_forced_align_task(std::move(task));
                     }
                 } break;
             case SERVER_TASK_TYPE_COMPLETION:
@@ -5926,6 +6035,7 @@ server_context_meta server_context::get_meta() const {
         /* model_path              */ impl->params_base.model.path,
         /* model_output_modalities */ server_model_output_modalities(common_get_decision_type(impl->model_tgt)),
         /* has_mtmd                */ impl->mctx != nullptr,
+        /* has_forced_aligner      */ llama_model_n_embd_out(impl->model_tgt) > 0,
         /* has_inp_image           */ impl->chat_params.allow_image,
         /* has_inp_audio           */ impl->chat_params.allow_audio,
         /* has_inp_video           */ impl->chat_params.allow_video,
@@ -6806,12 +6916,158 @@ void server_routes::init_routes() {
         return handle_count_tokens(req, TASK_RESPONSE_TYPE_OAI_RESP);
     };
 
-    this->post_transcriptions_oai = [this](const server_http_req & req) {
+    auto handle_forced_align = [this](const server_http_req & req, bool transcriptions) {
+        auto res = create_response();
+        if (!meta->has_mtmd || !meta->has_forced_aligner) {
+            res->error(format_error_response("The loaded model is not a forced aligner.", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        if (params.n_parallel != 1) {
+            res->error(format_error_response("Forced alignment requires --parallel 1.", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        json body = json::parse(req.body);
+        if (!body.is_object()) {
+            throw std::invalid_argument("request body must be a JSON object");
+        }
+        auto opt_string = [&](std::initializer_list<const char *> keys, const std::string & fallback = "") -> std::string {
+            for (const char * key : keys) {
+                if (body.contains(key) && !body.at(key).is_null()) {
+                    if (!body.at(key).is_string()) {
+                        throw std::invalid_argument(string_format("\"%s\" must be a string", key));
+                    }
+                    return body.at(key).get<std::string>();
+                }
+            }
+            return fallback;
+        };
+        auto decode_base64 = [](std::string encoded) {
+            const size_t data_uri = encoded.find(";base64,");
+            if (data_uri != std::string::npos) {
+                encoded = encoded.substr(data_uri + 8);
+            }
+            const std::string decoded = base64::decode(encoded);
+            return raw_buffer(decoded.begin(), decoded.end());
+        };
+
+        raw_buffer audio;
+        for (const char * key : { "file", "audio", "input_audio" }) {
+            auto it = req.files.find(key);
+            if (it != req.files.end()) {
+                audio = it->second.data;
+                break;
+            }
+        }
+        if (audio.empty() && body.contains("audio") && !body["audio"].is_null()) {
+            const json & value = body["audio"];
+            if (value.is_object() && value.contains("data") && value["data"].is_string()) {
+                audio = decode_base64(value["data"].get<std::string>());
+            } else if (value.is_string()) {
+                audio = decode_base64(value.get<std::string>());
+            } else {
+                throw std::invalid_argument("\"audio\" must be a base64 string or an object with \"data\"");
+            }
+        }
+        if (audio.empty() && body.contains("file") && body["file"].is_string()) {
+            audio = decode_base64(body["file"].get<std::string>());
+        }
+        if (audio.empty()) {
+            throw std::invalid_argument("missing audio file: use multipart field \"file\" or JSON \"audio\"");
+        }
+
+        const std::string transcript = opt_string({ "transcript", "text" });
+        if (transcript.empty()) {
+            throw std::invalid_argument("missing required field \"transcript\" (or \"text\")");
+        }
+        const std::string language = opt_string({ "language" }, "English");
+        int segment_ms = 80;
+        if (body.contains("segment_ms") && !body["segment_ms"].is_null()) {
+            if (body["segment_ms"].is_number_integer()) {
+                segment_ms = body["segment_ms"].get<int>();
+            } else if (body["segment_ms"].is_string()) {
+                segment_ms = std::stoi(body["segment_ms"].get<std::string>());
+            } else {
+                throw std::invalid_argument("\"segment_ms\" must be an integer");
+            }
+        }
+        const std::string response_format = opt_string({ "response_format" }, "json");
+        if (transcriptions) {
+            if (response_format != "json" && response_format != "verbose_json" && response_format != "text") {
+                throw std::invalid_argument(
+                    "unsupported response_format: only \"json\", \"verbose_json\" and \"text\" are supported");
+            }
+        } else if (response_format != "json") {
+            throw std::invalid_argument("only \"json\" response_format is supported by /v1/audio/alignments");
+        }
+
+        server_task task(SERVER_TASK_TYPE_FORCED_ALIGN);
+        task.forced_align.transcript = transcript;
+        task.forced_align.language = language;
+        task.forced_align.segment_ms = segment_ms;
+        task.forced_align.audio = std::move(audio);
+        task.forced_align.response_format = response_format;
+        task.id = res->rd.get_new_id();
+        res->rd.post_task(std::move(task));
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * aligned = dynamic_cast<server_task_result_align *>(result.get());
+        GGML_ASSERT(aligned != nullptr);
+        json full = json::parse(aligned->data);
+        res->headers["X-Align-Input-Tokens"] = std::to_string(aligned->input_tokens);
+        res->headers["X-Align-Audio-Tokens"] = std::to_string(aligned->audio_tokens);
+        res->headers["X-Align-Forward-Seconds"] = string_format("%.6f", aligned->t_forward_s);
+
+        if (!transcriptions) {
+            res->ok(full);
+            return res;
+        }
+
+        if (response_format == "text") {
+            res->status = 200;
+            res->content_type = "text/plain; charset=utf-8";
+            res->data = full.value("text", std::string());
+            return res;
+        }
+        if (response_format == "json") {
+            json out = { { "text", full.value("text", std::string()) } };
+            res->ok(out);
+            return res;
+        }
+        json out = full;
+        out["task"] = "transcribe";
+        res->ok(out);
+        return res;
+    };
+
+    this->post_audio_alignments = [this, handle_forced_align](const server_http_req & req) {
+        return handle_forced_align(req, false);
+    };
+
+    this->post_transcriptions_oai = [this, handle_forced_align](const server_http_req & req) {
         auto res = create_response();
 
         if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
             res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
             return res;
+        }
+        if (meta->has_forced_aligner) {
+            const json fields = json::parse(req.body);
+            if (!fields.is_object() || (!fields.contains("transcript") && !fields.contains("text"))) {
+                res->error(format_error_response(
+                    "The loaded forced aligner requires a known transcript in \"transcript\" (or \"text\").",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            return handle_forced_align(req, true);
         }
 
         std::vector<raw_buffer> files;

@@ -1593,6 +1593,13 @@ json server_task_result_tts::to_json() {
 }
 
 //
+// server_task_result_align
+//
+json server_task_result_align::to_json() {
+    return json::parse(data);
+}
+
+//
 // server_task_result_rerank
 //
 json server_task_result_rerank::to_json() {
