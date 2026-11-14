@@ -93,6 +93,8 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
         llm = make_qwen35_moe_sgl(m);
     } else if (m.model == "qwen3") {
         llm = make_qwen3(m);
+    } else if (m.model == "hymt") {
+        llm = make_hymt(m);
     } else {
         GGML_ABORT("axera: %s/manifest.json: no adapter for model %s\n", m.dir.c_str(), m.model.c_str());
     }

@@ -481,18 +481,21 @@ void output_head::bind(const kernel & lm, const ggml_tensor * output_weight) {
     }
     w                = output_weight;
     const int64_t N = w->ne[1], K = w->ne[0];
-    mx4              = lm.in_bytes("w") == N * K / 2;
+    const int64_t sc = lm.in_bytes("s");
+    vp               = sc / (K / AXERA_MX_GROUP);
+    mx4              = lm.in_bytes("w") == vp * K / 2;
     R                = lm.find_input("m") >= 0 ? (int) (lm.in_bytes("x") / (K * sizeof(ggml_bf16_t))) : 1;
-    GGML_ASSERT((mx4 || lm.in_bytes("w") == N * K) && lm.in_bytes("s") == N * K / AXERA_MX_GROUP &&
-                lm.in_bytes("x") == R * K * sizeof(ggml_bf16_t) && lm.out_bytes("out") == R * N * sizeof(float));
+    GGML_ASSERT((mx4 || lm.in_bytes("w") == vp * K) && vp >= N && vp - N < 64 &&
+                lm.in_bytes("x") == R * K * sizeof(ggml_bf16_t) && lm.out_bytes("out") == R * vp * sizeof(float));
     if (R > 1) {  // rows R at a time (output to y, copied to the logits)
         yk = axera_cmm_alloc(R * N * sizeof(float));
         mk = axera_cmm_alloc(sizeof(int32_t));
     }
     if (mx4) {
+        GGML_ASSERT(vp == N);
         axera_quantize_mxfp4(w, q, s);
     } else {
-        axera_quantize_mxfp8(w, q, s);
+        axera_quantize_mxfp8(w, q, s, vp - N);
     }
     axera_drop_mapped(w, true);  // (a tied output head shares token_embd.weight: the mapped rows are not needed now)
     x = axera_cmm_alloc(R * K * sizeof(ggml_bf16_t));
@@ -511,20 +514,21 @@ void output_head::bind_topk(const kernel & lm) {
     GGML_ASSERT(tK > 0 && (tR == 1 || lm.find_input("m") >= 0) && lm.find_input("bias") >= 0 && lm.find_input("mul_pos") >= 0 &&
                 lm.find_input("mul_neg") >= 0 && lm.find_input("temp") >= 0 &&
                 lm.in_bytes("x") == (uint32_t) (tR * K * sizeof(ggml_bf16_t)) &&
-                lm.in_bytes("w") == (uint32_t) (mx4 ? N * K / 2 : N * K) &&
-                lm.in_bytes("s") == N * K / AXERA_MX_GROUP && lm.in_bytes("bias") == N * sizeof(float) &&
-                lm.in_bytes("mul_pos") == N * sizeof(float) && lm.in_bytes("mul_neg") == N * sizeof(float) &&
+                lm.in_bytes("w") == (uint32_t) (mx4 ? vp * K / 2 : vp * K) &&
+                lm.in_bytes("s") == vp * K / AXERA_MX_GROUP && lm.in_bytes("bias") == vp * sizeof(float) &&
+                lm.in_bytes("mul_pos") == vp * sizeof(float) && lm.in_bytes("mul_neg") == vp * sizeof(float) &&
                 lm.in_bytes("temp") == sizeof(float) && (tR == 1 || lm.in_bytes("m") == sizeof(int32_t)) &&
                 lm.out_bytes("ids") == (uint32_t) (tK * tR * sizeof(int32_t)) &&
                 lm.out_bytes("vmax") == (uint32_t) (tR * sizeof(float)) &&
                 lm.out_bytes("sumexp") == (uint32_t) (tR * sizeof(float)));
     // the penalty state is the host sampler's: only the 1-2 rows that change per step are written (non-cacheable, so
     // the NPU sees them without a clean)
-    tbias = axera_cmm_alloc_nc(N * sizeof(float));
-    tmulp = axera_cmm_alloc_nc(N * sizeof(float));
-    tmuln = axera_cmm_alloc_nc(N * sizeof(float));
-    std::fill((float *) tmulp->vir, (float *) tmulp->vir + N, 1.0f);
-    std::fill((float *) tmuln->vir, (float *) tmuln->vir + N, 1.0f);
+    tbias = axera_cmm_alloc_nc(vp * sizeof(float));
+    tmulp = axera_cmm_alloc_nc(vp * sizeof(float));
+    tmuln = axera_cmm_alloc_nc(vp * sizeof(float));
+    std::fill((float *) tbias->vir, (float *) tbias->vir + vp, 0.0f);
+    std::fill((float *) tmulp->vir, (float *) tmulp->vir + vp, 1.0f);
+    std::fill((float *) tmuln->vir, (float *) tmuln->vir + vp, 1.0f);
     ttemp = axera_cmm_alloc_nc(sizeof(float));
     *(float *) ttemp->vir = 1.0f;
     tval  = axera_cmm_alloc((size_t) tR * tK * sizeof(float));
@@ -577,12 +581,13 @@ bool output_head::bind_combined(const kernel & lm, const ggml_tensor * output_we
         return false;
     }
     const int R = (int) (lm.in_bytes("x") / (K * sizeof(ggml_bf16_t)));
+    const int64_t VP = lm.out_bytes("out") / sizeof(float);
     if (R != 1 ||
         lm.in_bytes("norm_w") != (uint32_t) (K * sizeof(float)) ||
-        lm.in_bytes("w") != (uint32_t) (mx4 ? N * K / 2 : N * K) ||
-        lm.in_bytes("s") != (uint32_t) (N * K / AXERA_MX_GROUP) ||
+        lm.in_bytes("w") != (uint32_t) (mx4 ? VP * K / 2 : VP * K) ||
+        lm.in_bytes("s") != (uint32_t) (VP * K / AXERA_MX_GROUP) ||
         lm.in_bytes("x") != (uint32_t) (K * sizeof(ggml_bf16_t)) ||
-        lm.out_bytes("out") != (uint32_t) (N * sizeof(float)) || lm.out_bytes("ids") != sizeof(int32_t) ||
+        VP < N || VP - N >= 64 || lm.out_bytes("ids") != sizeof(int32_t) ||
         lm.out_bytes("top_logits") != sizeof(float)) {
         return false;
     }
@@ -591,15 +596,19 @@ bool output_head::bind_combined(const kernel & lm, const ggml_tensor * output_we
     }
     ck = &lm;
     cR = R;
+    cVP = VP;
     cnorm = axera_cmm_alloc((size_t) K * sizeof(float));
     cx    = axera_cmm_alloc((size_t) K * sizeof(ggml_bf16_t));
     cids  = axera_cmm_alloc(sizeof(int32_t));
     ctop  = axera_cmm_alloc(sizeof(float));
+    if (cVP > N) {
+        cpad = axera_cmm_alloc((size_t) cVP * sizeof(float));
+    }
     cin.assign(ck->info->nInputSize, AX_ENGINE_IO_BUFFER_T{});
     cout.assign(ck->info->nOutputSize, AX_ENGINE_IO_BUFFER_T{});
     cin[ck->input("norm_w")] = axera_io(cnorm, (size_t) K * sizeof(float));
-    cin[ck->input("w")]      = axera_io(q, mx4 ? (size_t) N * K / 2 : (size_t) N * K);
-    cin[ck->input("s")]      = axera_io(s, (size_t) N * K / AXERA_MX_GROUP);
+    cin[ck->input("w")]      = axera_io(q, mx4 ? (size_t) cVP * K / 2 : (size_t) cVP * K);
+    cin[ck->input("s")]      = axera_io(s, (size_t) cVP * K / AXERA_MX_GROUP);
     cout[ck->output("ids")]  = axera_io(cids, sizeof(int32_t));
     cout[ck->output("top_logits")] = axera_io(ctop, sizeof(float));
     cgw = nullptr;
@@ -622,7 +631,8 @@ bool output_head::combined_ready(ggml_cgraph * g, const graph_names & names) con
     }
     float         eps;
     const float * gw = final_norm(hn, (int) w->ne[0], &eps);
-    return gw != nullptr && eps == 1e-6f;
+    // the combined head embeds the final-norm eps: 1e-6 for the older dense models, 1e-5 for Hy-MT2
+    return gw != nullptr && (eps == 1e-6f || eps == 1e-5f);
 }
 
 bool output_head::topk_ready(ggml_cgraph * g, const graph_names & names, int T) const {
@@ -705,7 +715,7 @@ void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const
     }
     float         eps;
     const float * gw = final_norm(hn, (int) K, &eps);
-    GGML_ASSERT(gw && eps == 1e-6f);
+    GGML_ASSERT(gw && (eps == 1e-6f || eps == 1e-5f));
     if (gw != cgw) {
         memcpy(cnorm->vir, gw, (size_t) K * sizeof(float));
         cnorm->flush(cnorm->vir, (size_t) K * sizeof(float));
@@ -740,12 +750,22 @@ void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const
             cin[ck->input("x")] = axera_io(cx, (size_t) K * sizeof(ggml_bf16_t));
         }
         float * o = (float *) ((char *) logits->data + (size_t) r * logits->nb[1]);
-        // the output row is host-visible: flush a previous graph's CPU-dirty lines before the NPU writes it
-        dctx->flush(o, (size_t) N * sizeof(float));
-        cout[ck->output("out")] = axera_io(dctx, o, (size_t) N * sizeof(float));
-        axera_timer tk("lm_head (combined)");
-        ck->run(cin, cout, "output head (combined)");
-        tk.stop();
+        if (cVP > N) {
+            // the kernel covers the padded vocabulary in its private buffer; the graph's row keeps the real rows
+            cout[ck->output("out")] = axera_io(cpad, (size_t) cVP * sizeof(float));
+            axera_timer tk("lm_head (combined)");
+            ck->run(cin, cout, "output head (combined)");
+            tk.stop();
+            cpad->invalidate(cpad->vir, (size_t) cVP * sizeof(float));
+            memcpy(o, cpad->vir, (size_t) N * sizeof(float));
+        } else {
+            // the output row is host-visible: flush a previous graph's CPU-dirty lines before the NPU writes it
+            dctx->flush(o, (size_t) N * sizeof(float));
+            cout[ck->output("out")] = axera_io(dctx, o, (size_t) N * sizeof(float));
+            axera_timer tk("lm_head (combined)");
+            ck->run(cin, cout, "output head (combined)");
+            tk.stop();
+        }
         cids->invalidate(cids->vir, sizeof(int32_t));
         ctop->invalidate(ctop->vir, sizeof(float));
         memcpy(&pids[(size_t) r], cids->vir, sizeof(int32_t));
@@ -757,7 +777,9 @@ void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const
     // even when the fused argmax was published, or that check can consume a previous graph's cached values.
     for (int r = 0; r < n_out; ++r) {
         float * o = (float *) ((char *) logits->data + (size_t) r * logits->nb[1]);
-        dctx->invalidate(o, (size_t) N * sizeof(float));
+        if (cVP == N) {
+            dctx->invalidate(o, (size_t) N * sizeof(float));
+        }
     }
     if (!published) {
         dctx->clean_p     = (float *) logits->data;
@@ -996,12 +1018,12 @@ int output_head::full_row(int32_t idx, float * out, int32_t n) {
         ggml_fp32_to_bf16_row(xr, (ggml_bf16_t *) cx->vir, K);
         cx->flush(cx->vir, K * sizeof(ggml_bf16_t));
         if (!ffull) {
-            ffull = axera_cmm_alloc(N * sizeof(float));
+            ffull = axera_cmm_alloc((size_t) (cVP > N ? cVP : N) * sizeof(float));
         }
         cin[ck->input("x")] = axera_io(cx, (size_t) K * sizeof(ggml_bf16_t));
-        cout[ck->output("out")] = axera_io(ffull, (size_t) N * sizeof(float));
+        cout[ck->output("out")] = axera_io(ffull, (size_t) (cVP > N ? cVP : N) * sizeof(float));
         ck->run(cin, cout, "output head (combined fallback row)");
-        ffull->invalidate(ffull->vir, (size_t) N * sizeof(float));
+        ffull->invalidate(ffull->vir, (size_t) (cVP > N ? cVP : N) * sizeof(float));
         memcpy(out, (const float *) ffull->vir, (size_t) N * sizeof(float));
         return 1;
     }
@@ -1147,9 +1169,9 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
             int64_t                      gen = 0;
             npu_take_updates(upd, &gen);
             if (gen != tgen) {  // a new request (or a reset): the neutral state
-                std::fill((float *) tbias->vir, (float *) tbias->vir + N, 0.0f);
-                std::fill((float *) tmulp->vir, (float *) tmulp->vir + N, 1.0f);
-                std::fill((float *) tmuln->vir, (float *) tmuln->vir + N, 1.0f);
+                std::fill((float *) tbias->vir, (float *) tbias->vir + vp, 0.0f);
+                std::fill((float *) tmulp->vir, (float *) tmulp->vir + vp, 1.0f);
+                std::fill((float *) tmuln->vir, (float *) tmuln->vir + vp, 1.0f);
                 tgen = gen;
             }
             for (const auto & r : upd) {
@@ -1165,11 +1187,11 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
             }
             std::vector<AX_ENGINE_IO_BUFFER_T> tin(tk->info->nInputSize), tout(tk->info->nOutputSize);
             tin[tk->input("x")]       = axera_io(tx, (size_t) tR * K * sizeof(ggml_bf16_t));
-            tin[tk->input("w")]       = axera_io(q, mx4 ? (size_t) N * K / 2 : (size_t) N * K);
-            tin[tk->input("s")]       = axera_io(s, N * K / AXERA_MX_GROUP);
-            tin[tk->input("bias")]    = axera_io(tbias, N * sizeof(float));
-            tin[tk->input("mul_pos")] = axera_io(tmulp, N * sizeof(float));
-            tin[tk->input("mul_neg")] = axera_io(tmuln, N * sizeof(float));
+            tin[tk->input("w")]       = axera_io(q, mx4 ? (size_t) vp * K / 2 : (size_t) vp * K);
+            tin[tk->input("s")]       = axera_io(s, vp * K / AXERA_MX_GROUP);
+            tin[tk->input("bias")]    = axera_io(tbias, vp * sizeof(float));
+            tin[tk->input("mul_pos")] = axera_io(tmulp, vp * sizeof(float));
+            tin[tk->input("mul_neg")] = axera_io(tmuln, vp * sizeof(float));
             tin[tk->input("temp")]    = axera_io(ttemp, sizeof(float));
             if (tR > 1) {
                 tin[tk->input("m")] = axera_io(tkm, sizeof(int32_t));

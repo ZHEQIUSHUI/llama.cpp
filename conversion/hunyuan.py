@@ -245,6 +245,15 @@ class HunYuanModel(TextModel):
             if isinstance(eos, list) and len(eos) >= 2:
                 self.gguf_writer.add_eot_token_id(eos[0])
 
+        # The dense V1 config is authoritative.  Its tokenizer uses 818 added
+        # special tokens (base BPE vocab 120000), and some conversion paths fall
+        # back to the base-vocab <|endoftext|> id when resolving them.
+        for typ, key in (("bos", "bos_token_id"), ("eos", "eos_token_id"),
+                         ("pad", "pad_token_id"), ("sep", "sep_token_id")):
+            tid = config.get(key)
+            if isinstance(tid, int) and tid >= 0:
+                getattr(self.gguf_writer, f"add_{typ}_token_id")(tid)
+
     def set_gguf_parameters(self):
         # Some HunYuanVL variants set num_experts=1 (not real MoE);
         # prevent the parent class from emitting expert_count metadata in that case.

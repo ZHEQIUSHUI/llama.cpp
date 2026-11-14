@@ -43,6 +43,7 @@ std::shared_ptr<model> make_qwen35_whole(const manifest & m);  // Qwen3.5 dense:
 std::shared_ptr<model> make_qwen35_35b_a3b(const manifest & m);  // Qwen3.5-35B-A3B: one decode kernel, per-layer prefill
 std::shared_ptr<model> make_qwen35_moe_sgl(const manifest & m);  // Qwen3.5/3.6-35B-A3B with the sgl NVFP4 kernels
 std::shared_ptr<model> make_qwen3(const manifest & m);  // Qwen3 text decoders (Embedding, ASR text, TTS talker)
+std::shared_ptr<model> make_hymt(const manifest & m);  // Hy-MT2-1.8B: HunYuan dense 32-layer Llama, split-KV whole backbone
 std::shared_ptr<model> make_qwen35_vit(const manifest & m);  // the mmproj vision encoder (roles vit.*)
 std::shared_ptr<model> make_qwen35_vit_full(const manifest & m);  // the same in one call (role vit)
 std::shared_ptr<model> make_qwen3_asr(const manifest & m);  // the Qwen3-ASR audio encoder (roles audio.*)
