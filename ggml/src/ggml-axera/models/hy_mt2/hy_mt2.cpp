@@ -137,7 +137,8 @@ class hy_mt2 final : public model, public seq_model {
     void fill_bank(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node,
                    const ggml_tensor * inp_pos);
     void bind_calls(std::vector<call> & calls, const kernel & k, const char * tag, bool prefill);
-    void run_prefill_page(int64_t cell, int rows, const uint16_t * x, const int32_t * p4, int64_t batch_cell0);
+    void run_prefill_page(int64_t cell, int rows, const uint16_t * x, const int32_t * p4, int64_t batch_cell0,
+                          bool need_head);
     void dump_hidden(const axera_cmm & b, int rows, int64_t cell, int call_index);
     void open_route_dump();
     void dump_routes(int64_t cell, int rows, int layer_stride);
@@ -190,7 +191,8 @@ static const ggml_tensor * nv_scale(const std::map<std::string, ggml_tensor *> &
 
 static bool io_name(const std::string & n) {
     return n == "x" || n == "position_ids" || n == "indptr" || n == "indices" || n == "last_page_len" ||
-           n == "cache_location" || n == "head_x" || n == "head_rows" || n == "head_logits" || n == "head_ids" ||
+           n == "cache_location" || n == "head_x" || n == "head_rows" || n == "head_run" ||
+           n == "head_logits" || n == "head_ids" ||
            n == "head_topk_v" || n == "head_topk_i" || n == "head_vmax" || n == "head_sumexp" ||
            n == "valid_tokens";
 }
@@ -582,7 +584,8 @@ void hy_mt2::dump_hidden(const axera_cmm & b, int rows, int64_t cell, int call_i
     fclose(f);
 }
 
-void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const int32_t * p4, int64_t batch_cell0) {
+void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const int32_t * p4, int64_t batch_cell0,
+                              bool need_head) {
     GGML_ASSERT(cell % PG == 0 && rows > 0 && rows <= PG);
     auto xi = io.find("x"), oi = io.find("output");
     GGML_ASSERT(xi != io.end() && oi != io.end());
@@ -625,7 +628,11 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
 
     const bool prof = getenv("GGML_AXERA_HY_MT2_PROF") != nullptr;
     const bool dump = getenv("GGML_AXERA_HY_MT2_HIDDEN_DUMP") != nullptr;
+    auto head_run = io.find("head_run");
+    GGML_ASSERT(head_run != io.end());
     for (int ci = 0; ci < nchunks; ++ci) {
+        *(int32_t *) head_run->second->vir = need_head && ci + 1 == nchunks ? 1 : 0;
+        head_run->second->flush();
         const int64_t t0   = prof ? ggml_time_us() : 0;
         pre[ci].k->run(pre[ci].in, pre[ci].out, "prefill");
         if (prof) {
@@ -677,7 +684,11 @@ void hy_mt2::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4
     *(int32_t *) hri->second->vir = 0;
     hri->second->flush();
     const bool prof = getenv("GGML_AXERA_HY_MT2_PROF") != nullptr;
+    auto head_run = io.find("head_run");
+    GGML_ASSERT(head_run != io.end());
     for (int ci = 0; ci < (int) dec.size(); ++ci) {
+        *(int32_t *) head_run->second->vir = ci + 1 == (int) dec.size() ? 1 : 0;
+        head_run->second->flush();
         const int64_t t0 = prof ? ggml_time_us() : 0;
         dec[ci].k->run(dec[ci].in, dec[ci].out, "decode");
         if (prof) {
@@ -702,7 +713,8 @@ bool hy_mt2::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t 
     }
     for (int off = 0; off < n; off += PG) {
         const int rows = std::min(PG, n - off);
-        run_prefill_page(c0 + off, rows, xr + (size_t) off * H, p4 + (size_t) off * 4, c0 + batch0);
+        run_prefill_page(c0 + off, rows, xr + (size_t) off * H, p4 + (size_t) off * 4, c0 + batch0,
+                         off + PG >= n);
     }
     if (snap) snap->deferred = false;
     return true;
