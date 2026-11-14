@@ -1374,7 +1374,10 @@ int main(int argc, char ** argv) {
         // once on the full mel (so SineGen's phase is continuous), then give
         // each decoder window 64 frames of left context.
         constexpr int left = 64;
-        constexpr int stride = cap - left;
+        // conv_pre is right-causal and right-pads four mel frames, so every
+        // window must also carry four real future frames after its valid span.
+        constexpr int right = 4;
+        constexpr int stride = cap - left - right;
         const bool split = !a.hift_front.empty() && !a.hift_post.empty();
         const int s_frames = cap * 480 / 4 + 1;
         double t_front = 0.0, t_npu = 0.0, t_post = 0.0;
