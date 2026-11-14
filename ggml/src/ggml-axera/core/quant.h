@@ -9,8 +9,10 @@
 #include <thread>
 #include <vector>
 
-// [N, K] weight of any GGUF type -> MXFP8 elements [N, K] and scales [N, K / 32] in new CMM buffers
-void axera_quantize_mxfp8(const ggml_tensor * w, axera_cmm & q, axera_cmm & s);
+// [N, K] weight of any GGUF type -> MXFP8 elements [N + pad_rows, K] and scales [N + pad_rows, K / 32] in new CMM
+// buffers.  The padding rows are zero codes with unit E8M0 scales so a four-core kernel can round the vocabulary up to
+// a multiple of its core count and mask them.
+void axera_quantize_mxfp8(const ggml_tensor * w, axera_cmm & q, axera_cmm & s, int64_t pad_rows = 0);
 // [N, K] weight of any GGUF type -> MXFP4 elements [N, K / 2] and scales [N, K / 32] in new CMM buffers
 void axera_quantize_mxfp4(const ggml_tensor * w, axera_cmm & q, axera_cmm & s);
 // rows r0 .. r0 + nr of an [N, K] weight -> NVFP4 codes [nr, K / 2], E4M3 scales [nr, K / 16], one global scale
