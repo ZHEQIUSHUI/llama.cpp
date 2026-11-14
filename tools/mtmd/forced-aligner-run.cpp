@@ -1,12 +1,12 @@
-#include "arg.h"
-#include "common.h"
-#include "log.h"
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "forced-aligner.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -16,13 +16,6 @@
 #include <vector>
 
 namespace {
-
-struct options {
-    std::string transcript;
-    std::string language = "English";
-    std::string output = "-";
-    int segment_ms = 80;
-};
 
 struct seq_item {
     bool embd = false;
@@ -290,45 +283,6 @@ static void json_string(std::string & out, const std::string & s) {
     out += '"';
 }
 
-static std::string take_value(int & i, int argc, char ** argv, const char * name) {
-    if (i + 1 >= argc) {
-        throw std::runtime_error(std::string("missing value for ") + name);
-    }
-    return argv[++i];
-}
-
-static std::vector<std::string> strip_custom_args(int & argc, char ** argv, options & opt) {
-    std::vector<std::string> args;
-    args.push_back(argv[0]);
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--transcript" || a == "--text") {
-            opt.transcript = take_value(i, argc, argv, a.c_str());
-        } else if (a == "--language") {
-            opt.language = take_value(i, argc, argv, a.c_str());
-        } else if (a == "--output-json" || a == "--output") {
-            opt.output = take_value(i, argc, argv, a.c_str());
-        } else if (a == "--segment-ms") {
-            opt.segment_ms = std::stoi(take_value(i, argc, argv, a.c_str()));
-        } else {
-            args.push_back(a);
-        }
-    }
-    return args;
-}
-
-static void print_usage(int argc, char ** argv) {
-    (void) argc;
-    const char * argv0 = argv[0];
-    fprintf(stderr,
-            "usage: %s -m model.gguf --mmproj mmproj.gguf --audio audio.wav --transcript TEXT [options]\n"
-            "  --language NAME       Chinese or English (default: English)\n"
-            "  --output-json PATH    JSON output path, - for stdout (default: -)\n"
-            "  --segment-ms N        timestamp step in ms (default: 80)\n"
-            "  -c N -ub N -ngl N     standard llama.cpp options are accepted\n",
-            argv0);
-}
-
 static int argmax_class(const float * row, int n_vocab, int n_class, int * margin2) {
     int first = n_vocab - n_class;
     while (first < n_vocab && !std::isfinite(row[first])) {
@@ -358,84 +312,53 @@ static int argmax_class(const float * row, int n_vocab, int n_class, int * margi
 
 } // namespace
 
-int main(int argc, char ** argv) {
-    options opt;
+namespace mtmd_forced_aligner {
+
+result run(llama_model * model, llama_context * ctx, mtmd_context * mctx,
+           const void * audio, size_t audio_len, const options & opt) {
+    auto fail = [](int code, const std::string & message) {
+        result r;
+        r.code = code;
+        r.error = message;
+        return r;
+    };
     try {
-        std::vector<std::string> args = strip_custom_args(argc, argv, opt);
+        if (!model || !ctx || !mctx || !audio || audio_len == 0) {
+            return fail(400, "audio input is required");
+        }
         if (opt.transcript.empty()) {
-            print_usage(argc, argv);
-            return 1;
+            return fail(400, "transcript is required");
         }
-        std::vector<char *> av;
-        for (auto & s : args) {
-            av.push_back(s.data());
+        if (opt.segment_ms <= 0) {
+            return fail(400, "segment_ms must be positive");
         }
-
-        common_params params;
-        common_init();
-        if (!common_params_parse((int) av.size(), av.data(), params, LLAMA_EXAMPLE_MTMD, print_usage)) {
-            return 1;
-        }
-        if (params.mmproj.path.empty() || params.image.empty()) {
-            print_usage(argc, argv);
-            fprintf(stderr, "error: --mmproj and --audio are required\n");
-            return 1;
-        }
-        if (opt.language != "Chinese" && opt.language != "English") {
-            fprintf(stderr, "error: language %s is not implemented (Chinese and English only)\n", opt.language.c_str());
-            return 1;
-        }
-        if (params.n_ctx <= 0) {
-            params.n_ctx = 4096;
-        }
-        params.n_ctx = std::min(params.n_ctx, 4096);
-        params.n_batch = std::max(params.n_batch, 4096);
-        params.n_ubatch = 256;
-        params.warmup = false;
-
-        ggml_backend_load_all();
-        common_init_result_ptr init = common_init_from_params(params);
-        llama_model * model = init->model();
-        llama_context * ctx = init->context();
-        if (!model || !ctx) {
-            fprintf(stderr, "error: model/context init failed\n");
-            return 1;
+        std::string language = opt.language;
+        std::transform(language.begin(), language.end(), language.begin(),
+                       [](unsigned char c) { return (char) std::tolower(c); });
+        if (language == "japanese" || language == "korean") {
+            return fail(400, "Japanese and Korean are not supported: their official word segmentation requires "
+                              "the nagisa and soynlp dictionaries, which are not part of this self-contained binary");
         }
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const int n_vocab = llama_vocab_n_tokens(vocab);
         const int n_class = llama_model_n_embd_out(model);
         const int n_embd = llama_model_n_embd_inp(model);
         if (n_class <= 0 || n_class > n_vocab) {
-            fprintf(stderr, "error: invalid classifier width %d (tokenizer vocabulary %d)\n", n_class, n_vocab);
-            return 1;
+            return fail(400, "the loaded model has no valid classifier output width");
         }
+        llama_set_sampler(ctx, 0, nullptr);
 
-        mtmd_context_params mparams = mtmd_context_params_default();
-        mparams.use_gpu = params.mmproj_use_gpu;
-        mparams.device = params.mmproj_device;
-        mparams.print_timings = true;
-        mparams.n_threads = params.cpuparams.n_threads;
-        mparams.flash_attn_type = params.flash_attn_type;
-        mparams.warmup = false;
-        mtmd_context * mctx = mtmd_init_from_file(params.mmproj.path.c_str(), model, mparams);
-        if (!mctx) {
-            fprintf(stderr, "error: failed to load mmproj\n");
-            return 1;
+        mtmd_helper_bitmap_wrapper wrapper = mtmd_helper_bitmap_init_from_buf(
+                mctx, (const unsigned char *) audio, audio_len, false, mtmd_helper_init_opt_default());
+        std::unique_ptr<mtmd_bitmap, decltype(&mtmd_bitmap_free)> bitmap(wrapper.bitmap, mtmd_bitmap_free);
+        if (!bitmap || !mtmd_bitmap_is_audio(bitmap.get())) {
+            return fail(400, "failed to decode the input audio");
         }
-
-        const std::string audio_path = params.image[0];
-        mtmd_helper_bitmap_wrapper bm = mtmd_helper_bitmap_init_from_file(
-                mctx, audio_path.c_str(), false, mtmd_helper_init_opt_default());
-        if (!bm.bitmap || !mtmd_bitmap_is_audio(bm.bitmap)) {
-            fprintf(stderr, "error: failed to load audio %s\n", audio_path.c_str());
-            return 1;
-        }
-        const int64_t n_samples = (int64_t) mtmd_bitmap_get_nx(bm.bitmap);
+        const int64_t n_samples = (int64_t) mtmd_bitmap_get_nx(bitmap.get());
 
         std::vector<std::string> word_list = split_words(opt.transcript);
         if (word_list.empty()) {
-            fprintf(stderr, "error: transcript has no alignable words\n");
-            return 1;
+            return fail(400, "transcript has no alignable words");
         }
         const std::string suffix = timestamp_prompt(word_list);
 
@@ -443,33 +366,28 @@ int main(int argc, char ** argv) {
         mtmd_input_text text_suffix = { suffix.data(), suffix.size(), false, true };
         mtmd_input_part parts[3] = {
             { &text_empty, nullptr },
-            { nullptr, bm.bitmap },
+            { nullptr, bitmap.get() },
             { &text_suffix, nullptr },
         };
         const mtmd_input_part * part_ptrs[3] = { &parts[0], &parts[1], &parts[2] };
         std::unique_ptr<mtmd_input_chunks, decltype(&mtmd_input_chunks_free)> chunks(
                 mtmd_input_chunks_init(), mtmd_input_chunks_free);
         if (mtmd_tokenize_from_parts(mctx, chunks.get(), part_ptrs, 3, false) != 0) {
-            fprintf(stderr, "error: tokenize failed\n");
-            return 1;
+            return fail(400, "failed to tokenize the audio and transcript");
         }
 
-        size_t ts_id = (size_t) -1;
-        {
-            std::vector<llama_token> t;
-            t.resize(32);
-            int n = llama_tokenize(vocab, "<timestamp>", 11, t.data(), (int) t.size(), false, true);
-            if (n != 1) {
-                fprintf(stderr, "error: <timestamp> did not tokenize to one token (n=%d)\n", n);
-                return 1;
-            }
-            ts_id = (size_t) t[0];
+        std::vector<llama_token> ts;
+        ts.resize(32);
+        const int n_ts = llama_tokenize(vocab, "<timestamp>", 11, ts.data(), (int) ts.size(), false, true);
+        if (n_ts != 1) {
+            return fail(500, "the tokenizer does not map <timestamp> to one token");
         }
+        const size_t ts_id = (size_t) ts[0];
 
         const int64_t total_frames = n_samples / 160;
         int64_t window_off = 0;
         size_t audio_chunk_index = 0;
-        int64_t official_audio_tokens = 0;
+        int64_t audio_tokens = 0;
         std::vector<seq_item> items;
         std::vector<std::vector<float>> audio_rows;
         std::vector<size_t> timestamp_items;
@@ -492,24 +410,19 @@ int main(int argc, char ** argv) {
             } else if (type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
                 const int64_t win_eff = std::min<int64_t>(800, total_frames - window_off);
                 if (win_eff <= 0) {
-                    fprintf(stderr, "error: more audio chunks than mel windows\n");
-                    return 1;
+                    return fail(400, "more audio chunks than mel windows");
                 }
                 const int64_t want = feat_output_length(win_eff);
                 const size_t got = mtmd_input_chunk_get_n_tokens(chunk);
                 if ((int64_t) got < want) {
-                    fprintf(stderr, "error: audio chunk %zu has %zu rows, official window needs %lld\n",
-                            audio_chunk_index, got, (long long) want);
-                    return 1;
+                    return fail(400, "the audio encoder produced fewer rows than the official window");
                 }
                 if (mtmd_encode_chunk(mctx, chunk) != 0) {
-                    fprintf(stderr, "error: audio encode failed\n");
-                    return 1;
+                    return fail(500, "audio encoder failed");
                 }
                 const float * embd = mtmd_get_output_embd(mctx);
                 if (!embd) {
-                    fprintf(stderr, "error: no audio embeddings\n");
-                    return 1;
+                    return fail(500, "audio encoder returned no embeddings");
                 }
                 for (int64_t r = 0; r < want; ++r) {
                     seq_item item;
@@ -518,29 +431,30 @@ int main(int argc, char ** argv) {
                     audio_rows.emplace_back(embd + (size_t) r * n_embd, embd + (size_t) (r + 1) * n_embd);
                     items.push_back(item);
                 }
-                official_audio_tokens += want;
+                audio_tokens += want;
                 window_off += win_eff;
                 ++audio_chunk_index;
             }
         }
         if (window_off < total_frames) {
-            fprintf(stderr, "error: audio chunks cover %lld of %lld mel frames\n",
-                    (long long) window_off, (long long) total_frames);
-            return 1;
+            return fail(400, "the audio chunks do not cover the complete input");
         }
         if (timestamp_items.size() != word_list.size() * 2) {
-            fprintf(stderr, "error: %zu timestamp tokens for %zu words (expected %zu)\n",
-                    timestamp_items.size(), word_list.size(), word_list.size() * 2);
-            return 1;
+            return fail(400, "timestamp token count does not match the transcript");
         }
-        if (items.size() > (size_t) params.n_batch) {
-            fprintf(stderr, "error: prompt has %zu tokens, n_batch is %d (raise -b)\n", items.size(), params.n_batch);
-            return 1;
+        const int64_t n_ctx = llama_n_ctx(ctx);
+        const int64_t n_batch = llama_n_batch(ctx);
+        if ((int64_t) items.size() > n_batch) {
+            return fail(400, "prompt has " + std::to_string(items.size()) + " tokens, the server batch limit is " +
+                            std::to_string(n_batch));
         }
-        if ((int64_t) items.size() > params.n_ctx) {
-            fprintf(stderr, "error: prompt has %zu tokens, context is %d\n", items.size(), params.n_ctx);
-            return 1;
+        if ((int64_t) items.size() > n_ctx) {
+            return fail(400, "prompt has " + std::to_string(items.size()) + " tokens, the context limit is " +
+                            std::to_string(n_ctx));
         }
+
+        llama_synchronize(ctx);
+        llama_memory_clear(llama_get_memory(ctx), true);
 
         std::unique_ptr<llama_batch_ext, decltype(&llama_batch_ext_free)> batch(
                 llama_batch_ext_init(ctx), llama_batch_ext_free);
@@ -554,25 +468,24 @@ int main(int argc, char ** argv) {
                 idx = llama_batch_ext_add_token(batch.get(), 0, item.token);
             }
             if (idx < 0) {
-                fprintf(stderr, "error: failed to add batch item %zu\n", i);
-                return 1;
+                return fail(500, "failed to build the model input batch");
             }
             llama_pos p[4] = { (llama_pos) i, (llama_pos) i, (llama_pos) i, (llama_pos) i };
             if (!llama_batch_ext_set_pos(batch.get(), idx, p)) {
-                fprintf(stderr, "error: failed to set position %zu\n", i);
-                return 1;
+                return fail(500, "failed to set an input position");
             }
         }
         for (size_t idx : timestamp_items) {
             llama_batch_ext_set_output_logits(batch.get(), (int32_t) idx, true);
         }
 
-        const int64_t t_forward_us = ggml_time_us();
+        const auto t_forward = std::chrono::steady_clock::now();
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
-            fprintf(stderr, "error: llama_process failed\n");
-            return 1;
+            llama_memory_clear(llama_get_memory(ctx), true);
+            return fail(500, "the model forward pass failed");
         }
-        const double forward_s = (ggml_time_us() - t_forward_us) / 1e6;
+        llama_synchronize(ctx);
+        const double forward_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_forward).count();
 
         std::vector<int64_t> raw_ms;
         std::vector<int> argmax_ids;
@@ -583,14 +496,14 @@ int main(int argc, char ** argv) {
         for (size_t idx : timestamp_items) {
             const float * row = llama_get_logits_ith(ctx, (int32_t) idx);
             if (!row) {
-                fprintf(stderr, "error: no logits at token %zu\n", idx);
-                return 1;
+                llama_memory_clear(llama_get_memory(ctx), true);
+                return fail(500, "the model returned no logits for a timestamp position");
             }
             int margin = 0;
             const int id = argmax_class(row, n_vocab, n_class, &margin);
             if (id < 0 || id >= n_class) {
-                fprintf(stderr, "error: invalid argmax %d\n", id);
-                return 1;
+                llama_memory_clear(llama_get_memory(ctx), true);
+                return fail(500, "the classifier returned an invalid class");
             }
             argmax_ids.push_back(id);
             margins.push_back(margin);
@@ -623,6 +536,16 @@ int main(int argc, char ** argv) {
             snprintf(buf, sizeof(buf), ", \"start\": %.3f, \"end\": %.3f}", spans[i].start, spans[i].end);
             js += buf;
         }
+        js += "\n  ],\n  \"segments\": [";
+        if (!spans.empty()) {
+            char buf[160];
+            snprintf(buf, sizeof(buf),
+                     "\n    {\"id\": 0, \"start\": %.3f, \"end\": %.3f, \"text\": ", spans.front().start,
+                     spans.back().end);
+            js += buf;
+            json_string(js, opt.transcript);
+            js += ", \"words\": []}";
+        }
         js += "\n  ],\n  \"timestamp_ids\": [";
         for (size_t i = 0; i < argmax_ids.size(); ++i) {
             if (i) js += ", ";
@@ -644,7 +567,7 @@ int main(int argc, char ** argv) {
             js += std::to_string(margins[i]);
         }
         js += "],\n  \"input_tokens\": " + std::to_string(items.size());
-        js += ",\n  \"audio_tokens\": " + std::to_string(official_audio_tokens);
+        js += ",\n  \"audio_tokens\": " + std::to_string(audio_tokens);
         {
             char buf[96];
             snprintf(buf, sizeof(buf), ",\n  \"forward_seconds\": %.6f", forward_s);
@@ -652,22 +575,19 @@ int main(int argc, char ** argv) {
         }
         js += "\n}\n";
 
-        if (opt.output == "-") {
-            fputs(js.c_str(), stdout);
-        } else {
-            std::ofstream f(opt.output);
-            if (!f) {
-                fprintf(stderr, "error: cannot write %s\n", opt.output.c_str());
-                return 1;
-            }
-            f << js;
-        }
+        llama_memory_clear(llama_get_memory(ctx), true);
 
-        mtmd_bitmap_free(bm.bitmap);
-        mtmd_free(mctx);
-        return 0;
+        result r;
+        r.ok = true;
+        r.code = 200;
+        r.json = std::move(js);
+        r.input_tokens = (int) items.size();
+        r.audio_tokens = (int) audio_tokens;
+        r.forward_seconds = forward_s;
+        return r;
     } catch (const std::exception & e) {
-        fprintf(stderr, "error: %s\n", e.what());
-        return 1;
+        return fail(500, std::string("alignment failed: ") + e.what());
     }
 }
+
+} // namespace mtmd_forced_aligner
