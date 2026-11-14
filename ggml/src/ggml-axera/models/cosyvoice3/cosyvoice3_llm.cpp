@@ -683,9 +683,14 @@ ggml_status cosyvoice3_llm::compute(ggml_cgraph * g) {
 
     // The kernel's output is already final RMSNorm(x) * output_norm: copy it to the graph's embedding result.
     if (result) {
-        GGML_ASSERT(result->type == GGML_TYPE_F32 && result->ne[0] == H && result->ne[1] == T);
-        for (int r = 0; r < T; ++r) {
-            memcpy((char *) result->data + (size_t) r * result->nb[1], h_buf.data() + (size_t) r * H,
+        // A context with embeddings asks for every row.  Plain text generation asks only for the last row,
+        // so result_norm is one row and it is the batch's last output.
+        GGML_ASSERT(result->type == GGML_TYPE_F32 && result->ne[0] == H);
+        const int64_t nres = std::min<int64_t>(T, result->ne[1]);
+        GGML_ASSERT(result->ne[1] == T || result->ne[1] == 1);
+        for (int64_t r = 0; r < nres; ++r) {
+            const int64_t src_row = result->ne[1] == T ? r : T - nres + r;
+            memcpy((char *) result->data + (size_t) r * result->nb[1], h_buf.data() + (size_t) src_row * H,
                    (size_t) H * sizeof(float));
         }
         if (ggml_backend_buffer_is_axera(result->buffer)) {

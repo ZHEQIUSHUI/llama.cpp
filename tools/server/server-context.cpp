@@ -206,16 +206,24 @@ static bool server_cosy_worker_request_locked(server_cosy_paths & paths, std::st
     bool ok = server_write_all(w.in_fd, lens, sizeof(lens));
     for (int i = 0; ok && i < 4; i++) ok = server_write_all(w.in_fd, fields[i]->data(), fields[i]->size());
     if (!ok) { error = "worker write failed"; return false; }
+    // The worker's libraries may print diagnostics on stdout before the protocol line.  Scan lines and
+    // take the first OK/ERR, with generous bounds so one long diagnostic cannot desynchronize the pipe.
+    size_t total = 0;
     std::string line;
     for (;;) {
-        char c = 0;
-        if (!server_read_all(w.out_fd, &c, 1)) { error = "worker read failed"; return false; }
-        if (c == '\n') break;
-        line.push_back(c);
-        if (line.size() > 64) { error = "bad worker response"; return false; }
+        line.clear();
+        for (;;) {
+            char c = 0;
+            if (!server_read_all(w.out_fd, &c, 1)) { error = "worker read failed"; return false; }
+            if (c == '\n') break;
+            line.push_back(c);
+            if (line.size() > (1u << 16)) { error = "bad worker response"; return false; }
+        }
+        total += line.size() + 1;
+        if (total > (1u << 20)) { error = "bad worker response"; return false; }
+        if (line == "OK") return true;
+        if (line == "ERR") { error = "worker reported failure"; return false; }
     }
-    if (line != "OK") { error = "worker reported failure"; return false; }
-    return true;
 }
 
 static bool server_run_cosy_tts(const server_task::tts_params & tts, raw_buffer & data,

@@ -1248,10 +1248,6 @@ int main(int argc, char ** argv) {
         npu_flow_cap = a.flow_npu_long_cap;
         npu_flow_nlc = a.flow_npu_long_nlc;
     }
-    if (flow_model && T > npu_flow_cap) {
-        fprintf(stderr, "flow length %d exceeds the fixed NPU capacity %d; shorten the text or use the CPU flow\\n", T, npu_flow_cap);
-        return 1;
-    }
     std::vector<double> ts(steps + 1);
     for (int i = 0; i <= steps; i++) ts[i] = 1.0 - std::cos(0.5 * M_PI * (double) i / steps);
     std::vector<float> x((size_t) 80 * T);
@@ -1259,88 +1255,123 @@ int main(int argc, char ** argv) {
         for (int t = 0; t < T; t++)
             x[(size_t) c * T + t] = tab.flow_noise[(size_t) c * 15000 + t];
 
-    std::vector<float> x_in(2 * 80 * T), mu_in(2 * 80 * T), cond_in(2 * 80 * T);
-    std::vector<float> mask_in(2 * T), spks_in(2 * 80), t_in(2);
-    std::vector<int64_t> x_shape{2, 80, T}, mask2_shape{2, 1, T}, spks2_shape{2, 80}, t2_shape{2};
-    double t_cur = ts[0], dt = ts[1] - ts[0];
-    for (int step = 1; step <= steps; step++) {
-        for (int c = 0; c < 80; c++) {
-            memcpy(x_in.data() + (size_t) c * T, x.data() + (size_t) c * T, T * 4);
-            memcpy(x_in.data() + (size_t) (80 + c) * T, x.data() + (size_t) c * T, T * 4);
-            memcpy(mu_in.data() + (size_t) c * T, mu.data() + (size_t) c * T, T * 4);
-            memset(mu_in.data() + (size_t) (80 + c) * T, 0, T * 4);
-            memcpy(cond_in.data() + (size_t) c * T, cond.data() + (size_t) c * T, T * 4);
-            memset(cond_in.data() + (size_t) (80 + c) * T, 0, T * 4);
-        }
-        memcpy(mask_in.data(), mask.data(), T * 4);
-        memcpy(mask_in.data() + T, mask.data(), T * 4);
-        memcpy(spks_in.data(), spks.data(), 80 * 4);
-        memset(spks_in.data() + 80, 0, 80 * 4);
-        t_in[0] = t_in[1] = (float) t_cur;
-
-        const float * d = nullptr;
-        std::vector<Ort::Value> es_out;
-        if (flow_model) {
-            const size_t plane = (size_t) 80 * npu_flow_cap;
-            std::vector<float> nx(2 * plane), nmu(2 * plane), ncond(2 * plane), nmask(2 * npu_flow_cap), nspks(2 * 80), nt(2);
-            if (npu_flow_nlc) {
-                for (int t = 0; t < T; t++) {
+    // One Euler trajectory over Tw frames (Tw <= the kernel's capacity when it runs on NPU).
+    auto euler = [&](std::vector<float> & xw, const float * muw, const float * condw,
+                     const float * maskw, int Tw) -> bool {
+        const int cap = flow_model ? npu_flow_cap : Tw;
+        std::vector<float> x_in(2 * 80 * Tw), mu_in(2 * 80 * Tw), cond_in(2 * 80 * Tw);
+        std::vector<float> mask_in(2 * Tw), spks_in(2 * 80), t_in(2);
+        std::vector<int64_t> x_shape{2, 80, Tw}, mask2_shape{2, 1, Tw}, spks2_shape{2, 80}, t2_shape{2};
+        double t_cur = ts[0], dt = ts[1] - ts[0];
+        for (int step = 1; step <= steps; step++) {
+            const float * d = nullptr;
+            std::vector<Ort::Value> es_out;
+            if (flow_model) {
+                const size_t plane = (size_t) 80 * cap;
+                std::vector<float> nx(2 * plane), nmu(2 * plane), ncond(2 * plane);
+                std::vector<float> nmask(2 * cap), nspks(2 * 80), nt(2);
+                if (npu_flow_nlc) {
+                    for (int t = 0; t < Tw; t++) {
+                        for (int c = 0; c < 80; c++) {
+                            const size_t src = (size_t) c * Tw + t;
+                            nx[(size_t) t * 80 + c] = xw[src];
+                            nx[plane + (size_t) t * 80 + c] = xw[src];
+                            nmu[(size_t) t * 80 + c] = muw[src];
+                            ncond[(size_t) t * 80 + c] = condw[src];
+                        }
+                    }
+                } else {
                     for (int c = 0; c < 80; c++) {
-                        const size_t src = (size_t) c * T + t;
-                        nx[(size_t) t * 80 + c] = x[src];
-                        nx[plane + (size_t) t * 80 + c] = x[src];
-                        // The classifier-free batch's second row is unconditional: mu and cond stay zero there,
-                        // exactly as solve_euler leaves mu_in[1] / cond_in[1].  Filling them made the CFG update
-                        // partly conditional and produced a systematic log-mel gain/bias.
-                        nmu[(size_t) t * 80 + c] = mu[src];
-                        ncond[(size_t) t * 80 + c] = cond[src];
+                        memcpy(nx.data() + (size_t) c * cap, xw.data() + (size_t) c * Tw, Tw * 4);
+                        memcpy(nmu.data() + (size_t) c * cap, muw + (size_t) c * Tw, Tw * 4);
+                        memcpy(ncond.data() + (size_t) c * cap, condw + (size_t) c * Tw, Tw * 4);
+                        memcpy(nx.data() + plane + (size_t) c * cap, xw.data() + (size_t) c * Tw, Tw * 4);
                     }
                 }
+                memcpy(nmask.data(), maskw, (size_t) Tw * 4);
+                memcpy(nmask.data() + cap, maskw, (size_t) Tw * 4);
+                memcpy(nspks.data(), spks.data(), 80 * 4);
+                nt[0] = nt[1] = (float) t_cur;
+                if (!flow_model->set_input("x", nx.data(), nx.size() * 4) ||
+                    !flow_model->set_input("mask", nmask.data(), nmask.size() * 4) ||
+                    !flow_model->set_input("mu", nmu.data(), nmu.size() * 4) ||
+                    !flow_model->set_input("t", nt.data(), nt.size() * 4) ||
+                    !flow_model->set_input("spks", nspks.data(), nspks.size() * 4) ||
+                    !flow_model->set_input("cond", ncond.data(), ncond.size() * 4) || !flow_model->run()) {
+                    return false;
+                }
+                d = flow_model->output_f32(2 * plane);
+                if (!d) return false;
             } else {
                 for (int c = 0; c < 80; c++) {
-                    memcpy(nx.data() + (size_t) c * npu_flow_cap, x.data() + (size_t) c * T, T * 4);
-                    memcpy(nmu.data() + (size_t) c * npu_flow_cap, mu.data() + (size_t) c * T, T * 4);
-                    memcpy(ncond.data() + (size_t) c * npu_flow_cap, cond.data() + (size_t) c * T, T * 4);
-                    memcpy(nx.data() + plane + (size_t) c * npu_flow_cap, x.data() + (size_t) c * T, T * 4);
-                    memset(nmu.data() + plane + (size_t) c * npu_flow_cap, 0, T * 4);
-                    memset(ncond.data() + plane + (size_t) c * npu_flow_cap, 0, T * 4);
+                    memcpy(x_in.data() + (size_t) c * Tw, xw.data() + (size_t) c * Tw, Tw * 4);
+                    memcpy(x_in.data() + (size_t) (80 + c) * Tw, xw.data() + (size_t) c * Tw, Tw * 4);
+                    memcpy(mu_in.data() + (size_t) c * Tw, muw + (size_t) c * Tw, Tw * 4);
+                    memset(mu_in.data() + (size_t) (80 + c) * Tw, 0, Tw * 4);
+                    memcpy(cond_in.data() + (size_t) c * Tw, condw + (size_t) c * Tw, Tw * 4);
+                    memset(cond_in.data() + (size_t) (80 + c) * Tw, 0, Tw * 4);
+                }
+                memcpy(mask_in.data(), maskw, (size_t) Tw * 4);
+                memcpy(mask_in.data() + Tw, maskw, (size_t) Tw * 4);
+                memcpy(spks_in.data(), spks.data(), 80 * 4);
+                memset(spks_in.data() + 80, 0, 80 * 4);
+                t_in[0] = t_in[1] = (float) t_cur;
+                std::vector<Ort::Value> es_in;
+                es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, x_in.data(), x_in.size(), x_shape.data(), x_shape.size()));
+                es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mask_in.data(), mask_in.size(), mask2_shape.data(), mask2_shape.size()));
+                es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mu_in.data(), mu_in.size(), x_shape.data(), x_shape.size()));
+                es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, t_in.data(), 2, t2_shape.data(), t2_shape.size()));
+                es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, spks_in.data(), spks_in.size(), spks2_shape.data(), spks2_shape.size()));
+                es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, cond_in.data(), cond_in.size(), x_shape.data(), x_shape.size()));
+                es_out = estimator->run(std::move(es_in));
+                d = es_out[0].GetTensorData<float>();
+            }
+            const int dstride = flow_model ? cap : Tw;
+            for (int c = 0; c < 80; c++) {
+                for (int t = 0; t < Tw; t++) {
+                    float dphi = 1.7f * d[(size_t) c * dstride + t] - 0.7f * d[(size_t) (80 + c) * dstride + t];
+                    xw[(size_t) c * Tw + t] += (float) dt * dphi;
                 }
             }
-            memcpy(nmask.data(), mask.data(), T * 4);
-            memcpy(nmask.data() + npu_flow_cap, mask.data(), T * 4);
-            memcpy(nspks.data(), spks.data(), 80 * 4);
-            memset(nspks.data() + 80, 0, 80 * 4);
-            nt[0] = nt[1] = (float) t_cur;
-            if (!flow_model->set_input("x", nx.data(), nx.size() * 4) ||
-                !flow_model->set_input("mask", nmask.data(), nmask.size() * 4) ||
-                !flow_model->set_input("mu", nmu.data(), nmu.size() * 4) ||
-                !flow_model->set_input("t", nt.data(), nt.size() * 4) ||
-                !flow_model->set_input("spks", nspks.data(), nspks.size() * 4) ||
-                !flow_model->set_input("cond", ncond.data(), ncond.size() * 4) || !flow_model->run()) {
-                return 1;
-            }
-            d = flow_model->output_f32(2 * plane);
-            if (!d) return 1;
-        } else {
-            std::vector<Ort::Value> es_in;
-            es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, x_in.data(), x_in.size(), x_shape.data(), x_shape.size()));
-            es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mask_in.data(), mask_in.size(), mask2_shape.data(), mask2_shape.size()));
-            es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mu_in.data(), mu_in.size(), x_shape.data(), x_shape.size()));
-            es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, t_in.data(), 2, t2_shape.data(), t2_shape.size()));
-            es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, spks_in.data(), spks_in.size(), spks2_shape.data(), spks2_shape.size()));
-            es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, cond_in.data(), cond_in.size(), x_shape.data(), x_shape.size()));
-            es_out = estimator->run(std::move(es_in));
-            d = es_out[0].GetTensorData<float>();
+            t_cur += dt;
+            if (step < steps) dt = ts[step + 1] - t_cur;
         }
-        const int dstride = flow_model ? npu_flow_cap : T;
-        for (int c = 0; c < 80; c++) {
-            for (int t = 0; t < T; t++) {
-                float dphi = 1.7f * d[(size_t) c * dstride + t] - 0.7f * d[(size_t) (80 + c) * dstride + t];
-                x[(size_t) c * T + t] += (float) dt * dphi;
+        return true;
+    };
+
+    if (!flow_model) {
+        if (!euler(x, mu.data(), cond.data(), mask.data(), T)) return 1;
+    } else if (T <= npu_flow_cap) {
+        if (!euler(x, mu.data(), cond.data(), mask.data(), T)) return 1;
+    } else {
+        // The estimator is causal with 50-frame chunks.  Run the one fixed c1024 kernel over windows:
+        // a later window keeps 256 frames of left real context, and its output stops at a chunk boundary
+        // unless it is the tail of the sequence.  This removes the old fixed-length limit without a second
+        // length-specific AXModel.
+        const int left = 256;
+        int out0 = 0;
+        while (out0 < T) {
+            const int in0   = std::max(0, out0 - left);
+            const int take  = std::min(npu_flow_cap, T - in0);
+            const int maxout = in0 + take;
+            int out1 = std::min(out0 + (npu_flow_cap - left), maxout);
+            if (out1 < T) out1 = (out1 / 50) * 50;
+            if (out1 <= out0) out1 = std::min(maxout, out0 + 1);
+            std::vector<float> xw((size_t) 80 * take), muw((size_t) 80 * take), condw((size_t) 80 * take),
+                                maskw((size_t) take);
+            for (int c = 0; c < 80; c++) {
+                memcpy(xw.data() + (size_t) c * take, x.data() + (size_t) c * T + in0, (size_t) take * 4);
+                memcpy(muw.data() + (size_t) c * take, mu.data() + (size_t) c * T + in0, (size_t) take * 4);
+                memcpy(condw.data() + (size_t) c * take, cond.data() + (size_t) c * T + in0, (size_t) take * 4);
             }
+            memcpy(maskw.data(), mask.data() + in0, (size_t) take * 4);
+            if (!euler(xw, muw.data(), condw.data(), maskw.data(), take)) return 1;
+            for (int c = 0; c < 80; c++) {
+                memcpy(x.data() + (size_t) c * T + out0, xw.data() + (size_t) c * take + (out0 - in0),
+                       (size_t) (out1 - out0) * 4);
+            }
+            out0 = out1;
         }
-        t_cur += dt;
-        if (step < steps) dt = ts[step + 1] - t_cur;
     }
     auto t_flow = std::chrono::steady_clock::now();
 
