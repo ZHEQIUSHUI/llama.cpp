@@ -84,6 +84,24 @@ static server_state server_state_from_str(const std::string & str) {
 
 using server_state_callback_t = std::function<void(server_state, json /* payload */)>;
 
+struct server_voxcpm2_request {
+    std::string          input;
+    std::vector<uint8_t> ref_audio;
+    std::string          ref_text;
+    int                  max_steps   = 200;
+    int                  timesteps   = 10;
+    float                cfg_value   = 2.0f;
+    float                temperature = 1.0f;
+    uint32_t             seed        = 42;
+};
+
+struct server_voxcpm2_result {
+    std::vector<float> pcm;
+    int                sample_rate = 48000;
+    int                n_steps     = 0;
+    double             t_gen_s     = 0.0;
+};
+
 struct server_context {
     std::unique_ptr<server_context_impl> impl;
 
@@ -110,6 +128,11 @@ struct server_context {
     // get server metadata (read-only), can only be called after load_model()
     // not thread-safe, should only be used from the main thread
     server_context_meta get_meta() const;
+
+    // VoxCPM2 TTS is enabled when --voxcpm2-acoustic is set at load time.
+    bool voxcpm2_available() const;
+    bool voxcpm2_synthesize(const server_voxcpm2_request & request,
+                            server_voxcpm2_result & result, std::string & error);
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
