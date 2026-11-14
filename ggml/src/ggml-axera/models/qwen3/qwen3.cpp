@@ -504,10 +504,8 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
     // a decode group with the head: the batch's last token through the group, its logits the group's (the other
     // output rows' on the CPU without lm_head: the TTS codec head's, the prompt's rows with embeddings)
     const bool group_head = logits && LOGITS && logits->ne[1] > 0 && (logits->ne[1] == 1 || !man.kernels.count("lm_head"));
-    if (logits && logits->ne[1] > 0 && !group_head && !man.kernels.count("lm_head")) {
-        GGML_LOG_ERROR("axera qwen3: logits of %lld rows; the kernel directory has no lm_head\n", (long long) logits->ne[1]);
-        return GGML_STATUS_FAILED;
-    }
+    // A small classifier head (Qwen3-ForcedAligner's 5000 classes) stays on the CPU when the manifest has no lm_head
+    // kernel. The text graph still runs entirely on the NPU; the CPU only projects the output rows.
     // token t sees cell c (llama.cpp may keep several sequences in one stream, one after another: a sequence's cells
     // are this cache's from its first on)
     auto sees = [&](int t, int64_t c) {
@@ -579,7 +577,11 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
         LOGITS->invalidate();
         head.run(g, names, h, T, &normed, normed[T - 1] ? (const float *) LOGITS->vir : nullptr);
     } else {
-        head.bind(man.get("lm_head"), logits->src[0]);  // output.weight, or the tied token_embd.weight
+        if (man.kernels.count("lm_head")) {
+            head.bind(man.get("lm_head"), logits->src[0]);  // output.weight, or the tied token_embd.weight
+        } else {
+            head.bind_cpu(logits->src[0]);
+        }
         head.run(g, names, h, T);
     }
     return GGML_STATUS_SUCCESS;
