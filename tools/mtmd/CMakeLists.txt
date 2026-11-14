@@ -22,6 +22,8 @@ add_library(mtmd
             mtmd-helper-gen.cpp
             mtmd-helper-common.h
             mtmd-helper.h
+            forced-aligner-run.cpp
+            forced-aligner.h
             clip.cpp
             clip.h
             clip-impl.h

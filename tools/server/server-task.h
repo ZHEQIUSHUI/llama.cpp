@@ -20,6 +20,7 @@
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_TTS,
+    SERVER_TASK_TYPE_FORCED_ALIGN,
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
     SERVER_TASK_TYPE_DECISION,
@@ -197,6 +198,15 @@ struct server_task {
         int32_t  max_frames = 512;
     };
     tts_params tts;
+
+    struct forced_align_params {
+        std::string transcript;
+        std::string language = "English";
+        int32_t     segment_ms = 80;
+        raw_buffer  audio;
+        std::string response_format = "json";
+    };
+    forced_align_params forced_align;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -573,6 +583,15 @@ struct server_task_result_tts : server_task_result {
     double      t_gen_s = 0.0;
     double      t_vocoder_s = 0.0;
     double      t_total_s = 0.0;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_align : server_task_result {
+    std::string data;
+    int32_t     input_tokens = 0;
+    int32_t     audio_tokens = 0;
+    double      t_forward_s = 0.0;
 
     virtual json to_json() override;
 };
