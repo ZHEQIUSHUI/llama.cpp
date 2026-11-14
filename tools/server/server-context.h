@@ -132,6 +132,9 @@ struct server_context {
 
     // VoxCPM2 TTS is enabled when --voxcpm2-acoustic is set at load time.
     bool voxcpm2_available() const;
+    bool voxcpm2_synthesize_stream(const server_voxcpm2_request & request,
+                                   const std::function<bool(const std::vector<float> &, bool)> & on_chunk,
+                                   std::string & error);
     bool voxcpm2_synthesize(const server_voxcpm2_request & request,
                             server_voxcpm2_result & result, std::string & error);
 

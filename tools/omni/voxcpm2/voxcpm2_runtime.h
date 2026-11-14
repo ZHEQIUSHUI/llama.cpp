@@ -9,7 +9,9 @@
 #include "voxcpm2_localenc.h"
 
 #include <cstdint>
+#include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <random>
 #include <string>
@@ -65,6 +67,14 @@ struct VoxCPM2TokenEmbeddingTable {
     int         n_vocab     = 0;
     ggml_type   type        = GGML_TYPE_COUNT;
 
+    // Keep the GGUF stream open: reopening a multi-GB file for every text token
+    // cost several milliseconds per token during prefill.
+    mutable std::ifstream table_file;
+    mutable bool          table_open = false;
+    // The whole table is 300 MiB; holding it resident avoids a random read of
+    // the multi-GB GGUF per text token, which dominated short-prompt prefill.
+    std::vector<uint8_t> table_data;
+
     bool load(const std::string & gguf_path);
     bool embedding_for_token(int32_t token_id, std::vector<float> & dst) const;
     void free();
@@ -96,6 +106,35 @@ struct VoxCPM2ResidualLM {
     std::vector<float> forward_step(const std::vector<float> & input_1d, int position);
     void               clear_kv();
     void               free();
+};
+
+// A small per-step ggml graph built once and then reused: only the input
+// tensors are refilled and the graph re-run.  Rebuilding the context, the
+// graph and its backend buffer dominated the FSQ / fusion / stop / enc_to_lm
+// host cost (a tiny 2048->2 matmul measured 2 ms per call that way).
+struct VoxCachedGraph {
+    ggml_context *       ctx    = nullptr;
+    ggml_cgraph *        graph  = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    std::vector<ggml_tensor *> in;
+    ggml_tensor *        out    = nullptr;
+    int                  key    = -1;
+
+    void reset() {
+        if (buffer) {
+            ggml_backend_buffer_free(buffer);
+            buffer = nullptr;
+        }
+        if (ctx) {
+            ggml_free(ctx);
+            ctx = nullptr;
+        }
+        graph = nullptr;
+        out   = nullptr;
+        in.clear();
+        key = -1;
+    }
+    ~VoxCachedGraph() { reset(); }
 };
 
 struct VoxCPM2Runtime {
@@ -232,6 +271,11 @@ struct VoxCPM2Runtime {
         void free_graph();
     } cached_front_half;
 
+    std::map<int, VoxCachedGraph> fsq_cache;
+    std::map<int, VoxCachedGraph> fusion_cache;
+    std::map<int, VoxCachedGraph> enc_to_lm_cache;
+    VoxCachedGraph                stop_cache;
+
     bool fail(const std::string & message);
     void clear_error();
 
@@ -239,6 +283,7 @@ struct VoxCPM2Runtime {
     std::vector<float>   run_locenc_sequence(const std::vector<float> & feat, int seq_len);
     std::vector<float>   run_enc_to_lm(const std::vector<float> & locenc_hidden, int seq_len);
     std::vector<float>   run_fsq(const std::vector<float> & input, int seq_len);
+    bool                 run_stop_head(const std::vector<float> & hidden, float & continue_logit, float & stop_logit);
     std::vector<float>   run_residual_fusion(const std::vector<float> & blended,
                                              const std::vector<float> & feat_embed,
                                              int                        seq_len);
@@ -265,5 +310,7 @@ struct VoxCPM2Runtime {
     // Decode one latent patch through the AudioVAE's stateful streaming path.
     // Requires audio_vae.stream_begin(); consecutive calls continue the stream.
     std::vector<float>   decode_patch_streaming(const std::vector<float> & patch, int target_sr);
+    std::vector<float>   decode_latent_frames_streaming(const std::vector<float> & frames, int n_frames,
+                                                        int target_sr);
     std::vector<int32_t> expand_multichar_cjk_tokens(const std::vector<int32_t> & ids) const;
 };

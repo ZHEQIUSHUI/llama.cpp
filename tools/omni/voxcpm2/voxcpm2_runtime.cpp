@@ -44,10 +44,16 @@ struct VoxStageProf {
     double front_stop_ms = 0.0;
     double fsq_ms = 0.0;
     double fusion_ms = 0.0;
+    double post_ms = 0.0;
     double residual_ms = 0.0;
     double vae_ms = 0.0;
     double first_ms = -1.0;
     int    steps = 0;
+    // Prefill sub-buckets (the prefill total alone hid the per-token ResidualLM
+    // loop, which dominates short requests).
+    double prefill_base_ms = 0.0;
+    double prefill_embed_ms = 0.0;
+    double prefill_res_ms = 0.0;
 };
 
 static VoxStageProf g_prof;
@@ -71,12 +77,13 @@ static void vox_prof_report(const char * mode) {
     const double total_ms = vox_now_ms() - g_prof.start_ms;
     LOG_INF("VOXPROF mode=%s total_ms=%.3f prefill_ms=%.3f encode_ms=%.3f base_ms=%.3f "
             "front_ms=%.3f front_dit_ms=%.3f front_locenc_ms=%.3f front_stop_ms=%.3f "
-            "fsq_ms=%.3f fusion_ms=%.3f residual_ms=%.3f vae_ms=%.3f "
-            "steps=%d first_ms=%.3f\n",
+            "fsq_ms=%.3f fusion_ms=%.3f post_ms=%.3f residual_ms=%.3f vae_ms=%.3f "
+            "steps=%d first_ms=%.3f prefill_base_ms=%.3f prefill_res_ms=%.3f prefill_embed_ms=%.3f\n",
             mode, total_ms, g_prof.prefill_ms, g_prof.encode_ms, g_prof.base_ms, g_prof.front_ms,
             g_prof.front_dit_ms, g_prof.front_locenc_ms, g_prof.front_stop_ms,
-            g_prof.fsq_ms, g_prof.fusion_ms, g_prof.residual_ms, g_prof.vae_ms,
-            g_prof.steps, g_prof.first_ms >= 0.0 ? g_prof.first_ms : total_ms);
+            g_prof.fsq_ms, g_prof.fusion_ms, g_prof.post_ms, g_prof.residual_ms, g_prof.vae_ms,
+            g_prof.steps, g_prof.first_ms >= 0.0 ? g_prof.first_ms : total_ms,
+            g_prof.prefill_base_ms, g_prof.prefill_res_ms, g_prof.prefill_embed_ms);
 }
 
 struct VoxProfScope {
@@ -139,6 +146,40 @@ struct BackendBufferGuard {
     }
 };
 
+// Build (once per key) a small graph and keep its context/buffer alive so the
+// following calls only set inputs and run it.  The builder must fill cg.out.
+template <typename Build>
+static bool vox_cached_graph(VoxCachedGraph & cg, int key, ggml_backend_t backend, size_t mem_size,
+                             int max_nodes, Build build) {
+    if (cg.graph && cg.key == key) {
+        return true;
+    }
+    cg.reset();
+    ggml_init_params params{};
+    params.mem_size   = mem_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc   = true;
+    cg.ctx            = ggml_init(params);
+    if (!cg.ctx) {
+        return false;
+    }
+    build(cg.ctx, cg);
+    if (!cg.out) {
+        cg.reset();
+        return false;
+    }
+    cg.graph = ggml_new_graph_custom(cg.ctx, max_nodes, false);
+    ggml_set_output(cg.out);
+    ggml_build_forward_expand(cg.graph, cg.out);
+    cg.buffer = ggml_backend_alloc_ctx_tensors(cg.ctx, backend);
+    if (!cg.buffer) {
+        cg.reset();
+        return false;
+    }
+    cg.key = key;
+    return true;
+}
+
 static std::vector<float> tensor_to_vector(ggml_tensor * tensor) {
     std::vector<float> out(static_cast<size_t>(ggml_nelements(tensor)));
     ggml_backend_tensor_get(tensor, out.data(), 0, out.size() * sizeof(float));
@@ -163,6 +204,32 @@ static void trace_dump_i32(const std::string & name, const std::vector<int32_t> 
     std::ofstream file(std::string(dir) + "/" + name + ".i32", std::ios::binary);
     file.write(reinterpret_cast<const char *>(data.data()),
                static_cast<std::streamsize>(data.size() * sizeof(int32_t)));
+}
+
+static bool write_f32_file(const std::string & path, const std::vector<float> & data) {
+    std::ofstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    file.write(reinterpret_cast<const char *>(data.data()),
+               static_cast<std::streamsize>(data.size() * sizeof(float)));
+    return static_cast<bool>(file);
+}
+
+static bool read_f32_file(const std::string & path, std::vector<float> & out) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    file.seekg(0, std::ios::end);
+    const std::streamoff size = file.tellg();
+    if (size <= 0 || size % static_cast<std::streamoff>(sizeof(float)) != 0) {
+        return false;
+    }
+    file.seekg(0, std::ios::beg);
+    out.resize(static_cast<size_t>(size) / sizeof(float));
+    file.read(reinterpret_cast<char *>(out.data()), size);
+    return static_cast<bool>(file);
 }
 
 static std::vector<float> make_causal_mask(int n_tokens) {
@@ -396,6 +463,30 @@ bool VoxCPM2TokenEmbeddingTable::load(const std::string & gguf_path) {
     LOG_INF("VoxCPM2TokenEmbeddingTable: loaded metadata vocab=%d embd=%d type=%s\n", n_vocab, n_embd,
             ggml_type_name(type));
 
+    const size_t table_bytes = row_bytes * static_cast<size_t>(n_vocab);
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            LOG_ERR("VoxCPM2TokenEmbeddingTable: failed to open %s for preload\n", path.c_str());
+            free();
+            gguf_free(ctx_gguf);
+            ggml_free(meta);
+            return false;
+        }
+        in.seekg(static_cast<std::streamoff>(data_offset), std::ios::beg);
+        table_data.resize(table_bytes);
+        in.read(reinterpret_cast<char *>(table_data.data()), static_cast<std::streamsize>(table_bytes));
+        if (!in) {
+            LOG_ERR("VoxCPM2TokenEmbeddingTable: failed to preload %zu bytes from %s\n", table_bytes, path.c_str());
+            table_data.clear();
+            free();
+            gguf_free(ctx_gguf);
+            ggml_free(meta);
+            return false;
+        }
+        LOG_INF("VoxCPM2TokenEmbeddingTable: preloaded %.1f MiB\n", table_bytes / 1048576.0);
+    }
+
     gguf_free(ctx_gguf);
     ggml_free(meta);
     return true;
@@ -411,29 +502,15 @@ bool VoxCPM2TokenEmbeddingTable::embedding_for_token(int32_t token_id, std::vect
         return false;
     }
 
-    std::ifstream fin(path, std::ios::binary);
-    if (!fin) {
-        LOG_ERR("VoxCPM2TokenEmbeddingTable: failed to open %s\n", path.c_str());
+    if (table_data.size() != row_bytes * static_cast<size_t>(n_vocab)) {
+        LOG_ERR("VoxCPM2TokenEmbeddingTable: table is not preloaded\n");
         return false;
     }
 
-    const size_t offset = data_offset + static_cast<size_t>(token_id) * row_bytes;
-    fin.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    if (!fin) {
-        LOG_ERR("VoxCPM2TokenEmbeddingTable: seek failed for token %d\n", token_id);
-        return false;
-    }
-
-    std::vector<uint8_t> row(row_bytes);
-    fin.read(reinterpret_cast<char *>(row.data()), static_cast<std::streamsize>(row.size()));
-    if (!fin) {
-        LOG_ERR("VoxCPM2TokenEmbeddingTable: read failed for token %d\n", token_id);
-        return false;
-    }
-
+    const uint8_t * row = table_data.data() + static_cast<size_t>(token_id) * row_bytes;
     dst.resize(static_cast<size_t>(n_embd));
     if (type == GGML_TYPE_F32) {
-        std::memcpy(dst.data(), row.data(), dst.size() * sizeof(float));
+        std::memcpy(dst.data(), row, dst.size() * sizeof(float));
         return true;
     }
 
@@ -442,11 +519,13 @@ bool VoxCPM2TokenEmbeddingTable::embedding_for_token(int32_t token_id, std::vect
         LOG_ERR("VoxCPM2TokenEmbeddingTable: unsupported token embedding type %s\n", ggml_type_name(type));
         return false;
     }
-    traits->to_float(row.data(), dst.data(), n_embd);
+    traits->to_float(row, dst.data(), n_embd);
     return true;
 }
 
 void VoxCPM2TokenEmbeddingTable::free() {
+    table_data.clear();
+    table_data.shrink_to_fit();
     path.clear();
     data_offset = 0;
     row_bytes   = 0;
@@ -779,11 +858,17 @@ bool VoxCPM2Runtime::init(const std::string & base_lm_path,
         if (want_npu && loc_dit.store && loc_enc.store && audio_vae.store && projections.store) {
             std::map<std::string, ggml_tensor *> tensors;
             for (const auto * store : { loc_dit.store.get(), loc_enc.store.get(), audio_vae.store.get(),
-                                        projections.store.get(), residual_lm.store.get() }) {
+                                        projections.store.get(), residual_lm.store.get(),
+                                        stop_predictor.store.get() }) {
                 for (const auto & kv : store->tensors) {
                     tensors[kv.first] = kv.second;
                 }
             }
+            // FSQ keeps its four tensors directly instead of a weight store.
+            tensors["fsq.in_proj.weight"]  = fsq.weights.in_proj_weight;
+            tensors["fsq.in_proj.bias"]    = fsq.weights.in_proj_bias;
+            tensors["fsq.out_proj.weight"] = fsq.weights.out_proj_weight;
+            tensors["fsq.out_proj.bias"]   = fsq.weights.out_proj_bias;
             std::vector<float> factors;
             if (!loc_dit.store->get_f32_array("voxcpm.rope.long_factor", factors)) {
                 LOG_WRN("VoxCPM2Runtime: rope factors missing; acoustic NPU disabled\n");
@@ -808,6 +893,23 @@ bool VoxCPM2Runtime::init(const std::string & base_lm_path,
 
     is_initialized = true;
     reset_state();
+
+    // llama.cpp uploads the BaseLM's NPU weight banks on the first graph
+    // compute, not while the model is loaded.  Do that here so the first real
+    // request does not pay a multi-second surprise; run one short prefill and
+    // throw its state away.  VOXCPM2_WARMUP=0 skips it.
+    const char * warm = std::getenv("VOXCPM2_WARMUP");
+    if (warm == nullptr || warm[0] == '\0' || warm[0] != '0') {
+        const double t0 = vox_now_ms();
+        std::vector<int32_t> warm_tokens{0};
+        if (!prefill_tokens(warm_tokens)) {
+            LOG_WRN("VoxCPM2Runtime: warmup prefill failed: %s\n", last_error_msg.c_str());
+            clear_error();
+        }
+        reset_state();
+        LOG_INF("VoxCPM2Runtime: warmup prefill %.1f ms\n", vox_now_ms() - t0);
+    }
+
     LOG_INF("VoxCPM2Runtime: initialized (embedding_scale=%.3f)\n", embedding_scale);
     return true;
 }
@@ -920,12 +1022,17 @@ void VoxCPM2Runtime::reset_state() {
     noise_replay_pos  = 0;
     state_ready       = false;
     base_lm.clear_kv_cache();
-    residual_lm.clear_kv();
 #if defined(VOXCPM2_HAVE_AXERA)
-    if (acoustic_npu) {
+    if (acoustic_npu && axera::vox_acoustic_has_residual(static_cast<axera::vox_acoustic *>(acoustic_npu))) {
+        // Same reasoning as the BaseLM cache: reset the position counter, do
+        // not memset the 256 MiB residual KV cache.
+        axera::vox_acoustic_res_reset(static_cast<axera::vox_acoustic *>(acoustic_npu));
         axera::vox_acoustic_vae_reset(static_cast<axera::vox_acoustic *>(acoustic_npu));
-    }
+    } else
 #endif
+    {
+        residual_lm.clear_kv();
+    }
 }
 
 bool VoxCPM2Runtime::prefill_tokens(const std::vector<int32_t> & token_ids) {
@@ -974,22 +1081,50 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
 
     std::vector<float> combined(static_cast<size_t>(hidden) * static_cast<size_t>(seq_len), 0.0f);
     std::vector<float> token_embed;
-    for (int i = 0; i < seq_len; ++i) {
-        if (text_mask[static_cast<size_t>(i)] == 0) {
-            continue;
+    {
+        VoxProfScope prof_embed(&g_prof.prefill_embed_ms);
+        for (int i = 0; i < seq_len; ++i) {
+            if (text_mask[static_cast<size_t>(i)] == 0) {
+                continue;
+            }
+            if (!token_embeddings.embedding_for_token(inputs.token_ids[static_cast<size_t>(i)], token_embed)) {
+                return fail("failed to read token embedding");
+            }
+            std::copy_n(token_embed.data(), static_cast<size_t>(hidden),
+                        combined.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
         }
-        if (!token_embeddings.embedding_for_token(inputs.token_ids[static_cast<size_t>(i)], token_embed)) {
-            return fail("failed to read token embedding");
-        }
-        std::copy_n(token_embed.data(), static_cast<size_t>(hidden),
-                    combined.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
     }
 
     std::vector<float> feat_embed(static_cast<size_t>(hidden) * static_cast<size_t>(seq_len), 0.0f);
     if (has_feat) {
-        std::vector<float> loc_hidden = run_locenc_sequence(inputs.audio_feat, seq_len);
+        std::vector<float> loc_hidden;
+#if defined(VOXCPM2_HAVE_AXERA)
+        // VoxCPMLocEnc processes each patch independently: a special token plus
+        // four frames, non-causal.  The NPU kernel is exactly that 5-row graph,
+        // so a reference prompt can reuse it per patch instead of building a
+        // 100+ row ggml graph for the whole sequence.
+        auto * acoustic = acoustic_npu ? static_cast<axera::vox_acoustic *>(acoustic_npu) : nullptr;
+        if (acoustic && axera::vox_acoustic_has_locenc(acoustic)) {
+            const int le_hidden = axera::vox_acoustic_locenc_hidden(acoustic);
+            loc_hidden.assign(static_cast<size_t>(seq_len) * static_cast<size_t>(le_hidden), 0.0f);
+            for (int i = 0; i < seq_len; ++i) {
+                if (feat_mask[static_cast<size_t>(i)] == 0) {
+                    continue;
+                }
+                if (!axera::vox_acoustic_locenc(
+                        acoustic,
+                        inputs.audio_feat.data() + static_cast<size_t>(i) * static_cast<size_t>(patch_elems),
+                        loc_hidden.data() + static_cast<size_t>(i) * static_cast<size_t>(le_hidden))) {
+                    return fail("LocEnc NPU reference prefill failed");
+                }
+            }
+        }
+#endif
         if (loc_hidden.empty()) {
-            return fail("LocEnc sequence forward failed");
+            loc_hidden = run_locenc_sequence(inputs.audio_feat, seq_len);
+            if (loc_hidden.empty()) {
+                return fail("LocEnc sequence forward failed");
+            }
         }
         feat_embed = run_enc_to_lm(loc_hidden, seq_len);
         if (feat_embed.empty()) {
@@ -1006,6 +1141,27 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
         }
     }
 
+    // Teacher-forced diagnostics: replay the exact embedding matrix a torch CPU
+    // run fed to its BaseLM.  Without this, a tokenizer or embedding-path
+    // difference would masquerade as NPU precision drift.
+    if (const char * teacher_prefill = std::getenv("VOXCPM2_TEACHER_PREFILL")) {
+        if (teacher_prefill[0] != '\0') {
+            std::vector<float> replay;
+            if (!read_f32_file(teacher_prefill, replay)) {
+                return fail(std::string("cannot read VOXCPM2_TEACHER_PREFILL: ") + teacher_prefill);
+            }
+            if (replay.size() != combined.size()) {
+                return fail("VOXCPM2_TEACHER_PREFILL shape does not match [" + std::to_string(seq_len) +
+                            ", " + std::to_string(hidden) + "]");
+            }
+            combined = std::move(replay);
+            LOG_INF("VoxCPM2Runtime: teacher-forced prefill input from %s (%d x %d)\n",
+                    teacher_prefill, seq_len, hidden);
+        }
+    }
+
+    trace_dump("prefill_combined", combined);
+
     std::vector<float> base_input = combined;
     if (embedding_scale != 0.0f) {
         for (float & v : base_input) {
@@ -1013,33 +1169,20 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
         }
     }
 
-    if (!base_lm.prefill(base_input.data(), seq_len, 0)) {
-        return fail("BaseLM prefill failed");
+    {
+        VoxProfScope prof_base(&g_prof.prefill_base_ms);
+        if (!base_lm.prefill(base_input.data(), seq_len, 0)) {
+            return fail("BaseLM prefill failed");
+        }
     }
     std::vector<float> base_hidden = base_lm.get_all_hidden();
     if (base_hidden.size() != static_cast<size_t>(hidden) * static_cast<size_t>(seq_len)) {
         return fail("BaseLM did not return all prefill hidden states");
     }
 
+    trace_dump("prefill_base", base_hidden);
+
     std::vector<float> blended = base_hidden;
-    if (has_feat) {
-        std::vector<float> fsq_hidden;
-        {
-            VoxProfScope prof_fsq(&g_prof.fsq_ms);
-            fsq_hidden = run_fsq(base_hidden, seq_len);
-        }
-        if (fsq_hidden.empty()) {
-            return fail("FSQ prefill forward failed");
-        }
-        for (int i = 0; i < seq_len; ++i) {
-            if (feat_mask[static_cast<size_t>(i)] == 0) {
-                continue;
-            }
-            std::copy_n(fsq_hidden.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden),
-                        static_cast<size_t>(hidden),
-                        blended.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
-        }
-    }
 
     std::vector<float> feat_embed_masked(static_cast<size_t>(hidden) * static_cast<size_t>(seq_len), 0.0f);
     for (int i = 0; i < seq_len; ++i) {
@@ -1050,14 +1193,97 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
                     feat_embed_masked.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
     }
 
-    // Store for debug/dump
-
     std::vector<float> residual_fusion_input;
-    {
+    bool               batched_tail = false;
+    bool               residual_done = false;
+#if defined(VOXCPM2_HAVE_AXERA)
+    const char * res_cpu_env = std::getenv("VOXCPM2_RESIDUAL_CPU");
+    const bool   res_cpu = res_cpu_env != nullptr && res_cpu_env[0] != '\0' && res_cpu_env[0] != '0';
+    const char * post_cpu_env = std::getenv("VOXCPM2_POST_CPU");
+    const bool   post_cpu = post_cpu_env != nullptr && post_cpu_env[0] != '\0' && post_cpu_env[0] != '0';
+    const bool npu_res_post = !res_cpu && !post_cpu && acoustic_npu &&
+        axera::vox_acoustic_has_res_post(static_cast<axera::vox_acoustic *>(acoustic_npu));
+    if (!npu_res_post && acoustic_npu && seq_len <= 16 &&
+        axera::vox_acoustic_has_prefill_tail(static_cast<axera::vox_acoustic *>(acoustic_npu))) {
+        VoxProfScope prof_fusion(&g_prof.fusion_ms);
+        const size_t row = static_cast<size_t>(hidden);
+        std::vector<float> base16(16 * row, 0.0f), feat16(16 * row, 0.0f), mask16(16, 0.0f);
+        std::copy_n(base_hidden.data(), static_cast<size_t>(seq_len) * row, base16.data());
+        std::copy_n(feat_embed_masked.data(), static_cast<size_t>(seq_len) * row, feat16.data());
+        for (int i = 0; i < seq_len; ++i) {
+            mask16[static_cast<size_t>(i)] = feat_mask[static_cast<size_t>(i)] != 0 ? 1.0f : 0.0f;
+        }
+        std::vector<float> lm16(16 * row, 0.0f), fus16(16 * row, 0.0f);
+        if (!axera::vox_acoustic_prefill_tail(static_cast<axera::vox_acoustic *>(acoustic_npu), base16.data(),
+                                              feat16.data(), mask16.data(), lm16.data(), fus16.data())) {
+            fail("batched prefill FSQ/fusion kernel failed");
+            return false;
+        }
+        for (int i = 0; i < seq_len; ++i) {
+            if (feat_mask[static_cast<size_t>(i)] != 0) {
+                std::copy_n(lm16.data() + static_cast<size_t>(i) * row, row,
+                            blended.data() + static_cast<size_t>(i) * row);
+            }
+        }
+        residual_fusion_input.assign(fus16.begin(), fus16.begin() + static_cast<size_t>(seq_len) * row);
+        batched_tail = true;
+    }
+#endif
+    if (!batched_tail && !residual_done) {
+#if defined(VOXCPM2_HAVE_AXERA)
+        if (npu_res_post) {
+            VoxProfScope prof_res(&g_prof.residual_ms);
+            VoxProfScope prof_res_pf(&g_prof.prefill_res_ms);
+            axera::vox_acoustic * a = static_cast<axera::vox_acoustic *>(acoustic_npu);
+            axera::vox_acoustic_res_reset(a);
+            std::vector<float> prev(static_cast<size_t>(hidden), 0.0f);
+            std::vector<float> lm_row(static_cast<size_t>(hidden), 0.0f);
+            std::vector<float> fusion_row(static_cast<size_t>(hidden), 0.0f);
+            std::vector<float> res_row(static_cast<size_t>(hidden), 0.0f);
+            std::vector<float> stop_logits(2, 0.0f);
+            residual_fusion_input.assign(static_cast<size_t>(seq_len) * hidden, 0.0f);
+            for (int i = 0; i < seq_len; ++i) {
+                const float blend = feat_mask[static_cast<size_t>(i)] != 0 ? 1.0f : 0.0f;
+                if (!axera::vox_acoustic_res_post_step(
+                        a, base_hidden.data() + static_cast<size_t>(i) * hidden,
+                        feat_embed_masked.data() + static_cast<size_t>(i) * hidden, prev.data(), blend,
+                        lm_row.data(), fusion_row.data(), stop_logits.data(), res_row.data())) {
+                    return fail("merged ResidualLM+post NPU prefill failed");
+                }
+                std::copy_n(lm_row.begin(), hidden, blended.begin() + static_cast<size_t>(i) * hidden);
+                std::copy_n(fusion_row.begin(), hidden,
+                            residual_fusion_input.begin() + static_cast<size_t>(i) * hidden);
+                trace_dump("res_pre_" + std::to_string(i), res_row);
+                prev = lm_row;
+            }
+            residual_hidden = std::move(res_row);
+            residual_done = true;
+        }
+#endif
+    }
+    if (!batched_tail && !residual_done) {
+        if (has_feat) {
+            std::vector<float> fsq_hidden;
+            {
+                VoxProfScope prof_fsq(&g_prof.fsq_ms);
+                fsq_hidden = run_fsq(base_hidden, seq_len);
+            }
+            if (fsq_hidden.empty()) {
+                return fail("FSQ prefill forward failed");
+            }
+            for (int i = 0; i < seq_len; ++i) {
+                if (feat_mask[static_cast<size_t>(i)] == 0) {
+                    continue;
+                }
+                std::copy_n(fsq_hidden.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden),
+                            static_cast<size_t>(hidden),
+                            blended.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
+            }
+        }
         VoxProfScope prof_fusion(&g_prof.fusion_ms);
         residual_fusion_input = run_residual_fusion(blended, feat_embed_masked, seq_len);
     }
-    if (residual_fusion_input.empty()) {
+    if (residual_fusion_input.empty() && !residual_done) {
         return fail("residual fusion prefill failed");
     }
     trace_dump("prefill_fusion", residual_fusion_input);
@@ -1069,10 +1295,12 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
     // so decode step 0 attends to exactly the K/V that produced the prefill output.
     // prefill_kv() now returns the last hidden state of the prefill forward and the
     // cache writes are pure graph sinks that do not perturb that value.
-    {
+    if (!residual_done) {
         VoxProfScope prof_res(&g_prof.residual_ms);
+        VoxProfScope prof_res_pf(&g_prof.prefill_res_ms);
 #if defined(VOXCPM2_HAVE_AXERA)
-        if (acoustic_npu && axera::vox_acoustic_has_residual(static_cast<axera::vox_acoustic *>(acoustic_npu))) {
+        if (!res_cpu && acoustic_npu &&
+            axera::vox_acoustic_has_residual(static_cast<axera::vox_acoustic *>(acoustic_npu))) {
             axera::vox_acoustic * a = static_cast<axera::vox_acoustic *>(acoustic_npu);
             axera::vox_acoustic_res_reset(a);
             std::vector<float> last(static_cast<size_t>(hidden));
@@ -1171,89 +1399,90 @@ std::vector<float> VoxCPM2Runtime::run_locenc_sequence(const std::vector<float> 
 }
 
 std::vector<float> VoxCPM2Runtime::run_enc_to_lm(const std::vector<float> & locenc_hidden, int seq_len) {
-    GgmlContextGuard ctx_guard(kSmallGraphMem, true);
-    ggml_context *   ctx = ctx_guard.get();
-    if (!ctx) {
+    VoxCachedGraph & cg = enc_to_lm_cache[seq_len];
+    if (!vox_cached_graph(cg, seq_len, backend, kSmallGraphMem, kSmallGraphNodes,
+                          [&](ggml_context * ctx, VoxCachedGraph & c) {
+                              ggml_tensor * input =
+                                  ggml_new_tensor_2d(ctx, GGML_TYPE_F32, loc_enc.config.transformer.hidden_size, seq_len);
+                              ggml_set_input(input);
+                              c.in.push_back(input);
+                              c.out = projections.enc_to_lm(ctx, input);
+                          })) {
         return {};
     }
-
-    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, loc_enc.config.transformer.hidden_size, seq_len);
-    ggml_set_input(input);
-    ggml_tensor * output = projections.enc_to_lm(ctx, input);
-
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, kSmallGraphNodes, false);
-    ggml_set_output(output);
-    ggml_build_forward_expand(graph, output);
-
-    BackendBufferGuard buffer(ggml_backend_alloc_ctx_tensors(ctx, backend));
-    if (!buffer.buffer) {
+    ggml_backend_tensor_set(cg.in[0], locenc_hidden.data(), 0, locenc_hidden.size() * sizeof(float));
+    if (ggml_backend_graph_compute(backend, cg.graph) != GGML_STATUS_SUCCESS) {
         return {};
     }
-
-    ggml_backend_tensor_set(input, locenc_hidden.data(), 0, locenc_hidden.size() * sizeof(float));
-    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
-        return {};
-    }
-    return tensor_to_vector(output);
+    return tensor_to_vector(cg.out);
 }
 
 std::vector<float> VoxCPM2Runtime::run_fsq(const std::vector<float> & input_vec, int seq_len) {
-    GgmlContextGuard ctx_guard(kSmallGraphMem, true);
-    ggml_context *   ctx = ctx_guard.get();
-    if (!ctx) {
+    VoxCachedGraph & cg = fsq_cache[seq_len];
+    if (!vox_cached_graph(cg, seq_len, backend, kSmallGraphMem, kMediumGraphNodes,
+                          [&](ggml_context * ctx, VoxCachedGraph & c) {
+                              ggml_tensor * input =
+                                  ggml_new_tensor_2d(ctx, GGML_TYPE_F32, fsq.config.hidden_size, seq_len);
+                              ggml_set_input(input);
+                              c.in.push_back(input);
+                              c.out = fsq.forward(ctx, input);
+                          })) {
         return {};
     }
-
-    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, fsq.config.hidden_size, seq_len);
-    ggml_set_input(input);
-    ggml_tensor * output = fsq.forward(ctx, input);
-
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, kMediumGraphNodes, false);
-    ggml_set_output(output);
-    ggml_build_forward_expand(graph, output);
-
-    BackendBufferGuard buffer(ggml_backend_alloc_ctx_tensors(ctx, backend));
-    if (!buffer.buffer) {
+    ggml_backend_tensor_set(cg.in[0], input_vec.data(), 0, input_vec.size() * sizeof(float));
+    if (ggml_backend_graph_compute(backend, cg.graph) != GGML_STATUS_SUCCESS) {
         return {};
     }
+    return tensor_to_vector(cg.out);
+}
 
-    ggml_backend_tensor_set(input, input_vec.data(), 0, input_vec.size() * sizeof(float));
-    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
-        return {};
+bool VoxCPM2Runtime::run_stop_head(const std::vector<float> & hidden, float & continue_logit, float & stop_logit) {
+    if (!vox_cached_graph(stop_cache, 1, backend, kSmallGraphMem, kSmallGraphNodes,
+                          [&](ggml_context * ctx, VoxCachedGraph & c) {
+                              ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, base_lm.n_embd);
+                              ggml_set_input(input);
+                              c.in.push_back(input);
+                              c.out = stop_predictor.forward(ctx, input);
+                          })) {
+        return false;
     }
-    return tensor_to_vector(output);
+    ggml_backend_tensor_set(stop_cache.in[0], hidden.data(), 0, hidden.size() * sizeof(float));
+    if (ggml_backend_graph_compute(backend, stop_cache.graph) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    std::vector<float> logits = tensor_to_vector(stop_cache.out);
+    if (logits.size() < 2) {
+        return false;
+    }
+    continue_logit = logits[0];
+    stop_logit     = logits[1];
+    return true;
 }
 
 std::vector<float> VoxCPM2Runtime::run_residual_fusion(const std::vector<float> & blended,
                                                        const std::vector<float> & feat_embed,
                                                        int                        seq_len) {
-    GgmlContextGuard ctx_guard(kSmallGraphMem, true);
-    ggml_context *   ctx = ctx_guard.get();
-    if (!ctx) {
+    VoxCachedGraph & cg = fusion_cache[seq_len];
+    if (!vox_cached_graph(cg, seq_len, backend, kSmallGraphMem, kSmallGraphNodes,
+                          [&](ggml_context * ctx, VoxCachedGraph & c) {
+                              ggml_tensor * blended_t =
+                                  ggml_new_tensor_2d(ctx, GGML_TYPE_F32, projections.config.lm_hidden_size, seq_len);
+                              ggml_tensor * feat_t =
+                                  ggml_new_tensor_2d(ctx, GGML_TYPE_F32, projections.config.lm_hidden_size, seq_len);
+                              ggml_set_input(blended_t);
+                              ggml_set_input(feat_t);
+                              c.in.push_back(blended_t);
+                              c.in.push_back(feat_t);
+                              c.out = projections.build_residual_fusion(ctx, blended_t, feat_t);
+                          })) {
         return {};
     }
-
-    ggml_tensor * blended_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, projections.config.lm_hidden_size, seq_len);
-    ggml_tensor * feat_t    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, projections.config.lm_hidden_size, seq_len);
-    ggml_set_input(blended_t);
-    ggml_set_input(feat_t);
-    ggml_tensor * output = projections.build_residual_fusion(ctx, blended_t, feat_t);
-
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, kSmallGraphNodes, false);
-    ggml_set_output(output);
-    ggml_build_forward_expand(graph, output);
-
-    BackendBufferGuard buffer(ggml_backend_alloc_ctx_tensors(ctx, backend));
-    if (!buffer.buffer) {
+    ggml_backend_tensor_set(cg.in[0], blended.data(), 0, blended.size() * sizeof(float));
+    ggml_backend_tensor_set(cg.in[1], feat_embed.data(), 0, feat_embed.size() * sizeof(float));
+    if (ggml_backend_graph_compute(backend, cg.graph) != GGML_STATUS_SUCCESS) {
         return {};
     }
-
-    ggml_backend_tensor_set(blended_t, blended.data(), 0, blended.size() * sizeof(float));
-    ggml_backend_tensor_set(feat_t, feat_embed.data(), 0, feat_embed.size() * sizeof(float));
-    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
-        return {};
-    }
-    return tensor_to_vector(output);
+    return tensor_to_vector(cg.out);
 }
 
 bool VoxCPM2Runtime::ensure_decode_front_half_graph(int n_timesteps, float cfg_value) {
@@ -1360,6 +1589,60 @@ bool VoxCPM2Runtime::run_decode_front_half_npu(const std::vector<float> &    noi
         return fail("NPU LocDiT implements the model's cfg-zero-star blend only");
     }
 
+    // Teacher-forced front diagnostic: replay the per-step CPU lm/res rows and
+    // the previous CPU patch as the DiT condition.  With VOXCPM2_NOISE_FILE the
+    // initial noise is the CPU stream as well, so the only remaining difference
+    // is the NPU LocDiT/LocEnc arithmetic.  Results are dumped as
+    // npu_step<N>_patch.f32 next to the CPU step<N>_*.f32 trace.
+    const char * front_teacher_dir = std::getenv("VOXCPM2_FRONT_TEACHER_DIR");
+    std::vector<float> teacher_lm, teacher_res, teacher_cond;
+    const std::vector<float> * lm_arg   = &lm_hidden;
+    const std::vector<float> * res_arg  = &residual_hidden;
+    const std::vector<float> * cond_arg = &prefix_feat_cond;
+    bool front_teacher = false;
+    if (front_teacher_dir != nullptr && front_teacher_dir[0] != '\0') {
+        // Step 0 consumes the prefill lm/res rows; step N consumes the rows
+        // produced by decode step N-1, because the official loop updates
+        // lm_hidden/residual_hidden only after the DiT has run.
+        const std::string prefix = audio_frame_count == 0
+            ? std::string(front_teacher_dir) + "/prefill"
+            : std::string(front_teacher_dir) + "/step" + std::to_string(audio_frame_count - 1);
+        if (read_f32_file(prefix + "_lm.f32", teacher_lm) &&
+            teacher_lm.size() == lm_hidden.size() &&
+            read_f32_file(prefix + "_res.f32", teacher_res) &&
+            teacher_res.size() == residual_hidden.size()) {
+            if (audio_frame_count == 0) {
+                teacher_cond.assign(static_cast<size_t>(fdim) * psize, 0.0f);
+            } else {
+                const std::string prev =
+                    std::string(front_teacher_dir) + "/step" + std::to_string(audio_frame_count - 1) + "_patch.f32";
+                if (!read_f32_file(prev, teacher_cond) ||
+                    teacher_cond.size() != static_cast<size_t>(fdim) * psize) {
+                    return fail("front teacher trace has no usable previous patch");
+                }
+                // The torch trace stores a patch as [feat_dim, patch_size]
+                // (channel-major); the kernel's cond input is [patch_size,
+                // feat_dim] (time-major), the same layout as random_noise().
+                std::vector<float> cond_t(teacher_cond.size());
+                for (int tt = 0; tt < psize; ++tt) {
+                    for (int c = 0; c < fdim; ++c) {
+                        cond_t[static_cast<size_t>(tt) * fdim + c] =
+                            teacher_cond[static_cast<size_t>(c) * psize + tt];
+                    }
+                }
+                teacher_cond.swap(cond_t);
+            }
+            lm_arg   = &teacher_lm;
+            res_arg  = &teacher_res;
+            cond_arg = &teacher_cond;
+            front_teacher = true;
+            LOG_INF("VoxCPM2Runtime: front teacher step %d from %s\n", audio_frame_count, front_teacher_dir);
+        } else {
+            return fail(std::string("front teacher trace missing lm/res for step ") +
+                        std::to_string(audio_frame_count));
+        }
+    }
+
     std::vector<float> x = noise;
     if (params.temperature != 1.0f) {
         for (float & v : x) {
@@ -1378,27 +1661,54 @@ bool VoxCPM2Runtime::run_decode_front_half_npu(const std::vector<float> &    noi
         params.inference_timesteps > 1 ? std::max(1, static_cast<int>(t_span.size() * 0.04f)) : 0;
     std::vector<float> vel(static_cast<size_t>(fdim) * psize, 0.0f);
 
-    for (int step = 1; step <= params.inference_timesteps; ++step) {
-        if (step <= zero_init_steps) {
-            std::fill(vel.begin(), vel.end(), 0.0f);
-        } else {
-            VoxProfScope prof(&g_prof.front_dit_ms);
-            if (!axera::vox_acoustic_dit(static_cast<axera::vox_acoustic *>(acoustic_npu), x.data(), lm_hidden.data(),
-                                         residual_hidden.data(), prefix_feat_cond.data(), t, vel.data())) {
-                return fail("LocDiT NPU evaluation failed");
+    // The fused kernel owns the whole Euler loop (runtime step loop around the
+    // layer loop): nine estimator evaluations in one NPU call.  The host keeps
+    // the per-call loop only as a fallback for packages with the old kernel.
+    bool looped = false;
+    if (zero_init_steps == 1 && params.inference_timesteps - 1 <= 10 &&
+        params.inference_timesteps > 1) {
+        const int k = params.inference_timesteps - 1;
+        std::vector<float> ts(static_cast<size_t>(k), 0.0f), dts(static_cast<size_t>(k), 0.0f);
+        for (int i = 0; i < k; ++i) {
+            ts[static_cast<size_t>(i)]  = t_span[static_cast<size_t>(i + 1)];
+            dts[static_cast<size_t>(i)] = t_span[static_cast<size_t>(i + 1)] - t_span[static_cast<size_t>(i + 2)];
+        }
+        VoxProfScope prof(&g_prof.front_dit_ms);
+        looped = axera::vox_acoustic_dit_loop(static_cast<axera::vox_acoustic *>(acoustic_npu), x.data(),
+                                              lm_arg->data(), res_arg->data(),
+                                              cond_arg->data(), ts.data(), dts.data(), k, x.data());
+    }
+    if (!looped) {
+        for (int step = 1; step <= params.inference_timesteps; ++step) {
+            if (step <= zero_init_steps) {
+                std::fill(vel.begin(), vel.end(), 0.0f);
+            } else {
+                VoxProfScope prof(&g_prof.front_dit_ms);
+                if (!axera::vox_acoustic_dit(static_cast<axera::vox_acoustic *>(acoustic_npu), x.data(),
+                                             lm_arg->data(), res_arg->data(), cond_arg->data(),
+                                             t, vel.data())) {
+                    return fail("LocDiT NPU evaluation failed");
+                }
             }
-        }
-        for (size_t i = 0; i < x.size(); ++i) {
-            x[i] -= vel[i] * dt;
-        }
-        t -= dt;
-        if (step < params.inference_timesteps) {
-            dt = t - t_span[static_cast<size_t>(step + 1)];
+            for (size_t i = 0; i < x.size(); ++i) {
+                x[i] -= vel[i] * dt;
+            }
+            t -= dt;
+            if (step < params.inference_timesteps) {
+                dt = t - t_span[static_cast<size_t>(step + 1)];
+            }
         }
     }
 
     result.latent_patch = x;
     trace_dump("step" + std::to_string(audio_frame_count) + "_patch", result.latent_patch);
+    if (front_teacher) {
+        const std::string dump = std::string(front_teacher_dir) + "/npu_step" +
+            std::to_string(audio_frame_count) + "_patch.f32";
+        if (!write_f32_file(dump, x)) {
+            return fail("failed to dump teacher-forced NPU patch");
+        }
+    }
 
     std::vector<float> locenc_hidden(static_cast<size_t>(loc_enc.config.transformer.hidden_size));
     {
@@ -1414,36 +1724,22 @@ bool VoxCPM2Runtime::run_decode_front_half_npu(const std::vector<float> &    noi
     }
     trace_dump("step" + std::to_string(audio_frame_count) + "_embed", result.current_embed);
 
-    {
+    // With the merged post kernel the stop head runs together with FSQ and
+    // fusion after the BaseLM row is available; avoid the duplicate graph here.
+    if (!(axera::vox_acoustic_has_post(static_cast<axera::vox_acoustic *>(acoustic_npu))) &&
+        !(axera::vox_acoustic_has_res_post(static_cast<axera::vox_acoustic *>(acoustic_npu)))) {
         VoxProfScope prof(&g_prof.front_stop_ms);
-        GgmlContextGuard ctx_guard(kSmallGraphMem, true);
-        ggml_context *   ctx = ctx_guard.get();
-        if (!ctx) {
-            return fail("failed to create stop-predictor context");
-        }
-        ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, base_lm.n_embd);
-        ggml_set_input(input);
-        ggml_tensor * output = stop_predictor.forward(ctx, input);
-        ggml_cgraph * graph  = ggml_new_graph_custom(ctx, kSmallGraphNodes, false);
-        ggml_set_output(output);
-        ggml_build_forward_expand(graph, output);
-        BackendBufferGuard buffer(ggml_backend_alloc_ctx_tensors(ctx, backend));
-        if (!buffer.buffer) {
-            return fail("failed to allocate stop-predictor tensors");
-        }
-        ggml_backend_tensor_set(input, lm_hidden.data(), 0, lm_hidden.size() * sizeof(float));
-        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        float continue_logit = 0.0f;
+        float stop_logit     = 0.0f;
+        if (!run_stop_head(lm_hidden, continue_logit, stop_logit)) {
             return fail("stop-predictor graph compute failed");
         }
-        std::vector<float> stop_logits = tensor_to_vector(output);
-        if (stop_logits.size() >= 2) {
-            result.continue_logit = stop_logits[0];
-            result.stop_logit     = stop_logits[1];
-            result.should_stop    = stop_logits[1] > stop_logits[0];
-            if (std::getenv("VOXCPM2_DEBUG_STOP")) {
-                LOG_INF("STOP step=%d logits=[%.6f, %.6f] argmax=%d\n", current_position,
-                        result.continue_logit, result.stop_logit, result.should_stop ? 1 : 0);
-            }
+        result.continue_logit = continue_logit;
+        result.stop_logit     = stop_logit;
+        result.should_stop    = stop_logit > continue_logit;
+        if (std::getenv("VOXCPM2_DEBUG_STOP")) {
+            LOG_INF("STOP step=%d logits=[%.6f, %.6f] argmax=%d\n", current_position,
+                    result.continue_logit, result.stop_logit, result.should_stop ? 1 : 0);
         }
     }
 
@@ -1461,7 +1757,9 @@ bool VoxCPM2Runtime::run_decode_front_half(const std::vector<float> &    noise,
     }
 
 #if defined(VOXCPM2_HAVE_AXERA)
-    if (acoustic_npu) {
+    const char * front_cpu_env = std::getenv("VOXCPM2_FRONT_CPU");
+    const bool   front_cpu = front_cpu_env != nullptr && front_cpu_env[0] != '\0' && front_cpu_env[0] != '0';
+    if (acoustic_npu && !front_cpu) {
         return run_decode_front_half_npu(noise, params, result);
     }
 #endif
@@ -1569,7 +1867,24 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         return result;
     }
 
-    {
+    const char * teacher_dir = std::getenv("VOXCPM2_TEACHER_DIR");
+    const std::string teacher_step = teacher_dir
+        ? std::string(teacher_dir) + "/step" + std::to_string(audio_frame_count)
+        : std::string();
+    std::vector<float> teacher_embed;
+    const bool teacher = !teacher_step.empty() && read_f32_file(teacher_step + "_embed.f32", teacher_embed);
+    if (teacher) {
+        const size_t patch_elems = static_cast<size_t>(feat_dim()) * static_cast<size_t>(patch_size());
+        if (!read_f32_file(teacher_step + "_patch.f32", result.latent_patch) ||
+            result.latent_patch.size() != patch_elems ||
+            teacher_embed.size() != static_cast<size_t>(base_lm.n_embd)) {
+            fail("teacher-forced step files have the wrong shape");
+            return result;
+        }
+        result.current_embed = teacher_embed;
+        trace_dump("step" + std::to_string(audio_frame_count) + "_patch", result.latent_patch);
+        trace_dump("step" + std::to_string(audio_frame_count) + "_embed", result.current_embed);
+    } else {
         VoxProfScope prof_front(&g_prof.front_ms);
         if (!run_decode_front_half(noise, params, result)) {
             return result;
@@ -1602,22 +1917,102 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         return {};
     }
 
-    {
-        VoxProfScope prof_fsq(&g_prof.fsq_ms);
-        lm_hidden = run_fsq(base_hidden, 1);
-    }
     trace_dump("step" + std::to_string(audio_frame_count) + "_base", base_hidden);
+    const std::vector<float> lm_prev = lm_hidden;
+    std::vector<float>       fusion;
+    bool                     post_done = false;
+    bool                     res_done  = false;
+#if defined(VOXCPM2_HAVE_AXERA)
+    std::vector<float> teacher_fusion;
+    std::vector<float> teacher_lm;
+    const bool teacher_res = teacher && read_f32_file(teacher_step + "_fusion.f32", teacher_fusion) &&
+        teacher_fusion.size() == static_cast<size_t>(hidden) &&
+        read_f32_file(teacher_step + "_lm.f32", teacher_lm) &&
+        teacher_lm.size() == static_cast<size_t>(hidden);
+    const char * res_cpu_env = std::getenv("VOXCPM2_RESIDUAL_CPU");
+    const bool   res_cpu = res_cpu_env != nullptr && res_cpu_env[0] != '\0' && res_cpu_env[0] != '0';
+    const char * post_cpu_env = std::getenv("VOXCPM2_POST_CPU");
+    const bool   post_cpu = post_cpu_env != nullptr && post_cpu_env[0] != '\0' && post_cpu_env[0] != '0';
+    if (teacher_res && !res_cpu && acoustic_npu &&
+        axera::vox_acoustic_has_res_post(static_cast<axera::vox_acoustic *>(acoustic_npu))) {
+        VoxProfScope prof_res(&g_prof.residual_ms);
+        fusion = teacher_fusion;
+        residual_hidden.assign(static_cast<size_t>(hidden), 0.0f);
+        std::vector<float> post_lm(static_cast<size_t>(hidden), 0.0f);
+        float stop_logits[2] = { 0.0f, 0.0f };
+        if (!axera::vox_acoustic_res_post_step(
+                static_cast<axera::vox_acoustic *>(acoustic_npu), teacher_fusion.data(),
+                result.current_embed.data(), lm_prev.data(), 0.0f, post_lm.data(), fusion.data(),
+                stop_logits, residual_hidden.data(), teacher_fusion.data(), 1.0f)) {
+            fail("teacher-forced ResidualLM+post kernel failed");
+            return {};
+        }
+        lm_hidden = teacher_lm;
+        post_done = true;
+        res_done  = true;
+    } else if (!res_cpu && !post_cpu && acoustic_npu &&
+               axera::vox_acoustic_has_res_post(static_cast<axera::vox_acoustic *>(acoustic_npu))) {
+        VoxProfScope prof_res(&g_prof.residual_ms);
+        lm_hidden.assign(static_cast<size_t>(hidden), 0.0f);
+        fusion.assign(static_cast<size_t>(hidden), 0.0f);
+        residual_hidden.assign(static_cast<size_t>(hidden), 0.0f);
+        float stop_logits[2] = { 0.0f, 0.0f };
+        if (!axera::vox_acoustic_res_post_step(
+                static_cast<axera::vox_acoustic *>(acoustic_npu), base_hidden.data(),
+                result.current_embed.data(), lm_prev.data(), 1.0f, lm_hidden.data(), fusion.data(),
+                stop_logits, residual_hidden.data())) {
+            fail("merged ResidualLM+post kernel failed");
+            return {};
+        }
+        result.continue_logit = stop_logits[0];
+        result.stop_logit     = stop_logits[1];
+        result.should_stop    = stop_logits[1] > stop_logits[0];
+        if (std::getenv("VOXCPM2_DEBUG_STOP")) {
+            LOG_INF("STOP step=%d logits=[%.6f, %.6f] argmax=%d\n", current_position,
+                    result.continue_logit, result.stop_logit, result.should_stop ? 1 : 0);
+        }
+        post_done = true;
+        res_done  = true;
+    }
+#endif
+#if defined(VOXCPM2_HAVE_AXERA)
+    if (!res_cpu && !post_cpu && acoustic_npu &&
+        axera::vox_acoustic_has_post(static_cast<axera::vox_acoustic *>(acoustic_npu))) {
+        VoxProfScope prof_post(&g_prof.post_ms);
+        lm_hidden.assign(static_cast<size_t>(hidden), 0.0f);
+        fusion.assign(static_cast<size_t>(hidden), 0.0f);
+        float stop_logits[2] = { 0.0f, 0.0f };
+        if (!axera::vox_acoustic_post(static_cast<axera::vox_acoustic *>(acoustic_npu), base_hidden.data(),
+                                      result.current_embed.data(), lm_prev.data(), lm_hidden.data(),
+                                      fusion.data(), stop_logits)) {
+            fail("merged FSQ/fusion/stop kernel failed");
+            return {};
+        }
+        result.continue_logit = stop_logits[0];
+        result.stop_logit     = stop_logits[1];
+        result.should_stop    = stop_logits[1] > stop_logits[0];
+        if (std::getenv("VOXCPM2_DEBUG_STOP")) {
+            LOG_INF("STOP step=%d logits=[%.6f, %.6f] argmax=%d\n", current_position,
+                    result.continue_logit, result.stop_logit, result.should_stop ? 1 : 0);
+        }
+        post_done = true;
+    }
+#endif
+    if (!post_done) {
+        {
+            VoxProfScope prof_fsq(&g_prof.fsq_ms);
+            lm_hidden = run_fsq(base_hidden, 1);
+        }
+        if (lm_hidden.size() != static_cast<size_t>(hidden)) {
+            fail("FSQ decode hidden forward failed");
+            return {};
+        }
+        {
+            VoxProfScope prof_fusion(&g_prof.fusion_ms);
+            fusion = run_residual_fusion(lm_hidden, result.current_embed, 1);
+        }
+    }
     trace_dump("step" + std::to_string(audio_frame_count) + "_lm", lm_hidden);
-    if (lm_hidden.size() != static_cast<size_t>(hidden)) {
-        fail("FSQ decode hidden forward failed");
-        return {};
-    }
-
-    std::vector<float> fusion;
-    {
-        VoxProfScope prof_fusion(&g_prof.fusion_ms);
-        fusion = run_residual_fusion(lm_hidden, result.current_embed, 1);
-    }
     if (fusion.size() != static_cast<size_t>(hidden)) {
         fail("residual fusion decode failed");
         return {};
@@ -1625,14 +2020,15 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
     {
         VoxProfScope prof_res(&g_prof.residual_ms);
 #if defined(VOXCPM2_HAVE_AXERA)
-        if (acoustic_npu && axera::vox_acoustic_has_residual(static_cast<axera::vox_acoustic *>(acoustic_npu))) {
+        if (!res_done && !res_cpu && acoustic_npu &&
+            axera::vox_acoustic_has_residual(static_cast<axera::vox_acoustic *>(acoustic_npu))) {
             residual_hidden.assign(static_cast<size_t>(hidden), 0.0f);
             if (!axera::vox_acoustic_res_step(static_cast<axera::vox_acoustic *>(acoustic_npu), fusion.data(),
                                               residual_hidden.data())) {
                 fail("ResidualLM NPU decode failed");
                 return {};
             }
-        } else
+        } else if (!res_done)
 #endif
         {
             residual_hidden = residual_lm.forward_step(fusion, current_position);
@@ -1643,6 +2039,12 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
     if (residual_hidden.size() != static_cast<size_t>(hidden)) {
         fail("ResidualLM forward_step failed");
         return {};
+    }
+
+    // Diagnostics that replay a CPU trajectory must exercise every traced
+    // step, even when the NPU stop head flips earlier on its own state.
+    if (teacher && std::getenv("VOXCPM2_TEACHER_NO_STOP")) {
+        result.should_stop = false;
     }
 
     prefix_feat_cond = result.latent_patch;
@@ -1715,8 +2117,33 @@ std::vector<float> VoxCPM2Runtime::decode_pool_range_to_waveform(int start_patch
 #if defined(VOXCPM2_HAVE_AXERA)
     if (acoustic_npu && fdim == 64 && psize == 4 && (target_sr <= 0 || target_sr == 48000)) {
         axera::vox_acoustic * a = static_cast<axera::vox_acoustic *>(acoustic_npu);
+        const int batch_frames = axera::vox_acoustic_vae_batch_frames(a);
+        std::vector<float> result(static_cast<size_t>(total_frames) * 1920);
+        if (batch_frames >= 5) {
+            // One call decodes `batch_frames` latent frames; the tail repeats the
+            // last frame, which cannot change earlier samples of a causal decoder.
+            axera::vox_acoustic_vae_batch_reset(a);
+            std::vector<float> chunk(static_cast<size_t>(batch_frames) * fdim);
+            std::vector<float> pcm_chunk(static_cast<size_t>(batch_frames) * 1920);
+            for (int f0 = 0; f0 < total_frames; f0 += batch_frames) {
+                const int n = std::min(batch_frames, total_frames - f0);
+                for (int t = 0; t < batch_frames; ++t) {
+                    const int want = std::min(f0 + t, total_frames - 1);
+                    for (int c = 0; c < fdim; ++c) {
+                        chunk[static_cast<size_t>(t) * fdim + c] = latents[static_cast<size_t>(want) +
+                                                                         static_cast<size_t>(c) * total_frames];
+                    }
+                }
+                if (!axera::vox_acoustic_vae_batch(a, chunk.data(), pcm_chunk.data())) {
+                    fail("AudioVAE batched NPU decode failed");
+                    return {};
+                }
+                std::copy_n(pcm_chunk.data(), static_cast<size_t>(n) * 1920,
+                            result.data() + static_cast<size_t>(f0) * 1920);
+            }
+            return result;
+        }
         axera::vox_acoustic_vae_reset(a);
-        std::vector<float> result(static_cast<size_t>(n_patches) * 7680);
         for (int p = 0; p < n_patches; ++p) {
             const std::vector<float> & patch = output_pool[static_cast<size_t>(start_patch + p)];
             if (!axera::vox_acoustic_vae(a, patch.data(), result.data() + static_cast<size_t>(p) * 7680)) {
@@ -1858,6 +2285,43 @@ std::vector<float> VoxCPM2Runtime::decode_patch_streaming(const std::vector<floa
     auto result = tensor_to_vector(waveform);
     ggml_gallocr_free(galloc);
     return result;
+}
+
+std::vector<float> VoxCPM2Runtime::decode_latent_frames_streaming(
+        const std::vector<float> & frames, int n_frames, int target_sr) {
+    VoxProfScope prof_vae(&g_prof.vae_ms);
+    clear_error();
+    const int fdim  = feat_dim();
+    const int psize = patch_size();
+    if (n_frames <= 0 || frames.size() != static_cast<size_t>(n_frames) * fdim) {
+        fail("streaming decode received an invalid latent frame block");
+        return {};
+    }
+
+#if defined(VOXCPM2_HAVE_AXERA)
+    if (acoustic_npu && fdim == 64 && psize == 4 && (target_sr <= 0 || target_sr == 48000)) {
+        auto * a = static_cast<axera::vox_acoustic *>(acoustic_npu);
+        const int batch_frames = axera::vox_acoustic_vae_batch_frames(a);
+        if (batch_frames >= n_frames) {
+            std::vector<float> chunk(static_cast<size_t>(batch_frames) * fdim);
+            std::vector<float> decoded(static_cast<size_t>(batch_frames) * 1920);
+            std::copy_n(frames.begin(), static_cast<size_t>(n_frames) * fdim, chunk.begin());
+            for (int frame = n_frames; frame < batch_frames; ++frame) {
+                std::copy_n(chunk.begin() + static_cast<size_t>(n_frames - 1) * fdim, fdim,
+                            chunk.begin() + static_cast<size_t>(frame) * fdim);
+            }
+            if (!axera::vox_acoustic_vae_batch(a, chunk.data(), decoded.data())) {
+                fail("AudioVAE batched NPU streaming decode failed");
+                return {};
+            }
+            decoded.resize(static_cast<size_t>(n_frames) * 1920);
+            return decoded;
+        }
+    }
+#endif
+
+    fail("streaming latent block does not match an available AudioVAE decoder");
+    return {};
 }
 
 std::vector<float> VoxCPM2Runtime::encode_reference_audio(const std::vector<float> & reference_wav, int sample_rate) {
@@ -2295,6 +2759,73 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
     if (!is_initialized || !state_ready) {
         return fail("streaming decode requires initialized runtime and successful prefill");
     }
+
+#if defined(VOXCPM2_HAVE_AXERA)
+    if (acoustic_npu && axera::vox_acoustic_has_vae_batch(static_cast<axera::vox_acoustic *>(acoustic_npu))) {
+        auto * a = static_cast<axera::vox_acoustic *>(acoustic_npu);
+        const int group_frames = axera::vox_acoustic_vae_batch_frames(a);
+        axera::vox_acoustic_vae_batch_reset(a);
+        std::vector<float> pending;
+        bool sent_final = false;
+        auto emit = [&](int n, bool final_chunk) -> bool {
+            if (n <= 0) {
+                return true;
+            }
+            std::vector<float> block(pending.begin(), pending.begin() + static_cast<size_t>(n) * feat_dim());
+            pending.erase(pending.begin(), pending.begin() + static_cast<size_t>(n) * feat_dim());
+            std::vector<float> chunk = decode_latent_frames_streaming(block, n, params.target_sr);
+            if (chunk.empty()) {
+                return false;
+            }
+            if (g_prof.enabled && g_prof.first_ms < 0.0) {
+                g_prof.first_ms = vox_now_ms() - g_prof.start_ms;
+            }
+            if (callback && !callback(chunk, final_chunk)) {
+                return false;
+            }
+            return true;
+        };
+        for (int i = 0; i < params.max_steps; ++i) {
+            VoxCPM2DecodeStepResult step = decode_step(params);
+            if (step.latent_patch.empty()) {
+                break;
+            }
+            pending.insert(pending.end(), step.latent_patch.begin(), step.latent_patch.end());
+            const bool is_final = params.stop_on_predictor && i > params.min_steps && step.should_stop;
+            while (static_cast<int>(pending.size() / feat_dim()) >= group_frames) {
+                const bool last = is_final && static_cast<int>(pending.size() / feat_dim()) == group_frames;
+                if (!emit(group_frames, last)) {
+                    return last_error_msg.empty();
+                }
+                if (last) {
+                    sent_final = true;
+                }
+            }
+            if (is_final) {
+                const int left = static_cast<int>(pending.size() / feat_dim());
+                if (left > 0 && !emit(left, true)) {
+                    return last_error_msg.empty();
+                }
+                sent_final = true;
+                break;
+            }
+        }
+        if (!last_error_msg.empty()) {
+            return false;
+        }
+        const int left = static_cast<int>(pending.size() / feat_dim());
+        if (left > 0) {
+            if (!emit(left, true)) {
+                return false;
+            }
+            sent_final = true;
+        }
+        if (callback && !sent_final) {
+            callback({}, true);
+        }
+        return true;
+    }
+#endif
 
     // Stateful AudioVAE decode: each patch is decoded once, with the causal convs
     // carrying their left context across chunks. Re-decoding a window of patches
