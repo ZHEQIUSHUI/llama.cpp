@@ -75,4 +75,13 @@ bool vox_acoustic_has_residual(vox_acoustic * a);
 bool vox_acoustic_res_step(vox_acoustic * a, const float * x, float * out);
 void vox_acoustic_res_reset(vox_acoustic * a);
 
+// ResidualLM with the per-step FSQ/fusion/stop prologue in the same AXModel.
+// One call consumes the BaseLM row, current patch embedding and previous LM
+// row, and returns lm/fusion/stop plus the residual hidden row.
+bool vox_acoustic_has_res_post(vox_acoustic * a);
+bool vox_acoustic_res_post_step(vox_acoustic * a, const float * base, const float * feat,
+                                const float * prev_lm, float blend, float * lm, float * fusion,
+                                float * stop, float * out, const float * fusion_in = nullptr,
+                                float use_precomputed = 0.0f);
+
 }  // namespace axera

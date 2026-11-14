@@ -54,6 +54,7 @@ class voxcpm2_base final : public model, public seq_model {
     graph_names      names;
     const void *     bound = nullptr;
     int              L = 0, H = 0, NBLK = 0;
+    std::vector<float> rope_factors;
 
     axera_cmm                        KV;
     std::map<std::string, axera_cmm> banks;
@@ -217,12 +218,40 @@ axera_cmm voxcpm2_base::bank(const std::map<std::string, ggml_tensor *> & t, con
                 }
             }
         };
+        auto bf16w = [&](const char * g, bool scales, int heads) {
+            const ggml_tensor * w = T(il, g);
+            const int64_t       K = w->ne[0], N = ggml_nrows(w);
+            GGML_ASSERT(!scales);
+            GGML_ASSERT((size_t) N * K * sizeof(ggml_bf16_t) == bb);
+            thread_local std::vector<float> row;
+            row.resize(K);
+            const auto * traits = ggml_get_type_traits(w->type);
+            for (int64_t r = 0; r < N; ++r) {
+                const int64_t src_r = heads > 0 ? qk_source_row(r, N, heads) : r;
+                const void *  src   = (const char *) w->data + src_r * w->nb[1];
+                if (w->type == GGML_TYPE_F32) {
+                    memcpy(row.data(), src, K * sizeof(float));
+                } else {
+                    GGML_ASSERT(traits->to_float);
+                    traits->to_float(src, row.data(), K);
+                }
+                ggml_bf16_t * out = (ggml_bf16_t *) dst + r * K;
+                for (int64_t i = 0; i < K; ++i) {
+                    out[i] = ggml_fp32_to_bf16(row[i]);
+                }
+            }
+        };
         if (n == "cos" || n == "sin") {
             const int64_t P = d.shape[1], R = d.shape[2];
             GGML_ASSERT(d.dtype == 3 && (size_t) R == rp.inv_freq.size());
             for (int64_t p = 0; p < P; ++p) {
                 for (int64_t i = 0; i < R; ++i) {
-                    const double th = (double) p * rp.freq_scale * rp.inv_freq[(size_t) i];
+                    // llama.cpp applies the GGUF's per-dimension LongRoPE factors as
+                    // theta/factor; the kernel's RoPE takes plain inv_freq, so bake them in.
+                    const double inv = (size_t) i < rope_factors.size()
+                        ? (double) rp.inv_freq[(size_t) i] / (double) rope_factors[(size_t) i]
+                        : (double) rp.inv_freq[(size_t) i];
+                    const double th = (double) p * rp.freq_scale * inv;
                     ((float *) dst)[(size_t) p * R + i] = (float) (n == "cos" ? std::cos(th) : std::sin(th));
                 }
             }
@@ -236,9 +265,17 @@ axera_cmm voxcpm2_base::bank(const std::map<std::string, ggml_tensor *> & t, con
             if (n == "w_norm") {
                 put(f32_of(T(il, "ffn_norm.weight")));
             } else if (n.size() == 2 && W.count(n.substr(1))) {
-                mx8(W.at(n.substr(1)), false, 0);
+                if (d.dtype == 9) {
+                    bf16w(W.at(n.substr(1)), false, 0);
+                } else {
+                    mx8(W.at(n.substr(1)), false, 0);
+                }
             } else if (n.rfind("w_scale", 0) == 0 && W.count(n.substr(7))) {
-                mx8(W.at(n.substr(7)), true, 0);
+                if (d.bytes <= sizeof(float)) {
+                    fill(1.0f);
+                } else {
+                    mx8(W.at(n.substr(7)), true, 0);
+                }
             } else {
                 GGML_ABORT("axera voxcpm2: prefill: unexpected MLP input %s\n", d.name.c_str());
             }
@@ -250,7 +287,13 @@ axera_cmm voxcpm2_base::bank(const std::map<std::string, ggml_tensor *> & t, con
                 put(f32_of(T(il, "attn_norm.weight")));
             } else if (W.count(p) && (n == "w_" + p || n == "w_scale_" + p)) {
                 const int heads = p == "q" ? 16 : p == "k" ? 2 : 0;
-                mx8(W.at(p), n != "w_" + p, heads);
+                if (n == "w_scale_" + p && d.bytes <= sizeof(float)) {
+                    fill(1.0f);
+                } else if (d.dtype == 9) {
+                    bf16w(W.at(p), false, heads);
+                } else {
+                    mx8(W.at(p), n != "w_" + p, heads);
+                }
             } else {
                 GGML_ABORT("axera voxcpm2: prefill: unexpected attention input %s\n", d.name.c_str());
             }
@@ -304,6 +347,17 @@ void voxcpm2_base::init(const std::map<std::string, ggml_tensor *> & t, const gg
     INDICES->flush();
 
     const rope  rp(rope_node, names.find("inp_pos"), 1);
+    rope_factors.clear();
+    if (rope_node->src[2] != nullptr) {
+        rope_factors = f32_of(rope_node->src[2]);
+        if (rope_factors.size() != rp.inv_freq.size()) {
+            GGML_LOG_WARN("axera voxcpm2_base: rope factors have %zu rows, expected %zu; ignoring them\n",
+                          rope_factors.size(), rp.inv_freq.size());
+            rope_factors.clear();
+        }
+    }
+    GGML_LOG_INFO("axera voxcpm2_base: rope factors %s (%zu)\n",
+                  rope_factors.empty() ? "absent" : "applied", rope_factors.size());
     axera_timer tb("init: banks");
     banks.clear();
     std::vector<const io_desc *> work;

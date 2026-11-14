@@ -139,9 +139,12 @@ struct acoustic final : vox_acoustic {
 
     // ResidualLM: one decode graph, paged BF16 KV bound as the four b*_kv banks.
     axera_cmm res_x, res_out, res_indptr, res_indices, res_lastlen, res_cloc;
+    axera_cmm res_base, res_feat, res_prev, res_blend, res_lm, res_fusion, res_stop;
+    axera_cmm res_fusion_in, res_use_precomputed;
     axera_cmm res_kv;
     int       res_pos = 0;
     bool      res_ok  = false;
+    bool      res_post_ok = false;
 
     // Merged FSQ + residual fusion + stop head.
     axera_cmm po_base, po_feat, po_prev, po_lm, po_fusion, po_stop;
@@ -556,6 +559,11 @@ bool acoustic::res_weights(const std::map<std::string, ggml_tensor *> & t) {
     if (ii < 0) return fail("residual kernel has no b0_kv input");
     res_kv = axera_cmm_view(res.bufs[(size_t) ii].get(), 0, res.bufs[(size_t) ii]->size);
     res.in[(size_t) ii] = axera_io(res.bufs[(size_t) ii], res.k->info->pInputs[ii].nSize);
+
+    // The ResidualLM role also owns the per-step post prologue.  These are the
+    // same MXFP8 weights the standalone post kernel used, bound into the same
+    // four-core graph.
+    if (!post_weights(t, res)) return false;
     return true;
 }
 
@@ -770,8 +778,8 @@ vox_acoustic * vox_acoustic_open(const std::map<std::string, ggml_tensor *> & te
         return nullptr;
     }
     if (!(m->has("acoustic.dit") || m->has("acoustic.dit_loop")) || !m->has("acoustic.locenc") ||
-        !m->has("acoustic.vae")) {
-        if (err) *err = "manifest has no acoustic.dit(_loop) / acoustic.locenc / acoustic.vae";
+        !(m->has("acoustic.vae") || m->has("acoustic.vae_batch"))) {
+        if (err) *err = "manifest has no acoustic.dit(_loop) / acoustic.locenc / acoustic.vae(_batch)";
         return nullptr;
     }
     if (m->has("acoustic.dit_loop")) {
@@ -784,8 +792,12 @@ vox_acoustic * vox_acoustic_open(const std::map<std::string, ggml_tensor *> & te
         if (err) *err = "dit kernel load failed";
         return nullptr;
     }
-    if (!a->locenc.bind(&m->get("acoustic.locenc")) || !a->vae.bind(&m->get("acoustic.vae"))) {
+    if (!a->locenc.bind(&m->get("acoustic.locenc"))) {
         if (err) *err = "kernel load failed";
+        return nullptr;
+    }
+    if (m->has("acoustic.vae") && !a->vae.bind(&m->get("acoustic.vae"))) {
+        if (err) *err = "VAE kernel load failed";
         return nullptr;
     }
     if (m->has("acoustic.vae_encoder")) {
@@ -834,8 +846,10 @@ vox_acoustic * vox_acoustic_open(const std::map<std::string, ggml_tensor *> & te
     mk(a->le_cos, 5 * (kRopeDim / 2) * 4);
     mk(a->le_sin, 5 * (kRopeDim / 2) * 4);
     mk(a->le_out, kHidden * 2);
-    mk(a->vae_x, kPatch * kFeat * 2);
-    mk(a->vae_out, kVaeSamples * 4);
+    if (a->vae.k) {
+        mk(a->vae_x, kPatch * kFeat * 2);
+        mk(a->vae_out, kVaeSamples * 4);
+    }
     if (m->has("acoustic.vae_batch")) {
         if (!a->vae_batch.bind(&m->get("acoustic.vae_batch"))) {
             if (err) *err = "16-frame VAE kernel load failed";
@@ -904,8 +918,10 @@ vox_acoustic * vox_acoustic_open(const std::map<std::string, ggml_tensor *> & te
     a->locenc.in[a->locenc.find("sin")] = axera_io(a->le_sin);
     a->locenc.out[0]                    = axera_io(a->le_out);
 
-    a->vae.in[a->vae.find("x")] = axera_io(a->vae_x);
-    a->vae.out[0]               = axera_io(a->vae_out);
+    if (a->vae.k) {
+        a->vae.in[a->vae.find("x")] = axera_io(a->vae_x);
+        a->vae.out[0]               = axera_io(a->vae_out);
+    }
     if (a->vae_enc_ok) {
         a->vae_enc.in[a->vae_enc.find("x")] = axera_io(a->vae_enc_x, kVaeEncSamples * 2);
         a->vae_enc.out[0]                   = axera_io(a->vae_enc_out, kPatch * kFeat * 4);
@@ -914,7 +930,7 @@ vox_acoustic * vox_acoustic_open(const std::map<std::string, ggml_tensor *> & te
     if (!(a->dit_loop_ok ? a->dit_weights(tensors, a->dit_loop, factors)
                          : a->dit_weights(tensors, a->dit, factors)) ||
         !a->locenc_weights(tensors, factors) ||
-        !a->vae_weights(tensors, a->vae) || !a->vae_states()) {
+        (a->vae.k && (!a->vae_weights(tensors, a->vae) || !a->vae_states()))) {
         if (err) *err = a->err.empty() ? "weight binding failed" : a->err;
         return nullptr;
     }
@@ -944,6 +960,39 @@ vox_acoustic * vox_acoustic_open(const std::map<std::string, ggml_tensor *> & te
         const int res_o = a->res.find_out("output");
         GGML_ASSERT(res_o >= 0);
         a->res.out[(size_t) res_o]              = axera_io(a->res_out, 2048 * 2);
+        const int rb = a->res.find("base");
+        const int rf = a->res.find("feat");
+        const int rp = a->res.find("prev_lm");
+        const int rbl = a->res.find("blend");
+        const int rl = a->res.find("lm_out");
+        const int rfu = a->res.find("fusion_out");
+        const int rst = a->res.find("stop_out");
+        const int rfi = a->res.find("fusion_in");
+        const int rup = a->res.find("use_precomputed");
+        if (rb >= 0 && rf >= 0 && rp >= 0 && rbl >= 0 && rl >= 0 && rfu >= 0 && rst >= 0 &&
+            rfi >= 0 && rup >= 0) {
+            mk(a->res_base, 2048 * 2);
+            mk(a->res_feat, 2048 * 2);
+            mk(a->res_prev, 2048 * 2);
+            mk(a->res_blend, 4);
+            mk(a->res_lm, 2048 * 2);
+            mk(a->res_fusion, 2048 * 2);
+            mk(a->res_stop, 2 * 4);
+            mk(a->res_fusion_in, 2048 * 2);
+            mk(a->res_use_precomputed, 4);
+            a->res.in[(size_t) rb] = axera_io(a->res_base, 2048 * 2);
+            a->res.in[(size_t) rf] = axera_io(a->res_feat, 2048 * 2);
+            a->res.in[(size_t) rp] = axera_io(a->res_prev, 2048 * 2);
+            a->res.in[(size_t) rbl] = axera_io(a->res_blend, 4);
+            // The graph's in-place output surfaces are also IO inputs in the
+            // compiled axmodel.  They must alias the output buffers exactly.
+            a->res.in[(size_t) rl]  = axera_io(a->res_lm, 2048 * 2);
+            a->res.in[(size_t) rfu] = axera_io(a->res_fusion, 2048 * 2);
+            a->res.in[(size_t) rst] = axera_io(a->res_stop, 2 * 4);
+            a->res.in[(size_t) rfi] = axera_io(a->res_fusion_in, 2048 * 2);
+            a->res.in[(size_t) rup] = axera_io(a->res_use_precomputed, 4);
+            a->res_post_ok = true;
+        }
         a->res_ok = true;
         a->res_pos = 0;
     }
@@ -979,9 +1028,11 @@ vox_acoustic * vox_acoustic_open(const std::map<std::string, ggml_tensor *> & te
     }
 
     // A first VAE call sees zero state; the pair roles rotate afterwards.
-    for (size_t i = 0; i < a->vae_state.size(); ++i) {
-        a->vae.in[a->vae.find(a->vae_state_in[i])]  = axera_io(a->vae_state[i].first);
-        a->vae.in[a->vae.find(a->vae_state_out[i])] = axera_io(a->vae_state[i].second);
+    if (a->vae.k) {
+        for (size_t i = 0; i < a->vae_state.size(); ++i) {
+            a->vae.in[a->vae.find(a->vae_state_in[i])]  = axera_io(a->vae_state[i].first);
+            a->vae.in[a->vae.find(a->vae_state_out[i])] = axera_io(a->vae_state[i].second);
+        }
     }
     for (size_t i = 0; i < a->vae_enc_state.size(); ++i) {
         a->vae_enc.in[a->vae_enc.find(a->vae_enc_state_in[i])]  = axera_io(a->vae_enc_state[i].first);
@@ -1056,6 +1107,66 @@ bool vox_acoustic_res_step(vox_acoustic * a_, const float * x, float * out) {
     a->res_out->invalidate(a->res_out->vir, 2048 * 2);
     const auto * o = (const ggml_bf16_t *) a->res_out->vir;
     for (int i = 0; i < 2048; ++i) out[i] = bf16_to_f32(o[i].bits);
+    ++a->res_pos;
+    return true;
+}
+
+bool vox_acoustic_has_res_post(vox_acoustic * a_) {
+    auto * a = static_cast<acoustic *>(a_);
+    return a && a->res_post_ok;
+}
+
+bool vox_acoustic_res_post_step(vox_acoustic * a_, const float * base, const float * feat,
+                                const float * prev_lm, float blend, float * lm, float * fusion,
+                                float * stop, float * out, const float * fusion_in,
+                                float use_precomputed) {
+    auto * a = static_cast<acoustic *>(a_);
+    if (!a || !a->res_post_ok) return false;
+    put_bf16(a->res_base, base, 2048);
+    put_bf16(a->res_feat, feat, 2048);
+    put_bf16(a->res_prev, prev_lm, 2048);
+    *(float *) a->res_blend->vir = blend;
+    a->res_blend->flush(a->res_blend->vir, sizeof(float));
+    if (fusion_in) {
+        put_bf16(a->res_fusion_in, fusion_in, 2048);
+    } else {
+        memset(a->res_fusion_in->vir, 0, 2048 * 2);
+        a->res_fusion_in->flush(a->res_fusion_in->vir, 2048 * 2);
+    }
+    *(float *) a->res_use_precomputed->vir = fusion_in ? use_precomputed : 0.0f;
+    a->res_use_precomputed->flush(a->res_use_precomputed->vir, sizeof(float));
+    const int pos      = a->res_pos;
+    const int page     = pos / 256;
+    const int slot     = pos % 256;
+    const int npages   = (pos + 255) / 256;
+    const int last_len = npages ? pos - (npages - 1) * 256 : 0;
+    int32_t   indptr[2] = { 0, npages };
+    int32_t   cloc[2]   = { page, slot };
+    int32_t   last[1]   = { last_len };
+    int32_t   ind[32];
+    for (int i = 0; i < 32; ++i) ind[i] = i < npages ? i : 0;
+    memcpy(a->res_indptr->vir, indptr, sizeof(indptr));
+    memcpy(a->res_cloc->vir, cloc, sizeof(cloc));
+    memcpy(a->res_lastlen->vir, last, sizeof(last));
+    memcpy(a->res_indices->vir, ind, sizeof(ind));
+    a->res_indptr->flush(a->res_indptr->vir, sizeof(indptr));
+    a->res_cloc->flush(a->res_cloc->vir, sizeof(cloc));
+    a->res_lastlen->flush(a->res_lastlen->vir, sizeof(last));
+    a->res_indices->flush(a->res_indices->vir, sizeof(ind));
+    a->res.k->run(a->res.in, a->res.out, "voxcoustic residual+post");
+    a->res_out->invalidate(a->res_out->vir, 2048 * 2);
+    a->res_lm->invalidate(a->res_lm->vir, 2048 * 2);
+    a->res_fusion->invalidate(a->res_fusion->vir, 2048 * 2);
+    a->res_stop->invalidate(a->res_stop->vir, 2 * 4);
+    const auto * lo = (const ggml_bf16_t *) a->res_out->vir;
+    const auto * ll = (const ggml_bf16_t *) a->res_lm->vir;
+    const auto * ff = (const ggml_bf16_t *) a->res_fusion->vir;
+    for (int i = 0; i < 2048; ++i) {
+        out[i]    = bf16_to_f32(lo[i].bits);
+        lm[i]     = bf16_to_f32(ll[i].bits);
+        fusion[i] = bf16_to_f32(ff[i].bits);
+    }
+    memcpy(stop, a->res_stop->vir, 2 * sizeof(float));
     ++a->res_pos;
     return true;
 }
@@ -1223,7 +1334,7 @@ bool vox_acoustic_locenc(vox_acoustic * a_, const float * x, float * hidden) {
 
 bool vox_acoustic_vae(vox_acoustic * a_, const float * patch, float * pcm) {
     auto * a = static_cast<acoustic *>(a_);
-    if (!a) return false;
+    if (!a || !a->vae.k) return false;
     put_bf16(a->vae_x, patch, kPatch * kFeat);
     if (!a->vae_first) {
         for (size_t i = 0; i < a->vae_state.size(); ++i) {

@@ -310,5 +310,7 @@ struct VoxCPM2Runtime {
     // Decode one latent patch through the AudioVAE's stateful streaming path.
     // Requires audio_vae.stream_begin(); consecutive calls continue the stream.
     std::vector<float>   decode_patch_streaming(const std::vector<float> & patch, int target_sr);
+    std::vector<float>   decode_latent_frames_streaming(const std::vector<float> & frames, int n_frames,
+                                                        int target_sr);
     std::vector<int32_t> expand_multichar_cjk_tokens(const std::vector<int32_t> & ids) const;
 };
