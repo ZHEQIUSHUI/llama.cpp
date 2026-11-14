@@ -806,7 +806,8 @@ struct mtmd_context {
                     tok_sli_img_start = {lookup_token("<slice>")};
                     tok_sli_img_end   = {lookup_token("</slice>")};
                     tok_row_end       = {lookup_token("\n")};
-                    tok_row_end_trail = false; // no trailing end-of-row token
+                    // MiniCPM-OCR's processor keeps the newline after the last slice row.
+                    tok_row_end_trail = clip_get_hparams(ctx_v)->minicpmv_slice_align_merge > 0;
                     ov_img_first      = true;
                     use_image_id      = true;
                     image_preproc     = std::make_unique<mtmd_image_preprocessor_minicpmv>(ctx_v);

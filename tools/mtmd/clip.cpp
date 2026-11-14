@@ -1383,6 +1383,7 @@ struct clip_model_loader {
                 get_u32(KEY_MAX_SLICE_NUMS, hparams.max_slice_nums, false);
                 get_i32(KEY_MINICPMV_VERSION, hparams.minicpmv_version, false); // legacy
                 get_u32(KEY_MINICPMV_QUERY_NUM, hparams.minicpmv_query_num, false);
+                get_u32(KEY_MINICPMV_SLICE_ALIGN_MERGE, hparams.minicpmv_slice_align_merge, false);
                 if (hparams.minicpmv_query_num == 0) {
                     // Fallback to hardcoded values for legacy models
                     if (hparams.minicpmv_version == 3) {
@@ -2233,6 +2234,9 @@ struct clip_model_loader {
                 LOG_INF("%s: has_llava_proj:     %d\n", __func__, hparams.has_llava_projector);
                 LOG_INF("%s: minicpmv_version:   %d\n", __func__, hparams.minicpmv_version);
                 LOG_INF("%s: n_merge:            %d\n", __func__, hparams.n_merge);
+                if (hparams.minicpmv_slice_align_merge > 0) {
+                    LOG_INF("%s: minicpmv_slice_align_merge: %d\n", __func__, hparams.minicpmv_slice_align_merge);
+                }
                 LOG_INF("%s: n_wa_pattern: %d\n", __func__, hparams.n_wa_pattern);
                 if (!hparams.wa_layer_indexes.empty()) {
                     LOG_INF("%s: wa_layer_indexes:  ", __func__);
