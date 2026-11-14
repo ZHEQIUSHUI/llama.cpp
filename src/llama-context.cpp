@@ -435,7 +435,10 @@ llama_context::llama_context(
             n_seq_max_limit = std::min(n_seq_max_limit, limit_fn());
         }
     }
-    if (cparams.n_seq_max > n_seq_max_limit) {
+    // An embedding context processes independent sequences one after another
+    // and never continues one sequence inside another graph.  The backend's
+    // single-sequence limit applies to decode graphs, not to this batch sweep.
+    if (!cparams.embeddings && cparams.n_seq_max > n_seq_max_limit) {
         throw std::runtime_error(format(
                 "the backend supports at most %u sequence(s), but n_seq_max = %u; run the Axera server with -np %u",
                 n_seq_max_limit, cparams.n_seq_max, n_seq_max_limit));
