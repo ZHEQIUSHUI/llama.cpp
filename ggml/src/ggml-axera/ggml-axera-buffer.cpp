@@ -241,7 +241,7 @@ ggml_backend_buffer_type_t ggml_backend_axera_lazy_buffer_type(void) {
 ggml_backend_buffer_type_t ggml_backend_axera_kv_buffer_type(void) {
     const axera::manifest * m = axera::kernels();
     return m && (m->model == "qwen38_27b" || m->model == "qwen35_whole" || m->model == "qwen35_moe_sgl" ||
-                    m->model == "cpm5") ? ggml_backend_axera_lazy_buffer_type() :
+                    m->model == "cpm5" || m->model == "hymt") ? ggml_backend_axera_lazy_buffer_type() :
                                                                              ggml_backend_axera_buffer_type();
 }
 

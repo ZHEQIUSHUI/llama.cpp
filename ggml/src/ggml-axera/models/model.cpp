@@ -99,6 +99,8 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
         llm = make_cpm5(m);
     } else if (m.model == "voxcpm2_base") {
         llm = make_voxcpm2_base(m);
+    } else if (m.model == "hymt") {
+        llm = make_hymt(m);
     } else {
         GGML_ABORT("axera: %s/manifest.json: no adapter for model %s\n", m.dir.c_str(), m.model.c_str());
     }
