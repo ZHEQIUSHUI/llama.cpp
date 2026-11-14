@@ -772,6 +772,8 @@ struct common_params {
     std::string tts_instruct     = "";
     std::string tts_speaker_file = "";
     std::string tts_ref_text     = "";
+    std::string voxcpm2_base_lm  = "";
+    std::string voxcpm2_acoustic = "";
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };

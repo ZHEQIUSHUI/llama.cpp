@@ -5,9 +5,14 @@
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "voxcpm2_runtime.h"
+#include "voxcpm2_wav.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
 
 /**
@@ -20,6 +25,69 @@ struct tts_sampler_ctx {
     common_sampler * smpl;
     llama_context  * lctx;
 };
+
+static bool voxcpm2_load_wav(const std::string & path, std::vector<float> & pcm, int & sample_rate) {
+    return voxcpm2::load_wav_file(path, pcm, sample_rate);
+}
+
+static bool voxcpm2_write_wav(const std::string & path, const std::vector<float> & pcm, int sample_rate) {
+    return voxcpm2::write_wav_file(path, pcm, sample_rate);
+}
+
+static int run_voxcpm2(common_params & params) {
+    if (params.prompt.empty()) {
+        LOG_ERR("no prompt provided, use -p \"text\"\n");
+        return 1;
+    }
+    llama_backend_init();
+    VoxCPM2Runtime runtime;
+    if (!runtime.init(params.voxcpm2_base_lm, params.voxcpm2_acoustic, params.n_gpu_layers, true)) {
+        LOG_ERR("VoxCPM2 init failed: %s\n", runtime.last_error().c_str());
+        llama_backend_free();
+        return 1;
+    }
+    runtime.set_n_threads(params.cpuparams.n_threads);
+
+    VoxCPM2GenerateParams gen;
+    gen.max_steps = params.n_predict > 0 ? params.n_predict : 200;
+    gen.seed = params.sampling.seed == 0xFFFFFFFFu ? 42u : params.sampling.seed;
+    gen.target_sr = runtime.sample_rate();
+
+    std::vector<float> wav;
+    if (!params.tts_speaker_file.empty()) {
+        std::vector<float> ref;
+        int ref_sr = 0;
+        if (!voxcpm2_load_wav(params.tts_speaker_file, ref, ref_sr)) {
+            LOG_ERR("failed to load reference WAV %s\n", params.tts_speaker_file.c_str());
+            runtime.free();
+            llama_backend_free();
+            return 1;
+        }
+        gen.reference_sample_rate = ref_sr;
+        wav = params.tts_ref_text.empty()
+            ? runtime.generate_with_clone(params.prompt, ref, gen)
+            : runtime.generate_with_continuation(params.prompt, params.tts_ref_text, ref, gen);
+    } else {
+        wav = runtime.generate(params.prompt, gen);
+    }
+    if (wav.empty()) {
+        LOG_ERR("VoxCPM2 generation failed: %s\n", runtime.last_error().c_str());
+        runtime.free();
+        llama_backend_free();
+        return 1;
+    }
+    if (!voxcpm2_write_wav(params.out_file, wav, runtime.sample_rate())) {
+        LOG_ERR("failed to write %s\n", params.out_file.c_str());
+        runtime.free();
+        llama_backend_free();
+        return 1;
+    }
+    LOG_INF("VoxCPM2 wrote %s: %.2f s at %d Hz\n", params.out_file.c_str(),
+            static_cast<double>(wav.size()) / runtime.sample_rate(), runtime.sample_rate());
+    runtime.free();
+    llama_backend_free();
+    return 0;
+}
 
 static llama_token tts_sample_semantic_code(void * user_data) {
     auto * ctx = static_cast<tts_sampler_ctx *>(user_data);
@@ -45,6 +113,14 @@ int main(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_TTS, print_usage)) {
         return 1;
+    }
+
+    if (!params.voxcpm2_base_lm.empty() || !params.voxcpm2_acoustic.empty()) {
+        if (params.voxcpm2_base_lm.empty() || params.voxcpm2_acoustic.empty()) {
+            LOG_ERR("VoxCPM2 requires both --voxcpm2-base-lm and --voxcpm2-acoustic\n");
+            return 1;
+        }
+        return run_voxcpm2(params);
     }
 
     mtmd_helper_log_set(common_log_default_callback, nullptr);

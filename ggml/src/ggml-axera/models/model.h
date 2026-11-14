@@ -52,6 +52,8 @@ bool minicpm_ocr_vit_graph(const ggml_cgraph * g);
 std::shared_ptr<model> make_qwen3_asr(const manifest & m);  // the Qwen3-ASR audio encoder (roles audio.*)
 // the Qwen3-TTS generation graphs: code predictor frames, codec decoder, speaker encoder (roles cp.*, gen.*)
 std::shared_ptr<model> make_qwen3_tts(const manifest & m);
+// the VoxCPM2 BaseLM: one 256-row prefill and one decode AXModel, paged BF16 KV under core/seqstate
+std::shared_ptr<model> make_voxcpm2_base(const manifest & m);
 // a graph is the Qwen3-ASR audio encoder's: it reads the conv front-end's output projection and the layers (the
 // Qwen3-TTS speaker encoder has a conv_out too)
 bool qwen3_asr_graph(const ggml_cgraph * g);
