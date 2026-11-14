@@ -94,11 +94,20 @@ class cpm5 final : public model, public seq_model {
     std::unique_ptr<seqstate>        seq;
     int                              last_seq_status = 0;
     output_head                      head;
+    bool                             dec_head = false;
+    bool                             pre_head = false;
+    ggml_tensor *                    pre_logits = nullptr;
+    std::vector<int32_t>             pre_rows;
+    ggml_tensor *                    bound_logits = nullptr;
+    const void *                     bound_logits_data = nullptr;
+    bool                             bound_logits_direct = false;
 
     void      init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
+    void      bind_calls(ggml_tensor * logits);
     axera_cmm bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d, const rope & rp);
     void      paging(int64_t hist, int64_t write_cell);
-    void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0);
+    void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
+                      ggml_tensor * logits, const std::vector<int32_t> & rows);
     void      decode(int64_t c, int t, const ggml_bf16_t * x, float * h);
 };
 
@@ -309,42 +318,12 @@ void cpm5::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tenso
     for (const auto & d : pk.desc->in) {
         const std::string & n = d.name;
         if (n == "x" || n == "position_ids" || n == "indptr" || n == "indices" || n == "last_page_len" ||
-            n == "cache_location" || n == "valid_tokens" || n.rfind("b0_kv", 0) == 0) {
+            n == "cache_location" || n == "valid_tokens" || n.rfind("b0_kv", 0) == 0 ||
+            n == "head_on" || n == "out_row" || n == "nout" || n == "norm_w" || n == "w_lm" || n == "s_lm") {
             continue;
         }
         banks[n] = bank(t, d, rp);
     }
-
-    auto kv_index = [&](const std::string & n) { return atoi(n.c_str() + 5); };
-    auto bind_common = [&](const kernel & k, call & c) {
-        c   = {};
-        c.k = &k;
-        for (const auto & d : k.desc->in) {
-            const std::string & n = d.name;
-            if (n.rfind("b0_kv", 0) == 0) {
-                const int j = kv_index(n);
-                GGML_ASSERT(j >= 0 && j < L);
-                // The kernel's KV IO keeps its full manifest size; with a smaller -c the
-                // CMM pool holds fewer pages and indices never address the rest (the
-                // qwen38_27b / qwen35_whole split-KV layout).
-                c.in.push_back(axera_io(KVC[j], (uint32_t) kv_b));
-                continue;
-            }
-            const bool         prefill_call = c.k == &pk;
-            const axera_cmm * b = n == "x" ? (prefill_call ? &PX : &DX) : n == "position_ids" ? (prefill_call ? &POS : &DPOS) :
-                                  n == "indptr" ? &INDPTR : n == "indices" ? &INDICES : n == "last_page_len" ? &LASTLEN :
-                                  n == "cache_location" ? &CLOC : n == "valid_tokens" ? &VALID : nullptr;
-            if (!b) {
-                auto it = banks.find(n);
-                GGML_ASSERT(it != banks.end());
-                b = &it->second;
-            }
-            c.in.push_back(axera_io(*b, d.bytes));
-        }
-        c.out.push_back(axera_io(c.k == &pk ? POUT : DOUT, k.desc->out.at(0).bytes));
-    };
-    bind_common(pk, pre);
-    bind_common(dk, dec);
 
     seq_config cfg;
     cfg.kept_max     = 1;
@@ -367,6 +346,75 @@ void cpm5::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tenso
                   L, bsum / 1073741824.0, (double) kv_alloc * L / 1073741824.0, kv_pages, NBLK, (long long) kv_cells);
 }
 
+void cpm5::bind_calls(ggml_tensor * logits) {
+    const kernel & pk = man.get("prefill");
+    const kernel & dk = man.get("decode");
+    auto kv_index = [&](const std::string & n) { return atoi(n.c_str() + 5); };
+    auto bind_common = [&](const kernel & k, call & c, bool prefill_call) {
+        c   = {};
+        c.k = &k;
+        for (const auto & d : k.desc->in) {
+            const std::string & n = d.name;
+            if (n.rfind("b0_kv", 0) == 0) {
+                const int j = kv_index(n);
+                GGML_ASSERT(j >= 0 && j < L);
+                c.in.push_back(axera_io(KVC[j], (uint32_t) kv_b));
+                continue;
+            }
+            const axera_cmm * b = n == "x" ? (prefill_call ? &PX : &DX) :
+                                  n == "position_ids" ? (prefill_call ? &POS : &DPOS) :
+                                  n == "indptr" ? &INDPTR : n == "indices" ? &INDICES : n == "last_page_len" ? &LASTLEN :
+                                  n == "cache_location" ? &CLOC : n == "valid_tokens" ? &VALID : nullptr;
+            if (!b) {
+                if (prefill_call && pre_head) {
+                    b = n == "head_on" ? &head.mgh : n == "out_row" ? &head.mpr : n == "nout" ? &head.mgt :
+                        n == "norm_w" ? &head.cnorm : n == "w_lm" ? &head.q : n == "s_lm" ? &head.s : nullptr;
+                } else if (!prefill_call && dec_head) {
+                    b = n == "head" ? &head.mgh : n == "topk_on" ? &head.mgt : n == "norm_w" ? &head.cnorm :
+                        n == "w_lm" ? &head.q : n == "s_lm" ? &head.s : n == "bias" ? &head.tbias :
+                        n == "mul_pos" ? &head.tmulp : n == "mul_neg" ? &head.tmuln : n == "temp" ? &head.ttemp : nullptr;
+                }
+                if (!b) {
+                    auto it = banks.find(n);
+                    GGML_ASSERT(it != banks.end());
+                    b = &it->second;
+                }
+            }
+            c.in.push_back(axera_io(*b, d.bytes));
+        }
+        if (prefill_call && pre_head) {
+            for (const auto & d : k.desc->out) {
+                const axera_cmm * b = d.name == "output" ? &POUT : d.name == "logits" ? &head.mvl :
+                                      d.name == "ids" ? &head.c4ids : d.name == "top_logits" ? &head.c4top : nullptr;
+                GGML_ASSERT(b);
+                c.out.push_back(axera_io(*b, d.bytes));
+            }
+        } else if (!prefill_call && dec_head) {
+            for (const auto & d : k.desc->out) {
+                if (d.name == "logits") {
+                    if (head.mdirect) {
+                        auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+                        c.out.push_back(axera_io(dctx, logits->data, d.bytes));
+                    } else {
+                        c.out.push_back(axera_io(head.mgl, d.bytes));
+                    }
+                    continue;
+                }
+                const axera_cmm * b = d.name == "output" ? &DOUT : d.name == "ids" ? &head.cids :
+                                      d.name == "top_logits" ? &head.ctop : d.name == "values" ? &head.tval :
+                                      d.name == "kids" ? &head.tids : d.name == "vmax" ? &head.tmax :
+                                      d.name == "sumexp" ? &head.tsum : nullptr;
+                GGML_ASSERT(b);
+                c.out.push_back(axera_io(*b, d.bytes));
+            }
+        } else {
+            c.out.push_back(axera_io(prefill_call ? POUT : DOUT, k.desc->out.at(0).bytes));
+        }
+    };
+    bind_common(pk, pre, true);
+    bind_common(dk, dec, false);
+}
+
 void cpm5::paging(int64_t hist, int64_t write_cell) {
     const int64_t pages          = (hist + PG - 1) / PG;
     ((int32_t *) INDPTR->vir)[0] = 0;
@@ -379,7 +427,8 @@ void cpm5::paging(int64_t hist, int64_t write_cell) {
     }
 }
 
-void cpm5::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0) {
+void cpm5::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
+                   ggml_tensor * logits, const std::vector<int32_t> & rows) {
     GGML_ASSERT(c0 % PG == 0 && c0 >= 0 && n >= 0 && c0 + n <= kv_cells);
     for (int r0 = 0; r0 < n; r0 += PG) {
         const int     v    = std::min(PG, n - r0);
@@ -395,9 +444,40 @@ void cpm5::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4,
         paging(cell, cell);
         *(int32_t *) VALID->vir = v;
         VALID->flush();
+        std::vector<std::pair<int, int32_t>> page_rows;
+        if (pre_head && logits) {
+            for (size_t j = 0; j < rows.size(); ++j) {
+                const int64_t a = (int64_t) out0 + rows[j];
+                if (a >= r0 && a < r0 + v) {
+                    page_rows.push_back({ (int) j, (int32_t) (a - r0) });
+                }
+            }
+            *(int32_t *) head.mgh->vir = page_rows.empty() ? 0 : 1;
+            *(int32_t *) head.mgt->vir = (int32_t) page_rows.size();
+            for (size_t j = 0; j < page_rows.size(); ++j) {
+                ((int32_t *) head.mpr->vir)[j] = page_rows[j].second;
+            }
+            head.mgh->flush(head.mgh->vir, sizeof(int32_t));
+            head.mgt->flush(head.mgt->vir, sizeof(int32_t));
+            head.mpr->flush(head.mpr->vir, page_rows.size() * sizeof(int32_t));
+        }
         {
             axera_timer tl("prefill (page)");
             pre.k->run(pre.in, pre.out, "prefill");
+        }
+        if (!page_rows.empty()) {
+            const int64_t N = logits->ne[0];
+            head.mvl->invalidate(head.mvl->vir, (size_t) page_rows.size() * N * sizeof(float));
+            for (size_t j = 0; j < page_rows.size(); ++j) {
+                memcpy((char *) logits->data + (size_t) page_rows[j].first * logits->nb[1],
+                       (const char *) head.mvl->vir + j * N * sizeof(float), (size_t) N * sizeof(float));
+            }
+            if (ggml_backend_buffer_is_axera(logits->buffer)) {
+                auto * dctx       = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+                dctx->clean_p     = logits->data;
+                dctx->clean_n     = (size_t) logits->ne[1] * logits->nb[1];
+                dctx->clean_epoch = axera_graph_epoch;
+            }
         }
         POUT->invalidate(POUT->vir, (size_t) v * H * sizeof(ggml_bf16_t));
         axera_host_pool().run(v - std::max(0, out0 - r0), [&](int64_t i) {
@@ -410,11 +490,17 @@ void cpm5::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4,
 
 void cpm5::decode(int64_t c, int t, const ggml_bf16_t * x, float * h) {
     (void) t;
-    memcpy(DX->vir, x, H * sizeof(ggml_bf16_t));
+        memcpy(DX->vir, x, H * sizeof(ggml_bf16_t));
     DX->flush(DX->vir, H * sizeof(ggml_bf16_t));
     *(int32_t *) DPOS->vir = (int32_t) c;
     DPOS->flush();
     paging(c, c);
+    if (dec_head) {
+        *(int32_t *) head.mgh->vir = 1;
+        *(int32_t *) head.mgt->vir = head.merged_topk() ? 1 : 0;
+        head.mgh->flush(head.mgh->vir, sizeof(int32_t));
+        head.mgt->flush(head.mgt->vir, sizeof(int32_t));
+    }
     {
         axera_timer tl("layers (decode)");
         dec.k->run(dec.in, dec.out, "decode");
@@ -461,6 +547,60 @@ ggml_status cpm5::compute(ggml_cgraph * g) {
     if (bound != w0->data || L_ != L) {
         init(t, rope_node, L_, H_);
         bound = w0->data;
+    }
+    const bool merged = man.get("decode").find_input("head") >= 0 && man.get("prefill").find_input("head_on") >= 0;
+    pre_logits = nullptr;
+    pre_rows.clear();
+    if (merged) {
+        const ggml_tensor * ow = logits->src[0];
+        dec_head = head.bind_merged(man.get("decode"), ow);
+        pre_head = dec_head && head.bind_merged_prefill(man.get("prefill"), ow);
+        GGML_ASSERT(dec_head && pre_head);
+        head.bind_merged_logits(T == 1 ? logits : nullptr);
+        if (pre.in.empty() || dec.in.empty() || logits != bound_logits || logits->data != bound_logits_data ||
+            head.mdirect != bound_logits_direct) {
+            bind_calls(logits);
+            bound_logits        = logits;
+            bound_logits_data   = logits->data;
+            bound_logits_direct = head.mdirect;
+        }
+        ggml_tensor * hn = logits->src[1];
+        while (hn->op == GGML_OP_GET_ROWS || hn->op == GGML_OP_VIEW || hn->op == GGML_OP_RESHAPE) {
+            hn = hn->src[0];
+        }
+        float         eps = 0.0f;
+        const float * gw  = final_norm(hn, H, &eps);
+        GGML_ASSERT(gw && eps == 1e-6f);
+        head.set_merged_norm(gw, H);
+        if (T > 1) {
+            pre_logits = logits;
+            const int n_out = (int) logits->ne[1];
+            if (n_out > 4) {
+                GGML_ABORT("axera cpm5: a prompt asking for %d logits rows; the merged prefill head covers 4\n", n_out);
+            }
+            ggml_tensor * out_ids = nullptr;
+            if (n_out < T) {
+                out_ids = names.find("out_ids");
+                if (!out_ids || out_ids->type != GGML_TYPE_I32 || out_ids->ne[0] != n_out) {
+                    out_ids = nullptr;
+                    for (int i = 0; i < g->n_nodes && !out_ids; i++) {
+                        ggml_tensor * node = g->nodes[i];
+                        if (node->op == GGML_OP_GET_ROWS && node->src[1] && node->src[1]->type == GGML_TYPE_I32 &&
+                            node->src[1]->ne[0] == n_out && node->src[0]->ne[1] == T) {
+                            out_ids = node->src[1];
+                        }
+                    }
+                }
+                GGML_ASSERT(out_ids);
+            }
+            for (int r = 0; r < n_out; ++r) {
+                pre_rows.push_back(out_ids ? ((const int32_t *) out_ids->data)[r] : r);
+            }
+        } else {
+            head.prepare_merged_topk();
+        }
+    } else {
+        dec_head = pre_head = false;
     }
     const ggml_tensor * k_idxs = names.find("attn_inp_k_idxs");
     const ggml_tensor * kqm    = names.find("attn_inp_kq_mask");
@@ -512,16 +652,22 @@ ggml_status cpm5::compute(ggml_cgraph * g) {
         return GGML_STATUS_FAILED;
     }
 
-    axera_timer th("output head");
-    head.bind(man.get("lm_head"), logits->src[0]);
-    if (man.has("lm_head.topk")) {
-        head.bind_topk(man.get("lm_head.topk"));
-    }
-    const bool combined = head.bind_combined(man.get("lm_head"), logits->src[0]) && head.combined_ready(g, names);
-    if (combined) {
-        head.run_combined(g, names, h, T, nullptr, nullptr);
+    if (dec_head) {
+        if (T == 1) {
+            head.finish_merged_decode(g, names, h, T, logits);
+        }
     } else {
-        head.run(g, names, h, T);
+        axera_timer th("output head");
+        head.bind(man.get("lm_head"), logits->src[0]);
+        if (man.has("lm_head.topk")) {
+            head.bind_topk(man.get("lm_head.topk"));
+        }
+        const bool combined = head.bind_combined(man.get("lm_head"), logits->src[0]) && head.combined_ready(g, names);
+        if (combined) {
+            head.run_combined(g, names, h, T, nullptr, nullptr);
+        } else {
+            head.run(g, names, h, T);
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -546,7 +692,7 @@ bool cpm5::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t * 
         seq_rows(0, n, (uint16_t *) src_rows.data());
         xb = src_rows.data();
     }
-    prefill(c0, n, xb, p4, h_buf, batch0);
+    prefill(c0, n, xb, p4, h_buf, batch0, pre_logits, pre_rows);
     return true;
 }
 
