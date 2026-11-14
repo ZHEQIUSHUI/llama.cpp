@@ -61,6 +61,9 @@ class cosyvoice3_llm final : public model, public seq_model {
     call                             pre, dec;
     axera_cmm PX, POS, VALID, POUT, INDPTR, INDICES, LASTLEN, CLOC;
     axera_cmm DX, DOUT;
+    // The speech head rides inside both stage AXModels: the padded fp32 logits row and its top-25.
+    axera_cmm         PLOGITS, PTOPKV, PTOPKI, DLOGITS, DTOPKV, DTOPKI;
+    const axera_cmm * last_logits = nullptr;
 
     const ggml_bf16_t *      batch_rows = nullptr;
     std::vector<ggml_bf16_t> src_rows;
@@ -118,6 +121,9 @@ std::vector<float> f32_of(const ggml_tensor * w) {
 
 constexpr int HEAD_DIM   = 64;
 constexpr int SLOT_HEADS = 16;
+constexpr int SPEECH_VOCAB = 6761;
+constexpr int SPEECH_PAD   = 6784;
+constexpr int SPEECH_TOPK  = 25;
 constexpr int SLOT_HEAD[SLOT_HEADS] = { 0, 1, 2, 3, 4, 5, 6, -1, 7, 8, 9, 10, 11, 12, 13, -1 };
 
 axera_cmm cosyvoice3_llm::bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d) {
@@ -131,6 +137,36 @@ axera_cmm cosyvoice3_llm::bank(const std::map<std::string, ggml_tensor *> & t, c
         }
         memcpy(c->vir, host.data(), host.size() * sizeof(ggml_bf16_t));
         c->flush();
+        return c;
+    }
+
+    if (d.name == "speech_head") {
+        // The head GGUF stores the 6761-row speech decoder in output.weight's first rows (the rest of the Qwen2
+        // vocabulary is zero).  The kernel pads it to four equal core slices; the padded rows are zero and are
+        // masked to -inf inside the graph before the local top-k.
+        if (!t.count("output.weight")) {
+            GGML_ABORT("axera cosyvoice3_llm: speech_head needs output.weight in the model\n");
+        }
+        const ggml_tensor * w = t.at("output.weight");
+        GGML_ASSERT(w->ne[0] == H && w->ne[1] >= SPEECH_VOCAB && d.dtype == 9 && d.bytes == (size_t) SPEECH_PAD * H * 2);
+        axera_cmm c = axera_cmm_alloc_raw(d.bytes);
+        std::memset(c->vir, 0, c->size);
+        const auto *        traits = ggml_get_type_traits(w->type);
+        std::vector<float>  row(H);
+        for (int64_t r = 0; r < SPEECH_VOCAB; ++r) {
+            const void * src = (const char *) w->data + r * w->nb[1];
+            if (w->type == GGML_TYPE_F32) {
+                memcpy(row.data(), src, H * sizeof(float));
+            } else {
+                GGML_ASSERT(traits->to_float);
+                traits->to_float(src, row.data(), H);
+            }
+            for (int64_t i = 0; i < H; ++i) {
+                ((ggml_bf16_t *) c->vir)[r * H + i] = ggml_fp32_to_bf16(row[i]);
+            }
+        }
+        c->flush();
+        axera_drop_mapped(w);
         return c;
     }
 
@@ -354,6 +390,14 @@ void cosyvoice3_llm::init(const std::map<std::string, ggml_tensor *> & t, int L_
     CLOC    = axera_cmm_alloc(2 * sizeof(int32_t));
     DX      = axera_cmm_alloc(dk.in_bytes("x"));
     DOUT    = axera_cmm_alloc(dk.out_bytes("output"));
+    PLOGITS = axera_cmm_alloc(pk.out_bytes("logits"));
+    PTOPKV  = axera_cmm_alloc(pk.out_bytes("topk_values"));
+    PTOPKI  = axera_cmm_alloc(pk.out_bytes("topk_ids"));
+    DLOGITS = axera_cmm_alloc(dk.out_bytes("logits"));
+    DTOPKV  = axera_cmm_alloc(dk.out_bytes("topk_values"));
+    DTOPKI  = axera_cmm_alloc(dk.out_bytes("topk_ids"));
+    GGML_ASSERT(pk.out_bytes("logits") == (uint32_t) SPEECH_PAD * sizeof(float) &&
+                dk.out_bytes("logits") == (uint32_t) SPEECH_PAD * sizeof(float));
     for (int i = 0; i < NBLK; ++i) {
         ((int32_t *) INDICES->vir)[i] = i;
     }
@@ -386,8 +430,15 @@ void cosyvoice3_llm::init(const std::map<std::string, ggml_tensor *> & t, int L_
         GGML_ASSERT(b->get() && (*b)->size >= d.bytes);
         pre.in.push_back(axera_io(*b, d.bytes));
     }
-    GGML_ASSERT(pk.desc->out.size() == 1 && pk.desc->out[0].name == "output");
-    pre.out.push_back(axera_io(POUT, pk.desc->out[0].bytes));
+    pre.out.clear();
+    for (const auto & d : pk.desc->out) {
+        axera_cmm * b = d.name == "output" ? &POUT : d.name == "logits" ? &PLOGITS :
+                        d.name == "topk_values" ? &PTOPKV : d.name == "topk_ids" ? &PTOPKI : nullptr;
+        if (!b) {
+            GGML_ABORT("axera cosyvoice3_llm: prefill: unexpected output %s\n", d.name.c_str());
+        }
+        pre.out.push_back(axera_io(*b, d.bytes));
+    }
 
     dec = {};
     dec.k = &dk;
@@ -399,8 +450,15 @@ void cosyvoice3_llm::init(const std::map<std::string, ggml_tensor *> & t, int L_
         GGML_ASSERT(b->get() && (*b)->size >= d.bytes);
         dec.in.push_back(axera_io(*b, d.bytes));
     }
-    GGML_ASSERT(dk.desc->out.size() == 1 && dk.desc->out[0].name == "output");
-    dec.out.push_back(axera_io(DOUT, dk.desc->out[0].bytes));
+    dec.out.clear();
+    for (const auto & d : dk.desc->out) {
+        axera_cmm * b = d.name == "output" ? &DOUT : d.name == "logits" ? &DLOGITS :
+                        d.name == "topk_values" ? &DTOPKV : d.name == "topk_ids" ? &DTOPKI : nullptr;
+        if (!b) {
+            GGML_ABORT("axera cosyvoice3_llm: decode: unexpected output %s\n", d.name.c_str());
+        }
+        dec.out.push_back(axera_io(*b, d.bytes));
+    }
 
     seq_config cfg;
     cfg.kept_max = 1;
@@ -460,6 +518,10 @@ void cosyvoice3_llm::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int
             pre.k->run(pre.in, pre.out, "prefill");
         }
         POUT->invalidate(POUT->vir, (size_t) v * H * sizeof(ggml_bf16_t));
+        PLOGITS->invalidate(PLOGITS->vir, PLOGITS->size);
+        PTOPKV->invalidate(PTOPKV->vir, PTOPKV->size);
+        PTOPKI->invalidate(PTOPKI->vir, PTOPKI->size);
+        last_logits = &PLOGITS;
         {
             const char * dp = getenv("COSYVOICE3_DUMP_PREFIX");
             if (dp && dump_prefill == 0) {
@@ -490,6 +552,10 @@ void cosyvoice3_llm::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4
         dec.k->run(dec.in, dec.out, "decode");
     }
     DOUT->invalidate(DOUT->vir, (size_t) H * sizeof(ggml_bf16_t));
+    DLOGITS->invalidate(DLOGITS->vir, DLOGITS->size);
+    DTOPKV->invalidate(DTOPKV->vir, DTOPKV->size);
+    DTOPKI->invalidate(DTOPKI->vir, DTOPKI->size);
+    last_logits = &DLOGITS;
     {
         const char * dp = getenv("COSYVOICE3_DUMP_PREFIX");
         if (dp && dump_decode < 3) {
@@ -503,6 +569,30 @@ void cosyvoice3_llm::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4
     if (out_h) {
         ggml_bf16_to_fp32_row((const ggml_bf16_t *) DOUT->vir, out_h + (size_t) batch_row * H, H);
     }
+}
+
+// Host fallback for a graph that asks for more than the one output row the stage AXModels produce (e.g. a caller
+// requesting a whole prompt).  The speech head's first 6761 rows live in output.weight; the rest of the Qwen2
+// vocabulary is not part of this model.
+static void host_speech_logits(const ggml_tensor * w, const float * h, float * out, int64_t n) {
+    const int64_t K      = w->ne[0];
+    const auto *  traits = ggml_get_type_traits(w->type);
+    GGML_ASSERT(w->type == GGML_TYPE_F32 || traits->to_float);
+    axera_host_pool().run(n, [&](int64_t r) {
+        thread_local std::vector<float> row;
+        row.resize(K);
+        const void * src = (const char *) w->data + r * w->nb[1];
+        if (w->type == GGML_TYPE_F32) {
+            memcpy(row.data(), src, K * sizeof(float));
+        } else {
+            traits->to_float(src, row.data(), K);
+        }
+        float acc = 0.0f;
+        for (int64_t i = 0; i < K; ++i) {
+            acc += row[i] * h[i];
+        }
+        out[r] = acc;
+    });
 }
 
 ggml_status cosyvoice3_llm::compute(ggml_cgraph * g) {
@@ -600,6 +690,45 @@ ggml_status cosyvoice3_llm::compute(ggml_cgraph * g) {
         }
         if (ggml_backend_buffer_is_axera(result->buffer)) {
             ((ggml_backend_axera_buffer_context *) result->buffer->context)->flush(result->data, ggml_nbytes(result));
+        }
+    }
+    if (logits && logits->ne[1] > 0) {
+        GGML_ASSERT(logits->type == GGML_TYPE_F32 && logits->ne[0] >= SPEECH_VOCAB);
+        const int64_t n_out = logits->ne[1];
+        const int64_t n     = SPEECH_VOCAB;
+        GGML_ASSERT(last_logits && (*last_logits)->size >= (size_t) SPEECH_PAD * sizeof(float));
+        if (n_out == 1) {
+            // The stage AXModel computed the head of the last valid row (prefill reduces it inside the graph).
+            memcpy(logits->data, (*last_logits)->vir, (size_t) n * sizeof(float));
+        } else {
+            ggml_tensor * out_ids = names.find("out_ids");
+            if (!out_ids) {
+                for (int i = 0; i < g->n_nodes; i++) {
+                    ggml_tensor * node = g->nodes[i];
+                    if (node->op == GGML_OP_GET_ROWS && node->src[1] && node->src[1]->type == GGML_TYPE_I32 &&
+                        node->src[1]->ne[0] == n_out && node->src[0]->ne[1] == T) {
+                        out_ids = node->src[1];
+                    }
+                }
+            }
+            const ggml_tensor * w = logits->src[0];
+            for (int64_t r = 0; r < n_out; ++r) {
+                const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : (int) r;
+                GGML_ASSERT(row >= 0 && row < T);
+                host_speech_logits(w, h_buf.data() + (size_t) row * H,
+                                   (float *) ((char *) logits->data + r * logits->nb[1]), n);
+            }
+        }
+        // The model's text vocabulary is not part of the output; keep the tail finite-but-never-sampled so a caller
+        // that does look at the whole Qwen2 row cannot select a zero row.
+        for (int64_t r = 0; r < n_out; ++r) {
+            float * o = (float *) ((char *) logits->data + r * logits->nb[1]);
+            for (int64_t i = n; i < logits->ne[0]; ++i) {
+                o[i] = -INFINITY;
+            }
+        }
+        if (ggml_backend_buffer_is_axera(logits->buffer)) {
+            ((ggml_backend_axera_buffer_context *) logits->buffer->context)->flush(logits->data, ggml_nbytes(logits));
         }
     }
     return GGML_STATUS_SUCCESS;
