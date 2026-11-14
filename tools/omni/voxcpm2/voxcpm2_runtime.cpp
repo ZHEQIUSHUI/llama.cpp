@@ -52,6 +52,7 @@ struct VoxStageProf {
     // Prefill sub-buckets (the prefill total alone hid the per-token ResidualLM
     // loop, which dominates short requests).
     double prefill_base_ms = 0.0;
+    double prefill_embed_ms = 0.0;
     double prefill_res_ms = 0.0;
 };
 
@@ -77,12 +78,12 @@ static void vox_prof_report(const char * mode) {
     LOG_INF("VOXPROF mode=%s total_ms=%.3f prefill_ms=%.3f encode_ms=%.3f base_ms=%.3f "
             "front_ms=%.3f front_dit_ms=%.3f front_locenc_ms=%.3f front_stop_ms=%.3f "
             "fsq_ms=%.3f fusion_ms=%.3f post_ms=%.3f residual_ms=%.3f vae_ms=%.3f "
-            "steps=%d first_ms=%.3f prefill_base_ms=%.3f prefill_res_ms=%.3f\n",
+            "steps=%d first_ms=%.3f prefill_base_ms=%.3f prefill_res_ms=%.3f prefill_embed_ms=%.3f\n",
             mode, total_ms, g_prof.prefill_ms, g_prof.encode_ms, g_prof.base_ms, g_prof.front_ms,
             g_prof.front_dit_ms, g_prof.front_locenc_ms, g_prof.front_stop_ms,
             g_prof.fsq_ms, g_prof.fusion_ms, g_prof.post_ms, g_prof.residual_ms, g_prof.vae_ms,
             g_prof.steps, g_prof.first_ms >= 0.0 ? g_prof.first_ms : total_ms,
-            g_prof.prefill_base_ms, g_prof.prefill_res_ms);
+            g_prof.prefill_base_ms, g_prof.prefill_res_ms, g_prof.prefill_embed_ms);
 }
 
 struct VoxProfScope {
@@ -436,6 +437,30 @@ bool VoxCPM2TokenEmbeddingTable::load(const std::string & gguf_path) {
     LOG_INF("VoxCPM2TokenEmbeddingTable: loaded metadata vocab=%d embd=%d type=%s\n", n_vocab, n_embd,
             ggml_type_name(type));
 
+    const size_t table_bytes = row_bytes * static_cast<size_t>(n_vocab);
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            LOG_ERR("VoxCPM2TokenEmbeddingTable: failed to open %s for preload\n", path.c_str());
+            free();
+            gguf_free(ctx_gguf);
+            ggml_free(meta);
+            return false;
+        }
+        in.seekg(static_cast<std::streamoff>(data_offset), std::ios::beg);
+        table_data.resize(table_bytes);
+        in.read(reinterpret_cast<char *>(table_data.data()), static_cast<std::streamsize>(table_bytes));
+        if (!in) {
+            LOG_ERR("VoxCPM2TokenEmbeddingTable: failed to preload %zu bytes from %s\n", table_bytes, path.c_str());
+            table_data.clear();
+            free();
+            gguf_free(ctx_gguf);
+            ggml_free(meta);
+            return false;
+        }
+        LOG_INF("VoxCPM2TokenEmbeddingTable: preloaded %.1f MiB\n", table_bytes / 1048576.0);
+    }
+
     gguf_free(ctx_gguf);
     ggml_free(meta);
     return true;
@@ -451,33 +476,15 @@ bool VoxCPM2TokenEmbeddingTable::embedding_for_token(int32_t token_id, std::vect
         return false;
     }
 
-    if (!table_open) {
-        table_file.open(path, std::ios::binary);
-        if (!table_file) {
-            LOG_ERR("VoxCPM2TokenEmbeddingTable: failed to open %s\n", path.c_str());
-            return false;
-        }
-        table_open = true;
-    }
-
-    const size_t offset = data_offset + static_cast<size_t>(token_id) * row_bytes;
-    table_file.clear();
-    table_file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    if (!table_file) {
-        LOG_ERR("VoxCPM2TokenEmbeddingTable: seek failed for token %d\n", token_id);
+    if (table_data.size() != row_bytes * static_cast<size_t>(n_vocab)) {
+        LOG_ERR("VoxCPM2TokenEmbeddingTable: table is not preloaded\n");
         return false;
     }
 
-    std::vector<uint8_t> row(row_bytes);
-    table_file.read(reinterpret_cast<char *>(row.data()), static_cast<std::streamsize>(row.size()));
-    if (!table_file) {
-        LOG_ERR("VoxCPM2TokenEmbeddingTable: read failed for token %d\n", token_id);
-        return false;
-    }
-
+    const uint8_t * row = table_data.data() + static_cast<size_t>(token_id) * row_bytes;
     dst.resize(static_cast<size_t>(n_embd));
     if (type == GGML_TYPE_F32) {
-        std::memcpy(dst.data(), row.data(), dst.size() * sizeof(float));
+        std::memcpy(dst.data(), row, dst.size() * sizeof(float));
         return true;
     }
 
@@ -486,11 +493,13 @@ bool VoxCPM2TokenEmbeddingTable::embedding_for_token(int32_t token_id, std::vect
         LOG_ERR("VoxCPM2TokenEmbeddingTable: unsupported token embedding type %s\n", ggml_type_name(type));
         return false;
     }
-    traits->to_float(row.data(), dst.data(), n_embd);
+    traits->to_float(row, dst.data(), n_embd);
     return true;
 }
 
 void VoxCPM2TokenEmbeddingTable::free() {
+    table_data.clear();
+    table_data.shrink_to_fit();
     path.clear();
     data_offset = 0;
     row_bytes   = 0;
@@ -858,6 +867,23 @@ bool VoxCPM2Runtime::init(const std::string & base_lm_path,
 
     is_initialized = true;
     reset_state();
+
+    // llama.cpp uploads the BaseLM's NPU weight banks on the first graph
+    // compute, not while the model is loaded.  Do that here so the first real
+    // request does not pay a multi-second surprise; run one short prefill and
+    // throw its state away.  VOXCPM2_WARMUP=0 skips it.
+    const char * warm = std::getenv("VOXCPM2_WARMUP");
+    if (warm == nullptr || warm[0] == '\0' || warm[0] != '0') {
+        const double t0 = vox_now_ms();
+        std::vector<int32_t> warm_tokens{0};
+        if (!prefill_tokens(warm_tokens)) {
+            LOG_WRN("VoxCPM2Runtime: warmup prefill failed: %s\n", last_error_msg.c_str());
+            clear_error();
+        }
+        reset_state();
+        LOG_INF("VoxCPM2Runtime: warmup prefill %.1f ms\n", vox_now_ms() - t0);
+    }
+
     LOG_INF("VoxCPM2Runtime: initialized (embedding_scale=%.3f)\n", embedding_scale);
     return true;
 }
@@ -970,12 +996,17 @@ void VoxCPM2Runtime::reset_state() {
     noise_replay_pos  = 0;
     state_ready       = false;
     base_lm.clear_kv_cache();
-    residual_lm.clear_kv();
 #if defined(VOXCPM2_HAVE_AXERA)
-    if (acoustic_npu) {
+    if (acoustic_npu && axera::vox_acoustic_has_residual(static_cast<axera::vox_acoustic *>(acoustic_npu))) {
+        // Same reasoning as the BaseLM cache: reset the position counter, do
+        // not memset the 256 MiB residual KV cache.
+        axera::vox_acoustic_res_reset(static_cast<axera::vox_acoustic *>(acoustic_npu));
         axera::vox_acoustic_vae_reset(static_cast<axera::vox_acoustic *>(acoustic_npu));
-    }
+    } else
 #endif
+    {
+        residual_lm.clear_kv();
+    }
 }
 
 bool VoxCPM2Runtime::prefill_tokens(const std::vector<int32_t> & token_ids) {
@@ -1024,15 +1055,18 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
 
     std::vector<float> combined(static_cast<size_t>(hidden) * static_cast<size_t>(seq_len), 0.0f);
     std::vector<float> token_embed;
-    for (int i = 0; i < seq_len; ++i) {
-        if (text_mask[static_cast<size_t>(i)] == 0) {
-            continue;
+    {
+        VoxProfScope prof_embed(&g_prof.prefill_embed_ms);
+        for (int i = 0; i < seq_len; ++i) {
+            if (text_mask[static_cast<size_t>(i)] == 0) {
+                continue;
+            }
+            if (!token_embeddings.embedding_for_token(inputs.token_ids[static_cast<size_t>(i)], token_embed)) {
+                return fail("failed to read token embedding");
+            }
+            std::copy_n(token_embed.data(), static_cast<size_t>(hidden),
+                        combined.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
         }
-        if (!token_embeddings.embedding_for_token(inputs.token_ids[static_cast<size_t>(i)], token_embed)) {
-            return fail("failed to read token embedding");
-        }
-        std::copy_n(token_embed.data(), static_cast<size_t>(hidden),
-                    combined.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
     }
 
     std::vector<float> feat_embed(static_cast<size_t>(hidden) * static_cast<size_t>(seq_len), 0.0f);

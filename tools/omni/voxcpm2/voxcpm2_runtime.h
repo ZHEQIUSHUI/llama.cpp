@@ -71,6 +71,9 @@ struct VoxCPM2TokenEmbeddingTable {
     // cost several milliseconds per token during prefill.
     mutable std::ifstream table_file;
     mutable bool          table_open = false;
+    // The whole table is 300 MiB; holding it resident avoids a random read of
+    // the multi-GB GGUF per text token, which dominated short-prompt prefill.
+    std::vector<uint8_t> table_data;
 
     bool load(const std::string & gguf_path);
     bool embedding_for_token(int32_t token_id, std::vector<float> & dst) const;

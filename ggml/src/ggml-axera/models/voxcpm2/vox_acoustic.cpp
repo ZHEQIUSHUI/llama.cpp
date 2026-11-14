@@ -1063,8 +1063,8 @@ bool vox_acoustic_res_step(vox_acoustic * a_, const float * x, float * out) {
 void vox_acoustic_res_reset(vox_acoustic * a_) {
     auto * a = static_cast<acoustic *>(a_);
     if (!a || !a->res_ok) return;
-    memset(a->res_kv->vir, 0, a->res_kv->size);
-    a->res_kv->flush();
+    // The residual attention masks everything past res_pos, so stale rows in
+    // the 256 MiB cache are never read.  Zeroing it cost ~27 ms per request.
     a->res_pos = 0;
 }
 

@@ -183,7 +183,11 @@ std::vector<float> MiniCPMLM::get_logits() const {
 
 void MiniCPMLM::clear_kv_cache() {
     if (ctx) {
-        llama_memory_clear(llama_get_memory(ctx), true);
+        // Release the cells without zeroing the multi-GB cache.  The paged
+        // attention only reads positions below the current history length, so
+        // stale bytes past that point are never observed; memsetting 2.4 GiB
+        // cost ~66 ms on every request.
+        llama_memory_clear(llama_get_memory(ctx), false);
     }
     last_n_outputs = 0;
 }
