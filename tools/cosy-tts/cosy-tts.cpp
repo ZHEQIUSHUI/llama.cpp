@@ -601,7 +601,8 @@ struct torch_rng {
 
 struct sampler {
     torch_rng rng;
-    explicit sampler(uint32_t seed) : rng(seed) {}
+    bool greedy = false;
+    explicit sampler(uint32_t seed, bool greedy_ = false) : rng(seed), greedy(greedy_) {}
 
     static std::vector<float> softmax(const std::vector<float> & logits) {
         const float mx = *std::max_element(logits.begin(), logits.end());
@@ -638,21 +639,28 @@ struct sampler {
         std::iota(idx.begin(), idx.end(), 0);
         std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return probs[a] > probs[b]; });
 
-        std::vector<float> nucleus;
-        float cum = 0;
-        for (size_t i = 0; i < idx.size(); i++) {
-            if (!(cum < 0.8f) || nucleus.size() >= 25) break;
-            cum += probs[idx[i]];
-            nucleus.push_back(probs[idx[i]]);
+        int top = idx[0];
+        if (!greedy) {
+            std::vector<float> nucleus;
+            float cum = 0;
+            for (size_t i = 0; i < idx.size(); i++) {
+                if (!(cum < 0.8f) || nucleus.size() >= 25) break;
+                cum += probs[idx[i]];
+                nucleus.push_back(probs[idx[i]]);
+            }
+            if (nucleus.empty()) nucleus.push_back(probs[idx[0]]);
+            top = idx[multinomial(nucleus)];
         }
-        if (nucleus.empty()) nucleus.push_back(probs[idx[0]]);
-        int top = idx[multinomial(nucleus)];
 
         int rep = 0;
         for (int i = std::max(0, (int) decoded.size() - 10); i < (int) decoded.size(); i++) rep += decoded[i] == top;
         if (rep >= 1) {
             logits[top] = -std::numeric_limits<float>::infinity();
-            top = multinomial(softmax(logits));
+            if (greedy) {
+                top = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+            } else {
+                top = multinomial(softmax(logits));
+            }
         }
         return top;
     }
@@ -748,6 +756,7 @@ struct args {
     std::string text, prompt_text, prompt_wav, out = "out.wav";
     int ngl = 0, ctx = 4096, threads = 16;
     uint32_t seed = 1986;
+    bool greedy = false;
     bool dump_codes = false, mel_only = false;
     bool worker = false;
     int repeat = 1;
@@ -788,6 +797,7 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (k == "-c") a.ctx = std::stoi(val());
         else if (k == "-t") a.threads = std::stoi(val());
         else if (k == "--seed") a.seed = (uint32_t) std::stoul(val());
+        else if (k == "-g" || k == "--greedy") a.greedy = true;
         else if (k == "--dump-codes") a.dump_codes = true;
         else if (k == "--mel-only") a.mel_only = true;
         else if (k == "--worker") a.worker = true;
@@ -1168,7 +1178,7 @@ int main(int argc, char ** argv) {
         if (!load_codes(codes_path, codes)) return 1;
         fprintf(stderr, "[llm] injected %zu speech tokens from %s\n", codes.size(), codes_path.c_str());
     } else {
-        sampler smp(a.seed);
+        sampler smp(a.seed, a.greedy);
         const int min_len = (int) text_tok.size() * 2;
         const int max_len = (int) text_tok.size() * 20;
         int n_past = n_prompt_rows;
