@@ -442,6 +442,10 @@ result run(llama_model * model, llama_context * ctx, mtmd_context * mctx,
         if (timestamp_items.size() != word_list.size() * 2) {
             return fail(400, "timestamp token count does not match the transcript");
         }
+        if (opt.max_outputs > 0 && (int64_t) timestamp_items.size() > opt.max_outputs) {
+            return fail(400, "the transcript needs " + std::to_string(timestamp_items.size()) +
+                              " timestamp rows, the output limit is " + std::to_string(opt.max_outputs));
+        }
         const int64_t n_ctx = llama_n_ctx(ctx);
         const int64_t n_batch = llama_n_batch(ctx);
         if ((int64_t) items.size() > n_batch) {

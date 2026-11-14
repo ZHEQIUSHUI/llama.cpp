@@ -1687,7 +1687,7 @@ private:
         if (!params_base.mmproj.path.empty() && !params_base.embedding &&
                 server_model_embedding_length_out(params_base.model.path) > 0) {
             const int base = params_base.n_ctx > 0 ? params_base.n_ctx : 4096;
-            const int align_outputs = std::max(1, std::min(params_base.n_batch, base / 2));
+            const int align_outputs = std::max(1, std::min(params_base.n_batch, base));
             params_base.n_outputs_max = align_outputs;
             params_base.n_outputs_max_per_seq = align_outputs;
             SRV_INF("forced aligner: output reserve = %d rows\n", align_outputs);
@@ -3673,6 +3673,7 @@ private:
         options.transcript = task.forced_align.transcript;
         options.language = task.forced_align.language;
         options.segment_ms = task.forced_align.segment_ms;
+        options.max_outputs = params_base.n_outputs_max;
         const mtmd_forced_aligner::result aligned = mtmd_forced_aligner::run(
                 model_tgt, ctx_tgt, mctx, task.forced_align.audio.data(), task.forced_align.audio.size(), options);
         clear_align_state();

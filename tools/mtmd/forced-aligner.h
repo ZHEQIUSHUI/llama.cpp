@@ -13,6 +13,7 @@ struct options {
     std::string transcript;
     std::string language = "English";
     int segment_ms = 80;
+    int max_outputs = 0;  // 0: no extra limit (the caller's context still bounds the batch)
 };
 
 struct result {

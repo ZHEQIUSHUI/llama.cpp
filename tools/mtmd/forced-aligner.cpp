@@ -135,6 +135,7 @@ int main(int argc, char ** argv) {
             opt.transcript,
             opt.language,
             opt.segment_ms,
+            (int) llama_n_batch(ctx),
         };
         const std::vector<unsigned char> audio = read_file(params.image[0]);
         const mtmd_forced_aligner::result result = mtmd_forced_aligner::run(
