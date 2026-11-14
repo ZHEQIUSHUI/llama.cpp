@@ -21,6 +21,7 @@ struct server_context_meta {
     std::string model_path;
     std::vector<std::string> model_output_modalities; // output modalities for GET /models
     bool has_mtmd;
+    bool has_forced_aligner;
     bool has_inp_image;
     bool has_inp_audio;
     bool has_inp_video;
@@ -147,6 +148,7 @@ struct server_routes {
     server_http_context::handler_t post_responses_tok_oai;
     server_http_context::handler_t post_transcriptions_oai;
     server_http_context::handler_t post_audio_speech;
+    server_http_context::handler_t post_audio_alignments;
     server_http_context::handler_t post_anthropic_messages;
     server_http_context::handler_t post_anthropic_count_tokens;
     server_http_context::handler_t post_apply_template;

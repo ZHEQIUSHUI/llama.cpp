@@ -287,6 +287,8 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
+    ctx_http.post("/v1/audio/alignments",      ex_wrapper(routes.post_audio_alignments));
+    ctx_http.post("/audio/alignments",         ex_wrapper(routes.post_audio_alignments));
     ctx_http.post("/v1/audio/speech",          ex_wrapper(routes.post_audio_speech));
     ctx_http.post("/audio/speech",             ex_wrapper(routes.post_audio_speech));
     ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
