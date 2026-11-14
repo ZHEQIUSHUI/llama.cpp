@@ -1097,9 +1097,34 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
 
     std::vector<float> feat_embed(static_cast<size_t>(hidden) * static_cast<size_t>(seq_len), 0.0f);
     if (has_feat) {
-        std::vector<float> loc_hidden = run_locenc_sequence(inputs.audio_feat, seq_len);
+        std::vector<float> loc_hidden;
+#if defined(VOXCPM2_HAVE_AXERA)
+        // VoxCPMLocEnc processes each patch independently: a special token plus
+        // four frames, non-causal.  The NPU kernel is exactly that 5-row graph,
+        // so a reference prompt can reuse it per patch instead of building a
+        // 100+ row ggml graph for the whole sequence.
+        auto * acoustic = acoustic_npu ? static_cast<axera::vox_acoustic *>(acoustic_npu) : nullptr;
+        if (acoustic && axera::vox_acoustic_has_locenc(acoustic)) {
+            const int le_hidden = axera::vox_acoustic_locenc_hidden(acoustic);
+            loc_hidden.assign(static_cast<size_t>(seq_len) * static_cast<size_t>(le_hidden), 0.0f);
+            for (int i = 0; i < seq_len; ++i) {
+                if (feat_mask[static_cast<size_t>(i)] == 0) {
+                    continue;
+                }
+                if (!axera::vox_acoustic_locenc(
+                        acoustic,
+                        inputs.audio_feat.data() + static_cast<size_t>(i) * static_cast<size_t>(patch_elems),
+                        loc_hidden.data() + static_cast<size_t>(i) * static_cast<size_t>(le_hidden))) {
+                    return fail("LocEnc NPU reference prefill failed");
+                }
+            }
+        }
+#endif
         if (loc_hidden.empty()) {
-            return fail("LocEnc sequence forward failed");
+            loc_hidden = run_locenc_sequence(inputs.audio_feat, seq_len);
+            if (loc_hidden.empty()) {
+                return fail("LocEnc sequence forward failed");
+            }
         }
         feat_embed = run_enc_to_lm(loc_hidden, seq_len);
         if (feat_embed.empty()) {

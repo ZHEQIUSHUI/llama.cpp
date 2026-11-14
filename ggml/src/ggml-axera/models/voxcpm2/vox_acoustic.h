@@ -57,6 +57,10 @@ bool vox_acoustic_post(vox_acoustic * a, const float * base, const float * feat,
                        float * lm, float * fusion, float * stop);
 // CLS + four patch frames -> 1024 hidden.  `x` is [64, 4].
 bool vox_acoustic_locenc(vox_acoustic * a, const float * x, float * hidden);
+
+// True when the manifest provides the LocEnc kernel; the hidden width is 1024.
+bool vox_acoustic_has_locenc(vox_acoustic * a);
+int  vox_acoustic_locenc_hidden(vox_acoustic * a);
 // One four-frame latent patch -> 7680 samples at 48 kHz; the causal state carries across
 // calls until vox_acoustic_vae_reset().
 bool vox_acoustic_vae(vox_acoustic * a, const float * patch, float * pcm);

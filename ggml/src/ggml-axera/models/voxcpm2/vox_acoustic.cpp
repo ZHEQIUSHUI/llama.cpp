@@ -1323,13 +1323,23 @@ void vox_acoustic_vae_batch_reset(vox_acoustic * a_) {
 
 bool vox_acoustic_locenc(vox_acoustic * a_, const float * x, float * hidden) {
     auto * a = static_cast<acoustic *>(a_);
-    if (!a) return false;
+    if (!a || !a->locenc.k) return false;
     put_bf16(a->le_x, x, kPatch * kFeat);
     a->locenc.k->run(a->locenc.in, a->locenc.out, "voxcoustic locenc");
     a->le_out->invalidate(a->le_out->vir, kHidden * 2);
     const auto * o = (const ggml_bf16_t *) a->le_out->vir;
     for (int i = 0; i < kHidden; ++i) hidden[i] = bf16_to_f32(o[i].bits);
     return true;
+}
+
+bool vox_acoustic_has_locenc(vox_acoustic * a_) {
+    auto * a = static_cast<acoustic *>(a_);
+    return a && a->locenc.k;
+}
+
+int vox_acoustic_locenc_hidden(vox_acoustic * a_) {
+    auto * a = static_cast<acoustic *>(a_);
+    return a && a->locenc.k ? kHidden : 0;
 }
 
 bool vox_acoustic_vae(vox_acoustic * a_, const float * patch, float * pcm) {
