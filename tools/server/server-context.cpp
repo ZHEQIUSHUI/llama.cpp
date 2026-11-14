@@ -1,3 +1,6 @@
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -1494,6 +1497,49 @@ public:
 
     bool voxcpm2_available() const {
         return vox_runtime != nullptr;
+    }
+
+    bool voxcpm2_synthesize_stream(const server_voxcpm2_request & request,
+                                   const std::function<bool(const std::vector<float> &, bool)> & on_chunk,
+                                   std::string & error) {
+        if (!vox_runtime) {
+            error = "VoxCPM2 is not enabled; start llama-server with --voxcpm2-acoustic";
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(vox_mutex);
+        VoxCPM2GenerateParams params;
+        params.max_steps           = request.max_steps;
+        params.inference_timesteps = request.timesteps;
+        params.cfg_value           = request.cfg_value;
+        params.temperature         = request.temperature;
+        params.seed                = request.seed;
+
+        bool ok = false;
+        if (request.ref_audio.empty()) {
+            ok = vox_runtime->generate_streaming(request.input, on_chunk, params);
+        } else {
+            std::vector<float> ref_pcm;
+            int                ref_sr = 0;
+            if (!voxcpm2::load_wav_memory(request.ref_audio.data(), request.ref_audio.size(), ref_pcm, ref_sr)) {
+                error = "invalid ref_audio WAV data";
+                return false;
+            }
+            params.reference_sample_rate = ref_sr;
+            if (!request.ref_text.empty()) {
+                ok = vox_runtime->generate_with_continuation_streaming(
+                        request.input, request.ref_text, ref_pcm, on_chunk, params);
+            } else {
+                ok = vox_runtime->generate_with_clone_streaming(request.input, ref_pcm, on_chunk, params);
+            }
+        }
+        if (!ok) {
+            error = vox_runtime->last_error();
+            if (error.empty()) {
+                error = "VoxCPM2 streaming generation failed";
+            }
+        }
+        return ok;
     }
 
     bool voxcpm2_synthesize(const server_voxcpm2_request & request,
@@ -5981,8 +6027,47 @@ struct server_res_generator : server_res_spipe {
     }
 };
 
+namespace {
+struct vox_stream_state {
+    std::mutex              mutex;
+    std::condition_variable cond;
+    std::deque<std::string> queue;
+    bool                    done   = false;
+    bool                    cancel = false;
+    bool                    header = false;
+    std::thread             worker;
+    std::string             error;
+};
+
+struct vox_stream_response : server_res_generator {
+    std::shared_ptr<vox_stream_state> state;
+    vox_stream_response(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds)
+            : server_res_generator(queue_tasks, queue_results, sleep_idle_seconds) {}
+    void on_complete() override {
+        if (state) {
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->cancel = true;
+                state->cond.notify_all();
+            }
+            if (state->worker.joinable()) {
+                state->worker.join();
+            }
+        }
+        server_res_generator::on_complete();
+    }
+};
+}  // namespace
+
 bool server_context::voxcpm2_available() const {
     return impl->voxcpm2_available();
+}
+
+bool server_context::voxcpm2_synthesize_stream(
+        const server_voxcpm2_request & request,
+        const std::function<bool(const std::vector<float> &, bool)> & on_chunk,
+        std::string & error) {
+    return impl->voxcpm2_synthesize_stream(request, on_chunk, error);
 }
 
 bool server_context::voxcpm2_synthesize(const server_voxcpm2_request & request,
@@ -6884,6 +6969,71 @@ void server_routes::init_routes() {
                     const std::string decoded = base64::decode(encoded);
                     vox_req.ref_audio.assign(decoded.begin(), decoded.end());
                     break;
+                }
+
+                if (body.value("stream", false)) {
+                    auto st      = std::make_shared<vox_stream_state>();
+                    const int sr = 48000;
+                    const server_context_impl * ctx_ptr = &ctx_server;
+                    auto * snew = new vox_stream_response(queue_tasks, queue_results,
+                                                          params.sleep_idle_seconds);
+                    snew->state        = st;
+                    snew->content_type = format == "pcm" ? "audio/pcm" : "audio/wav";
+                    snew->headers["X-TTS-Backend"]     = "voxcpm2";
+                    snew->headers["X-TTS-Sample-Rate"] = std::to_string(sr);
+                    std::unique_ptr<server_res_generator> sres(snew);
+                    auto & res = sres;
+                    res->next = [st, vox_req, ctx_ptr, sr, format](std::string & out) -> bool {
+                        if (!st->worker.joinable()) {
+                            st->worker = std::thread([st, vox_req, ctx_ptr]() {
+                                auto cb = [st](const std::vector<float> & chunk, bool) -> bool {
+                                    if (chunk.empty()) return true;
+                                    std::string buf(chunk.size() * 2, '\0');
+                                    auto *      dst = reinterpret_cast<int16_t *>(buf.data());
+                                    for (size_t i = 0; i < chunk.size(); ++i) {
+                                        float v = std::max(-1.0f, std::min(1.0f, chunk[i]));
+                                        dst[i] = static_cast<int16_t>(v * 32767.0f);
+                                    }
+                                    std::lock_guard<std::mutex> lock(st->mutex);
+                                    if (st->cancel) return false;
+                                    st->queue.push_back(std::move(buf));
+                                    st->cond.notify_one();
+                                    return true;
+                                };
+                                std::string err;
+                                const_cast<server_context_impl *>(ctx_ptr)->voxcpm2_synthesize_stream(vox_req, cb, err);
+                                std::lock_guard<std::mutex> lock(st->mutex);
+                                st->error = std::move(err);
+                                st->done  = true;
+                                st->cond.notify_all();
+                            });
+                        }
+                        std::unique_lock<std::mutex> lock(st->mutex);
+                        st->cond.wait(lock, [&] { return !st->queue.empty() || st->done; });
+                        if (!st->queue.empty()) {
+                            std::string chunk = std::move(st->queue.front());
+                            st->queue.pop_front();
+                            if (format == "wav" && !st->header) {
+                                st->header = true;
+                                std::string h(44, '\0');
+                                auto * p = h.data();
+                                auto w32 = [&](int32_t v) { memcpy(p, &v, 4); p += 4; };
+                                auto w16 = [&](int16_t v) { memcpy(p, &v, 2); p += 2; };
+                                memcpy(p, "RIFF", 4); p += 4; w32(0x7FFFFFFF); memcpy(p, "WAVE", 4); p += 4;
+                                memcpy(p, "fmt ", 4); p += 4; w32(16); w16(1); w16(1); w32(sr); w32(sr * 2);
+                                w16(2); w16(16); memcpy(p, "data", 4); p += 4; w32(0x7FFFFFFF);
+                                h += chunk;
+                                out = std::move(h);
+                            } else {
+                                out = std::move(chunk);
+                            }
+                            return true;
+                        }
+                        lock.unlock();
+                        if (st->worker.joinable()) st->worker.join();
+                        return false;
+                    };
+                    return sres;
                 }
 
                 server_voxcpm2_result vox_result;

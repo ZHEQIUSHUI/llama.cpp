@@ -57,9 +57,11 @@ class voxcpm2_base final : public model, public seq_model {
 
     axera_cmm                        KV;
     std::map<std::string, axera_cmm> banks;
-    call                             pre, dec;
+    call                             pre, dec, pre16;
     axera_cmm PX, POS, VALID, POUT, INDPTR, INDICES, LASTLEN, CLOC;
+    axera_cmm PX16, POS16, VALID16, POUT16;
     axera_cmm DX, DOUT;
+    int      pre16_rows = 0;
 
     const ggml_bf16_t *      batch_rows = nullptr;
     std::vector<ggml_bf16_t> src_rows;
@@ -345,6 +347,33 @@ void voxcpm2_base::init(const std::map<std::string, ggml_tensor *> & t, const gg
     GGML_ASSERT(dk.desc->out.size() == 1 && dk.desc->out[0].name == "output");
     dec.out.push_back(axera_io(DOUT, dk.desc->out[0].bytes));
 
+    // Optional short-prompt prefill: same graph at 16 rows, so a ten-token
+    // prompt does not pad to the 256-row page.
+    pre16_rows = 0;
+    if (man.has("prefill16")) {
+        const kernel & sk = man.get("prefill16");
+        const int64_t  rows = (int64_t) (sk.in_bytes("x") / (H * sizeof(ggml_bf16_t)));
+        GGML_ASSERT(rows == 16 || rows == 32);
+        GGML_ASSERT(sk.in_bytes("b0_kv") == kv->bytes);
+        pre16_rows = (int) rows;
+        PX16    = axera_cmm_alloc(sk.in_bytes("x"));
+        POUT16  = axera_cmm_alloc(sk.out_bytes("output"));
+        POS16   = axera_cmm_alloc(sk.in_bytes("position_ids"));
+        VALID16 = axera_cmm_alloc(sizeof(int32_t));
+        pre16 = {};
+        pre16.k = &sk;
+        for (const auto & d : sk.desc->in) {
+            const std::string & n = d.name;
+            const axera_cmm *   b = n == "x" ? &PX16 : n == "position_ids" ? &POS16 : n == "valid_tokens" ? &VALID16 :
+                                    n == "indptr" ? &INDPTR : n == "indices" ? &INDICES : n == "last_page_len" ? &LASTLEN :
+                                    n == "cache_location" ? &CLOC : n == "b0_kv" ? &KV : &banks.at(n);
+            GGML_ASSERT(b->get() && (*b)->size >= d.bytes);
+            pre16.in.push_back(axera_io(*b, d.bytes));
+        }
+        GGML_ASSERT(sk.desc->out.size() == 1 && sk.desc->out[0].name == "output");
+        pre16.out.push_back(axera_io(POUT16, sk.desc->out[0].bytes));
+    }
+
     seq_config cfg;
     cfg.kept_max = 1;
     cfg.check = [] {
@@ -379,6 +408,44 @@ void voxcpm2_base::paging(int64_t hist, int64_t write_cell) {
 
 void voxcpm2_base::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, int batch0, seq_snap * snap) {
     GGML_ASSERT(c0 % PG == 0 && c0 + n <= man.context);
+    if (pre16_rows > 0 && n <= pre16_rows) {
+        const int v = n;
+        if (snap && snap->cell == c0) {
+            KV->invalidate(KV->vir, KV->size);
+            memcpy(snap->dst, KV->vir, KV->size);
+            snap->deferred = false;
+        }
+        memcpy(PX16->vir, x, (size_t) v * H * sizeof(ggml_bf16_t));
+        memset((ggml_bf16_t *) PX16->vir + (size_t) v * H, 0, (size_t) (pre16_rows - v) * H * sizeof(ggml_bf16_t));
+        PX16->flush();
+        int32_t * pp = (int32_t *) POS16->vir;
+        for (int r = 0; r < pre16_rows; ++r) {
+            pp[r] = r < v ? p4[(size_t) r * 4] : 0;
+        }
+        POS16->flush();
+        paging(c0, c0);
+        *(int32_t *) VALID16->vir = v;
+        VALID16->flush();
+        {
+            axera_timer tl("prefill (16 rows)");
+            pre16.k->run(pre16.in, pre16.out, "prefill16");
+        }
+        POUT16->invalidate(POUT16->vir, (size_t) v * H * sizeof(ggml_bf16_t));
+        for (int r = 0; r < v; ++r) {
+            const int global = r;
+            if (global >= batch0 && out_h) {
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) POUT16->vir + (size_t) r * H,
+                                      out_h + (size_t) (global - batch0) * H, H);
+            }
+        }
+        if (const char * dp = getenv("VOXCPM2_DUMP_PREFIX"); dp && dump_prefill == 0) {
+            dump_bin(dp, "prefill_in", x, (size_t) v * H * sizeof(ggml_bf16_t));
+            dump_bin(dp, "prefill_out", POUT16->vir, (size_t) v * H * sizeof(ggml_bf16_t));
+            dump_meta(dp, "prefill", v, (int) c0, 0);
+            ++dump_prefill;
+        }
+        return;
+    }
     for (int r0 = 0; r0 < n; r0 += PG) {
         const int     v    = std::min(PG, n - r0);
         const int64_t cell = c0 + r0;
