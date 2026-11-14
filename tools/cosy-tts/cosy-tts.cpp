@@ -25,10 +25,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <fstream>
 #include <limits>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct wav_data {
@@ -290,27 +293,42 @@ struct npu_model {
         }
         in.resize(info->nInputSize);
         out.resize(info->nOutputSize);
-        auto alloc = [](AX_ENGINE_IO_BUFFER_T & b, AX_U32 size) {
-            if (AX_SYS_MemAllocCached(&b.phyAddr, &b.pVirAddr, size, 4096, (const AX_S8 *) "cosy-tts") != 0) {
+        auto alloc = [](AX_ENGINE_IO_BUFFER_T & b, AX_U32 size, bool pad64) {
+            const AX_U32 alloc_size = pad64 ? (size + 63u) & ~63u : size;
+            if (AX_SYS_MemAllocCached(&b.phyAddr, &b.pVirAddr, alloc_size, 4096, (const AX_S8 *) "cosy-tts") != 0) {
                 return false;
             }
-            b.nSize = size;
-            memset(b.pVirAddr, 0, size);
+            b.nSize = alloc_size;
+            memset(b.pVirAddr, 0, alloc_size);
             return true;
         };
         for (AX_U32 i = 0; i < info->nInputSize; i++) {
-            if (!alloc(in[i], info->pInputs[i].nSize)) { fprintf(stderr, "input CMM alloc failed\n"); return false; }
+            if (!alloc(in[i], info->pInputs[i].nSize, false)) { fprintf(stderr, "input CMM alloc failed\n"); return false; }
         }
         for (AX_U32 i = 0; i < info->nOutputSize; i++) {
-            if (!alloc(out[i], info->pOutputs[i].nSize)) { fprintf(stderr, "output CMM alloc failed\n"); return false; }
+            // HiFT's 18x61441 f32 output is not a multiple of 64 bytes.  The
+            // board runtime splits that final partial vector into the two
+            // phase rows, duplicating channel 16 into channel 17.  Allocate a
+            // 64-byte-aligned output capacity while keeping the graph's shape.
+            if (!alloc(out[i], info->pOutputs[i].nSize, true)) { fprintf(stderr, "output CMM alloc failed\n"); return false; }
         }
         for (AX_U32 i = 0; i < info->nInputSize; i++) {
             const auto & m = info->pInputs[i];
-            fprintf(stderr, "[npu] in  %-10s %u bytes dtype=%d\n", m.pName, m.nSize, (int) m.eDataType);
+            fprintf(stderr, "[npu] in  %-10s %u bytes dtype=%d layout=%d shape=[", m.pName, m.nSize,
+                    (int) m.eDataType, (int) m.eLayout);
+            for (int d = 0; d < m.nShapeSize; d++) fprintf(stderr, "%s%d", d ? "," : "", m.pShape[d]);
+            fprintf(stderr, "] stride=[");
+            if (m.pStride) for (int d = 0; d < m.nShapeSize; d++) fprintf(stderr, "%s%d", d ? "," : "", m.pStride[d]);
+            fprintf(stderr, "]\n");
         }
         for (AX_U32 i = 0; i < info->nOutputSize; i++) {
             const auto & m = info->pOutputs[i];
-            fprintf(stderr, "[npu] out %-10s %u bytes dtype=%d\n", m.pName, m.nSize, (int) m.eDataType);
+            fprintf(stderr, "[npu] out %-10s %u bytes dtype=%d layout=%d shape=[", m.pName, m.nSize,
+                    (int) m.eDataType, (int) m.eLayout);
+            for (int d = 0; d < m.nShapeSize; d++) fprintf(stderr, "%s%d", d ? "," : "", m.pShape[d]);
+            fprintf(stderr, "] stride=[");
+            if (m.pStride) for (int d = 0; d < m.nShapeSize; d++) fprintf(stderr, "%s%d", d ? "," : "", m.pStride[d]);
+            fprintf(stderr, "]\n");
         }
         return true;
     }
@@ -333,6 +351,10 @@ struct npu_model {
     }
 
     bool run() {
+        // The output buffers are zeroed by the CPU at load time.  Flush those
+        // dirty lines before the first device write, otherwise the first NPU
+        // result can be overwritten by a late CPU cache write-back.
+        for (auto & b : out) AX_SYS_MflushCache(b.phyAddr, b.pVirAddr, b.nSize);
         AX_ENGINE_IO_T io{};
         io.pInputs = in.data();
         io.nInputSize = (AX_U32) in.size();
@@ -344,14 +366,19 @@ struct npu_model {
         return true;
     }
 
+
     const float * output_f32(size_t expected) const {
         if (info->nOutputSize != 1 || info->pOutputs[0].eDataType != AX_ENGINE_DT_FLOAT32 ||
-            out[0].nSize != expected * sizeof(float)) {
+            out[0].nSize < expected * sizeof(float)) {
             fprintf(stderr, "NPU output mismatch: outputs=%u dtype=%d bytes=%u expected=%zu\n",
                     info->nOutputSize, (int) info->pOutputs[0].eDataType, out[0].nSize, expected * sizeof(float));
             return nullptr;
         }
         return (const float *) out[0].pVirAddr;
+    }
+
+    size_t output_bytes() const {
+        return info->nOutputSize == 1 ? info->pOutputs[0].nSize : 0;
     }
 
     ~npu_model() {
@@ -369,6 +396,7 @@ struct npu_model {
     bool set_input(const char *, const void *, size_t) { return false; }
     bool run() { return false; }
     const float * output_f32(size_t) const { return nullptr; }
+    size_t output_bytes() const { return 0; }
 };
 #endif
 
@@ -631,18 +659,100 @@ struct sampler {
 };
 
 // ---------------------------------------------------------------------------
+// Reference-audio feature cache
+//
+// The speaker encoder, the speech tokenizer and both mel front ends depend only
+// on the prompt wav.  The HTTP server runs one process per request, so the
+// cache has to live on disk: a warm request with the same recording skips all
+// of them.
+
+struct feat_cache {
+    int fbank_frames = 0, wmel_frames = 0, flow_frames = 0, n_tok = 0;
+    std::vector<float>   fbank, wmel, flowfeat, embedding;
+    std::vector<int32_t> tok;
+};
+
+struct ref_feats {
+    int fbank_frames = 0, wmel_frames = 0, flow_frames = 0;
+    std::vector<float> fbank, wmel, flowfeat, embedding;
+    std::vector<int32_t> tok;
+};
+
+static uint64_t feat_hash(const void * data, size_t bytes) {
+    const uint8_t * p = (const uint8_t *) data;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < bytes; i++) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static std::string feat_cache_path(const std::string & dir, uint64_t h) {
+    char name[64];
+    snprintf(name, sizeof(name), "feat_%016llx.bin", (unsigned long long) h);
+    return dir + "/" + name;
+}
+
+static bool feat_cache_load(const std::string & path, feat_cache & c) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char magic[8];
+    uint32_t hdr[4];
+    bool ok = fread(magic, 1, 8, f) == 8 && memcmp(magic, "COSYFT2", 7) == 0 &&
+              fread(hdr, sizeof(uint32_t), 4, f) == 4;
+    if (ok) {
+        c.fbank_frames = (int) hdr[0];
+        c.wmel_frames  = (int) hdr[1];
+        c.flow_frames  = (int) hdr[2];
+        c.n_tok        = (int) hdr[3];
+        auto rd = [&](std::vector<float> & v, size_t n) {
+            v.resize(n);
+            return n == 0 || fread(v.data(), sizeof(float), n, f) == n;
+        };
+        ok = rd(c.fbank, (size_t) c.fbank_frames * 80) && rd(c.wmel, (size_t) 128 * c.wmel_frames) &&
+             rd(c.flowfeat, (size_t) c.flow_frames * 80) && rd(c.embedding, 192);
+        if (ok) {
+            c.tok.resize((size_t) c.n_tok);
+            ok = c.n_tok > 0 && fread(c.tok.data(), sizeof(int32_t), (size_t) c.n_tok, f) == (size_t) c.n_tok;
+        }
+    }
+    fclose(f);
+    return ok;
+}
+
+static void feat_cache_save(const std::string & path, const feat_cache & c) {
+    FILE * f = fopen(path.c_str(), "wb");
+    if (!f) return;
+    uint32_t hdr[4] = { (uint32_t) c.fbank_frames, (uint32_t) c.wmel_frames, (uint32_t) c.flow_frames, (uint32_t) c.n_tok };
+    fwrite("COSYFT2", 1, 8, f);
+    fwrite(hdr, sizeof(uint32_t), 4, f);
+    fwrite(c.fbank.data(), sizeof(float), c.fbank.size(), f);
+    fwrite(c.wmel.data(), sizeof(float), c.wmel.size(), f);
+    fwrite(c.flowfeat.data(), sizeof(float), c.flowfeat.size(), f);
+    fwrite(c.embedding.data(), sizeof(float), c.embedding.size(), f);
+    fwrite(c.tok.data(), sizeof(int32_t), c.tok.size(), f);
+    fclose(f);
+}
+
+// ---------------------------------------------------------------------------
 // Main
 
 struct args {
     std::string model, aux, tables;
     std::string campplus, tokenizer, flow_encoder, flow_estimator, hift;
-    std::string flow_npu, hift_npu;
-    bool flow_npu_nlc = false;
+    std::string flow_npu, flow_npu_long, hift_npu, hift_front, hift_post;
+    std::string hift_npu_long, hift_front_long, hift_post_long;
+    bool flow_npu_nlc = false, flow_npu_long_nlc = false;
+    int flow_npu_cap = 512, flow_npu_long_cap = 1024, hift_npu_long_cap = 1024;
     std::string text, prompt_text, prompt_wav, out = "out.wav";
     int ngl = 0, ctx = 4096, threads = 16;
     uint32_t seed = 1986;
-    bool dump_codes = false;
-    std::string parity_in, parity_out, dump_feats, codes_in, dump_mel;
+    bool dump_codes = false, mel_only = false;
+    bool worker = false;
+    int repeat = 1;
+    std::string parity_in, parity_out, dump_feats, codes_in, dump_mel, dump_hift_s, dump_hift_mp;
+    std::string feat_cache;
 };
 
 static bool parse_args(int argc, char ** argv, args & a) {
@@ -658,8 +768,18 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (k == "--flow-estimator") a.flow_estimator = val();
         else if (k == "--hift") a.hift = val();
         else if (k == "--flow-npu") a.flow_npu = val();
+        else if (k == "--flow-npu-long") a.flow_npu_long = val();
         else if (k == "--hift-npu") a.hift_npu = val();
+        else if (k == "--hift-front") a.hift_front = val();
+        else if (k == "--hift-post") a.hift_post = val();
+        else if (k == "--hift-npu-long") a.hift_npu_long = val();
+        else if (k == "--hift-front-long") a.hift_front_long = val();
+        else if (k == "--hift-post-long") a.hift_post_long = val();
+        else if (k == "--hift-npu-long-cap") a.hift_npu_long_cap = std::stoi(val());
         else if (k == "--flow-npu-nlc") a.flow_npu_nlc = true;
+        else if (k == "--flow-npu-long-nlc") a.flow_npu_long_nlc = true;
+        else if (k == "--flow-npu-cap") a.flow_npu_cap = std::stoi(val());
+        else if (k == "--flow-npu-long-cap") a.flow_npu_long_cap = std::stoi(val());
         else if (k == "-p" || k == "--text") a.text = val();
         else if (k == "--prompt-text") a.prompt_text = val();
         else if (k == "--prompt-wav") a.prompt_wav = val();
@@ -669,11 +789,17 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (k == "-t") a.threads = std::stoi(val());
         else if (k == "--seed") a.seed = (uint32_t) std::stoul(val());
         else if (k == "--dump-codes") a.dump_codes = true;
+        else if (k == "--mel-only") a.mel_only = true;
+        else if (k == "--worker") a.worker = true;
+        else if (k == "--repeat") a.repeat = std::max(1, std::stoi(val()));
         else if (k == "--parity-in") a.parity_in = val();
         else if (k == "--parity-out") a.parity_out = val();
         else if (k == "--dump-feats") a.dump_feats = val();
         else if (k == "--codes") a.codes_in = val();
         else if (k == "--dump-mel") a.dump_mel = val();
+        else if (k == "--dump-hift-s") a.dump_hift_s = val();
+        else if (k == "--dump-hift-mp") a.dump_hift_mp = val();
+        else if (k == "--feat-cache") a.feat_cache = val();
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && !a.aux.empty() && !a.tables.empty() && !a.text.empty() && !a.prompt_wav.empty() &&
@@ -695,6 +821,10 @@ static bool axera_engine_init_once() {
     fprintf(stderr, "this build has no AXERA support; rebuild with GGML_AXERA and GGML_AXERA_BSP_DIR\n");
     return false;
 #endif
+}
+
+static double sec(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+    return std::chrono::duration<double>(b - a).count();
 }
 
 static int decode_embd(llama_context * ctx, const float * embd, int n_tokens, int n_embd, int pos0, bool logits_last) {
@@ -727,16 +857,61 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(GGML_NUMA_STRATEGY_DISABLED);
     auto t_all0 = std::chrono::steady_clock::now();
-    auto t0 = t_all0;
+    aux_weights aux;
+    auto t_aux0 = std::chrono::steady_clock::now();
+    if (!load_aux(a.aux, aux)) return 1;
+    auto t_aux1 = std::chrono::steady_clock::now();
+
+    // LLM-only parity check: no front end, ONNX session or flow/HiFT model is
+    // constructed.  The file is [rows, n_embd] f32 embeddings; every row's
+    // final hidden state is written back for comparison with the CPU path.
+    if (!a.parity_in.empty()) {
+        llama_model_params mp = llama_model_default_params();
+        mp.n_gpu_layers = a.ngl;
+        llama_model * model = llama_model_load_from_file(a.model.c_str(), mp);
+        if (!model) { fprintf(stderr, "failed to load %s\n", a.model.c_str()); return 1; }
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = a.ctx;
+        cp.n_batch = 512;
+        cp.n_ubatch = 256;
+        cp.n_threads = a.threads;
+        cp.n_threads_batch = a.threads;
+        cp.embeddings = true;
+        cp.offload_kqv = true;
+        llama_context * ctx = llama_init_from_model(model, cp);
+        if (!ctx) { fprintf(stderr, "failed to create llama context\n"); return 1; }
+        const int n_embd = llama_model_n_embd(model);
+        if (n_embd != aux.n_embd) { fprintf(stderr, "embedding dim mismatch %d vs %d\n", n_embd, aux.n_embd); return 1; }
+        auto in = load_f32(a.parity_in);
+        const int rows = (int) (in.size() / n_embd);
+        if (rows <= 0 || (size_t) rows * n_embd != in.size()) { fprintf(stderr, "bad parity input\n"); return 1; }
+        if (decode_embd(ctx, in.data(), rows, n_embd, 0, true) != 0) { fprintf(stderr, "parity decode failed\n"); return 1; }
+        std::vector<float> all_hidden((size_t) rows * n_embd);
+        for (int r = 0; r < rows; r++) {
+            const float * h = llama_get_embeddings_ith(ctx, r);
+            if (!h) { fprintf(stderr, "no hidden row %d\n", r); return 1; }
+            memcpy(all_hidden.data() + (size_t) r * n_embd, h, (size_t) n_embd * sizeof(float));
+        }
+        const float * hidden = llama_get_embeddings_ith(ctx, -1);
+        std::vector<float> logits(aux.n_speech);
+        for (int j = 0; j < aux.n_speech; j++) {
+            const float * w = aux.speech_dec.data() + (size_t) j * n_embd;
+            double sum = 0;
+            for (int k = 0; k < n_embd; k++) sum += (double) w[k] * hidden[k];
+            logits[j] = (float) sum;
+        }
+        auto dump = [&](const std::string & path, const float * data, size_t n) {
+            FILE * f = fopen(path.c_str(), "wb"); fwrite(data, 4, n, f); fclose(f);
+        };
+        dump(a.parity_out + ".hidden.f32", hidden, n_embd);
+        dump(a.parity_out + ".all_hidden.f32", all_hidden.data(), all_hidden.size());
+        dump(a.parity_out + ".logits.f32", logits.data(), logits.size());
+        fprintf(stderr, "parity rows=%d hidden=%d logits=%d\n", rows, n_embd, aux.n_speech);
+        llama_free(ctx); llama_model_free(model); llama_backend_free();
+        return 0;
+    }
 
     feature_tables tab = load_tables(a.tables);
-    aux_weights aux;
-    if (!load_aux(a.aux, aux)) return 1;
-
-    wav_data wav;
-    if (!read_wav(a.prompt_wav.c_str(), wav)) return 1;
-    auto pcm16 = resample_sinc(wav.pcm, wav.sample_rate, 16000);
-    auto pcm24 = resample_sinc(wav.pcm, wav.sample_rate, 24000);
 
     Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "cosyvoice3");
     Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
@@ -744,72 +919,162 @@ int main(int argc, char ** argv) {
                             GraphOptimizationLevel level = GraphOptimizationLevel::ORT_ENABLE_ALL) {
         return std::make_unique<ort_session>(env, path, level);
     };
+    double t_sess = 0.0;
+    auto session = [&](std::unique_ptr<ort_session> & slot, const std::string & path,
+                       GraphOptimizationLevel level = GraphOptimizationLevel::ORT_ENABLE_ALL) -> ort_session & {
+        if (!slot) {
+            auto s0 = std::chrono::steady_clock::now();
+            slot = make_session(path, level);
+            t_sess += sec(s0, std::chrono::steady_clock::now());
+        }
+        return *slot;
+    };
     // ORT >= 1.23 fuses this graph in a way that changes the FP32 result by
     // ~1%; the reference path keeps its unoptimized computation.
-    auto campplus = make_session(a.campplus, GraphOptimizationLevel::ORT_DISABLE_ALL);
-    auto tokenizer = make_session(a.tokenizer);
-    auto flow_enc = make_session(a.flow_encoder);
-    std::unique_ptr<ort_session> estimator, hift;
-    std::unique_ptr<npu_model> flow_npu, hift_npu;
+    std::unique_ptr<ort_session> campplus, tokenizer, flow_enc, estimator, hift, hift_front, hift_post;
+    std::unique_ptr<npu_model> flow_npu, flow_npu_long, hift_npu, hift_npu_long;
+    double t_npu_load = 0.0;
     if (!a.flow_npu.empty()) {
         if (!axera_engine_init_once()) return 1;
+        auto s0 = std::chrono::steady_clock::now();
         flow_npu = std::make_unique<npu_model>();
         if (!flow_npu->load(a.flow_npu)) return 1;
+        t_npu_load += sec(s0, std::chrono::steady_clock::now());
     } else {
-        estimator = make_session(a.flow_estimator);
+        session(estimator, a.flow_estimator);
+    }
+    if (!a.flow_npu_long.empty()) {
+        if (!axera_engine_init_once()) return 1;
+        auto s0 = std::chrono::steady_clock::now();
+        flow_npu_long = std::make_unique<npu_model>();
+        if (!flow_npu_long->load(a.flow_npu_long)) return 1;
+        t_npu_load += sec(s0, std::chrono::steady_clock::now());
     }
     if (!a.hift_npu.empty()) {
         if (!axera_engine_init_once()) return 1;
+        auto s0 = std::chrono::steady_clock::now();
         hift_npu = std::make_unique<npu_model>();
         if (!hift_npu->load(a.hift_npu)) return 1;
-    } else {
-        hift = make_session(a.hift);
+        // The first launch of the 89 MiB convolution bank can return stale
+        // output rows.  A synthetic launch at load time moves that one-time
+        // device transition out of the first speech request.
+        std::vector<float> wm((size_t) 80 * 512), ws((size_t) 18 * 61441);
+        for (size_t i = 0; i < wm.size(); i++) wm[i] = 0.25f * std::sin((float) i * 0.013f);
+        for (size_t i = 0; i < ws.size(); i++) ws[i] = 0.1f * std::cos((float) i * 0.007f);
+        if (!hift_npu->set_input("mel", wm.data(), wm.size() * 4) ||
+            !hift_npu->set_input("s_stft", ws.data(), ws.size() * 4) || !hift_npu->run()) return 1;
+        t_npu_load += sec(s0, std::chrono::steady_clock::now());
+    }
+    if (!a.hift_npu_long.empty()) {
+        if (!axera_engine_init_once()) return 1;
+        auto s0 = std::chrono::steady_clock::now();
+        hift_npu_long = std::make_unique<npu_model>();
+        if (!hift_npu_long->load(a.hift_npu_long)) return 1;
+        t_npu_load += sec(s0, std::chrono::steady_clock::now());
     }
 
     // ---- reference audio front ends -------------------------------------
-    int fbank_frames = 0, wmel_frames = 0, flow_frames = 0;
-    auto fbank = kaldi_fbank80(pcm16, fbank_frames, tab);
-    std::vector<int64_t> spk_shape{1, fbank_frames, 80};
-    Ort::Value spk_in = Ort::Value::CreateTensor<float>(mem, fbank.data(), fbank.size(), spk_shape.data(), spk_shape.size());
-    std::vector<Ort::Value> spk_inputs;
-    spk_inputs.emplace_back(std::move(spk_in));
-    auto spk_out = campplus->run(std::move(spk_inputs));
-    const float * spk_data = spk_out[0].GetTensorData<float>();
-    std::vector<float> embedding(spk_data, spk_data + 192);
-
-    auto wmel = whisper_mel(pcm16, wmel_frames, tab);
-    std::vector<int64_t> wmel_shape{1, 128, wmel_frames};
-    std::vector<int32_t> wmel_len{wmel_frames};
-    std::vector<int64_t> one_shape{1};
-    std::vector<Ort::Value> tok_in;
-    tok_in.emplace_back(Ort::Value::CreateTensor<float>(mem, wmel.data(), wmel.size(), wmel_shape.data(), wmel_shape.size()));
-    tok_in.emplace_back(Ort::Value::CreateTensor<int32_t>(mem, wmel_len.data(), 1, one_shape.data(), one_shape.size()));
-    auto tok_out = tokenizer->run(std::move(tok_in));
-    const int32_t * tok_data = tok_out[0].GetTensorData<int32_t>();
-    auto tok_info = tok_out[0].GetTensorTypeAndShapeInfo();
-    size_t n_prompt_tok = 1;
-    for (auto d : tok_info.GetShape()) n_prompt_tok *= (size_t) d;
-    std::vector<int32_t> prompt_tok(tok_data, tok_data + n_prompt_tok);
-
-    auto prompt_feat = flow_mel24(pcm24, flow_frames, tab);
-    fprintf(stderr, "[frontend] fbank=%d whisper_mel=%d flow_mel=%d speech_tokens=%zu\n",
-            fbank_frames, wmel_frames, flow_frames, prompt_tok.size());
-    if (!a.dump_feats.empty()) {
-        auto dump = [&](const std::string & suffix, const void * data, size_t bytes) {
-            FILE * f = fopen((a.dump_feats + suffix).c_str(), "wb"); fwrite(data, 1, bytes, f); fclose(f);
-        };
-        dump(".fbank.f32", fbank.data(), fbank.size() * 4);
-        dump(".wmel.f32", wmel.data(), wmel.size() * 4);
-        dump(".ptok.i32", prompt_tok.data(), prompt_tok.size() * 4);
-        dump(".embedding.f32", embedding.data(), embedding.size() * 4);
-        dump(".flowfeat.f32", prompt_feat.data(), prompt_feat.size() * 4);
-        dump(".pcm16.f32", pcm16.data(), pcm16.size() * 4);
-        dump(".pcm24.f32", pcm24.data(), pcm24.size() * 4);
-        FILE * f = fopen((a.dump_feats + ".shape.txt").c_str(), "w");
-        fprintf(f, "fbank %d 80\nwmel 128 %d\nptok %zu\nflowfeat %d 80\n", fbank_frames, wmel_frames, prompt_tok.size(), flow_frames);
-        fclose(f);
+    std::string cache_dir = a.feat_cache;
+    if (cache_dir.empty()) {
+        const char * tmp = getenv("TMPDIR");
+        cache_dir = std::string(tmp && *tmp ? tmp : "/tmp") + "/cosy_feat_cache";
     }
-    auto t_front = std::chrono::steady_clock::now();
+    mkdir(cache_dir.c_str(), 0777);
+    std::unordered_map<uint64_t, std::shared_ptr<ref_feats>> ref_mem;
+    auto prepare_ref = [&](const std::string & wavpath) -> std::shared_ptr<ref_feats> {
+        auto now = [] { return std::chrono::steady_clock::now(); };
+        auto ts0 = now();
+        wav_data wav;
+        if (!read_wav(wavpath.c_str(), wav)) return nullptr;
+        auto pcm16 = resample_sinc(wav.pcm, wav.sample_rate, 16000);
+        auto pcm24 = resample_sinc(wav.pcm, wav.sample_rate, 24000);
+        const uint64_t feat_key = feat_hash(pcm16.data(), pcm16.size() * sizeof(float)) ^
+                                  ((uint64_t) pcm16.size() * 0x9e3779b97f4a7c15ull);
+        auto hit = ref_mem.find(feat_key);
+        if (hit != ref_mem.end()) {
+            fprintf(stderr, "[frontend] cache=memory total=%.3fs speech_tokens=%zu\n",
+                    sec(ts0, now()), hit->second->tok.size());
+            return hit->second;
+        }
+        auto rf = std::make_shared<ref_feats>();
+        const std::string feat_path = feat_cache_path(cache_dir, feat_key);
+        feat_cache fc;
+        const bool feat_hit = feat_cache_load(feat_path, fc);
+        double t_fbank = 0, t_spk = 0, t_wmel = 0, t_stok = 0, t_flowmel = 0;
+        if (feat_hit) {
+            rf->fbank_frames = fc.fbank_frames;
+            rf->wmel_frames  = fc.wmel_frames;
+            rf->flow_frames  = fc.flow_frames;
+            rf->fbank        = std::move(fc.fbank);
+            rf->wmel         = std::move(fc.wmel);
+            rf->flowfeat     = std::move(fc.flowfeat);
+            rf->embedding    = std::move(fc.embedding);
+            rf->tok          = std::move(fc.tok);
+        } else {
+            auto t0 = now();
+            rf->fbank = kaldi_fbank80(pcm16, rf->fbank_frames, tab);
+            auto t1 = now();
+            std::vector<int64_t> spk_shape{1, rf->fbank_frames, 80};
+            Ort::Value spk_in = Ort::Value::CreateTensor<float>(mem, rf->fbank.data(), rf->fbank.size(), spk_shape.data(), spk_shape.size());
+            std::vector<Ort::Value> spk_inputs;
+            spk_inputs.emplace_back(std::move(spk_in));
+            auto spk_out = session(campplus, a.campplus, GraphOptimizationLevel::ORT_DISABLE_ALL).run(std::move(spk_inputs));
+            const float * spk_data = spk_out[0].GetTensorData<float>();
+            rf->embedding.assign(spk_data, spk_data + 192);
+            auto t2 = now();
+            rf->wmel = whisper_mel(pcm16, rf->wmel_frames, tab);
+            auto t3 = now();
+            std::vector<int64_t> wmel_shape{1, 128, rf->wmel_frames};
+            std::vector<int32_t> wmel_len{rf->wmel_frames};
+            std::vector<int64_t> one_shape{1};
+            std::vector<Ort::Value> tok_in;
+            tok_in.emplace_back(Ort::Value::CreateTensor<float>(mem, rf->wmel.data(), rf->wmel.size(), wmel_shape.data(), wmel_shape.size()));
+            tok_in.emplace_back(Ort::Value::CreateTensor<int32_t>(mem, wmel_len.data(), 1, one_shape.data(), one_shape.size()));
+            auto tok_out = session(tokenizer, a.tokenizer).run(std::move(tok_in));
+            const int32_t * tok_data = tok_out[0].GetTensorData<int32_t>();
+            auto tok_info = tok_out[0].GetTensorTypeAndShapeInfo();
+            size_t n_prompt_tok = 1;
+            for (auto d : tok_info.GetShape()) n_prompt_tok *= (size_t) d;
+            rf->tok.assign(tok_data, tok_data + n_prompt_tok);
+            auto t4 = now();
+            rf->flowfeat = flow_mel24(pcm24, rf->flow_frames, tab);
+            auto t5 = now();
+            t_fbank   = sec(t0, t1);
+            t_spk     = sec(t1, t2);
+            t_wmel    = sec(t2, t3);
+            t_stok    = sec(t3, t4);
+            t_flowmel = sec(t4, t5);
+            fc.fbank_frames = rf->fbank_frames; fc.wmel_frames = rf->wmel_frames; fc.flow_frames = rf->flow_frames;
+            fc.n_tok = (int) rf->tok.size();
+            fc.fbank = rf->fbank; fc.wmel = rf->wmel; fc.flowfeat = rf->flowfeat;
+            fc.embedding = rf->embedding; fc.tok = rf->tok;
+            feat_cache_save(feat_path, fc);
+        }
+        auto t_front_done = now();
+        fprintf(stderr,
+                "[frontend] cache=%s aux_load=%.3fs sessions=%.3fs npu_load=%.3fs total=%.3fs | "
+                "fbank=%.3fs speaker=%.3fs whisper_mel=%.3fs tokenizer=%.3fs flow_mel=%.3fs | "
+                "fbank_frames=%d whisper_mel_frames=%d flow_mel_frames=%d speech_tokens=%zu\n",
+                feat_hit ? "file" : "miss", sec(t_aux0, t_aux1), t_sess, t_npu_load,
+                sec(ts0, t_front_done), t_fbank, t_spk, t_wmel, t_stok, t_flowmel,
+                rf->fbank_frames, rf->wmel_frames, rf->flow_frames, rf->tok.size());
+        if (!a.dump_feats.empty()) {
+            auto dump = [&](const std::string & suffix, const void * data, size_t bytes) {
+                FILE * f = fopen((a.dump_feats + suffix).c_str(), "wb"); fwrite(data, 1, bytes, f); fclose(f);
+            };
+            dump(".fbank.f32", rf->fbank.data(), rf->fbank.size() * 4);
+            dump(".wmel.f32", rf->wmel.data(), rf->wmel.size() * 4);
+            dump(".ptok.i32", rf->tok.data(), rf->tok.size() * 4);
+            dump(".embedding.f32", rf->embedding.data(), rf->embedding.size() * 4);
+            dump(".flowfeat.f32", rf->flowfeat.data(), rf->flowfeat.size() * 4);
+            FILE * f = fopen((a.dump_feats + ".shape.txt").c_str(), "w");
+            fprintf(f, "fbank %d 80\nwmel 128 %d\nptok %zu\nflowfeat %d 80\n",
+                    rf->fbank_frames, rf->wmel_frames, rf->tok.size(), rf->flow_frames);
+            fclose(f);
+        }
+        ref_mem.emplace(feat_key, rf);
+        return rf;
+    };
 
     // ---- Qwen2 backbone -------------------------------------------------
     auto t_load0 = std::chrono::steady_clock::now();
@@ -824,34 +1089,13 @@ int main(int argc, char ** argv) {
     cp.n_threads = a.threads;
     cp.n_threads_batch = a.threads;
     cp.embeddings = true;
+    cp.offload_kqv = true;
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "failed to create llama context\n"); return 1; }
     auto t_load1 = std::chrono::steady_clock::now();
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_embd = llama_model_n_embd(model);
     if (n_embd != aux.n_embd) { fprintf(stderr, "embedding dim mismatch %d vs %d\n", n_embd, aux.n_embd); return 1; }
-
-    if (!a.parity_in.empty()) {
-        auto in = load_f32(a.parity_in);
-        int rows = (int) (in.size() / n_embd);
-        if (decode_embd(ctx, in.data(), rows, n_embd, 0, true) != 0) { fprintf(stderr, "parity decode failed\n"); return 1; }
-        const float * hidden = llama_get_embeddings_ith(ctx, -1);
-        std::vector<float> logits(aux.n_speech);
-        for (int j = 0; j < aux.n_speech; j++) {
-            const float * w = aux.speech_dec.data() + (size_t) j * n_embd;
-            double sum = 0;
-            for (int k = 0; k < n_embd; k++) sum += (double) w[k] * hidden[k];
-            logits[j] = (float) sum;
-        }
-        auto dump = [&](const std::string & path, const float * data, size_t n) {
-            FILE * f = fopen(path.c_str(), "wb"); fwrite(data, 4, n, f); fclose(f);
-        };
-        dump(a.parity_out + ".hidden.f32", hidden, n_embd);
-        dump(a.parity_out + ".logits.f32", logits.data(), logits.size());
-        fprintf(stderr, "parity rows=%d hidden=%d logits=%d\n", rows, n_embd, aux.n_speech);
-        llama_free(ctx); llama_model_free(model); llama_backend_free();
-        return 0;
-    }
 
     auto tokenize = [&](const std::string & text) {
         std::vector<llama_token> v(text.size() + 64);
@@ -861,8 +1105,16 @@ int main(int argc, char ** argv) {
         v.resize(n);
         return v;
     };
-    auto prompt_text_tok = tokenize(a.prompt_text);
-    auto text_tok = tokenize(a.text);
+    auto generate = [&](const std::string & req_text, const std::string & req_prompt_text,
+                        const std::string & outpath, const ref_feats & rf,
+                        const std::string & codes_path, double front_s, double llm_load_s) -> int {
+    auto t_req0 = std::chrono::steady_clock::now();
+    llama_memory_clear(llama_get_memory(ctx), true);
+    const std::vector<int32_t> & prompt_tok = rf.tok;
+    const std::vector<float> & prompt_feat = rf.flowfeat;
+    const std::vector<float> & embedding = rf.embedding;
+    auto prompt_text_tok = tokenize(req_prompt_text);
+    auto text_tok = tokenize(req_text);
     std::vector<llama_token> text_all = prompt_text_tok;
     text_all.insert(text_all.end(), text_tok.begin(), text_tok.end());
 
@@ -881,36 +1133,46 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "[llm] prompt_text=%zu text=%zu prompt_speech=%zu rows=%d\n",
             prompt_text_tok.size(), text_tok.size(), prompt_tok.size(), n_prompt_rows);
 
-    if (decode_embd(ctx, lm_input.data(), n_prompt_rows, n_embd, 0, true) != 0) {
-        fprintf(stderr, "prefill decode failed\n"); return 1;
-    }
-    const float * hidden = llama_get_embeddings_ith(ctx, -1);
-    if (!hidden) { fprintf(stderr, "no hidden state\n"); return 1; }
-    std::vector<float> h(hidden, hidden + n_embd);
+    std::vector<float> h;
+    const float * hidden = nullptr;
     auto t_prefill = std::chrono::steady_clock::now();
+    if (codes_path.empty()) {
+        if (decode_embd(ctx, lm_input.data(), n_prompt_rows, n_embd, 0, true) != 0) {
+            fprintf(stderr, "prefill decode failed\n"); return 1;
+        }
+        hidden = llama_get_embeddings_ith(ctx, -1);
+        if (!hidden) { fprintf(stderr, "no hidden state\n"); return 1; }
+        h.assign(hidden, hidden + n_embd);
+        t_prefill = std::chrono::steady_clock::now();
+    }
 
     // ---- autoregressive speech token sampling ---------------------------
+    // The speech decoder is the output head of both stage AXModels:
+    // llama_get_logits_ith returns its 6761 real rows (the padded tail is -inf).
     std::vector<float> logits(aux.n_speech);
-    auto compute_logits = [&](const std::vector<float> & hidden_vec, std::vector<float> & out) {
-        for (int j = 0; j < aux.n_speech; j++) {
-            const float * w = aux.speech_dec.data() + (size_t) j * n_embd;
-            double s = 0;
-            for (int k = 0; k < n_embd; k++) s += (double) w[k] * hidden_vec[k];
-            out[j] = (float) s;
+    auto read_logits = [&](std::vector<float> & out) {
+        const float * l = llama_get_logits_ith(ctx, -1);
+        if (!l) {
+            return false;
         }
+        std::copy(l, l + aux.n_speech, out.begin());
+        return true;
     };
+    if (codes_path.empty() && !read_logits(logits)) {
+        fprintf(stderr, "no speech logits from the prefill graph\n");
+        return 1;
+    }
     std::vector<int> codes;
     auto t_gen0 = std::chrono::steady_clock::now();
-    if (!a.codes_in.empty()) {
-        if (!load_codes(a.codes_in, codes)) return 1;
-        fprintf(stderr, "[llm] injected %zu speech tokens from %s\n", codes.size(), a.codes_in.c_str());
+    if (!codes_path.empty()) {
+        if (!load_codes(codes_path, codes)) return 1;
+        fprintf(stderr, "[llm] injected %zu speech tokens from %s\n", codes.size(), codes_path.c_str());
     } else {
         sampler smp(a.seed);
         const int min_len = (int) text_tok.size() * 2;
         const int max_len = (int) text_tok.size() * 20;
         int n_past = n_prompt_rows;
         for (int i = 0; i < max_len; i++) {
-            compute_logits(h, logits);
             int tok = smp.sample(logits, codes, i < min_len, 6561);
             if (i >= min_len && tok >= 6561) break;
             if (tok < 0 || tok >= 6561) break;
@@ -924,6 +1186,9 @@ int main(int argc, char ** argv) {
             hidden = llama_get_embeddings_ith(ctx, -1);
             if (!hidden) { fprintf(stderr, "no hidden at step %d\n", i); return 1; }
             std::copy(hidden, hidden + n_embd, h.begin());
+            if (!read_logits(logits)) {
+                fprintf(stderr, "no speech logits at step %d\n", i); return 1;
+            }
         }
     }
     auto t_gen1 = std::chrono::steady_clock::now();
@@ -947,14 +1212,14 @@ int main(int argc, char ** argv) {
     std::vector<int32_t> gen_tok(flow_codes.begin(), flow_codes.end());
     std::vector<int64_t> tok_shape{1, (int64_t) gen_tok.size()};
     std::vector<int64_t> ptok_shape{1, (int64_t) prompt_tok.size()};
-    std::vector<int64_t> pfeat_shape{1, flow_frames, 80};
+    std::vector<int64_t> pfeat_shape{1, rf.flow_frames, 80};
     std::vector<int64_t> emb_shape{1, 192};
     std::vector<Ort::Value> fe_in;
     fe_in.emplace_back(Ort::Value::CreateTensor<int32_t>(mem, gen_tok.data(), gen_tok.size(), tok_shape.data(), tok_shape.size()));
-    fe_in.emplace_back(Ort::Value::CreateTensor<int32_t>(mem, prompt_tok.data(), prompt_tok.size(), ptok_shape.data(), ptok_shape.size()));
-    fe_in.emplace_back(Ort::Value::CreateTensor<float>(mem, prompt_feat.data(), prompt_feat.size(), pfeat_shape.data(), pfeat_shape.size()));
-    fe_in.emplace_back(Ort::Value::CreateTensor<float>(mem, embedding.data(), embedding.size(), emb_shape.data(), emb_shape.size()));
-    auto fe_out = flow_enc->run(std::move(fe_in));
+    fe_in.emplace_back(Ort::Value::CreateTensor<int32_t>(mem, const_cast<int32_t *>(prompt_tok.data()), prompt_tok.size(), ptok_shape.data(), ptok_shape.size()));
+    fe_in.emplace_back(Ort::Value::CreateTensor<float>(mem, const_cast<float *>(prompt_feat.data()), prompt_feat.size(), pfeat_shape.data(), pfeat_shape.size()));
+    fe_in.emplace_back(Ort::Value::CreateTensor<float>(mem, const_cast<float *>(embedding.data()), embedding.size(), emb_shape.data(), emb_shape.size()));
+    auto fe_out = session(flow_enc, a.flow_encoder).run(std::move(fe_in));
     auto shape_of = [](const Ort::Value & v) { return v.GetTensorTypeAndShapeInfo().GetShape(); };
     auto mu_shape = shape_of(fe_out[0]);
     auto cond_shape = shape_of(fe_out[1]);
@@ -975,8 +1240,15 @@ int main(int argc, char ** argv) {
 
     // ---- Euler flow matching -------------------------------------------
     const int steps = 10;
-    const int npu_flow_cap = 512;
-    if (flow_npu && T > npu_flow_cap) {
+    npu_model * flow_model = flow_npu.get();
+    int npu_flow_cap = a.flow_npu_cap;
+    bool npu_flow_nlc = a.flow_npu_nlc;
+    if (T > npu_flow_cap && flow_npu_long) {
+        flow_model = flow_npu_long.get();
+        npu_flow_cap = a.flow_npu_long_cap;
+        npu_flow_nlc = a.flow_npu_long_nlc;
+    }
+    if (flow_model && T > npu_flow_cap) {
         fprintf(stderr, "flow length %d exceeds the fixed NPU capacity %d; shorten the text or use the CPU flow\\n", T, npu_flow_cap);
         return 1;
     }
@@ -1008,15 +1280,18 @@ int main(int argc, char ** argv) {
 
         const float * d = nullptr;
         std::vector<Ort::Value> es_out;
-        if (flow_npu) {
+        if (flow_model) {
             const size_t plane = (size_t) 80 * npu_flow_cap;
             std::vector<float> nx(2 * plane), nmu(2 * plane), ncond(2 * plane), nmask(2 * npu_flow_cap), nspks(2 * 80), nt(2);
-            if (a.flow_npu_nlc) {
+            if (npu_flow_nlc) {
                 for (int t = 0; t < T; t++) {
                     for (int c = 0; c < 80; c++) {
                         const size_t src = (size_t) c * T + t;
                         nx[(size_t) t * 80 + c] = x[src];
                         nx[plane + (size_t) t * 80 + c] = x[src];
+                        // The classifier-free batch's second row is unconditional: mu and cond stay zero there,
+                        // exactly as solve_euler leaves mu_in[1] / cond_in[1].  Filling them made the CFG update
+                        // partly conditional and produced a systematic log-mel gain/bias.
                         nmu[(size_t) t * 80 + c] = mu[src];
                         ncond[(size_t) t * 80 + c] = cond[src];
                     }
@@ -1036,15 +1311,15 @@ int main(int argc, char ** argv) {
             memcpy(nspks.data(), spks.data(), 80 * 4);
             memset(nspks.data() + 80, 0, 80 * 4);
             nt[0] = nt[1] = (float) t_cur;
-            if (!flow_npu->set_input("x", nx.data(), nx.size() * 4) ||
-                !flow_npu->set_input("mask", nmask.data(), nmask.size() * 4) ||
-                !flow_npu->set_input("mu", nmu.data(), nmu.size() * 4) ||
-                !flow_npu->set_input("t", nt.data(), nt.size() * 4) ||
-                !flow_npu->set_input("spks", nspks.data(), nspks.size() * 4) ||
-                !flow_npu->set_input("cond", ncond.data(), ncond.size() * 4) || !flow_npu->run()) {
+            if (!flow_model->set_input("x", nx.data(), nx.size() * 4) ||
+                !flow_model->set_input("mask", nmask.data(), nmask.size() * 4) ||
+                !flow_model->set_input("mu", nmu.data(), nmu.size() * 4) ||
+                !flow_model->set_input("t", nt.data(), nt.size() * 4) ||
+                !flow_model->set_input("spks", nspks.data(), nspks.size() * 4) ||
+                !flow_model->set_input("cond", ncond.data(), ncond.size() * 4) || !flow_model->run()) {
                 return 1;
             }
-            d = flow_npu->output_f32(2 * plane);
+            d = flow_model->output_f32(2 * plane);
             if (!d) return 1;
         } else {
             std::vector<Ort::Value> es_in;
@@ -1057,7 +1332,7 @@ int main(int argc, char ** argv) {
             es_out = estimator->run(std::move(es_in));
             d = es_out[0].GetTensorData<float>();
         }
-        const int dstride = flow_npu ? npu_flow_cap : T;
+        const int dstride = flow_model ? npu_flow_cap : T;
         for (int c = 0; c < 80; c++) {
             for (int t = 0; t < T; t++) {
                 float dphi = 1.7f * d[(size_t) c * dstride + t] - 0.7f * d[(size_t) (80 + c) * dstride + t];
@@ -1081,24 +1356,156 @@ int main(int argc, char ** argv) {
         fclose(f);
         fprintf(stderr, "[flow] wrote %s (%d x %d)\n", a.dump_mel.c_str(), 80, Tgen);
     }
+    if (a.mel_only) {
+        fprintf(stderr,
+                "[timing] frontend %.3fs llm_load %.3fs prefill %.3fs gen %.3fs (%.1f tok/s) flow_enc %.3fs flow %.3fs hift %.3fs total %.3fs\n",
+                front_s, llm_load_s, sec(t_req0, t_prefill), sec(t_gen0, t_gen1),
+                codes.size() / std::max(1e-9, sec(t_gen0, t_gen1)),
+                sec(t_gen1, t_flowenc), sec(t_flowenc, t_flow), 0.0,
+                front_s + llm_load_s + sec(t_req0, t_flow));
+        return 0;
+    }
     std::vector<float> pcm;
     if (hift_npu) {
-        const int cap = 512;
-        if (Tgen > cap) {
-            fprintf(stderr, "mel length %d exceeds the fixed NPU capacity %d\\n", Tgen, cap);
+        npu_model * hmodel = hift_npu.get();
+        constexpr int cap = 512;
+        // Reuse the one 512-frame vocoder for long utterances.  CausalHiFT is
+        // convolution-only after the CPU front end.  Compute the source STFT
+        // once on the full mel (so SineGen's phase is continuous), then give
+        // each decoder window 64 frames of left context.
+        constexpr int left = 64;
+        constexpr int stride = cap - left;
+        const bool split = !a.hift_front.empty() && !a.hift_post.empty();
+        const int s_frames = cap * 480 / 4 + 1;
+        double t_front = 0.0, t_npu = 0.0, t_post = 0.0;
+        int chunks = 0;
+        std::vector<float> full_s;
+        if (split) {
+            auto t0 = std::chrono::steady_clock::now();
+            std::vector<int64_t> shape{1, 80, Tgen};
+            std::vector<Ort::Value> in;
+            in.emplace_back(Ort::Value::CreateTensor<float>(mem, mel.data(), mel.size(),
+                                                            shape.data(), shape.size()));
+            auto out = session(hift_front, a.hift_front).run(std::move(in));
+            auto got = shape_of(out[0]);
+            size_t n = 1;
+            for (auto d : got) n *= (size_t) d;
+            if (got.size() != 3 || got[1] != 18 || n != (size_t) 18 * (Tgen * 120 + 1)) {
+                fprintf(stderr, "hift front produced a bad shape for %d frames\\n", Tgen);
+                return 1;
+            }
+            full_s.assign(out[0].GetTensorData<float>(), out[0].GetTensorData<float>() + n);
+            if (!a.dump_hift_s.empty()) {
+                FILE * f = fopen(a.dump_hift_s.c_str(), "wb");
+                if (f) { fwrite(full_s.data(), sizeof(float), full_s.size(), f); fclose(f); }
+            }
+            t_front = sec(t0, std::chrono::steady_clock::now());
+        }
+        std::vector<float> audio_out((size_t) Tgen * 480);
+        for (int start = 0; start < Tgen; start += stride) {
+            const int in_start = std::max(0, start - left);
+            // The first window starts the graph at row zero.  HiFT's tiled
+            // convolution path is not numerically stable there because it has
+            // no real left context.  Reserve the same 64-frame history used by
+            // every later window and prepend zeros instead; the discarded
+            // prefix then also moves the first consumed row off the boundary.
+            const int dst_off = split && start == 0 ? left : 0;
+            const int off = start - in_start + dst_off;
+            const int valid = std::min(stride, Tgen - start);
+            const int take = std::min(cap - dst_off, Tgen - in_start);
+            std::vector<float> hmel((size_t) 80 * cap, 0.0f);
+            for (int c = 0; c < 80; c++) {
+                memcpy(hmel.data() + (size_t) c * cap + dst_off,
+                       mel.data() + (size_t) c * Tgen + in_start, (size_t) take * 4);
+            }
+            const float * audio = nullptr;
+            std::vector<float> decoded;
+            if (split) {
+                auto th1 = std::chrono::steady_clock::now();
+                const size_t s0 = (size_t) in_start * 120;
+                const size_t s_dst = (size_t) dst_off * 120;
+                const size_t s_take = std::min((size_t) s_frames - s_dst,
+                                               (size_t) Tgen * 120 + 1 - s0);
+                std::vector<float> s_chunk((size_t) 18 * s_frames, 0.0f);
+                for (int c = 0; c < 18; c++) {
+                    memcpy(s_chunk.data() + (size_t) c * s_frames + s_dst,
+                           full_s.data() + (size_t) c * (Tgen * 120 + 1) + s0, s_take * 4);
+                }
+                if (!hmodel->set_input("mel", hmel.data(), hmel.size() * 4) ||
+                    !hmodel->set_input("s_stft", s_chunk.data(), s_chunk.size() * 4) || !hmodel->run()) return 1;
+                const size_t mp_bytes = hmodel->output_bytes();
+                if (!mp_bytes || mp_bytes % (sizeof(float) * (size_t) s_frames) != 0) {
+                    fprintf(stderr, "hift NPU output has an unexpected size %zu\n", mp_bytes);
+                    return 1;
+                }
+                const int mp_ch = (int) (mp_bytes / (sizeof(float) * (size_t) s_frames));
+                const float * mp = hmodel->output_f32((size_t) mp_ch * s_frames);
+                if (!mp) return 1;
+                std::vector<float> mp18;
+                if (mp_ch > 18) {
+                    mp18.resize((size_t) 18 * s_frames);
+                    for (int c = 0; c < 18; c++) {
+                        memcpy(mp18.data() + (size_t) c * s_frames,
+                               mp + (size_t) c * mp_ch * s_frames, (size_t) s_frames * 4);
+                    }
+                    mp = mp18.data();
+                } else if (mp_ch != 18) {
+                    fprintf(stderr, "hift NPU output has %d channels\n", mp_ch);
+                    return 1;
+                }
+                if (!a.dump_hift_mp.empty()) {
+                    char name[1024];
+                    snprintf(name, sizeof(name), "%s.%d.f32", a.dump_hift_mp.c_str(), chunks);
+                    FILE * f = fopen(name, "wb");
+                    if (f) { fwrite(mp, sizeof(float), (size_t) 18 * s_frames, f); fclose(f); }
+                }
+                auto th2 = std::chrono::steady_clock::now();
+                std::vector<int64_t> mp_shape{1, 18, s_frames};
+                std::vector<Ort::Value> po_in;
+                po_in.emplace_back(Ort::Value::CreateTensor<float>(mem, const_cast<float *>(mp),
+                                                                   (size_t) 18 * s_frames,
+                                                                   mp_shape.data(), mp_shape.size()));
+                auto pr = session(hift_post, a.hift_post).run(std::move(po_in));
+                auto pr_shape = shape_of(pr[0]);
+                size_t n_samples = 1;
+                for (auto d : pr_shape) n_samples *= (size_t) d;
+                if (n_samples < (size_t) cap * 480) {
+                    fprintf(stderr, "hift post produced %zu samples, expected %d\\n", n_samples, cap * 480);
+                    return 1;
+                }
+                decoded.assign(pr[0].GetTensorData<float>(), pr[0].GetTensorData<float>() + (size_t) cap * 480);
+                audio = decoded.data();
+                auto th3 = std::chrono::steady_clock::now();
+                t_npu += sec(th1, th2);
+                t_post += sec(th2, th3);
+            } else {
+                auto th0 = std::chrono::steady_clock::now();
+                if (Tgen > cap) {
+                    fprintf(stderr, "shift-only HiFT needs the split front end above %d frames\\n", cap);
+                    return 1;
+                }
+                if (!hmodel->set_input("mel", hmel.data(), hmel.size() * 4) || !hmodel->run()) return 1;
+                const float * out = hmodel->output_f32((size_t) cap * 480);
+                if (!out) return 1;
+                decoded.assign(out, out + (size_t) cap * 480);
+                audio = decoded.data();
+                t_npu += sec(th0, std::chrono::steady_clock::now());
+            }
+            memcpy(audio_out.data() + (size_t) start * 480, audio + (size_t) off * 480, (size_t) valid * 480 * 4);
+            chunks++;
+        }
+        pcm.swap(audio_out);
+        if (pcm.size() != (size_t) Tgen * 480) {
+            fprintf(stderr, "hift produced %zu samples, expected %zu\n", pcm.size(), (size_t) Tgen * 480);
             return 1;
         }
-        std::vector<float> hmel((size_t) 80 * cap);
-        for (int c = 0; c < 80; c++) memcpy(hmel.data() + (size_t) c * cap, mel.data() + (size_t) c * Tgen, Tgen * 4);
-        if (!hift_npu->set_input("mel", hmel.data(), hmel.size() * 4) || !hift_npu->run()) return 1;
-        const float * audio = hift_npu->output_f32((size_t) cap * 480);
-        if (!audio) return 1;
-        pcm.assign(audio, audio + (size_t) Tgen * 480);
+        fprintf(stderr, "[hift] chunks=%d cap=%d front=%.3fs npu=%.3fs post=%.3fs\n",
+                chunks, cap, t_front, t_npu, t_post);
     } else {
         std::vector<int64_t> hmel_shape{1, 80, Tgen};
         std::vector<Ort::Value> hi_in;
         hi_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mel.data(), mel.size(), hmel_shape.data(), hmel_shape.size()));
-        auto hi_out = hift->run(std::move(hi_in));
+        auto hi_out = session(hift, a.hift).run(std::move(hi_in));
         auto audio_shape = shape_of(hi_out[0]);
         const float * audio = hi_out[0].GetTensorData<float>();
         size_t n_samples = 1;
@@ -1107,17 +1514,71 @@ int main(int argc, char ** argv) {
     }
     auto t_hift = std::chrono::steady_clock::now();
 
-    if (!write_wav(a.out.c_str(), pcm, 24000)) { fprintf(stderr, "failed to write %s\n", a.out.c_str()); return 1; }
+    if (!write_wav(outpath.c_str(), pcm, 24000)) { fprintf(stderr, "failed to write %s\n", outpath.c_str()); return 1; }
 
-    auto sec = [](auto a0, auto a1) { return std::chrono::duration<double>(a1 - a0).count(); };
     fprintf(stderr,
             "[timing] frontend %.3fs llm_load %.3fs prefill %.3fs gen %.3fs (%.1f tok/s) flow_enc %.3fs flow %.3fs hift %.3fs total %.3fs\n",
-            sec(t0, t_front), sec(t_load0, t_load1),
-            sec(t_load1, t_prefill), sec(t_gen0, t_gen1), codes.size() / std::max(1e-9, sec(t_gen0, t_gen1)),
-            sec(t_gen1, t_flowenc), sec(t_flowenc, t_flow), sec(t_flow, t_hift), sec(t_all0, t_hift));
+            front_s, llm_load_s,
+            sec(t_req0, t_prefill), sec(t_gen0, t_gen1), codes.size() / std::max(1e-9, sec(t_gen0, t_gen1)),
+            sec(t_gen1, t_flowenc), sec(t_flowenc, t_flow), sec(t_flow, t_hift),
+            front_s + llm_load_s + sec(t_req0, t_hift));
     fprintf(stderr, "[audio] %.3fs %zu samples, codes=%zu flow_codes=%zu, T=%d Tgen=%d\n",
             pcm.size() / 24000.0, pcm.size(), codes.size(), flow_codes.size(), T, Tgen);
-    fprintf(stderr, "[out] %s\n", a.out.c_str());
+    fprintf(stderr, "[timing2] aux %.3fs sessions %.3fs npu_load %.3fs request %.3fs wall %.3fs\n",
+            sec(t_aux0, t_aux1), t_sess, t_npu_load, front_s + llm_load_s + sec(t_req0, t_hift),
+            sec(t_all0, std::chrono::steady_clock::now()));
+    fprintf(stderr, "[out] %s\n", outpath.c_str());
+    return 0;
+    };
+
+    if (a.worker) {
+        // Upload weight banks and create every lazy session before the first
+        // request, so service start time (not first-token latency) pays for it.
+        if (!a.prompt_wav.empty()) {
+            auto warm = prepare_ref(a.prompt_wav);
+            if (warm) {
+                generate("你好。", a.prompt_text, "/tmp/cosy_worker_warmup.wav", *warm,
+                         std::string(), 0.0, 0.0);
+                unlink("/tmp/cosy_worker_warmup.wav");
+            }
+        }
+        FILE * in = stdin;
+        for (;;) {
+            uint32_t lens[4] = {};
+            if (fread(lens, sizeof(uint32_t), 4, in) != 4) break;
+            std::string fields[4];
+            bool ok = true;
+            for (int i = 0; i < 4; i++) {
+                if (lens[i] > (1u << 20)) { ok = false; break; }
+                fields[i].resize(lens[i]);
+                if (lens[i] && fread(fields[i].data(), 1, lens[i], in) != lens[i]) { ok = false; break; }
+            }
+            if (!ok) break;
+            auto t_front0 = std::chrono::steady_clock::now();
+            auto rf = prepare_ref(fields[2]);
+            double front_s = sec(t_front0, std::chrono::steady_clock::now());
+            int rc = rf ? generate(fields[0], fields[1], fields[3], *rf, std::string(), front_s, 0.0) : 1;
+            fprintf(stdout, rc == 0 ? "OK\n" : "ERR\n");
+            fflush(stdout);
+        }
+        llama_free(ctx);
+        llama_model_free(model);
+        llama_backend_free();
+        return 0;
+    }
+
+    auto t_ref0 = std::chrono::steady_clock::now();
+    auto rf0 = prepare_ref(a.prompt_wav);
+    if (!rf0) return 1;
+    double front_s = sec(t_ref0, std::chrono::steady_clock::now());
+    double llm_load_s = sec(t_load0, t_load1);
+    for (int rep = 0; rep < a.repeat; rep++) {
+        std::string outpath = a.repeat > 1 && rep + 1 < a.repeat
+            ? a.out + ".warm" + std::to_string(rep + 1) + ".wav" : a.out;
+        if (generate(a.text, a.prompt_text, outpath, *rf0,
+                     rep == 0 ? a.codes_in : std::string(),
+                     rep == 0 ? front_s : 0.0, rep == 0 ? llm_load_s : 0.0) != 0) return 1;
+    }
 
     llama_free(ctx);
     llama_model_free(model);

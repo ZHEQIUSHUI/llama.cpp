@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <filesystem>
 #include <random>
 #include <utility>
@@ -86,6 +87,137 @@ static uint32_t server_u32le(const uint8_t * p) {
     return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
 }
 
+struct server_cosy_worker {
+    pid_t pid = -1;
+    int in_fd = -1;
+    int out_fd = -1;
+    std::mutex mu;
+};
+
+struct server_cosy_paths {
+    std::string text, ref_text, ref_path, out_path;
+};
+
+static server_cosy_worker g_cosy_worker;
+
+static bool server_write_all(int fd, const void * data, size_t size) {
+    const uint8_t * p = static_cast<const uint8_t *>(data);
+    while (size > 0) {
+        const ssize_t n = write(fd, p, size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += n;
+        size -= (size_t) n;
+    }
+    return true;
+}
+
+static bool server_read_all(int fd, void * data, size_t size) {
+    uint8_t * p = static_cast<uint8_t *>(data);
+    while (size > 0) {
+        const ssize_t n = read(fd, p, size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += n;
+        size -= (size_t) n;
+    }
+    return true;
+}
+
+static void server_cosy_worker_stop_locked() {
+    auto & w = g_cosy_worker;
+    if (w.in_fd >= 0) {
+        close(w.in_fd);
+        w.in_fd = -1;
+    }
+    if (w.out_fd >= 0) {
+        close(w.out_fd);
+        w.out_fd = -1;
+    }
+    if (w.pid < 0) return;
+    int status = 0;
+    for (int i = 0; i < 50; i++) {
+        const pid_t r = waitpid(w.pid, &status, WNOHANG);
+        if (r == w.pid || (r < 0 && errno == ECHILD)) {
+            w.pid = -1;
+            return;
+        }
+        usleep(100000);
+    }
+    kill(w.pid, SIGTERM);
+    for (int i = 0; i < 300; i++) {
+        const pid_t r = waitpid(w.pid, &status, WNOHANG);
+        if (r == w.pid || (r < 0 && errno == ECHILD)) break;
+        usleep(100000);
+    }
+    w.pid = -1;
+}
+
+static void server_cosy_worker_stop() {
+    std::lock_guard<std::mutex> lock(g_cosy_worker.mu);
+    server_cosy_worker_stop_locked();
+}
+
+static bool server_cosy_worker_start_locked(const std::vector<std::string> & base, std::string & error) {
+    auto & w = g_cosy_worker;
+    if (w.pid >= 0) return true;
+    int in_pipe[2] = {-1, -1}, out_pipe[2] = {-1, -1};
+    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
+        if (in_pipe[0] >= 0) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (out_pipe[0] >= 0) { close(out_pipe[0]); close(out_pipe[1]); }
+        error = "pipe failed";
+        return false;
+    }
+    std::vector<std::string> words = base;
+    words.emplace_back("--worker");
+    std::vector<char *> argv;
+    argv.reserve(words.size() + 1);
+    for (auto & s : words) argv.push_back(const_cast<char *>(s.c_str()));
+    argv.push_back(nullptr);
+    const pid_t pid = fork();
+    if (pid < 0) {
+        close(in_pipe[0]); close(in_pipe[1]); close(out_pipe[0]); close(out_pipe[1]);
+        error = "fork failed";
+        return false;
+    }
+    if (pid == 0) {
+        dup2(in_pipe[0], STDIN_FILENO);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        close(in_pipe[0]); close(in_pipe[1]); close(out_pipe[0]); close(out_pipe[1]);
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    close(in_pipe[0]);
+    close(out_pipe[1]);
+    w.pid = pid;
+    w.in_fd = in_pipe[1];
+    w.out_fd = out_pipe[0];
+    return true;
+}
+
+static bool server_cosy_worker_request_locked(server_cosy_paths & paths, std::string & error) {
+    auto & w = g_cosy_worker;
+    const std::string * fields[4] = { &paths.text, &paths.ref_text, &paths.ref_path, &paths.out_path };
+    uint32_t lens[4];
+    for (int i = 0; i < 4; i++) {
+        if (fields[i]->size() > (1u << 20)) { error = "request field too long"; return false; }
+        lens[i] = (uint32_t) fields[i]->size();
+    }
+    bool ok = server_write_all(w.in_fd, lens, sizeof(lens));
+    for (int i = 0; ok && i < 4; i++) ok = server_write_all(w.in_fd, fields[i]->data(), fields[i]->size());
+    if (!ok) { error = "worker write failed"; return false; }
+    std::string line;
+    for (;;) {
+        char c = 0;
+        if (!server_read_all(w.out_fd, &c, 1)) { error = "worker read failed"; return false; }
+        if (c == '\n') break;
+        line.push_back(c);
+        if (line.size() > 64) { error = "bad worker response"; return false; }
+    }
+    if (line != "OK") { error = "worker reported failure"; return false; }
+    return true;
+}
+
 static bool server_run_cosy_tts(const server_task::tts_params & tts, raw_buffer & data,
         int & sample_rate, int64_t & n_samples, std::string & error) {
     const char * cmd = std::getenv("COSY_TTS_CMD");
@@ -120,43 +252,28 @@ static bool server_run_cosy_tts(const server_task::tts_params & tts, raw_buffer 
         return false;
     }
 
-    words.emplace_back("-p");
-    words.emplace_back(tts.prompt);
-    words.emplace_back("--prompt-text");
-    words.emplace_back(tts.ref_text);
-    words.emplace_back("--prompt-wav");
-    words.emplace_back(ref_path);
-    words.emplace_back("-o");
-    words.emplace_back(out_path);
-
-    std::vector<char *> argv;
-    argv.reserve(words.size() + 1);
-    for (auto & w : words) argv.push_back(const_cast<char *>(w.c_str()));
-    argv.push_back(nullptr);
-
-    const std::string log_path = std::string(out_path) + ".log";
-    const pid_t pid = fork();
-    if (pid < 0) {
-        unlink(ref_path);
-        unlink(out_path);
-        error = "fork failed";
-        return false;
-    }
-    if (pid == 0) {
-        const int fd = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd >= 0) {
-            dup2(fd, STDOUT_FILENO);
-            dup2(fd, STDERR_FILENO);
-            close(fd);
+    server_cosy_paths paths;
+    paths.text = tts.prompt;
+    paths.ref_text = tts.ref_text;
+    paths.ref_path = ref_path;
+    paths.out_path = out_path;
+    bool ok = false;
+    {
+        std::lock_guard<std::mutex> lock(g_cosy_worker.mu);
+        if (!server_cosy_worker_start_locked(words, error)) {
+            unlink(ref_path);
+            unlink(out_path);
+            return false;
         }
-        execvp(argv[0], argv.data());
-        _exit(127);
+        ok = server_cosy_worker_request_locked(paths, error);
+        if (!ok) {
+            // A worker that died (for example after a bad reference file) is
+            // restarted once; the request itself is not silently retried.
+            server_cosy_worker_stop_locked();
+            server_cosy_worker_start_locked(words, error);
+        }
     }
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
     unlink(ref_path);
-
-    bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
     if (ok) {
         std::ifstream in(out_path, std::ios::binary);
         data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
@@ -170,15 +287,10 @@ static bool server_run_cosy_tts(const server_task::tts_params & tts, raw_buffer 
         const uint32_t payload = server_u32le(p + 40);
         const int frame_bytes = channels * bits / 8;
         n_samples = frame_bytes > 0 ? payload / frame_bytes : 0;
-    } else {
-        std::ifstream log(log_path);
-        std::string tail((std::istreambuf_iterator<char>(log)), std::istreambuf_iterator<char>());
-        if (tail.size() > 2000) tail = tail.substr(tail.size() - 2000);
+    } else if (error.empty()) {
         error = "cosy-tts failed";
-        if (!tail.empty()) error += ": " + tail;
     }
     unlink(out_path);
-    unlink(log_path.c_str());
     return ok;
 }
 #endif
@@ -1586,6 +1698,7 @@ public:
     }
 
     ~server_context_impl() {
+        server_cosy_worker_stop();
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
