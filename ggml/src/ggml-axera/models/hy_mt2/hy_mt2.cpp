@@ -759,6 +759,15 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
     auto body_run   = io.find("body_run");
     if (wp == WP_MAX) {
         GGML_ASSERT(layer0_run != io.end() && body_run != io.end());
+    } else {
+        // A 256-row graph does not use these inputs, but keep them defined if
+        // the compiler left them in the IO table.
+        for (auto * it : { &layer0_run, &body_run }) {
+            if (*it != io.end()) {
+                *(int32_t *) (*it)->second->vir = 1;
+                (*it)->second->flush();
+            }
+        }
     }
     for (int ci = 0; ci < (int) pre.size(); ++ci) {
         if (wp == WP_MAX) {
@@ -828,6 +837,13 @@ void hy_mt2::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4
     const bool prof = getenv("GGML_AXERA_HY_MT2_PROF") != nullptr;
     auto head_run = io.find("head_run");
     GGML_ASSERT(head_run != io.end());
+    for (const char * n : { "layer0_run", "body_run" }) {
+        auto it = io.find(n);
+        if (it != io.end()) {
+            *(int32_t *) it->second->vir = 1;
+            it->second->flush();
+        }
+    }
     for (int ci = 0; ci < (int) dec.size(); ++ci) {
         *(int32_t *) head_run->second->vir = ci + 1 == (int) dec.size() ? 1 : 0;
         head_run->second->flush();
