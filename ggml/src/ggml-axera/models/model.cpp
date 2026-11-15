@@ -93,6 +93,8 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
         llm = make_qwen35_35b_a3b(m);
     } else if (m.model == "qwen35_moe_sgl") {
         llm = make_qwen35_moe_sgl(m);
+    } else if (m.model == "minicpmv4_7") {
+        llm = make_qwen35_moe_sgl(m);  // the text tower is the published 35B-A3B NVFP4 stack
     } else if (m.model == "hy_mt2") {
         llm = make_hy_mt2(m);
     } else if (m.model == "qwen3") {
@@ -118,7 +120,8 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
     }
     auto c   = std::make_shared<composite>();
     c->llm   = llm;
-    c->vit   = vision1 ? (m.model == "minicpm_ocr" ? make_minicpm_ocr_vit_full(m) : make_qwen35_vit_full(m)) :
+    c->vit   = vision1 ? (m.model == "minicpm_ocr" ? make_minicpm_ocr_vit_full(m) :
+                          m.model == "minicpmv4_7" ? make_cpmv47_vit_full(m) : make_qwen35_vit_full(m)) :
                vision ? make_qwen35_vit(m) : nullptr;
     c->audio = audio ? make_qwen3_asr(m) : nullptr;
     c->gen   = gen ? make_qwen3_tts(m) : nullptr;
