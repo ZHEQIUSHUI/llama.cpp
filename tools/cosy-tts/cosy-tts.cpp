@@ -1707,18 +1707,11 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     // core/seqstate, so seq_cp moves the private pages too.
     struct prompt_kv_cache {
         bool valid = false;
-        int seq = 0;
-        uint64_t used = 0;
         std::vector<int32_t> ids;
         int rows = 0;
         std::vector<float> logits;
     };
-    // Four prefix snapshots cover the common "alternate two voices/sentences"
-    // service pattern without growing with context.  Each snapshot owns a
-    // private seqstate page set; the request itself always runs in sequence 0.
-    constexpr int PREFIX_SLOTS = 4;
-    std::array<prompt_kv_cache, PREFIX_SLOTS> pcaches;
-    uint64_t prefix_clock = 0;
+    prompt_kv_cache pcache;
     auto generate = [&](const std::string & req_text, const std::string & req_prompt_text,
                         const std::string & outpath, const ref_feats & rf, uint32_t req_seed,
                         const std::string & codes_path, double front_s, double llm_load_s,
@@ -1770,25 +1763,25 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     for (auto t : text_all) prefix_key.push_back((int32_t) t);
     for (auto t : prompt_tok) prefix_key.push_back(t);
     bool prefix_hit = false;
-    int prefix_hit_slot = -1;
     const auto t_kv_hit0 = std::chrono::steady_clock::now();
-    if (codes_path.empty()) {
-        for (int i = 0; i < PREFIX_SLOTS; i++) {
-            auto & c = pcaches[i];
-            if (c.valid && c.rows == n_prompt_rows && c.ids == prefix_key) {
-                llama_memory_seq_cp(kv_mem, c.seq, 0, -1, -1);
-                c.used = ++prefix_clock;
-                prefix_hit = true;
-                prefix_hit_slot = i;
-                break;
-            }
-        }
+    const bool prefix_valid = pcache.valid && pcache.rows == n_prompt_rows;
+    const bool prefix_ids_match = prefix_valid && pcache.ids == prefix_key;
+    if (codes_path.empty() && pcache.valid && pcache.rows == n_prompt_rows &&
+        pcache.ids == prefix_key) {
+        llama_memory_seq_cp(kv_mem, 1, 0, -1, -1);
+        prefix_hit = true;
+    } else {
+        // seq 1 holds the previous prompt's pages.  They must be released
+        // before a new prompt can receive consecutive cells from cell 0; a
+        // seq_rm(seq 0) alone leaves those pages owned by seq 1 and shifts the
+        // new prefill to high physical cells, which breaks seqstate's page
+        // boundaries.
+        llama_memory_seq_rm(kv_mem, 1, -1, -1);
     }
     if (codes_path.empty() && getenv("COSY_LLM_PROBE")) {
-        int valid = 0;
-        for (const auto & c : pcaches) valid += c.valid ? 1 : 0;
-        fprintf(stderr, "[llm-cache] slots=%d rows=%d key=%zu hit_slot=%d\n",
-                valid, n_prompt_rows, prefix_key.size(), prefix_hit_slot);
+        fprintf(stderr, "[llm-cache] valid=%d rows=%d/%d ids_match=%d key=%zu\n",
+                pcache.valid ? 1 : 0, pcache.rows, n_prompt_rows, prefix_ids_match ? 1 : 0,
+                prefix_key.size());
     }
     const double t_kv_hit = sec(t_kv_hit0, std::chrono::steady_clock::now());
 
@@ -2004,9 +1997,8 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     double t_logits_initial = 0.0, t_cache_cp = 0.0;
     if (codes_path.empty()) {
         if (prefix_hit) {
-            logits = pcaches[prefix_hit_slot].logits;
-            fprintf(stderr, "[llm] prefix cache hit slot=%d rows=%d\n",
-                    prefix_hit_slot, n_prompt_rows);
+            logits = pcache.logits;
+            fprintf(stderr, "[llm] prefix cache hit rows=%d\n", n_prompt_rows);
         } else {
             const auto t_l0 = std::chrono::steady_clock::now();
             if (!read_logits(logits)) {
@@ -2015,21 +2007,13 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             }
             t_logits_initial = sec(t_l0, std::chrono::steady_clock::now());
             const auto t_c0 = std::chrono::steady_clock::now();
-            int victim = 0;
-            for (int i = 1; i < PREFIX_SLOTS; i++) {
-                if (!pcaches[i].valid) { victim = i; break; }
-                if (pcaches[i].used < pcaches[victim].used) victim = i;
-            }
-            auto & c = pcaches[victim];
-            if (c.valid) llama_memory_seq_rm(kv_mem, c.seq, -1, -1);
-            c.seq = victim + 1;
-            llama_memory_seq_cp(kv_mem, 0, c.seq, 0, n_prompt_rows);
+            llama_memory_seq_rm(kv_mem, 1, -1, -1);
+            llama_memory_seq_cp(kv_mem, 0, 1, 0, n_prompt_rows);
             t_cache_cp = sec(t_c0, std::chrono::steady_clock::now());
-            c.valid = true;
-            c.used = ++prefix_clock;
-            c.rows = n_prompt_rows;
-            c.ids = prefix_key;
-            c.logits = logits;
+            pcache.valid = true;
+            pcache.rows = n_prompt_rows;
+            pcache.ids = std::move(prefix_key);
+            pcache.logits = logits;
         }
     }
     if (codes_path.empty()) {
