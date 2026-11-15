@@ -1071,6 +1071,9 @@ struct common_memory {
 
     // aborts execution on failure
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    // returns false when the target or the draft memory cannot remove the range (e.g. a recurrent state that has
+    // no snapshot before p0); the memories may be left out of step, so the caller has to clear the sequence
+    bool try_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
 };

@@ -5075,7 +5075,16 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    if (!slot.mem.try_seq_rm(slot.id, p0, -1)) {
+                        // e.g. an identical prompt sent again: its last token is evaluated again [TAG_PROMPT_LOGITS],
+                        // and a recurrent state without a snapshot before that token cannot step back.
+                        // Process the whole prompt again instead of aborting the server
+                        SLT_WRN(slot, "the memory cannot remove [%d, end), re-processing the full prompt (%d tokens)\n", p0, slot.task->n_tokens());
+                        slot.prompt.tokens.keep_first(0);
+                        slot.prompt.checkpoints.clear();
+                        slot.stats.n_prompt_cached = 0;
+                        slot.mem.seq_rm(slot.id, -1, -1);
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
