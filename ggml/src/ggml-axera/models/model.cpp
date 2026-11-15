@@ -121,7 +121,7 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
     auto c   = std::make_shared<composite>();
     c->llm   = llm;
     c->vit   = vision1 ? (m.model == "minicpm_ocr" ? make_minicpm_ocr_vit_full(m) :
-                          m.model == "minicpmv4_7" ? make_cpmv47_vit_full(m) : make_qwen35_vit_full(m)) :
+                          m.model == "minicpmv4_7" ? make_minicpmv4_7_vit_full(m) : make_qwen35_vit_full(m)) :
                vision ? make_qwen35_vit(m) : nullptr;
     c->audio = audio ? make_qwen3_asr(m) : nullptr;
     c->gen   = gen ? make_qwen3_tts(m) : nullptr;

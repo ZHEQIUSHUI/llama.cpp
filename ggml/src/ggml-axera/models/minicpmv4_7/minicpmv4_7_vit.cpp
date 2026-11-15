@@ -16,9 +16,9 @@
 namespace axera {
 namespace {
 
-class cpmv47_vit_full final : public model {
+class minicpmv4_7_vit_full final : public model {
   public:
-    explicit cpmv47_vit_full(const manifest & m) : man(m), k(man.get("vit")) {}
+    explicit minicpmv4_7_vit_full(const manifest & m) : man(m), k(man.get("vit")) {}
     ggml_status compute(ggml_cgraph * g) override;
 
   private:
@@ -55,8 +55,8 @@ void to_bf16(const ggml_tensor * w, ggml_bf16_t * dst) {
     }
 }
 
-void cpmv47_vit_full::weights(int L, int H) {
-    axera_timer tm("cpmv47 vit weights (load)");
+void minicpmv4_7_vit_full::weights(int L, int H) {
+    axera_timer tm("minicpmv4_7 vit weights (load)");
     auto stack = [&](const char * in, const char * suffix) {
         axera_cmm &  c   = io(in);
         const size_t per = k.in_bytes(in) / L;
@@ -141,8 +141,8 @@ void cpmv47_vit_full::weights(int L, int H) {
     io("w_patch")->flush();
 }
 
-void cpmv47_vit_full::tables(int gh, int gw, int n, const ggml_tensor * pe, int H) {
-    axera_timer tm("cpmv47 vit tables (cpu)");
+void minicpmv4_7_vit_full::tables(int gh, int gw, int n, const ggml_tensor * pe, int H) {
+    axera_timer tm("minicpmv4_7 vit tables (cpu)");
     const int side = (int) std::lround(std::sqrt((double) pe->ne[1]));
     GGML_ASSERT(side * side == pe->ne[1]);
     auto row_f32 = [&](int64_t r, ggml_bf16_t * d) {
@@ -206,7 +206,7 @@ void cpmv47_vit_full::tables(int gh, int gw, int n, const ggml_tensor * pe, int 
     io("kmask2")->flush();
 }
 
-ggml_status cpmv47_vit_full::compute(ggml_cgraph * g) {
+ggml_status minicpmv4_7_vit_full::compute(ggml_cgraph * g) {
     names.of(g);
     ggml_tensor * raw = names.at("inp_raw");
     ggml_tensor * pe  = names.at("v.position_embd.weight");
@@ -231,7 +231,7 @@ ggml_status cpmv47_vit_full::compute(ggml_cgraph * g) {
         GGML_ASSERT(km.pShape[0] * BC == N && N2 * 4 == N);
     }
     if (raw->ne[3] != 1 || gw % 4 || gh % 4 || n > N || L != 27) {
-        GGML_LOG_ERROR("axera cpmv47_vit_full: %d frame(s) of %d x %d patches, %d layers, at most %d patches\n",
+        GGML_LOG_ERROR("axera minicpmv4_7_vit_full: %d frame(s) of %d x %d patches, %d layers, at most %d patches\n",
                        (int) raw->ne[3], gw, gh, L, N);
         return GGML_STATUS_FAILED;
     }
@@ -247,7 +247,7 @@ ggml_status cpmv47_vit_full::compute(ggml_cgraph * g) {
         gw_ = gw;
     }
     {
-        axera_timer   tm("cpmv47 vit patches (cpu)");
+        axera_timer   tm("minicpmv4_7 vit patches (cpu)");
         const float * img = (const float *) raw->data;
         const int64_t W = raw->ne[0], HI = raw->ne[1];
         auto *        pxb = (ggml_bf16_t *) io("px")->vir;
@@ -279,7 +279,7 @@ ggml_status cpmv47_vit_full::compute(ggml_cgraph * g) {
         outs[i]                      = axera_io(io(m.pName), m.nSize);
     }
     {
-        axera_timer tm("cpmv47 vit (one call)");
+        axera_timer tm("minicpmv4_7 vit (one call)");
         k.run(in, outs, "vit");
     }
 
@@ -328,8 +328,8 @@ ggml_status cpmv47_vit_full::compute(ggml_cgraph * g) {
 
 }  // namespace
 
-std::shared_ptr<model> make_cpmv47_vit_full(const manifest & m) {
-    return std::make_shared<cpmv47_vit_full>(m);
+std::shared_ptr<model> make_minicpmv4_7_vit_full(const manifest & m) {
+    return std::make_shared<minicpmv4_7_vit_full>(m);
 }
 
 }  // namespace axera
