@@ -625,43 +625,78 @@ struct hift_native {
 template <typename Fn>
 static void parallel_ranges(int n, int max_threads, Fn && fn);
 
-// Input and output are time-major [T][channels].  The original layout
-// recomputed every input channel once per output channel and wrote one time
-// sample at a time; this blocks 16 outputs per accumulator so the inner loop
-// is a contiguous FMA over weights and stays vectorizable on the board CPU.
+// Input and output are time-major [T][channels].  A scalar time-major loop
+// reloads the 3.3 MB f0 predictor for every frame.  Keep a short time tile in
+// registers so each block of weights is reused across eight frames while the
+// inner 16-output FMA stays contiguous.
 static void conv_causal_parallel(const float * x, int T, const hift_native::layer & l,
                                  bool right, std::vector<float> & y) {
-    constexpr int BLK = 16;
+    constexpr int BLK = 32;
+    constexpr int BT = 4;
     y.resize((size_t) l.out_c * T);
-    const int blocks = (l.out_c + BLK - 1) / BLK;
+    const int blocks = l.out_c / BLK;
     parallel_ranges(blocks, 16, [&](int b0, int b1) {
         for (int blk = b0; blk < b1; blk++) {
             const int oc0 = blk * BLK;
-            const int nv = std::min(BLK, l.out_c - oc0);
-            for (int t = 0; t < T; t++) {
-                float acc[BLK];
-                for (int v = 0; v < nv; v++) acc[v] = l.b[oc0 + v];
+            const int tend = (T / BT) * BT;
+            for (int t0 = 0; t0 < tend; t0 += BT) {
+                float acc[BT][BLK];
+                #pragma GCC unroll 4
+                for (int t = 0; t < BT; t++)
+                    #pragma GCC ivdep
+                    for (int v = 0; v < BLK; v++) acc[t][v] = l.b[oc0 + v];
                 for (int ic = 0; ic < l.in_c; ic++) {
                     for (int k = 0; k < l.k; k++) {
                         const int off = right ? k : k - (l.k - 1);
-                        const int st = t + off;
-                        if (st < 0 || st >= T) continue;
-                        const float xv = x[(size_t) st * l.in_c + ic];
                         const float * __restrict w = l.wt.data() +
                             ((size_t) ic * l.k + k) * l.out_c + oc0;
-                        #pragma GCC ivdep
-                        for (int v = 0; v < nv; v++) acc[v] += xv * w[v];
+                        #pragma GCC unroll 4
+                        for (int t = 0; t < BT; t++) {
+                            const int st = t0 + t + off;
+                            if (st < 0 || st >= T) continue;
+                            const float xv = x[(size_t) st * l.in_c + ic];
+                            #pragma GCC ivdep
+                            for (int v = 0; v < BLK; v++) acc[t][v] += xv * w[v];
+                        }
                     }
                 }
+                #pragma GCC unroll 4
+                for (int t = 0; t < BT; t++) {
+                    float * __restrict dst = y.data() + (size_t) (t0 + t) * l.out_c + oc0;
+                    #pragma GCC ivdep
+                    for (int v = 0; v < BLK; v++) {
+                        const float z = acc[t][v];
+                        dst[v] = z < 0.0f ? std::expm1f(z) : z;
+                    }
+                }
+            }
+            for (int t = tend; t < T; t++) {
+                float acc[BLK];
+                for (int v = 0; v < BLK; v++) acc[v] = l.b[oc0 + v];
+                for (int ic = 0; ic < l.in_c; ic++) for (int k = 0; k < l.k; k++) {
+                    const int off = right ? k : k - (l.k - 1);
+                    const int st = t + off;
+                    if (st < 0 || st >= T) continue;
+                    const float xv = x[(size_t) st * l.in_c + ic];
+                    const float * __restrict w = l.wt.data() +
+                        ((size_t) ic * l.k + k) * l.out_c + oc0;
+                    #pragma GCC ivdep
+                    for (int v = 0; v < BLK; v++) acc[v] += xv * w[v];
+                }
                 float * __restrict dst = y.data() + (size_t) t * l.out_c + oc0;
-                #pragma GCC ivdep
-                for (int v = 0; v < nv; v++) {
+                for (int v = 0; v < BLK; v++) {
                     const float z = acc[v];
                     dst[v] = z < 0.0f ? std::expm1f(z) : z;
                 }
             }
         }
     });
+    // The CosyVoice3 f0 predictor has five 512-output layers.  Keep the tail
+    // path for completeness, but never silently drop a non-multiple model.
+    if (l.out_c % BLK != 0) {
+        fprintf(stderr, "hift conv: unsupported output width %d\n", l.out_c);
+        std::abort();
+    }
 }
 
 static void hift_front_native(const hift_native & h, const float * mel, int T,
@@ -2033,12 +2068,13 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         sampler smp(req_seed, a.greedy);
         int max_len = (int) text_tok.size() * 20;
         if (flow_loop_npu) {
-            // One flow call covers the complete token prefix.  Never let the
-            // language model generate past that window; the text splitter
-            // keeps each request segment below this bound.
+            // One flow call covers the complete token prefix.  Leave room for
+            // the minimum reference prefix; the flow window itself trims the
+            // reference as needed instead of forcing an extra full call.
             const int tok_cap = (int) flow_loop_npu->input_elems("tokens");
-            const int prompt_n = std::min((int) prompt_tok.size(), std::max(0, tok_cap - 16));
-            max_len = std::min(max_len, std::max(1, tok_cap - prompt_n - 4));
+            const int prompt_floor = std::min((int) prompt_tok.size(),
+                                              std::max(8, a.flow_prompt_min));
+            max_len = std::min(max_len, std::max(1, tok_cap - prompt_floor - 4));
         }
         const int min_len = std::min((int) text_tok.size() * 2, max_len);
         int n_past = n_prompt_rows;
@@ -2127,13 +2163,12 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             return 1;
         }
         const int full_prompt_n = (int) prompt_tok.size();
-        // Keep at least 16 generation tokens in the first window.  References
-        // longer than this are truncated only for the flow prefix; the speaker
+        // Keep the longest reference prefix that leaves room for this
+        // sentence, with --flow-prompt-min as the lower bound.  The speaker
         // embedding and the language-model prompt remain complete.
-        // The flow prompt prefix must stay aligned with the acoustic prompt
-        // features.  Trimming it changes the model's output layout, so keep
-        // the complete reference prefix and slide later windows instead.
-        const int prompt_n = std::min(full_prompt_n, std::max(0, tok_cap - 16));
+        const int prompt_floor = std::min(full_prompt_n, std::max(8, a.flow_prompt_min));
+        const int prompt_n = std::min(full_prompt_n,
+                                      std::max(prompt_floor, tok_cap - (int) flow_codes.size() - 4));
         const int prompt_mel = 2 * prompt_n;
         if (full_prompt_n > prompt_n) {
             fprintf(stderr, "[flow] reference prompt %d tokens truncated to %d for the merged window\n",
@@ -2616,8 +2651,8 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         int gen_cap = 0;
         if (codes_path.empty() && flow_loop_npu) {
             const int tok_cap = (int) flow_loop_npu->input_elems("tokens");
-            const int prompt_n = std::min((int) rf.tok.size(), std::max(0, tok_cap - 16));
-            gen_cap = tok_cap - prompt_n - 4;
+            const int prompt_floor = std::min((int) rf.tok.size(), std::max(8, a.flow_prompt_min));
+            gen_cap = tok_cap - prompt_floor - 4;
             segments = split_text_segments(req_text, gen_cap);
         }
         const auto req_t0 = std::chrono::steady_clock::now();
