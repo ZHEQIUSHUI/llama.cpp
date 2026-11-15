@@ -7436,7 +7436,10 @@ void server_routes::init_routes() {
             return res;
         }
 
+        const auto t_tts_route0 = std::chrono::steady_clock::now();
         const json body = json::parse(req.body);
+        const double t_tts_json = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_tts_route0).count();
         if (!body.is_object()) {
             throw std::invalid_argument("request body must be a JSON object");
         }
@@ -7479,12 +7482,40 @@ void server_routes::init_routes() {
             if (data_uri != std::string::npos) {
                 encoded = encoded.substr(data_uri + 8);
             }
-            try {
-                const std::string decoded = base64::decode(encoded);
-                task.tts.ref_audio.assign(decoded.begin(), decoded.end());
-            } catch (const std::exception & e) {
-                throw std::invalid_argument(std::string("invalid ref_audio base64: ") + e.what());
+            // /v1/audio/speech sends the same reference WAV on every request.
+            // Decoding its base64 is tens of ms on the board, so keep a tiny
+            // LRU of decoded buffers keyed by a 64-bit hash of the payload.
+            uint64_t ref_hash = 1469598103934665603ull;
+            for (unsigned char ch : encoded) { ref_hash ^= ch; ref_hash *= 1099511628211ull; }
+            static std::mutex ref_cache_mu;
+            static std::deque<std::pair<uint64_t, std::vector<uint8_t>>> ref_cache;
+            bool ref_hit = false;
+            {
+                std::lock_guard<std::mutex> lock(ref_cache_mu);
+                for (const auto & e : ref_cache) {
+                    if (e.first == ref_hash) {
+                        task.tts.ref_audio = e.second;
+                        ref_hit = true;
+                        break;
+                    }
+                }
             }
+            const auto t_b64_0 = std::chrono::steady_clock::now();
+            if (!ref_hit) {
+                try {
+                    const std::string decoded = base64::decode(encoded);
+                    task.tts.ref_audio.assign(decoded.begin(), decoded.end());
+                } catch (const std::exception & e) {
+                    throw std::invalid_argument(std::string("invalid ref_audio base64: ") + e.what());
+                }
+                std::lock_guard<std::mutex> lock(ref_cache_mu);
+                ref_cache.emplace_back(ref_hash, task.tts.ref_audio);
+                while (ref_cache.size() > 4) ref_cache.pop_front();
+            }
+            const double t_tts_b64 = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_b64_0).count();
+            fprintf(stderr, "[http-tts] json=%.4f ref_b64=%.4f ref_cache=%d enc=%zu dec=%zu\n",
+                    t_tts_json, t_tts_b64, ref_hit ? 1 : 0, encoded.size(), task.tts.ref_audio.size());
             if (task.tts.ref_audio.empty()) {
                 throw std::invalid_argument("\"ref_audio\" decoded to an empty buffer");
             }

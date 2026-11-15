@@ -1769,6 +1769,10 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     // the last one: callers commonly alternate voices or repeat an earlier
     // sentence, and a one-entry cache turns both into a full prompt prefill.
     std::vector<prompt_kv_cache> pcache;
+    // Snapshotting the whole KV state costs 25-70 ms.  Only pay it once the
+    // same prefix has been seen before, so a one-off text does not carry the
+    // cache-population cost; a repeated prefix is still cached from request 2.
+    std::vector<std::vector<int32_t>> pcache_seen;
     uint64_t pcache_tick = 0;
     constexpr size_t PCACHE_MAX = 4;
     auto t_load0 = std::chrono::steady_clock::now();
@@ -2147,24 +2151,31 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             }
             t_logits_initial = sec(t_l0, std::chrono::steady_clock::now());
             const auto t_c0 = std::chrono::steady_clock::now();
-            prompt_kv_cache entry;
-            entry.rows = n_prompt_rows;
-            entry.ids = prefix_key;
-            entry.logits = logits;
-            const size_t state_size = llama_state_seq_get_size(ctx, 0);
-            if (state_size > 0) {
-                entry.state.resize(state_size);
-                const size_t got = llama_state_seq_get_data(
-                        ctx, entry.state.data(), entry.state.size(), 0);
-                if (got != entry.state.size()) entry.state.clear();
-            }
-            if (!entry.state.empty()) {
-                entry.used = ++pcache_tick;
-                pcache.push_back(std::move(entry));
-                if (pcache.size() > PCACHE_MAX) {
-                    auto oldest = std::min_element(pcache.begin(), pcache.end(),
-                            [](const auto & a, const auto & b) { return a.used < b.used; });
-                    pcache.erase(oldest);
+            const bool prefix_seen = std::find(pcache_seen.begin(), pcache_seen.end(), prefix_key) !=
+                                     pcache_seen.end();
+            if (!prefix_seen) {
+                pcache_seen.push_back(prefix_key);
+                if (pcache_seen.size() > 2 * PCACHE_MAX) pcache_seen.erase(pcache_seen.begin());
+            } else {
+                prompt_kv_cache entry;
+                entry.rows = n_prompt_rows;
+                entry.ids = prefix_key;
+                entry.logits = logits;
+                const size_t state_size = llama_state_seq_get_size(ctx, 0);
+                if (state_size > 0) {
+                    entry.state.resize(state_size);
+                    const size_t got = llama_state_seq_get_data(
+                            ctx, entry.state.data(), entry.state.size(), 0);
+                    if (got != entry.state.size()) entry.state.clear();
+                }
+                if (!entry.state.empty()) {
+                    entry.used = ++pcache_tick;
+                    pcache.push_back(std::move(entry));
+                    if (pcache.size() > PCACHE_MAX) {
+                        auto oldest = std::min_element(pcache.begin(), pcache.end(),
+                                [](const auto & a, const auto & b) { return a.used < b.used; });
+                        pcache.erase(oldest);
+                    }
                 }
             }
             t_cache_cp = sec(t_c0, std::chrono::steady_clock::now());
