@@ -109,7 +109,7 @@ python convert_hf_to_gguf.py path/to/pocket-tts/languages/english --mmproj --out
 
 CosyVoice3 keeps its own Qwen2 backbone GGUF, auxiliary speech-token GGUF,
 ONNX frontend and flow/HiFT runner.  `llama-tts` forwards any invocation that
-contains `--aux` to the `cosy-tts` binary in the same directory:
+contains `--aux` to the in-process CosyVoice3 runtime:
 
 ```sh
 llama-tts -m cosyvoice3-llm-bf16.gguf --aux cosyvoice3-aux-llm-f32.gguf \
@@ -121,14 +121,14 @@ llama-tts -m cosyvoice3-llm-bf16.gguf --aux cosyvoice3-aux-llm-f32.gguf \
     --prompt-wav zero_shot_prompt.wav -o out.wav
 ```
 
-For the OpenAI-compatible server, export `COSY_TTS_CMD` with the fixed part
-of the same command line.  `POST /v1/audio/speech` then accepts the request in
-the task description (`input`, `voice`, `response_format`, base64 `ref_audio`
-and `ref_text`).  The existing Qwen3-TTS path is unchanged.
+For the OpenAI-compatible server, set `COSYVOICE3_HOME` to the model package
+directory.  `llama-server` creates the kernel sessions and runs the reference
+warm-up in its own process before `/health` becomes ready.  `POST
+/v1/audio/speech` then accepts `input`, `voice`, `response_format`, base64
+`ref_audio` and `ref_text`; no separate TTS worker process is started.  The
+existing Qwen3-TTS path is unchanged.
 
 ```sh
-COSY_TTS_CMD="./cosy-tts -m cosyvoice3-llm-bf16.gguf --aux cosyvoice3-aux-llm-f32.gguf \
-    --tables tables --campplus campplus.onnx --tokenizer speech_tokenizer_v3.onnx \
-    --flow-encoder flow_encoder.onnx --flow-npu flow_npu4.axmodel --hift-npu hift_npu4.axmodel" \
+COSYVOICE3_HOME="$PWD" \
     llama-server -m cosyvoice3-llm-bf16.gguf -np 1 --host 0.0.0.0 --port 18260
 ```
