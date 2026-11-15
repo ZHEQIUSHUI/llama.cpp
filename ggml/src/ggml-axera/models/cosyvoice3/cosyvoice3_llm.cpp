@@ -705,8 +705,10 @@ ggml_status cosyvoice3_llm::compute(ggml_cgraph * g) {
         GGML_ASSERT(logits->type == GGML_TYPE_F32 && logits->ne[0] >= SPEECH_VOCAB);
         const int64_t n_out = logits->ne[1];
         const int64_t n     = SPEECH_VOCAB;
+        bool text_tail_consumed = false;
         GGML_ASSERT(last_logits && (*last_logits)->size >= (size_t) SPEECH_PAD * sizeof(float));
         if (n_out == 1) {
+            text_tail_consumed = false;
             // The stage AXModel computed the head of the last valid row (prefill reduces it inside the graph).
             memcpy(logits->data, (*last_logits)->vir, (size_t) n * sizeof(float));
         } else {
@@ -725,6 +727,7 @@ ggml_status cosyvoice3_llm::compute(ggml_cgraph * g) {
             // running the 6761-row head on all T rows here costs hundreds of milliseconds for a
             // prefill and is never observed.
             const bool last_row_only = result && result->ne[1] == T;
+            text_tail_consumed = !last_row_only;
             const ggml_tensor * w = logits->src[0];
             for (int64_t r = 0; r < n_out; ++r) {
                 const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : (int) r;
@@ -741,12 +744,17 @@ ggml_status cosyvoice3_llm::compute(ggml_cgraph * g) {
                 }
             }
         }
-        // The model's text vocabulary is not part of the output; keep the tail finite-but-never-sampled so a caller
-        // that does look at the whole Qwen2 row cannot select a zero row.
-        for (int64_t r = 0; r < n_out; ++r) {
-            float * o = (float *) ((char *) logits->data + r * logits->nb[1]);
-            for (int64_t i = n; i < logits->ne[0]; ++i) {
-                o[i] = -INFINITY;
+        // The stage models expose a speech-only head.  The TTS runtime samples
+        // the first 6761 values and never observes the Qwen2 text vocabulary,
+        // so do not spend a prefill writing ~74 MiB of -inf into that tail.
+        // A logits-only caller that explicitly asks for the text tail still
+        // gets the finite-but-never-sampled values.
+        if (text_tail_consumed) {
+            for (int64_t r = 0; r < n_out; ++r) {
+                float * o = (float *) ((char *) logits->data + r * logits->nb[1]);
+                for (int64_t i = n; i < logits->ne[0]; ++i) {
+                    o[i] = -INFINITY;
+                }
             }
         }
         if (ggml_backend_buffer_is_axera(logits->buffer)) {

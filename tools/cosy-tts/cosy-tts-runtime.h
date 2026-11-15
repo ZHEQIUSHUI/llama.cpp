@@ -21,9 +21,10 @@ bool cosyvoice3_service_start(const std::vector<std::string> & args, std::string
 bool cosyvoice3_service_request(const std::string & text,
                                 const std::string & ref_text,
                                 const std::vector<uint8_t> & ref_wav,
-                                uint32_t seed,
+                                uint32_t seed, bool streaming,
                                 const cosy_audio_chunk_callback & on_chunk,
-                                std::string & error);
+                                std::string & error,
+                                std::string * pcm_out = nullptr);
 
 void cosyvoice3_service_stop();
 bool cosyvoice3_service_available();

@@ -88,8 +88,8 @@ static bool server_cosy_tts_start(std::string & error) {
         "--tables", path("tables"),
         "--campplus", path("onnx/campplus.onnx"),
         "--tokenizer", path("onnx/speech_tokenizer_v3.onnx"),
-        "--flow-loop-npu", path("kernels/cosyvoice3_flow_loop_c512_npu4.axmodel"),
-        "--flow-loop-left", "64",
+        "--flow-loop-npu", path("kernels/cosyvoice3_flow_loop_npu4.axmodel"),
+        "--flow-loop-left", "25",
         "--hift-npu", path("kernels/cosyvoice3_hift_dec_c512_npu4.axmodel"),
         "--feat-cache", path("cache"),
         "-p", "x", "--prompt-text", "x", "--prompt-wav", "/dev/null",
@@ -6934,7 +6934,7 @@ void server_routes::init_routes() {
                                 return true;
                             };
                             std::string err;
-                            if (!cosyvoice3_service_request(text, ref_text, ref_wav, cosy_seed, cb, err)) {
+                            if (!cosyvoice3_service_request(text, ref_text, ref_wav, cosy_seed, true, cb, err)) {
                                 std::lock_guard<std::mutex> lock(st->mutex);
                                 st->error = std::move(err);
                             }
@@ -6970,7 +6970,7 @@ void server_routes::init_routes() {
             };
             std::string cosy_error;
             if (!cosyvoice3_service_request(task.tts.prompt, task.tts.ref_text, task.tts.ref_audio,
-                                            cosy_seed, cb, cosy_error)) {
+                                            cosy_seed, false, cb, cosy_error, &pcm)) {
                 res->error(format_error_response(cosy_error, ERROR_TYPE_SERVER));
                 return res;
             }
