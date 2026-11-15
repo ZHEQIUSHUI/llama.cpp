@@ -891,7 +891,7 @@ struct mtmd_context {
                     img_beg = "<|image_start|>";
                     img_end = "<|image_end|>";
                     LOG_WRN("%s: llama 4 vision is known to have degraded quality:\n"
-                            "    https://github.com/ggml-org/llama.cpp/pull/13282\n", __func__);
+                            "    https://github.com/ZHEQIUSHUI/llama.cpp/pull/13282\n", __func__);
                     image_preproc = std::make_unique<mtmd_image_preprocessor_llava_uhd>(ctx_v);
                     ov_img_first = false;
                 } break;
@@ -1074,7 +1074,7 @@ struct mtmd_context {
         projector_type proj = clip_get_projector_type(ctx_a);
 
         LOG_WRN("%s: audio input is in experimental stage and may have reduced quality:\n"
-                "    https://github.com/ggml-org/llama.cpp/discussions/13759\n", __func__);
+                "    https://github.com/ZHEQIUSHUI/llama.cpp/discussions/13759\n", __func__);
 
         // set preprocessor
         switch (proj) {
@@ -1652,7 +1652,7 @@ struct mtmd_tokenizer {
             } else {
 
                 if (preproc_out.entries.size() == 0) {
-                    LOG_ERR("%s: no image tokens produced by preprocessor (ref: https://github.com/ggml-org/llama.cpp/pull/24769)\n", __func__);
+                    LOG_ERR("%s: no image tokens produced by preprocessor (ref: https://github.com/ZHEQIUSHUI/llama.cpp/pull/24769)\n", __func__);
                     return 2;
                 }
 

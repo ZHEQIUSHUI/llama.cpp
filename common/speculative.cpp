@@ -398,7 +398,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             } else {
                 // mtmd input is projected by the target encoder, a draft with a different width cannot read it
                 // it gets zeros instead, keeping its positions contiguous
-                // ref: https://github.com/ggml-org/llama.cpp/pull/29385#discussion_r4124743243
+                // ref: https://github.com/ZHEQIUSHUI/llama.cpp/pull/29385#discussion_r4124743243
                 const size_t n_embd = t.embd.n_rows * t.embd.n_embd;
                 const bool same_width = n_embd == zeros.size();
                 if (!same_width && !zeros_warned) {
@@ -1263,7 +1263,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // Target prefill may contain token IDs or multimodal embeddings. Both
         // produce the target-layer features used to seed the draft KV cache, so
         // embeddings are injected too, except the pinned ones skipped below.
-        // TODO: revisit after https://github.com/ggml-org/llama.cpp/pull/24669 is merged
+        // TODO: revisit after https://github.com/ZHEQIUSHUI/llama.cpp/pull/24669 is merged
         const bool has_tokens     = batch_in.has_token();
         const bool has_embeddings = batch_in.has_embd();
         if (has_tokens == has_embeddings) {
@@ -1807,7 +1807,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
                 if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                    // ref: https://github.com/ZHEQIUSHUI/llama.cpp/pull/24340/changes#r3413498544
                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                         if (i_batch_beg[seq_id] < 0) {
                             continue;
@@ -2148,7 +2148,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
+                    // ref: https://github.com/ZHEQIUSHUI/llama.cpp/pull/24340#discussion_r3448031546
                     chain_h[seq_id].insert(chain_h[seq_id].end(), h_row, h_row + n_embd);
 
                     const int n_rows = (int) result.size() + 1; // id_last + tokens drafted so far
@@ -2349,7 +2349,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         if (this->params.n_match < 16) {
             SPC_WRN("ngram_mod n_match=%d is too small - poor quality is possible, "
-                    "see: https://github.com/ggml-org/llama.cpp/pull/19164\n", this->params.n_match);
+                    "see: https://github.com/ZHEQIUSHUI/llama.cpp/pull/19164\n", this->params.n_match);
         }
 
         sinfos.resize(n_seq);

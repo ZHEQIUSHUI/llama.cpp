@@ -75,7 +75,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     // when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size
     if (swa_full) {
         LLAMA_LOG_WARN("%s: using full-size SWA cache (ref: %s)\n",
-                __func__, "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                __func__, "https://github.com/ZHEQIUSHUI/llama.cpp/pull/13194#issuecomment-2868343055");
 
         size_swa = size_base;
     }

@@ -195,7 +195,7 @@ static std::vector<llama_token> server_sample_and_accept_synth(
     return result;
 }
 
-// state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
+// state diagram: https://github.com/ZHEQIUSHUI/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
     SLOT_STATE_WAIT_OTHER, // after assigning a task, but waiting for parent slot to process prompt
@@ -341,7 +341,7 @@ struct server_slot {
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
-    //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
+    //       see https://github.com/ZHEQIUSHUI/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
     std::unique_ptr<const server_task> task_prev; // used for debugging
 
@@ -2277,7 +2277,7 @@ private:
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` or `--slot-save-path DIR` to enable it\n");
         }
-        SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+        SRV_TRC("%s", "for more info see https://github.com/ZHEQIUSHUI/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
@@ -3426,7 +3426,7 @@ private:
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
-        //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+        //       this is not true for SWA models: https://github.com/ZHEQIUSHUI/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -4476,7 +4476,7 @@ private:
                 const int n_left    = slot.prompt.n_tokens() - n_keep;
                 int       n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
 
-                // ref: https://github.com/ggml-org/llama.cpp/pull/24786
+                // ref: https://github.com/ZHEQIUSHUI/llama.cpp/pull/24786
                 n_discard = std::clamp(n_discard, 0, std::max(0, n_left - 1));
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
@@ -4485,7 +4485,7 @@ private:
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
                 // add generated tokens to cache
-                // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
+                // ref: https://github.com/ZHEQIUSHUI/llama.cpp/pull/16818#discussion_r2473269481
                 {
                     GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
 
@@ -4893,7 +4893,7 @@ private:
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
-                            // ref: https://github.com/ggml-org/llama.cpp/pull/24110
+                            // ref: https://github.com/ZHEQIUSHUI/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
                             // the first evaluated token attends to the positions > pos_eval - n_swa, so a SWA state
@@ -4923,7 +4923,7 @@ private:
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
-                                    GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
+                                    GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ZHEQIUSHUI/llama.cpp/pull/13833#discussion_r2116181237");
                                 }
 
                                 // when the prompt prefix does not match, print the tokens around the mismatch
@@ -5012,7 +5012,7 @@ private:
 
                                     if (do_reset) {
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                                                "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                                "https://github.com/ZHEQIUSHUI/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
                                     }
@@ -5268,7 +5268,7 @@ private:
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
                         //  - 4
-                        // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+                        // ref: https://github.com/ZHEQIUSHUI/llama.cpp/pull/20288
                         // On the Axera NPU every extra prompt batch pays a graph rebuild and a restart of the prefill
                         // kernels, and a checkpoint copies hundreds of MiB: keep only the user-message checkpoints
                         // there (a regenerate replays the last user message). LLAMA_SERVER_CKPT_TAIL=1/0 overrides.
@@ -5380,7 +5380,7 @@ private:
         return on && !use_mixed_batch();  // (use_mixed_batch() adds the whole prompt at once already)
     }
 
-    // see https://github.com/ggml-org/llama.cpp/pull/29969
+    // see https://github.com/ZHEQIUSHUI/llama.cpp/pull/29969
     // TODO @ngxson : maybe remove this once we use "mixed" batch everywhere
     bool use_mixed_batch() const {
         return !llama_get_memory(ctx_tgt) || !llama_get_causal_attn(ctx_tgt);
@@ -5449,7 +5449,7 @@ private:
             SRV_WRN("%s", "no tokens to decode\n");
 
             if (++n_empty_consecutive > 3) {
-                GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
+                GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ZHEQIUSHUI/llama.cpp/pull/20277");
             }
 
             return decode_result::ok; // nothing to decode
@@ -5562,7 +5562,7 @@ private:
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
-        //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+        //       ref: https://github.com/ZHEQIUSHUI/llama.cpp/pull/22728#issuecomment-4400925384
         // while the adaptive gate has drafting off, do not pay the draft-context catch-up after every target
         // decode: the next draft (a sparse probe) is verified by the target anyway, so a stale draft KV can only
         // cost acceptance, never output correctness
@@ -5641,7 +5641,7 @@ private:
         };
 
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
-        // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
+        // so for now we will throw an error in this case: https://github.com/ZHEQIUSHUI/llama.cpp/issues/24840
         iterate(slots, [&](server_slot & slot) {
             for (auto & i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
@@ -6353,7 +6353,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     } else {
         // in streaming mode, the first error must be treated as non-stream response
         // this is to match the OAI API behavior
-        // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
+        // ref: https://github.com/ZHEQIUSHUI/llama.cpp/pull/16486#discussion_r2419657309
         auto first_result = rd.next(req.should_stop);
         if (first_result == nullptr) {
             GGML_ASSERT(req.should_stop());

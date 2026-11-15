@@ -167,7 +167,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     if (!is_router_server) {
         // validate batch size for embeddings
         // embeddings require all tokens to be processed in a single ubatch
-        // see https://github.com/ggml-org/llama.cpp/issues/12836
+        // see https://github.com/ZHEQIUSHUI/llama.cpp/issues/12836
         if (params.embedding && params.n_batch > params.n_ubatch) {
             SRV_WRN("embeddings enabled with n_batch (%d) > n_ubatch (%d)\n", params.n_batch, params.n_ubatch);
             SRV_WRN("setting n_batch = n_ubatch = %d to avoid assertion failure\n", params.n_ubatch);
@@ -352,7 +352,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     };
 
     if (params.cors_origins == "*" && params.api_keys.empty()) {
-        SRV_WRN("%s", "security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)\n");
+        SRV_WRN("%s", "security: no API key is set and CORS allows all origins (see https://github.com/ZHEQIUSHUI/llama.cpp/pull/25655)\n");
     }
 
     // CORS proxy (EXPERIMENTAL, only used by the Web UI for MCP)
