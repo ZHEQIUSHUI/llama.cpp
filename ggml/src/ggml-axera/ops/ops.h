@@ -113,6 +113,7 @@ struct output_head {
     std::vector<int32_t> dids;
     axera_cmm            dq, ds, dy;
     bool                 dargmax = false;  // the draft head returns one (local id, logit) instead of 65536 logits
+    bool                 dqm4 = false;     // the gathered draft rows are MXFP4 (else MXFP8, matching q / s)
     axera_cmm            did, dtop;
     bool                 draft = false;  // the next run's single output row through the draft head
     // one already-normalized row through an argmax draft head (the fused draft chain); the global id
@@ -142,9 +143,23 @@ struct output_head {
     // logits for the fallback path, plus one id/logit per row. The greedy sampler reads only the latter.
     const kernel *                     ck = nullptr;
     int                                cR = 0;
-    axera_cmm                          cnorm, cids, ctop, cx;
+    int64_t                            vp = 0;   // the vocabulary the head kernels were built for (rounded up)
+    int64_t                            cVP = 0;  // the head kernel's padded vocabulary (>= w->ne[1])
+    axera_cmm                          cnorm, cids, ctop, cx, cpad;
     const float *                      cgw = nullptr;
     std::vector<AX_ENGINE_IO_BUFFER_T> cin, cout;
+    // a layer kernel's merged output head: the last group call writes logits / ids / top_logits (and, for the
+    // decode group, the sampler's top-K). The host only publishes the outputs, no head kernel call.
+    const kernel *                     mg = nullptr;  // the decode group
+    const kernel *                     mp = nullptr;  // the prefill kernel when it carries the head
+    axera_cmm                          mgh, mgt;     // the layer kernel's runtime head / top-K flags
+    axera_cmm                          mgl;          // one full-vocabulary logits row (a non-last group)
+    axera_cmm                          mvl;          // the prefill head's four selected logits rows
+    axera_cmm                          mpr;          // the prefill head's selected output rows (four int32)
+    const float *                      mgnorm = nullptr;
+    bool                               mdirect = false;  // the decode head's logits write the graph row directly
+    ggml_tensor *                      mlogits = nullptr;
+    size_t                             fstride = 0;  // the graph logits' row stride, for full_row
     // the same combined head for an MTP verify's four rows (role lm_head.verify; input m = the valid rows)
     const kernel *                     c4k = nullptr;
     axera_cmm                          c4norm, c4x, c4m, c4ids, c4top;
@@ -156,6 +171,15 @@ struct output_head {
     bool bind_fused(const kernel & lm, const ggml_tensor * output_weight);
     bool bind_combined(const kernel & lm, const ggml_tensor * output_weight);
     bool bind_combined4(const kernel & lm, const ggml_tensor * output_weight);
+    // a layer kernel's merged head: the weight is the graph's output weight; the kernel's IO names the rest
+    bool bind_merged(const kernel & g, const ggml_tensor * output_weight);
+    bool bind_merged_prefill(const kernel & p, const ggml_tensor * output_weight);
+    bool bind_merged_logits(ggml_tensor * logits);  // direct write when the graph row holds the padded vocabulary
+    bool merged_topk() const;
+    void prepare_merged_topk();  // the host sampler's penalty state, before the last decode group runs
+    void set_merged_norm(const float * w, int64_t K);  // the graph's final norm, into the layer head's input
+    void finish_merged_decode(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,
+                              ggml_tensor * logits);
     bool combined_ready(ggml_cgraph * g, const graph_names & names) const;
     bool topk_ready(ggml_cgraph * g, const graph_names & names, int T) const;
     void run_combined(ggml_cgraph * g, const graph_names & names, const std::vector<float> & h, int T,

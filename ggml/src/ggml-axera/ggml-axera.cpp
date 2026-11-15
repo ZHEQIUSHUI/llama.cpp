@@ -481,6 +481,17 @@ static bool ggml_backend_axera_sched_whole_graph(const struct ggml_cgraph * g) {
     if (g == NULL || g->n_nodes == 0) {
         return false;
     }
+    // A VoxCPM2 manifest may carry only the acoustic roles: then the BaseLM is
+    // deliberately on CPU and this adapter must not claim the llama graph.
+    // A server that drives VoxCPM2 through its own runtime also sets this env
+    // while it creates the generic llama_context, so that context stays CPU.
+    if (getenv("GGML_AXERA_DISABLE_MODEL_OFFLOAD") != nullptr) {
+        return false;
+    }
+    const axera::manifest * m = axera::kernels();
+    if (m && m->model == "voxcpm2_base" && !m->has("prefill")) {
+        return false;
+    }
     for (int i = 0; i < g->n_nodes; ++i) {
         if (axera_pooling_op(g->nodes[i])) {
             return false;

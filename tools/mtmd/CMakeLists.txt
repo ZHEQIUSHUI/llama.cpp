@@ -22,6 +22,8 @@ add_library(mtmd
             mtmd-helper-gen.cpp
             mtmd-helper-common.h
             mtmd-helper.h
+            forced-aligner-run.cpp
+            forced-aligner.h
             clip.cpp
             clip.h
             clip-impl.h
@@ -162,6 +164,15 @@ if (LLAMA_BUILD_TOOLS)
     set(TARGET llama-mtmd-cli)
     add_executable         (${TARGET} mtmd-cli.cpp)
     set_target_properties  (${TARGET} PROPERTIES OUTPUT_NAME llama-mtmd-cli)
+    if(LLAMA_TOOLS_INSTALL)
+        install(TARGETS ${TARGET} RUNTIME)
+    endif()
+    target_link_libraries  (${TARGET} PRIVATE llama-common mtmd Threads::Threads)
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+    set(TARGET llama-forced-aligner)
+    add_executable         (${TARGET} forced-aligner.cpp)
+    set_target_properties  (${TARGET} PROPERTIES OUTPUT_NAME llama-forced-aligner)
     if(LLAMA_TOOLS_INSTALL)
         install(TARGETS ${TARGET} RUNTIME)
     endif()

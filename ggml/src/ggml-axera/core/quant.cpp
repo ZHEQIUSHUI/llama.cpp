@@ -66,14 +66,19 @@ axera_split_report axera_split_report_instance;
 }  // namespace
 
 // [N, K] weight of any GGUF type -> MXFP8 elements [N, K] and scales [N, K / 32] in new CMM buffers
-void axera_quantize_mxfp8(const ggml_tensor * w, axera_cmm & q, axera_cmm & s) {
+void axera_quantize_mxfp8(const ggml_tensor * w, axera_cmm & q, axera_cmm & s, int64_t pad_rows) {
     GGML_ASSERT(w->ne[0] % AXERA_MX_GROUP == 0);
     const int64_t K = w->ne[0], N = ggml_nrows(w);
-    q = axera_cmm_alloc(N * K);
-    s = axera_cmm_alloc(N * K / AXERA_MX_GROUP);
+    GGML_ASSERT(pad_rows >= 0);
+    q = axera_cmm_alloc((N + pad_rows) * K);
+    s = axera_cmm_alloc((N + pad_rows) * K / AXERA_MX_GROUP);
     axera_for_rows_f32(w, [&](int64_t r, const float * row) {
         axera_quantize_row_mxfp8_f32(row, (uint8_t *) q->vir + r * K, (uint8_t *) s->vir + r * (K / AXERA_MX_GROUP), K);
     });
+    if (pad_rows > 0) {
+        memset((uint8_t *) q->vir + N * K, 0, pad_rows * K);
+        memset((uint8_t *) s->vir + N * (K / AXERA_MX_GROUP), 127, pad_rows * (K / AXERA_MX_GROUP));
+    }
     q->flush(q->vir, q->size);
     s->flush(s->vir, s->size);
 }

@@ -315,6 +315,7 @@ static std::unique_ptr<manifest> load_manifest(const std::string & dir) {
     m->model   = j.at("model").get<std::string>();
     m->context = j.at("context").get<int64_t>();
     m->cores   = j.at("cores").get<int>();
+    m->phases  = j.value("phases", 4);
     for (const auto & [kind, ps] : j.at("params").items()) {
         for (const auto & [name, p] : ps.items()) {
             param_desc d;

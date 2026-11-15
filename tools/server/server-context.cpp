@@ -1,3 +1,6 @@
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -7,6 +10,8 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "voxcpm2_runtime.h"
+#include "voxcpm2_wav.h"
 
 #include "build-info.h"
 #include "base64.hpp"
@@ -20,6 +25,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "cosy-tts-runtime.h"
+#include "gguf.h"
+#include "forced-aligner.h"
 
 #include <algorithm>
 #include <cctype>
@@ -57,6 +64,25 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static std::vector<uint8_t> server_voxcpm2_encode_wav(const std::vector<float> & pcm, int sample_rate) {
+    const int32_t n_samples = (int32_t) pcm.size();
+    const int32_t data_size = n_samples * 2;
+    std::vector<uint8_t> out((size_t) 44 + data_size);
+    uint8_t * p = out.data();
+    auto w32 = [&](int32_t v) { memcpy(p, &v, 4); p += 4; };
+    auto w16 = [&](int16_t v) { memcpy(p, &v, 2); p += 2; };
+    memcpy(p, "RIFF", 4); p += 4; w32(36 + data_size);
+    memcpy(p, "WAVE", 4); p += 4;
+    memcpy(p, "fmt ", 4); p += 4; w32(16); w16(1); w16(1);
+    w32(sample_rate); w32(sample_rate * 2); w16(2); w16(16);
+    memcpy(p, "data", 4); p += 4; w32(data_size);
+    auto * dst = reinterpret_cast<int16_t *>(p);
+    for (int32_t i = 0; i < n_samples; ++i) {
+        dst[i] = (int16_t) (std::max(-1.0f, std::min(1.0f, pcm[i])) * 32767.0f);
+    }
+    return out;
+}
 
 struct server_tts_sampler_ctx {
     common_sampler * smpl = nullptr;
@@ -98,6 +124,36 @@ static bool server_cosy_tts_start(std::string & error) {
         "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。",
     };
     return cosyvoice3_service_start(args, error);
+}
+
+// A forced aligner emits one classifier row per timestamp token.  The server's normal output
+// reserve is sized for one row per slot; size a separate reserve for this non-autoregressive path.
+static int server_model_embedding_length_out(const std::string & path) {
+    gguf_init_params p = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), p);
+    if (!g) {
+        return 0;
+    }
+    int result = 0;
+    for (const char * key : { "qwen3vl.embedding_length_out", "qwen3.embedding_length_out" }) {
+        const int64_t id = gguf_find_key(g, key);
+        if (id < 0) {
+            continue;
+        }
+        const gguf_type type = gguf_get_kv_type(g, id);
+        if (type == GGUF_TYPE_UINT32) {
+            result = (int) gguf_get_val_u32(g, id);
+        } else if (type == GGUF_TYPE_INT32) {
+            result = gguf_get_val_i32(g, id);
+        } else if (type == GGUF_TYPE_UINT64) {
+            result = (int) gguf_get_val_u64(g, id);
+        } else if (type == GGUF_TYPE_INT64) {
+            result = (int) gguf_get_val_i64(g, id);
+        }
+        break;
+    }
+    gguf_free(g);
+    return result;
 }
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -1516,6 +1572,99 @@ public:
         return metrics;
     }
 
+    bool voxcpm2_available() const {
+        return vox_runtime != nullptr;
+    }
+
+    bool voxcpm2_synthesize_stream(const server_voxcpm2_request & request,
+                                   const std::function<bool(const std::vector<float> &, bool)> & on_chunk,
+                                   std::string & error) {
+        if (!vox_runtime) {
+            error = "VoxCPM2 is not enabled; start llama-server with --voxcpm2-acoustic";
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(vox_mutex);
+        VoxCPM2GenerateParams params;
+        params.max_steps           = request.max_steps;
+        params.inference_timesteps = request.timesteps;
+        params.cfg_value           = request.cfg_value;
+        params.temperature         = request.temperature;
+        params.seed                = request.seed;
+
+        bool ok = false;
+        if (request.ref_audio.empty()) {
+            ok = vox_runtime->generate_streaming(request.input, on_chunk, params);
+        } else {
+            std::vector<float> ref_pcm;
+            int                ref_sr = 0;
+            if (!voxcpm2::load_wav_memory(request.ref_audio.data(), request.ref_audio.size(), ref_pcm, ref_sr)) {
+                error = "invalid ref_audio WAV data";
+                return false;
+            }
+            params.reference_sample_rate = ref_sr;
+            if (!request.ref_text.empty()) {
+                ok = vox_runtime->generate_with_continuation_streaming(
+                        request.input, request.ref_text, ref_pcm, on_chunk, params);
+            } else {
+                ok = vox_runtime->generate_with_clone_streaming(request.input, ref_pcm, on_chunk, params);
+            }
+        }
+        if (!ok) {
+            error = vox_runtime->last_error();
+            if (error.empty()) {
+                error = "VoxCPM2 streaming generation failed";
+            }
+        }
+        return ok;
+    }
+
+    bool voxcpm2_synthesize(const server_voxcpm2_request & request,
+                            server_voxcpm2_result & result, std::string & error) {
+        if (!vox_runtime) {
+            error = "VoxCPM2 is not enabled; start llama-server with --voxcpm2-acoustic";
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(vox_mutex);
+        VoxCPM2GenerateParams params;
+        params.max_steps           = request.max_steps;
+        params.inference_timesteps = request.timesteps;
+        params.cfg_value           = request.cfg_value;
+        params.temperature         = request.temperature;
+        params.seed                = request.seed;
+
+        const int64_t t0 = ggml_time_us();
+        if (request.ref_audio.empty()) {
+            result.pcm = vox_runtime->generate(request.input, params);
+        } else {
+            std::vector<float> ref_pcm;
+            int                ref_sr = 0;
+            if (!voxcpm2::load_wav_memory(request.ref_audio.data(), request.ref_audio.size(), ref_pcm, ref_sr)) {
+                error = "invalid ref_audio WAV data";
+                return false;
+            }
+            params.reference_sample_rate = ref_sr;
+            if (!request.ref_text.empty()) {
+                result.pcm = vox_runtime->generate_with_continuation(
+                        request.input, request.ref_text, ref_pcm, params);
+            } else {
+                result.pcm = vox_runtime->generate_with_clone(request.input, ref_pcm, params);
+            }
+        }
+        result.t_gen_s = (ggml_time_us() - t0) / 1e6;
+        if (result.pcm.empty()) {
+            error = vox_runtime->last_error();
+            if (error.empty()) {
+                error = "VoxCPM2 generation produced no audio";
+            }
+            return false;
+        }
+        result.sample_rate = vox_runtime->sample_rate();
+        result.n_steps     = vox_runtime->audio_frame_count;
+        return true;
+    }
+
     void reset_metrics_bucket() {
         metrics.reset_bucket();
     }
@@ -1545,6 +1694,11 @@ private:
 
     // only used by SERVER_TASK_TYPE_TTS, on the main loop thread
     std::unique_ptr<mtmd_helper::gen_audio> tts_gen;
+
+    // VoxCPM2 owns its BaseLM/Acoustic runtime; HTTP requests are serialized.
+    std::unique_ptr<VoxCPM2Runtime> vox_runtime;
+    std::mutex                      vox_mutex;
+    int                             voxcpm2_ngl = -1;
 
     bool add_bos_token = true;
 
@@ -1614,6 +1768,10 @@ private:
     }
 
     void destroy() {
+        if (vox_runtime) {
+            vox_runtime->free();
+            vox_runtime.reset();
+        }
         tts_gen.reset();
         spec.reset();
         spec_init.reset();
@@ -1690,10 +1848,33 @@ private:
 
         const bool is_resume = sleeping;
 
+        const bool voxcpm2_enabled = !params.voxcpm2_acoustic.empty();
+        if (params.n_gpu_layers > 0) {
+            voxcpm2_ngl = params.n_gpu_layers;
+        }
+        const int voxcpm2_n_gpu_layers = voxcpm2_ngl;
+
         params_base = params;
+        if (voxcpm2_enabled) {
+            // The VoxCPM2 runtime owns its own BaseLM context and NPU KV/banks.
+            // Keep the generic llama_server context on CPU so the 28-layer model
+            // and its 224 MiB paged KV are not allocated twice on the NPU.
+            params_base.n_gpu_layers = 0;
+        }
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+        // Only the audiovisual classifier path needs many output rows.  Do not
+        // change the output reserve of text embedding / generation models that
+        // happen to carry the same metadata.
+        if (!params_base.mmproj.path.empty() && !params_base.embedding &&
+                server_model_embedding_length_out(params_base.model.path) > 0) {
+            const int base = params_base.n_ctx > 0 ? params_base.n_ctx : 4096;
+            const int align_outputs = std::max(1, std::min(params_base.n_batch, base));
+            params_base.n_outputs_max = align_outputs;
+            params_base.n_outputs_max_per_seq = align_outputs;
+            SRV_INF("forced aligner: output reserve = %d rows\n", align_outputs);
+        }
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -1784,7 +1965,19 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        const char * old_disable_offload = getenv("GGML_AXERA_DISABLE_MODEL_OFFLOAD");
+        const std::string saved_disable_offload = old_disable_offload ? old_disable_offload : "";
+        if (voxcpm2_enabled) {
+            setenv("GGML_AXERA_DISABLE_MODEL_OFFLOAD", "1", 1);
+        }
         llama_init = common_init_from_params(params_base);
+        if (voxcpm2_enabled) {
+            if (old_disable_offload) {
+                setenv("GGML_AXERA_DISABLE_MODEL_OFFLOAD", saved_disable_offload.c_str(), 1);
+            } else {
+                unsetenv("GGML_AXERA_DISABLE_MODEL_OFFLOAD");
+            }
+        }
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -2162,6 +2355,20 @@ private:
                 return false;
             }
             SRV_INF("%s", "CosyVoice3 runtime ready\n");
+        }
+        if (voxcpm2_enabled) {
+            const std::string & base_path = !params.voxcpm2_base_lm.empty()
+                    ? params.voxcpm2_base_lm : params.model.path;
+            SRV_INF("loading VoxCPM2 runtime: BaseLM=%s Acoustic=%s\n",
+                    base_path.c_str(), params.voxcpm2_acoustic.c_str());
+            auto rt = std::make_unique<VoxCPM2Runtime>();
+            if (!rt->init(base_path, params.voxcpm2_acoustic, voxcpm2_n_gpu_layers, true)) {
+                SRV_ERR("failed to initialize VoxCPM2 runtime: %s\n", rt->last_error().c_str());
+                return false;
+            }
+            rt->set_n_threads(params.cpuparams.n_threads);
+            vox_runtime = std::move(rt);
+            SRV_INF("VoxCPM2 runtime loaded, sample_rate=%d\n", vox_runtime->sample_rate());
         }
 
         if (!is_resume) {
@@ -2619,14 +2826,21 @@ private:
                 slot.spec_structured = slot.prompt_is_structured(slot.task->tokens);
                 static const bool cold_start = getenv("LLAMA_SPEC_COLD_START") == nullptr ||
                                                atoi(getenv("LLAMA_SPEC_COLD_START")) != 0;
-                if (cold_start && !slot.spec_structured) {
+                // Sampled requests can look structured but have low draft acceptance and pay the verified-window
+                // rollback cost for little gain.  Opt-in launchers can start them dormant like prose.
+                static const bool sample_dormant = getenv("LLAMA_SPEC_SAMPLE_DORMANT") != nullptr &&
+                                                   atoi(getenv("LLAMA_SPEC_SAMPLE_DORMANT")) != 0;
+                const bool dormant = !slot.spec_structured || (sample_dormant && slot.use_spec_rejection());
+                if (cold_start && dormant) {
                     slot.spec_gate_init   = true;
                     slot.spec_gate_on     = false;
                     slot.spec_gate_locked = true;
                     slot.spec_nextn_on    = false;
                     llama_set_embeddings_nextn(ctx_tgt, false, false);
                     cold_dormant = true;
-                    SLT_INF(slot, "%s", "adaptive MTP off (non-structured prompt starts dormant)\n");
+                    SLT_INF(slot, "%s", slot.spec_structured
+                        ? "adaptive MTP off (sampled prompt starts dormant)\n"
+                        : "adaptive MTP off (non-structured prompt starts dormant)\n");
                 }
             }
             // Structured prompts start with a short verified window and keep drafting while it pays.  A verified
@@ -3645,6 +3859,57 @@ private:
         }
     }
 
+    void process_forced_align_task(server_task && task) {
+        const int id_task = task.id;
+        auto clear_align_state = [&]() {
+            llama_synchronize(ctx_tgt);
+            for (auto & slot : slots) {
+                if (slot.prompt.n_tokens() > 0) {
+                    slot.prompt_clear();
+                }
+            }
+            llama_memory_clear(llama_get_memory(ctx_tgt), true);
+        };
+        auto fail = [&](const std::string & message, error_type type) {
+            clear_align_state();
+            queue_tasks.pop_deferred_task(-1);
+            send_error(id_task, message, type);
+        };
+
+        clear_align_state();
+        if (!mctx) {
+            return fail("forced alignment requires an audio projector", ERROR_TYPE_NOT_SUPPORTED);
+        }
+        if (llama_model_n_embd_out(model_tgt) <= 0) {
+            return fail("the loaded model is not a forced aligner", ERROR_TYPE_NOT_SUPPORTED);
+        }
+        if (params_base.n_parallel != 1) {
+            return fail("forced alignment requires --parallel 1", ERROR_TYPE_INVALID_REQUEST);
+        }
+
+        mtmd_forced_aligner::options options;
+        options.transcript = task.forced_align.transcript;
+        options.language = task.forced_align.language;
+        options.segment_ms = task.forced_align.segment_ms;
+        options.max_outputs = params_base.n_outputs_max;
+        const mtmd_forced_aligner::result aligned = mtmd_forced_aligner::run(
+                model_tgt, ctx_tgt, mctx, task.forced_align.audio.data(), task.forced_align.audio.size(), options);
+        clear_align_state();
+        if (!aligned.ok) {
+            const error_type type = aligned.code == 400 ? ERROR_TYPE_INVALID_REQUEST : ERROR_TYPE_SERVER;
+            return fail(aligned.error, type);
+        }
+
+        auto out = std::make_unique<server_task_result_align>();
+        out->id = id_task;
+        out->data = aligned.json;
+        out->input_tokens = aligned.input_tokens;
+        out->audio_tokens = aligned.audio_tokens;
+        out->t_forward_s = aligned.forward_seconds;
+        queue_tasks.pop_deferred_task(-1);
+        queue_results.send(std::move(out));
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -3667,6 +3932,21 @@ private:
                     }
                     if (!busy) {
                         process_tts_task(std::move(task));
+                    }
+                } break;
+            case SERVER_TASK_TYPE_FORCED_ALIGN:
+                {
+                    bool busy = false;
+                    for (const auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            SRV_DBG("a slot is busy, defer forced alignment task, id_task = %d\n", task.id);
+                            queue_tasks.defer(std::move(task));
+                            busy = true;
+                            break;
+                        }
+                    }
+                    if (!busy) {
+                        process_forced_align_task(std::move(task));
                     }
                 } break;
             case SERVER_TASK_TYPE_COMPLETION:
@@ -4679,7 +4959,9 @@ private:
                             // a pure append reuses the live state at the end of the cached prompt: the recurrent state
                             // is already at the right position, so rewinding through a checkpoint and replaying the tail
                             // would only copy the checkpoint payload (hundreds of MiB on Axera) for an identical result.
-                            const bool state_at_prompt_tip = n_swa == 0 && n_past == (int) slot.prompt.n_tokens();
+                            // an identical prompt has no new token: its last token is evaluated again [TAG_PROMPT_LOGITS],
+                            // which needs a state from before that token, so the tip state cannot be used as is
+                            const bool state_at_prompt_tip = n_swa == 0 && has_new_tokens && n_past == (int) slot.prompt.n_tokens();
 
                             // a continuation can still be short of the live tip: the generated tokens of the previous
                             // request are in the slot state but the client may encode the same text differently (or
@@ -5852,6 +6134,7 @@ server_context_meta server_context::get_meta() const {
         /* model_path              */ impl->params_base.model.path,
         /* model_output_modalities */ server_model_output_modalities(common_get_decision_type(impl->model_tgt)),
         /* has_mtmd                */ impl->mctx != nullptr,
+        /* has_forced_aligner      */ llama_model_n_embd_out(impl->model_tgt) > 0,
         /* has_inp_image           */ impl->chat_params.allow_image,
         /* has_inp_audio           */ impl->chat_params.allow_audio,
         /* has_inp_video           */ impl->chat_params.allow_video,
@@ -5908,6 +6191,17 @@ struct server_res_generator : server_res_spipe {
 };
 
 namespace {
+struct vox_stream_state {
+    std::mutex              mutex;
+    std::condition_variable cond;
+    std::deque<std::string> queue;
+    bool                    done   = false;
+    bool                    cancel = false;
+    bool                    header = false;
+    std::thread             worker;
+    std::string             error;
+};
+
 struct cosy_stream_state {
     std::mutex              mutex;
     std::condition_variable cond;
@@ -5936,6 +6230,24 @@ struct cosy_stream_response : server_res_generator {
     }
 };
 
+struct vox_stream_response : server_res_generator {
+    std::shared_ptr<vox_stream_state> state;
+    vox_stream_response(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds)
+            : server_res_generator(queue_tasks, queue_results, sleep_idle_seconds) {}
+    void on_complete() override {
+        if (state) {
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->cancel = true;
+                state->cond.notify_all();
+            }
+            if (state->worker.joinable()) {
+                state->worker.join();
+            }
+        }
+        server_res_generator::on_complete();
+    }
+};
 static std::string cosy_wav_header(uint32_t data_bytes, uint32_t sample_rate) {
     std::string h(44, '\0');
     auto * p = reinterpret_cast<uint8_t *>(h.data());
@@ -5946,7 +6258,24 @@ static std::string cosy_wav_header(uint32_t data_bytes, uint32_t sample_rate) {
     w32(sample_rate * 2); w16(2); w16(16); memcpy(p, "data", 4); p += 4; w32(data_bytes);
     return h;
 }
-} // namespace
+}  // namespace
+
+
+bool server_context::voxcpm2_available() const {
+    return impl->voxcpm2_available();
+}
+
+bool server_context::voxcpm2_synthesize_stream(
+        const server_voxcpm2_request & request,
+        const std::function<bool(const std::vector<float> &, bool)> & on_chunk,
+        std::string & error) {
+    return impl->voxcpm2_synthesize_stream(request, on_chunk, error);
+}
+
+bool server_context::voxcpm2_synthesize(const server_voxcpm2_request & request,
+                                        server_voxcpm2_result & result, std::string & error) {
+    return impl->voxcpm2_synthesize(request, result, error);
+}
 
 void server_context::set_state_callback(server_state_callback_t callback) {
     impl->callback_state = std::move(callback);
@@ -6764,12 +7093,158 @@ void server_routes::init_routes() {
         return handle_count_tokens(req, TASK_RESPONSE_TYPE_OAI_RESP);
     };
 
-    this->post_transcriptions_oai = [this](const server_http_req & req) {
+    auto handle_forced_align = [this](const server_http_req & req, bool transcriptions) {
+        auto res = create_response();
+        if (!meta->has_mtmd || !meta->has_forced_aligner) {
+            res->error(format_error_response("The loaded model is not a forced aligner.", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        if (params.n_parallel != 1) {
+            res->error(format_error_response("Forced alignment requires --parallel 1.", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        json body = json::parse(req.body);
+        if (!body.is_object()) {
+            throw std::invalid_argument("request body must be a JSON object");
+        }
+        auto opt_string = [&](std::initializer_list<const char *> keys, const std::string & fallback = "") -> std::string {
+            for (const char * key : keys) {
+                if (body.contains(key) && !body.at(key).is_null()) {
+                    if (!body.at(key).is_string()) {
+                        throw std::invalid_argument(string_format("\"%s\" must be a string", key));
+                    }
+                    return body.at(key).get<std::string>();
+                }
+            }
+            return fallback;
+        };
+        auto decode_base64 = [](std::string encoded) {
+            const size_t data_uri = encoded.find(";base64,");
+            if (data_uri != std::string::npos) {
+                encoded = encoded.substr(data_uri + 8);
+            }
+            const std::string decoded = base64::decode(encoded);
+            return raw_buffer(decoded.begin(), decoded.end());
+        };
+
+        raw_buffer audio;
+        for (const char * key : { "file", "audio", "input_audio" }) {
+            auto it = req.files.find(key);
+            if (it != req.files.end()) {
+                audio = it->second.data;
+                break;
+            }
+        }
+        if (audio.empty() && body.contains("audio") && !body["audio"].is_null()) {
+            const json & value = body["audio"];
+            if (value.is_object() && value.contains("data") && value["data"].is_string()) {
+                audio = decode_base64(value["data"].get<std::string>());
+            } else if (value.is_string()) {
+                audio = decode_base64(value.get<std::string>());
+            } else {
+                throw std::invalid_argument("\"audio\" must be a base64 string or an object with \"data\"");
+            }
+        }
+        if (audio.empty() && body.contains("file") && body["file"].is_string()) {
+            audio = decode_base64(body["file"].get<std::string>());
+        }
+        if (audio.empty()) {
+            throw std::invalid_argument("missing audio file: use multipart field \"file\" or JSON \"audio\"");
+        }
+
+        const std::string transcript = opt_string({ "transcript", "text" });
+        if (transcript.empty()) {
+            throw std::invalid_argument("missing required field \"transcript\" (or \"text\")");
+        }
+        const std::string language = opt_string({ "language" }, "English");
+        int segment_ms = 80;
+        if (body.contains("segment_ms") && !body["segment_ms"].is_null()) {
+            if (body["segment_ms"].is_number_integer()) {
+                segment_ms = body["segment_ms"].get<int>();
+            } else if (body["segment_ms"].is_string()) {
+                segment_ms = std::stoi(body["segment_ms"].get<std::string>());
+            } else {
+                throw std::invalid_argument("\"segment_ms\" must be an integer");
+            }
+        }
+        const std::string response_format = opt_string({ "response_format" }, "json");
+        if (transcriptions) {
+            if (response_format != "json" && response_format != "verbose_json" && response_format != "text") {
+                throw std::invalid_argument(
+                    "unsupported response_format: only \"json\", \"verbose_json\" and \"text\" are supported");
+            }
+        } else if (response_format != "json") {
+            throw std::invalid_argument("only \"json\" response_format is supported by /v1/audio/alignments");
+        }
+
+        server_task task(SERVER_TASK_TYPE_FORCED_ALIGN);
+        task.forced_align.transcript = transcript;
+        task.forced_align.language = language;
+        task.forced_align.segment_ms = segment_ms;
+        task.forced_align.audio = std::move(audio);
+        task.forced_align.response_format = response_format;
+        task.id = res->rd.get_new_id();
+        res->rd.post_task(std::move(task));
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * aligned = dynamic_cast<server_task_result_align *>(result.get());
+        GGML_ASSERT(aligned != nullptr);
+        json full = json::parse(aligned->data);
+        res->headers["X-Align-Input-Tokens"] = std::to_string(aligned->input_tokens);
+        res->headers["X-Align-Audio-Tokens"] = std::to_string(aligned->audio_tokens);
+        res->headers["X-Align-Forward-Seconds"] = string_format("%.6f", aligned->t_forward_s);
+
+        if (!transcriptions) {
+            res->ok(full);
+            return res;
+        }
+
+        if (response_format == "text") {
+            res->status = 200;
+            res->content_type = "text/plain; charset=utf-8";
+            res->data = full.value("text", std::string());
+            return res;
+        }
+        if (response_format == "json") {
+            json out = { { "text", full.value("text", std::string()) } };
+            res->ok(out);
+            return res;
+        }
+        json out = full;
+        out["task"] = "transcribe";
+        res->ok(out);
+        return res;
+    };
+
+    this->post_audio_alignments = [this, handle_forced_align](const server_http_req & req) {
+        return handle_forced_align(req, false);
+    };
+
+    this->post_transcriptions_oai = [this, handle_forced_align](const server_http_req & req) {
         auto res = create_response();
 
         if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
             res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
             return res;
+        }
+        if (meta->has_forced_aligner) {
+            const json fields = json::parse(req.body);
+            if (!fields.is_object() || (!fields.contains("transcript") && !fields.contains("text"))) {
+                res->error(format_error_response(
+                    "The loaded forced aligner requires a known transcript in \"transcript\" (or \"text\").",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            return handle_forced_align(req, true);
         }
 
         std::vector<raw_buffer> files;
@@ -6799,6 +7274,143 @@ void server_routes::init_routes() {
     this->post_audio_speech = [this](const server_http_req & req) {
         auto res = create_response();
         const bool cosyvoice3 = !meta->has_mtmd && server_cosy_tts_enabled();
+
+        if (ctx_server.voxcpm2_available()) {
+            try {
+                const json body = json::parse(req.body);
+                server_voxcpm2_request vox_req;
+                vox_req.input = body.value("input", std::string());
+                if (vox_req.input.empty()) {
+                    res->error(format_error_response("\"input\" is required", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                const std::string model = body.value("model", std::string());
+                if (!model.empty() && model != "voxcpm2" && model != "voxcpm" && model != "vox") {
+                    res->error(format_error_response("unknown model: \"" + model + "\"", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                const std::string format = body.value("response_format", std::string("wav"));
+                if (format != "wav" && format != "pcm") {
+                    res->error(format_error_response("supported response_format: wav, pcm", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                vox_req.max_steps = body.value("max_steps", body.value("max_frames", 200));
+                vox_req.timesteps = body.value("inference_timesteps", body.value("timesteps", 10));
+                vox_req.cfg_value = body.value("cfg_value", 2.0f);
+                vox_req.temperature = body.value("temperature", 1.0f);
+                vox_req.seed = body.value("seed", 42u);
+                vox_req.ref_text = body.value("ref_text", body.value("reference_text",
+                        body.value("prompt_text", std::string())));
+
+                const char * ref_keys[] = {"ref_audio", "reference_audio"};
+                for (const char * key : ref_keys) {
+                    if (!body.contains(key) || !body.at(key).is_string()) {
+                        continue;
+                    }
+                    std::string encoded = body.at(key).get<std::string>();
+                    const size_t data_uri = encoded.find(";base64,");
+                    if (data_uri != std::string::npos) {
+                        encoded = encoded.substr(data_uri + 8);
+                    }
+                    if (encoded.empty()) {
+                        continue;
+                    }
+                    const std::string decoded = base64::decode(encoded);
+                    vox_req.ref_audio.assign(decoded.begin(), decoded.end());
+                    break;
+                }
+
+                if (body.value("stream", false)) {
+                    auto st      = std::make_shared<vox_stream_state>();
+                    const int sr = 48000;
+                    const server_context_impl * ctx_ptr = &ctx_server;
+                    auto * snew = new vox_stream_response(queue_tasks, queue_results,
+                                                          params.sleep_idle_seconds);
+                    snew->state        = st;
+                    snew->content_type = format == "pcm" ? "audio/pcm" : "audio/wav";
+                    snew->headers["X-TTS-Backend"]     = "voxcpm2";
+                    snew->headers["X-TTS-Sample-Rate"] = std::to_string(sr);
+                    std::unique_ptr<server_res_generator> sres(snew);
+                    auto & res = sres;
+                    res->next = [st, vox_req, ctx_ptr, sr, format](std::string & out) -> bool {
+                        if (!st->worker.joinable()) {
+                            st->worker = std::thread([st, vox_req, ctx_ptr]() {
+                                auto cb = [st](const std::vector<float> & chunk, bool) -> bool {
+                                    if (chunk.empty()) return true;
+                                    std::string buf(chunk.size() * 2, '\0');
+                                    auto *      dst = reinterpret_cast<int16_t *>(buf.data());
+                                    for (size_t i = 0; i < chunk.size(); ++i) {
+                                        float v = std::max(-1.0f, std::min(1.0f, chunk[i]));
+                                        dst[i] = static_cast<int16_t>(v * 32767.0f);
+                                    }
+                                    std::lock_guard<std::mutex> lock(st->mutex);
+                                    if (st->cancel) return false;
+                                    st->queue.push_back(std::move(buf));
+                                    st->cond.notify_one();
+                                    return true;
+                                };
+                                std::string err;
+                                const_cast<server_context_impl *>(ctx_ptr)->voxcpm2_synthesize_stream(vox_req, cb, err);
+                                std::lock_guard<std::mutex> lock(st->mutex);
+                                st->error = std::move(err);
+                                st->done  = true;
+                                st->cond.notify_all();
+                            });
+                        }
+                        std::unique_lock<std::mutex> lock(st->mutex);
+                        st->cond.wait(lock, [&] { return !st->queue.empty() || st->done; });
+                        if (!st->queue.empty()) {
+                            std::string chunk = std::move(st->queue.front());
+                            st->queue.pop_front();
+                            if (format == "wav" && !st->header) {
+                                st->header = true;
+                                std::string h(44, '\0');
+                                auto * p = h.data();
+                                auto w32 = [&](int32_t v) { memcpy(p, &v, 4); p += 4; };
+                                auto w16 = [&](int16_t v) { memcpy(p, &v, 2); p += 2; };
+                                memcpy(p, "RIFF", 4); p += 4; w32(0x7FFFFFFF); memcpy(p, "WAVE", 4); p += 4;
+                                memcpy(p, "fmt ", 4); p += 4; w32(16); w16(1); w16(1); w32(sr); w32(sr * 2);
+                                w16(2); w16(16); memcpy(p, "data", 4); p += 4; w32(0x7FFFFFFF);
+                                h += chunk;
+                                out = std::move(h);
+                            } else {
+                                out = std::move(chunk);
+                            }
+                            return true;
+                        }
+                        lock.unlock();
+                        if (st->worker.joinable()) st->worker.join();
+                        return false;
+                    };
+                    return sres;
+                }
+
+                server_voxcpm2_result vox_result;
+                std::string vox_error;
+                if (!ctx_server.voxcpm2_synthesize(vox_req, vox_result, vox_error)) {
+                    res->error(format_error_response(vox_error, ERROR_TYPE_SERVER));
+                    return res;
+                }
+                const std::vector<uint8_t> wav = server_voxcpm2_encode_wav(vox_result.pcm, vox_result.sample_rate);
+                if (format == "wav") {
+                    res->content_type = "audio/wav";
+                    res->data.assign((const char *) wav.data(), wav.size());
+                } else {
+                    res->content_type = "audio/pcm";
+                    res->data.assign((const char *) wav.data() + 44, wav.size() - 44);
+                }
+                res->headers["X-TTS-Backend"] = "voxcpm2";
+                res->headers["X-TTS-Frames"] = std::to_string(vox_result.n_steps);
+                res->headers["X-TTS-Sample-Rate"] = std::to_string(vox_result.sample_rate);
+                res->headers["X-TTS-Audio-Seconds"] = string_format("%.3f",
+                        vox_result.sample_rate > 0 ? (double) vox_result.pcm.size() / vox_result.sample_rate : 0.0);
+                res->headers["X-TTS-Gen-Seconds"] = string_format("%.3f", vox_result.t_gen_s);
+                return res;
+            } catch (const std::exception & e) {
+                res->error(format_error_response(std::string("invalid request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
 
         if (!meta->has_mtmd && !cosyvoice3) {
             res->error(format_error_response(

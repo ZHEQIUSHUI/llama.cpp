@@ -24,13 +24,20 @@ ggml_add_backend_library(ggml-axera
                          models/qwen35_dense/qwen35_dense.cpp
                          models/qwen38_27b/qwen38_27b.cpp
                          models/qwen35_whole/qwen35_whole.cpp
+                         models/minicpm_ocr/minicpm_ocr_text.cpp
+                         models/minicpm_ocr/minicpm_ocr_vit_full.cpp
                          models/qwen35_35b_a3b/qwen35_35b_a3b.cpp
                          models/qwen35_moe_sgl/qwen35_moe_sgl.cpp
+                         models/hy_mt2/hy_mt2.cpp
                          models/qwen3/qwen3.cpp
+                         models/cpm5/cpm5.cpp
+                         models/hymt/hymt.cpp
                          models/qwen3_asr/qwen3_asr.cpp
                          models/qwen3_tts/qwen3_tts.cpp
                          models/qwen3_tts/codec.cpp
                          models/cosyvoice3/cosyvoice3_llm.cpp
+                         models/voxcpm2/voxcpm2.cpp
+                         models/voxcpm2/vox_acoustic.cpp
                          models/qwen35_vit/qwen35_vit.cpp
                          models/qwen35_vit/qwen35_vit_full.cpp
                          ggml-axera-buffer.cpp

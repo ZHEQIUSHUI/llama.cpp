@@ -75,6 +75,7 @@
 #define KEY_WA_PATTERN_MODE        "clip.vision.wa_pattern_mode"
 #define KEY_ATTN_WINDOW_SIZE       "clip.vision.window_size"
 #define KEY_MINICPMV_VERSION       "clip.minicpmv_version"
+#define KEY_MINICPMV_SLICE_ALIGN_MERGE "clip.vision.minicpmv_slice_align_merge"
 #define KEY_MINICPMV_QUERY_NUM     "clip.minicpmv_query_num"
 #define KEY_SAM_N_HEAD             "clip.vision.sam.head_count"
 #define KEY_SAM_N_BLOCK            "clip.vision.sam.block_count"
