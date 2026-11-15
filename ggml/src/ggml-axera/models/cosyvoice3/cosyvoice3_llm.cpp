@@ -614,8 +614,8 @@ ggml_status cosyvoice3_llm::compute(ggml_cgraph * g) {
         x0 = x0->src[0];
     }
     GGML_ASSERT(x0 && x0->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(x0->src[0]));
+    int n0 = 0;
     if (x0->src[0]->op != GGML_OP_NONE) {
-        int n0 = 0;
         while (n0 < g->n_nodes && g->nodes[n0] != x0) {
             ++n0;
         }
@@ -655,6 +655,7 @@ ggml_status cosyvoice3_llm::compute(ggml_cgraph * g) {
         }
     }
 
+    const auto probe_t0 = std::chrono::steady_clock::now();
     std::vector<ggml_bf16_t> xb((size_t) T * H);
     {
         axera_timer tin("input rows");
@@ -668,7 +669,9 @@ ggml_status cosyvoice3_llm::compute(ggml_cgraph * g) {
     out_h           = h_buf.data();
     last_seq_status = 0;
     axera_timer tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
+    const auto probe_t1 = std::chrono::steady_clock::now();
     const seq_status sst = seq->feed(kv.cell_of(0), T, (const uint16_t *) xb.data(), pb.data());
+    const auto probe_t2 = std::chrono::steady_clock::now();
     if (sst != SEQ_OK) {
         last_seq_status = (int) sst;
         if (sst == SEQ_MISS) {
@@ -681,6 +684,7 @@ ggml_status cosyvoice3_llm::compute(ggml_cgraph * g) {
         return GGML_STATUS_FAILED;
     }
 
+    const auto probe_t3 = std::chrono::steady_clock::now();
     // The kernel's output is already final RMSNorm(x) * output_norm: copy it to the graph's embedding result.
     if (result) {
         // A context with embeddings asks for every row.  Plain text generation asks only for the last row,
@@ -716,12 +720,25 @@ ggml_status cosyvoice3_llm::compute(ggml_cgraph * g) {
                     }
                 }
             }
+            // An embeddings context asks for every hidden row but its caller samples only the last
+            // logits row.  The stage AXModel already reduced the head of the last valid row, so
+            // running the 6761-row head on all T rows here costs hundreds of milliseconds for a
+            // prefill and is never observed.
+            const bool last_row_only = result && result->ne[1] == T;
             const ggml_tensor * w = logits->src[0];
             for (int64_t r = 0; r < n_out; ++r) {
                 const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : (int) r;
                 GGML_ASSERT(row >= 0 && row < T);
-                host_speech_logits(w, h_buf.data() + (size_t) row * H,
-                                   (float *) ((char *) logits->data + r * logits->nb[1]), n);
+                float * dst = (float *) ((char *) logits->data + r * logits->nb[1]);
+                if (last_row_only) {
+                    if (r + 1 == n_out) {
+                        memcpy(dst, (*last_logits)->vir, (size_t) n * sizeof(float));
+                    } else {
+                        memset(dst, 0, (size_t) n * sizeof(float));
+                    }
+                } else {
+                    host_speech_logits(w, h_buf.data() + (size_t) row * H, dst, n);
+                }
             }
         }
         // The model's text vocabulary is not part of the output; keep the tail finite-but-never-sampled so a caller
@@ -736,7 +753,14 @@ ggml_status cosyvoice3_llm::compute(ggml_cgraph * g) {
             ((ggml_backend_axera_buffer_context *) logits->buffer->context)->flush(logits->data, ggml_nbytes(logits));
         }
     }
-    return GGML_STATUS_SUCCESS;
+        if (T > 1 && std::getenv("COSY_LLM_PROBE")) {
+        const auto probe_t4 = std::chrono::steady_clock::now();
+        const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        fprintf(stderr, "[llm-probe] nodes=%d cpu_nodes=%d T=%d prep=%.3f feed=%.3f out=%.3f total=%.3f\n",
+                g->n_nodes, n0, T, ms(probe_t0, probe_t1), ms(probe_t1, probe_t2),
+                ms(probe_t3, probe_t4), ms(probe_t0, probe_t4));
+    }
+return GGML_STATUS_SUCCESS;
 }
 
 seq_caps cosyvoice3_llm::seq_get_caps() const {
@@ -761,10 +785,10 @@ void cosyvoice3_llm::seq_state_load(const uint8_t * src) {
     if (src) {
         memcpy(KV->vir, src, KV->size);
         KV->flush();
-    } else {
-        memset(KV->vir, 0, KV->size);
-        KV->flush();
     }
+    // A new sequence starts at cell 0.  Causal paging only reads cells that
+    // the prefill/decode kernels have already written, so clearing the 48 MiB
+    // image here would only flush cold cache lines and cost ~0.2 s per request.
 }
 
 bool cosyvoice3_llm::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t * p4, int batch0, seq_snap * snap) {

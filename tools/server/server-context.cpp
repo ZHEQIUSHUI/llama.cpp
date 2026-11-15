@@ -19,6 +19,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "cosy-tts-runtime.h"
 
 #include <algorithm>
 #include <cctype>
@@ -31,6 +32,10 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <thread>
 #include <filesystem>
 #include <random>
 #include <utility>
@@ -66,242 +71,35 @@ static llama_token server_tts_sample(void * user_data) {
 }
 
 static bool server_cosy_tts_enabled() {
-    const char * cmd = std::getenv("COSY_TTS_CMD");
-    return cmd != nullptr && cmd[0] != '\0';
+    return cosyvoice3_service_available();
 }
 
-#if !defined(_WIN32)
-static std::vector<std::string> server_split_words(const std::string & text) {
-    std::vector<std::string> words;
-    size_t i = 0;
-    while (i < text.size()) {
-        while (i < text.size() && std::isspace((unsigned char) text[i])) i++;
-        const size_t begin = i;
-        while (i < text.size() && !std::isspace((unsigned char) text[i])) i++;
-        if (i > begin) words.emplace_back(text.substr(begin, i - begin));
+static bool server_cosy_tts_start(std::string & error) {
+    const char * home_env = std::getenv("COSYVOICE3_HOME");
+    if (home_env == nullptr || home_env[0] == '\0') {
+        return true;
     }
-    return words;
+    const std::filesystem::path home(home_env);
+    const auto path = [&](const char * rel) { return (home / rel).string(); };
+    std::vector<std::string> args = {
+        "cosyvoice3",
+        "-m", path("gguf/cosyvoice3-llm-bf16.gguf"),
+        "--aux", path("gguf/cosyvoice3-aux-llm-f32.gguf"),
+        "--tables", path("tables"),
+        "--campplus", path("onnx/campplus.onnx"),
+        "--tokenizer", path("onnx/speech_tokenizer_v3.onnx"),
+        "--flow-loop-npu", path("kernels/cosyvoice3_flow_loop_c512_npu4.axmodel"),
+        "--flow-loop-left", "64",
+        "--hift-npu", path("kernels/cosyvoice3_hift_dec_c512_npu4.axmodel"),
+        "--feat-cache", path("cache"),
+        "-p", "x", "--prompt-text", "x", "--prompt-wav", "/dev/null",
+        "-o", "/tmp/cosy_service.wav", "-ngl", "99", "-t", "8", "--seed", "123",
+        "--warm-prompt-wav", path("examples/zero_shot_prompt.wav"),
+        "--warm-prompt-text",
+        "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。",
+    };
+    return cosyvoice3_service_start(args, error);
 }
-
-static uint32_t server_u32le(const uint8_t * p) {
-    return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
-}
-
-struct server_cosy_worker {
-    pid_t pid = -1;
-    int in_fd = -1;
-    int out_fd = -1;
-    std::mutex mu;
-};
-
-struct server_cosy_paths {
-    std::string text, ref_text, ref_path, out_path;
-};
-
-static server_cosy_worker g_cosy_worker;
-
-static bool server_write_all(int fd, const void * data, size_t size) {
-    const uint8_t * p = static_cast<const uint8_t *>(data);
-    while (size > 0) {
-        const ssize_t n = write(fd, p, size);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return false;
-        p += n;
-        size -= (size_t) n;
-    }
-    return true;
-}
-
-static bool server_read_all(int fd, void * data, size_t size) {
-    uint8_t * p = static_cast<uint8_t *>(data);
-    while (size > 0) {
-        const ssize_t n = read(fd, p, size);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return false;
-        p += n;
-        size -= (size_t) n;
-    }
-    return true;
-}
-
-static void server_cosy_worker_stop_locked() {
-    auto & w = g_cosy_worker;
-    if (w.in_fd >= 0) {
-        close(w.in_fd);
-        w.in_fd = -1;
-    }
-    if (w.out_fd >= 0) {
-        close(w.out_fd);
-        w.out_fd = -1;
-    }
-    if (w.pid < 0) return;
-    int status = 0;
-    for (int i = 0; i < 50; i++) {
-        const pid_t r = waitpid(w.pid, &status, WNOHANG);
-        if (r == w.pid || (r < 0 && errno == ECHILD)) {
-            w.pid = -1;
-            return;
-        }
-        usleep(100000);
-    }
-    kill(w.pid, SIGTERM);
-    for (int i = 0; i < 300; i++) {
-        const pid_t r = waitpid(w.pid, &status, WNOHANG);
-        if (r == w.pid || (r < 0 && errno == ECHILD)) break;
-        usleep(100000);
-    }
-    w.pid = -1;
-}
-
-static void server_cosy_worker_stop() {
-    std::lock_guard<std::mutex> lock(g_cosy_worker.mu);
-    server_cosy_worker_stop_locked();
-}
-
-static bool server_cosy_worker_start_locked(const std::vector<std::string> & base, std::string & error) {
-    auto & w = g_cosy_worker;
-    if (w.pid >= 0) return true;
-    int in_pipe[2] = {-1, -1}, out_pipe[2] = {-1, -1};
-    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
-        if (in_pipe[0] >= 0) { close(in_pipe[0]); close(in_pipe[1]); }
-        if (out_pipe[0] >= 0) { close(out_pipe[0]); close(out_pipe[1]); }
-        error = "pipe failed";
-        return false;
-    }
-    std::vector<std::string> words = base;
-    words.emplace_back("--worker");
-    std::vector<char *> argv;
-    argv.reserve(words.size() + 1);
-    for (auto & s : words) argv.push_back(const_cast<char *>(s.c_str()));
-    argv.push_back(nullptr);
-    const pid_t pid = fork();
-    if (pid < 0) {
-        close(in_pipe[0]); close(in_pipe[1]); close(out_pipe[0]); close(out_pipe[1]);
-        error = "fork failed";
-        return false;
-    }
-    if (pid == 0) {
-        dup2(in_pipe[0], STDIN_FILENO);
-        dup2(out_pipe[1], STDOUT_FILENO);
-        close(in_pipe[0]); close(in_pipe[1]); close(out_pipe[0]); close(out_pipe[1]);
-        execvp(argv[0], argv.data());
-        _exit(127);
-    }
-    close(in_pipe[0]);
-    close(out_pipe[1]);
-    w.pid = pid;
-    w.in_fd = in_pipe[1];
-    w.out_fd = out_pipe[0];
-    return true;
-}
-
-static bool server_cosy_worker_request_locked(server_cosy_paths & paths, std::string & error) {
-    auto & w = g_cosy_worker;
-    const std::string * fields[4] = { &paths.text, &paths.ref_text, &paths.ref_path, &paths.out_path };
-    uint32_t lens[4];
-    for (int i = 0; i < 4; i++) {
-        if (fields[i]->size() > (1u << 20)) { error = "request field too long"; return false; }
-        lens[i] = (uint32_t) fields[i]->size();
-    }
-    bool ok = server_write_all(w.in_fd, lens, sizeof(lens));
-    for (int i = 0; ok && i < 4; i++) ok = server_write_all(w.in_fd, fields[i]->data(), fields[i]->size());
-    if (!ok) { error = "worker write failed"; return false; }
-    // The worker's libraries may print diagnostics on stdout before the protocol line.  Scan lines and
-    // take the first OK/ERR, with generous bounds so one long diagnostic cannot desynchronize the pipe.
-    size_t total = 0;
-    std::string line;
-    for (;;) {
-        line.clear();
-        for (;;) {
-            char c = 0;
-            if (!server_read_all(w.out_fd, &c, 1)) { error = "worker read failed"; return false; }
-            if (c == '\n') break;
-            line.push_back(c);
-            if (line.size() > (1u << 16)) { error = "bad worker response"; return false; }
-        }
-        total += line.size() + 1;
-        if (total > (1u << 20)) { error = "bad worker response"; return false; }
-        if (line == "OK") return true;
-        if (line == "ERR") { error = "worker reported failure"; return false; }
-    }
-}
-
-static bool server_run_cosy_tts(const server_task::tts_params & tts, raw_buffer & data,
-        int & sample_rate, int64_t & n_samples, std::string & error) {
-    const char * cmd = std::getenv("COSY_TTS_CMD");
-    std::vector<std::string> words = server_split_words(cmd ? cmd : "");
-    if (words.empty()) {
-        error = "COSY_TTS_CMD is empty";
-        return false;
-    }
-
-    char ref_path[] = "/tmp/cosy_ref_XXXXXX";
-    char out_path[] = "/tmp/cosy_out_XXXXXX";
-    const int ref_fd = mkstemp(ref_path);
-    const int out_fd = mkstemp(out_path);
-    if (ref_fd < 0 || out_fd < 0) {
-        if (ref_fd >= 0) close(ref_fd);
-        if (out_fd >= 0) close(out_fd);
-        error = "failed to create temporary files";
-        return false;
-    }
-    close(out_fd);
-    size_t written = 0;
-    while (written < tts.ref_audio.size()) {
-        const ssize_t n = write(ref_fd, tts.ref_audio.data() + written, tts.ref_audio.size() - written);
-        if (n <= 0) break;
-        written += (size_t) n;
-    }
-    close(ref_fd);
-    if (written != tts.ref_audio.size()) {
-        unlink(ref_path);
-        unlink(out_path);
-        error = "failed to write the reference audio";
-        return false;
-    }
-
-    server_cosy_paths paths;
-    paths.text = tts.prompt;
-    paths.ref_text = tts.ref_text;
-    paths.ref_path = ref_path;
-    paths.out_path = out_path;
-    bool ok = false;
-    {
-        std::lock_guard<std::mutex> lock(g_cosy_worker.mu);
-        if (!server_cosy_worker_start_locked(words, error)) {
-            unlink(ref_path);
-            unlink(out_path);
-            return false;
-        }
-        ok = server_cosy_worker_request_locked(paths, error);
-        if (!ok) {
-            // A worker that died (for example after a bad reference file) is
-            // restarted once; the request itself is not silently retried.
-            server_cosy_worker_stop_locked();
-            server_cosy_worker_start_locked(words, error);
-        }
-    }
-    unlink(ref_path);
-    if (ok) {
-        std::ifstream in(out_path, std::ios::binary);
-        data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-        ok = data.size() >= 44 && !memcmp(data.data(), "RIFF", 4) && !memcmp(data.data() + 8, "WAVE", 4);
-    }
-    if (ok) {
-        const uint8_t * p = data.data();
-        const int channels = (int) (p[22] | (p[23] << 8));
-        sample_rate = (int) server_u32le(p + 24);
-        const int bits = (int) (p[34] | (p[35] << 8));
-        const uint32_t payload = server_u32le(p + 40);
-        const int frame_bytes = channels * bits / 8;
-        n_samples = frame_bytes > 0 ? payload / frame_bytes : 0;
-    } else if (error.empty()) {
-        error = "cosy-tts failed";
-    }
-    unlink(out_path);
-    return ok;
-}
-#endif
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -1706,7 +1504,7 @@ public:
     }
 
     ~server_context_impl() {
-        server_cosy_worker_stop();
+        cosyvoice3_service_stop();
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -2357,6 +2155,15 @@ private:
 
         // propagate new defaults back to caller
         params = params_base;
+
+        if (std::getenv("COSYVOICE3_HOME") != nullptr) {
+            std::string cosy_error;
+            if (!server_cosy_tts_start(cosy_error)) {
+                SRV_ERR("failed to initialize CosyVoice3 runtime: %s\n", cosy_error.c_str());
+                return false;
+            }
+            SRV_INF("%s", "CosyVoice3 runtime ready\n");
+        }
 
         if (!is_resume) {
             return init();
@@ -3707,32 +3514,6 @@ private:
         clear_tts_state();
 
         try {
-            if (task.tts.cosyvoice3) {
-#if !defined(_WIN32)
-                const int64_t t0 = ggml_time_us();
-                raw_buffer data;
-                int sample_rate = 0;
-                int64_t n_samples = 0;
-                std::string error;
-                if (!server_run_cosy_tts(task.tts, data, sample_rate, n_samples, error)) {
-                    return fail(error, ERROR_TYPE_SERVER);
-                }
-                auto out = std::make_unique<server_task_result_tts>();
-                out->id           = id_task;
-                out->data         = std::move(data);
-                out->content_type = "audio/wav";
-                out->sample_rate  = sample_rate;
-                out->n_samples    = n_samples;
-                out->t_total_s    = (ggml_time_us() - t0) / 1e6;
-                clear_tts_state();
-                queue_tasks.pop_deferred_task(-1);
-                queue_results.send(std::move(out));
-                return;
-#else
-                return fail("CosyVoice3 subprocess dispatch is not supported on this platform", ERROR_TYPE_NOT_SUPPORTED);
-#endif
-            }
-
             if (!tts_gen) {
                 return fail("audio generation is not available for this model", ERROR_TYPE_NOT_SUPPORTED);
             }
@@ -6127,6 +5908,47 @@ struct server_res_generator : server_res_spipe {
     }
 };
 
+namespace {
+struct cosy_stream_state {
+    std::mutex              mutex;
+    std::condition_variable cond;
+    std::deque<std::string> queue;
+    bool                    done   = false;
+    bool                    cancel = false;
+    bool                    header = false;
+    std::thread             worker;
+    std::string             error;
+};
+
+struct cosy_stream_response : server_res_generator {
+    std::shared_ptr<cosy_stream_state> state;
+    cosy_stream_response(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds)
+            : server_res_generator(queue_tasks, queue_results, sleep_idle_seconds) {}
+    void on_complete() override {
+        if (state) {
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->cancel = true;
+                state->cond.notify_all();
+            }
+            if (state->worker.joinable()) state->worker.join();
+        }
+        server_res_generator::on_complete();
+    }
+};
+
+static std::string cosy_wav_header(uint32_t data_bytes, uint32_t sample_rate) {
+    std::string h(44, '\0');
+    auto * p = reinterpret_cast<uint8_t *>(h.data());
+    auto w32 = [&](uint32_t v) { memcpy(p, &v, 4); p += 4; };
+    auto w16 = [&](uint16_t v) { memcpy(p, &v, 2); p += 2; };
+    memcpy(p, "RIFF", 4); p += 4; w32(36 + data_bytes); memcpy(p, "WAVE", 4); p += 4;
+    memcpy(p, "fmt ", 4); p += 4; w32(16); w16(1); w16(1); w32(sample_rate);
+    w32(sample_rate * 2); w16(2); w16(16); memcpy(p, "data", 4); p += 4; w32(data_bytes);
+    return h;
+}
+} // namespace
+
 void server_context::set_state_callback(server_state_callback_t callback) {
     impl->callback_state = std::move(callback);
 }
@@ -7074,9 +6896,97 @@ void server_routes::init_routes() {
             if (task.tts.ref_text.empty()) {
                 throw std::invalid_argument("ref_text is required for CosyVoice3 zero-shot cloning");
             }
-            if (task.tts.response_format != "wav") {
-                throw std::invalid_argument("CosyVoice3 supports response_format=\"wav\" only");
+            uint32_t cosy_seed = 123;
+            if (body.contains("seed") && !body.at("seed").is_null()) {
+                if (!body.at("seed").is_number_integer()) {
+                    throw std::invalid_argument("\"seed\" must be an integer");
+                }
+                const int64_t v = body.at("seed").get<int64_t>();
+                if (v < 0 || v > (int64_t) UINT32_MAX) {
+                    throw std::invalid_argument("\"seed\" must be in the uint32 range");
+                }
+                cosy_seed = (uint32_t) v;
             }
+            const bool stream = body.value("stream", false);
+            const int sr = 24000;
+            if (stream) {
+                auto st = std::make_shared<cosy_stream_state>();
+                auto * snew = new cosy_stream_response(queue_tasks, queue_results, params.sleep_idle_seconds);
+                snew->state        = st;
+                snew->content_type = task.tts.response_format == "pcm" ? "audio/pcm" : "audio/wav";
+                snew->headers["X-TTS-Backend"] = "cosyvoice3";
+                snew->headers["X-TTS-Sample-Rate"] = std::to_string(sr);
+                std::unique_ptr<server_res_generator> sres(snew);
+                const std::string text = task.tts.prompt;
+                const std::string ref_text = task.tts.ref_text;
+                const std::vector<uint8_t> ref_wav = task.tts.ref_audio;
+                const std::string format = task.tts.response_format;
+                sres->next = [st, text, ref_text, ref_wav, cosy_seed, sr, format](std::string & out) -> bool {
+                    if (!st->worker.joinable()) {
+                        st->worker = std::thread([st, text, ref_text, ref_wav, cosy_seed]() {
+                            auto cb = [st](const std::vector<uint8_t> & chunk, bool) -> bool {
+                                if (chunk.empty()) return true;
+                                std::string buf((const char *) chunk.data(), chunk.size());
+                                std::lock_guard<std::mutex> lock(st->mutex);
+                                if (st->cancel) return false;
+                                st->queue.push_back(std::move(buf));
+                                st->cond.notify_one();
+                                return true;
+                            };
+                            std::string err;
+                            if (!cosyvoice3_service_request(text, ref_text, ref_wav, cosy_seed, cb, err)) {
+                                std::lock_guard<std::mutex> lock(st->mutex);
+                                st->error = std::move(err);
+                            }
+                            std::lock_guard<std::mutex> lock(st->mutex);
+                            st->done = true;
+                            st->cond.notify_all();
+                        });
+                    }
+                    std::unique_lock<std::mutex> lock(st->mutex);
+                    st->cond.wait(lock, [&] { return !st->queue.empty() || st->done; });
+                    if (!st->queue.empty()) {
+                        std::string chunk = std::move(st->queue.front());
+                        st->queue.pop_front();
+                        if (format == "wav" && !st->header) {
+                            st->header = true;
+                            out = cosy_wav_header(0x7FFFFFFFu, (uint32_t) sr) + chunk;
+                        } else {
+                            out = std::move(chunk);
+                        }
+                        return true;
+                    }
+                    lock.unlock();
+                    if (st->worker.joinable()) st->worker.join();
+                    return false;
+                };
+                return sres;
+            }
+
+            std::string pcm;
+            auto cb = [&pcm](const std::vector<uint8_t> & chunk, bool) -> bool {
+                pcm.append((const char *) chunk.data(), chunk.size());
+                return true;
+            };
+            std::string cosy_error;
+            if (!cosyvoice3_service_request(task.tts.prompt, task.tts.ref_text, task.tts.ref_audio,
+                                            cosy_seed, cb, cosy_error)) {
+                res->error(format_error_response(cosy_error, ERROR_TYPE_SERVER));
+                return res;
+            }
+            if (task.tts.response_format == "wav") {
+                const std::string header = cosy_wav_header((uint32_t) pcm.size(), (uint32_t) sr);
+                res->content_type = "audio/wav";
+                res->data = header + pcm;
+            } else {
+                res->content_type = "audio/pcm";
+                res->data = std::move(pcm);
+            }
+            res->status = 200;
+            res->headers["X-TTS-Backend"] = "cosyvoice3";
+            res->headers["X-TTS-Sample-Rate"] = std::to_string(sr);
+            res->headers["X-TTS-Audio-Seconds"] = string_format("%.3f", pcm.size() / 2.0 / sr);
+            return res;
         }
 
         if (body.contains("top_k") && !body.at("top_k").is_null()) {
