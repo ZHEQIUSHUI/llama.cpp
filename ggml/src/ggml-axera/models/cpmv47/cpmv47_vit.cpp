@@ -2,10 +2,9 @@
 //
 // One kernel runs patch embedding, encoder layers 0..6, the window-attention
 // vit_merger (four patches -> one token), layers 7..26, post LayerNorm and the
-// final 2x2 DownsampleMLP.  The host gives it patches in 2x2-window-major
-// order, matching the get_vision_window_index() reorder of the official model;
-// global attention is permutation equivariant, so this is the official graph
-// with its patch order permuted once.
+// final 2x2 DownsampleMLP.  The host gives it patches in 2-level order
+// (2x2 tile of windows -> window -> 2x2 patches), which keeps both merger
+// group boundaries consecutive; global attention is permutation equivariant.
 
 #include "../model.h"
 #include "../../ops/ops.h"
@@ -165,8 +164,12 @@ void cpmv47_vit_full::tables(int gh, int gw, int n, const ggml_tensor * pe, int 
             std::fill(d, d + H, ggml_fp32_to_bf16(0.0f));
             return;
         }
-        const int y = (int) ((i / 4) / (gw / 2)) * 2 + (int) ((i % 4) / 2);
-        const int x = (int) ((i / 4) % (gw / 2)) * 2 + (int) (i % 2);
+        // 2-level order: a 2x2 tile of windows (16 patches), then the four windows, then the 2x2 patches.
+        // The vit_merger groups the inner four (a window) and the final merger groups four consecutive
+        // merged tokens (a tile of windows); global attention is permutation equivariant.
+        const int tile = (int) (i / 16), win = (int) ((i / 4) % 4), pat = (int) (i % 4);
+        const int y    = (tile / (gw / 4)) * 4 + (win / 2) * 2 + pat / 2;
+        const int x    = (tile % (gw / 4)) * 4 + (win % 2) * 2 + pat % 2;
         const int by = (int) ((int64_t) y * side / gh);
         const int bx = (int) ((int64_t) x * side / gw);
         row_f32((int64_t) by * side + bx, d);
@@ -227,7 +230,7 @@ ggml_status cpmv47_vit_full::compute(ggml_cgraph * g) {
         HD  = 72;
         GGML_ASSERT(km.pShape[0] * BC == N && N2 * 4 == N);
     }
-    if (raw->ne[3] != 1 || gw % 2 || gh % 2 || n > N || L != 27) {
+    if (raw->ne[3] != 1 || gw % 4 || gh % 4 || n > N || L != 27) {
         GGML_LOG_ERROR("axera cpmv47_vit_full: %d frame(s) of %d x %d patches, %d layers, at most %d patches\n",
                        (int) raw->ne[3], gw, gh, L, N);
         return GGML_STATUS_FAILED;
@@ -254,8 +257,9 @@ ggml_status cpmv47_vit_full::compute(ggml_cgraph * g) {
                 std::fill(d, d + CP, ggml_fp32_to_bf16(0.0f));
                 return;
             }
-            const int y = (int) ((i / 4) / (gw / 2)) * 2 + (int) ((i % 4) / 2);
-            const int x = (int) ((i / 4) % (gw / 2)) * 2 + (int) (i % 2);
+            const int tile = (int) (i / 16), win = (int) ((i / 4) % 4), pat = (int) (i % 4);
+            const int y    = (tile / (gw / 4)) * 4 + (win / 2) * 2 + pat / 2;
+            const int x    = (tile % (gw / 4)) * 4 + (win % 2) * 2 + pat % 2;
             for (int c = 0; c < 3; ++c) {
                 for (int ky = 0; ky < PS; ++ky) {
                     const float * row = img + c * W * HI + (int64_t) (y * PS + ky) * W + x * PS;
