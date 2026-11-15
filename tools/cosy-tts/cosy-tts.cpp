@@ -1867,7 +1867,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         }
 
         std::vector<float> pfeat((size_t) stream_mel_cap * 80, 0.0f);
-        const int pframes = std::min((int) rf.flow_frames, stream_mel_cap);
+        const int pframes = std::min({(int) rf.flow_frames, stream_prompt_mel, stream_mel_cap});
         memcpy(pfeat.data(), rf.flowfeat.data(), (size_t) pframes * 80 * sizeof(float));
         std::vector<float> noise((size_t) 80 * stream_mel_cap, 0.0f);
         for (int c = 0; c < 80; c++) {
@@ -2179,7 +2179,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         mel.assign((size_t) 80 * Tgen, 0.0f);
         std::vector<int32_t> tokens(tok_cap, 0);
         std::vector<float> pfeat((size_t) mel_cap * 80, 0.0f);
-        const int pframes = std::min((int) rf.flow_frames, mel_cap);
+        const int pframes = std::min({(int) rf.flow_frames, prompt_mel, mel_cap});
         memcpy(pfeat.data(), rf.flowfeat.data(), (size_t) pframes * 80 * sizeof(float));
         std::vector<float> noise((size_t) 80 * mel_cap, 0.0f);
         std::vector<float> emb = rf.embedding;
