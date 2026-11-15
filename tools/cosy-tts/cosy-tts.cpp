@@ -172,6 +172,20 @@ static std::vector<float> load_f32(const std::string & path, size_t expected = 0
     std::vector<float> v(n); f.seekg(0); f.read((char *) v.data(), n * sizeof(float)); return v;
 }
 
+static std::vector<float> load_f32_optional(const std::string & path, size_t expected) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return {};
+    const size_t n = (size_t) f.tellg() / sizeof(float);
+    if (n != expected) {
+        fprintf(stderr, "%s: expected %zu floats, got %zu; ignoring\n", path.c_str(), expected, n);
+        return {};
+    }
+    std::vector<float> v(n);
+    f.seekg(0);
+    if (!f.read((char *) v.data(), n * sizeof(float))) return {};
+    return v;
+}
+
 // Read the int32 vector written by ref/run_reference.py's --codes file, or the
 // raw little-endian int32 form emitted by --dump-codes.
 static bool load_codes(const std::string & path, std::vector<int> & out) {
@@ -278,7 +292,11 @@ static std::vector<std::string> split_text_segments(const std::string & text, in
         i += len;
     }
     if (gen_cap <= 0 || cps.empty()) return {text};
-    const double limit = std::max(8.0, gen_cap * 0.95);
+    // gen_cap already leaves the reference prompt and a few rows of headroom
+    // below the fixed flow window.  An estimate that lands exactly at the
+    // limit is safe: if the sampled sequence is longer, the flow runner opens
+    // another window with left context instead of truncating audio.
+    const double limit = std::max(8.0, (double) gen_cap);
     auto cost = [](uint32_t cp) {
         // Whole-sentence CPU runs on the evaluation set produce about six
         // speech tokens per CJK character and two per Latin character.  The
@@ -504,18 +522,24 @@ struct npu_model {
     }
 
 
-    const float * output_f32(size_t expected) const {
-        if (info->nOutputSize != 1 || info->pOutputs[0].eDataType != AX_ENGINE_DT_FLOAT32 ||
-            out[0].nSize < expected * sizeof(float)) {
-            fprintf(stderr, "NPU output mismatch: outputs=%u dtype=%d bytes=%u expected=%zu\n",
-                    info->nOutputSize, (int) info->pOutputs[0].eDataType, out[0].nSize, expected * sizeof(float));
-            return nullptr;
-        }
-        return (const float *) out[0].pVirAddr;
+    int output_index(const char * name) const {
+        for (AX_U32 i = 0; i < info->nOutputSize; i++) if (!strcmp(info->pOutputs[i].pName, name)) return (int) i;
+        return -1;
     }
 
-    size_t output_bytes() const {
-        return info->nOutputSize == 1 ? info->pOutputs[0].nSize : 0;
+    const float * output_f32(size_t expected, int idx = 0) const {
+        if (idx < 0 || idx >= (int) info->nOutputSize ||
+            info->pOutputs[idx].eDataType != AX_ENGINE_DT_FLOAT32 ||
+            out[idx].nSize < expected * sizeof(float)) {
+            fprintf(stderr, "NPU output mismatch: outputs=%u idx=%d dtype=%d bytes=%u expected=%zu\n",
+                    info->nOutputSize, idx, info->pOutputs[idx].eDataType, out[idx].nSize, expected * sizeof(float));
+            return nullptr;
+        }
+        return (const float *) out[idx].pVirAddr;
+    }
+
+    size_t output_bytes(int idx = 0) const {
+        return idx >= 0 && idx < (int) info->nOutputSize ? info->pOutputs[idx].nSize : 0;
     }
 
     ~npu_model() {
@@ -702,27 +726,33 @@ static void conv_causal_parallel(const float * x, int T, const hift_native::laye
 static void hift_front_native(const hift_native & h, const float * mel, int T,
                               std::vector<float> & s_stft, int & nf,
                               const double * phase0 = nullptr, double * phase_end = nullptr,
-                              size_t sample_offset = 0, double * phase_frames = nullptr) {
+                              size_t sample_offset = 0, double * phase_frames = nullptr,
+                              const float * f0_in = nullptr) {
     constexpr int HARM = 9, UPS = 480, SR = 24000, HOP = 4, KB = 9;
     const auto clock_now = [] { return std::chrono::steady_clock::now(); };
     const auto elapsed = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
     const auto t0 = clock_now();
-    std::vector<float> a((size_t) T * 80), b;
-    for (int c = 0; c < 80; c++) {
-        for (int t = 0; t < T; t++) a[(size_t) t * 80 + c] = mel[(size_t) c * T + t];
-    }
-    for (int li = 0; li < (int) h.layers.size(); li++) {
-        conv_causal_parallel(a.data(), T, h.layers[li], li == 0, b);
-        a.swap(b);
+    std::vector<float> f0;
+    if (f0_in) {
+        f0.assign(f0_in, f0_in + T);
+    } else {
+        std::vector<float> a((size_t) T * 80), b;
+        for (int c = 0; c < 80; c++) {
+            for (int t = 0; t < T; t++) a[(size_t) t * 80 + c] = mel[(size_t) c * T + t];
+        }
+        for (int li = 0; li < (int) h.layers.size(); li++) {
+            conv_causal_parallel(a.data(), T, h.layers[li], li == 0, b);
+            a.swap(b);
+        }
+        const int C = h.layers.back().out_c;
+        f0.resize(T);
+        for (int t = 0; t < T; t++) {
+            double sum = h.classifier_b[0];
+            for (int c = 0; c < C; c++) sum += (double) a[(size_t) t * C + c] * h.classifier_w[c];
+            f0[t] = std::fabs((float) sum);
+        }
     }
     const auto t1 = clock_now();
-    const int C = h.layers.back().out_c;
-    std::vector<float> f0(T);
-    for (int t = 0; t < T; t++) {
-        double sum = h.classifier_b[0];
-        for (int c = 0; c < C; c++) sum += (double) a[(size_t) t * C + c] * h.classifier_w[c];
-        f0[t] = std::fabs((float) sum);
-    }
 
     const int L = T * UPS;
     std::vector<float> rad((size_t) HARM * T);
@@ -896,6 +926,7 @@ struct feature_tables {
     std::vector<float> flow_noise;     // 1 x 80 x 15000
     std::vector<float> flow_mel;       // 80 x 961
     std::vector<float> flow_hann;      // 1920
+    std::vector<float> flow_affine;    // 80 gains + 80 biases
 };
 
 static feature_tables load_tables(const std::string & dir) {
@@ -907,7 +938,16 @@ static feature_tables load_tables(const std::string & dir) {
     t.flow_noise   = load_f32(dir + "/flow_noise_1x80x15000.f32", 80 * 15000);
     t.flow_mel     = load_f32(dir + "/flow_mel_80x961.f32", 80 * 961);
     t.flow_hann    = load_f32(dir + "/flow_hann1920.f32", 1920);
+    // The merged flow kernel keeps its five Euler states in BF16.  The
+    // calibration table removes the small, repeatable per-bin gain/bias error
+    // without changing the kernel's single-call CFG/Euler contract.
+    t.flow_affine  = load_f32_optional(dir + "/flow_affine.f32", 160);
     return t;
+}
+
+static inline float flow_mel_value(const feature_tables & t, int c, float v) {
+    if (t.flow_affine.size() != 160) return v;
+    return t.flow_affine[(size_t) c] * v + t.flow_affine[(size_t) (80 + c)];
 }
 
 // Whisper log-mel [128,T] normalized exactly like whisper.log_mel_spectrogram.
@@ -1275,6 +1315,7 @@ struct args {
     bool flow_npu_nlc = false, flow_npu_long_nlc = false;
     int flow_npu_cap = 512, flow_npu_long_cap = 1024, hift_npu_long_cap = 1024;
     int flow_prompt_min = 32;
+    int flow_steps = 10;
     int hift_left = 64;
     std::string text, prompt_text, prompt_wav, out = "out.wav";
     int ngl = 0, ctx = 4096, threads = 16;
@@ -1285,7 +1326,7 @@ struct args {
     int repeat = 1;
     std::string parity_in, parity_out, dump_feats, codes_in, dump_mel, dump_hift_s, dump_hift_mp;
     std::string feat_cache;
-    std::string warm_prompt, warm_text;
+    std::string warm_prompt, warm_text, warm_prompt2, warm_text2;
 };
 
 static bool parse_args(int argc, char ** argv, args & a) {
@@ -1303,6 +1344,7 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (k == "--flow-npu") a.flow_npu = val();
         else if (k == "--flow-loop-npu") a.flow_loop_npu = val();
         else if (k == "--flow-prompt-min") a.flow_prompt_min = std::max(0, std::stoi(val()));
+        else if (k == "--flow-steps") a.flow_steps = std::max(1, std::min(32, std::stoi(val())));
         else if (k == "--hift-left") a.hift_left = std::max(8, std::stoi(val()));
         else if (k == "--flow-npu-long") a.flow_npu_long = val();
         else if (k == "--hift-npu") a.hift_npu = val();
@@ -1339,6 +1381,8 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (k == "--feat-cache") a.feat_cache = val();
         else if (k == "--warm-prompt-wav") a.warm_prompt = val();
         else if (k == "--warm-prompt-text") a.warm_text = val();
+        else if (k == "--warm-prompt-wav2") a.warm_prompt2 = val();
+        else if (k == "--warm-prompt-text2") a.warm_text2 = val();
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && !a.aux.empty() && !a.tables.empty() && !a.text.empty() && !a.prompt_wav.empty() &&
@@ -1546,6 +1590,16 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         if (!flow_loop_npu->load(a.flow_loop_npu)) return 1;
         t_npu_load += sec(s0, std::chrono::steady_clock::now());
     }
+    // The merged flow graph may expose the Euler state under its own name
+    // (the debug build materializes x1..x5 to force inter-step ordering).
+    // Prefer the named final state over output index 0, which can be mu.
+    int flow_out_idx = 0;
+    if (flow_loop_npu) {
+        for (const char * name : {"mel", "x5", "output"}) {
+            const int idx = flow_loop_npu->output_index(name);
+            if (idx >= 0) { flow_out_idx = idx; break; }
+        }
+    }
     if (!a.flow_npu.empty()) {
         if (!axera_engine_init_once()) return 1;
         auto s0 = std::chrono::steady_clock::now();
@@ -1599,16 +1653,23 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         auto ts0 = now();
         wav_data wav;
         if (!read_wav(wavpath.c_str(), wav)) return nullptr;
-        auto pcm16 = resample_sinc(wav.pcm, wav.sample_rate, 16000);
-        auto pcm24 = resample_sinc(wav.pcm, wav.sample_rate, 24000);
-        const uint64_t feat_key = feat_hash(pcm16.data(), pcm16.size() * sizeof(float)) ^
-                                  ((uint64_t) pcm16.size() * 0x9e3779b97f4a7c15ull);
-        auto hit = ref_mem.find(feat_key);
+        // Hit the in-process cache before resampling.  The HTTP worker writes
+        // each request's reference bytes to a fresh temporary path, so keying
+        // on the decoded PCM (not the path) is what makes repeated prompts
+        // genuinely free even when their file names differ.
+        const uint64_t mem_key = feat_hash(wav.pcm.data(), wav.pcm.size() * sizeof(float)) ^
+                                 ((uint64_t) wav.pcm.size() * 0x9e3779b97f4a7c15ull) ^
+                                 ((uint64_t) wav.sample_rate << 32);
+        auto hit = ref_mem.find(mem_key);
         if (hit != ref_mem.end()) {
             fprintf(stderr, "[frontend] cache=memory total=%.3fs speech_tokens=%zu\n",
                     sec(ts0, now()), hit->second->tok.size());
             return hit->second;
         }
+        auto pcm16 = resample_sinc(wav.pcm, wav.sample_rate, 16000);
+        auto pcm24 = resample_sinc(wav.pcm, wav.sample_rate, 24000);
+        const uint64_t feat_key = feat_hash(pcm16.data(), pcm16.size() * sizeof(float)) ^
+                                  ((uint64_t) pcm16.size() * 0x9e3779b97f4a7c15ull);
         auto rf = std::make_shared<ref_feats>();
         const std::string feat_path = feat_cache_path(cache_dir, feat_key);
         feat_cache fc;
@@ -1685,11 +1746,31 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
                     rf->fbank_frames, rf->wmel_frames, rf->tok.size(), rf->flow_frames);
             fclose(f);
         }
-        ref_mem.emplace(feat_key, rf);
+        ref_mem.emplace(mem_key, rf);
         return rf;
     };
 
     // ---- Qwen2 backbone -------------------------------------------------
+    // The reference prompt (sos + prompt text + task id + prompt speech
+    // tokens) is identical for repeated requests with the same reference and
+    // text.  Keep its KV in sequence 1 and copy it back instead of re-prefilling
+    // ~100 rows every request.  The AXERA backend stores the page images in
+    // core/seqstate, so seq_cp moves the private pages too.  This cache must
+    // live outside the per-request lambda or it can never hit.
+    struct prompt_kv_cache {
+        std::vector<int32_t> ids;
+        int rows = 0;
+        std::vector<float> logits;
+        std::vector<uint8_t> state;
+        uint64_t used = 0;
+    };
+    // A request's text precedes the reference-speech prompt, so the cached KV
+    // is keyed by both.  Keep a few complete sequence images instead of only
+    // the last one: callers commonly alternate voices or repeat an earlier
+    // sentence, and a one-entry cache turns both into a full prompt prefill.
+    std::vector<prompt_kv_cache> pcache;
+    uint64_t pcache_tick = 0;
+    constexpr size_t PCACHE_MAX = 4;
     auto t_load0 = std::chrono::steady_clock::now();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = a.ngl;
@@ -1735,18 +1816,6 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         v.resize(n);
         return v;
     };
-    // The reference prompt (sos + prompt text + task id + prompt speech
-    // tokens) is identical for repeated requests with the same reference and
-    // text.  Keep its KV in sequence 1 and copy it back instead of re-prefilling
-    // ~100 rows every request.  The AXERA backend stores the page images in
-    // core/seqstate, so seq_cp moves the private pages too.
-    struct prompt_kv_cache {
-        bool valid = false;
-        std::vector<int32_t> ids;
-        int rows = 0;
-        std::vector<float> logits;
-    };
-    prompt_kv_cache pcache;
     auto generate = [&](const std::string & req_text, const std::string & req_prompt_text,
                         const std::string & outpath, const ref_feats & rf, uint32_t req_seed,
                         const std::string & codes_path, double front_s, double llm_load_s,
@@ -1798,35 +1867,36 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     for (auto t : text_all) prefix_key.push_back((int32_t) t);
     for (auto t : prompt_tok) prefix_key.push_back(t);
     bool prefix_hit = false;
+    size_t prefix_hit_idx = 0;
     const auto t_kv_hit0 = std::chrono::steady_clock::now();
-    const bool prefix_valid = pcache.valid && pcache.rows == n_prompt_rows;
-    const bool prefix_ids_match = prefix_valid && pcache.ids == prefix_key;
-    if (codes_path.empty() && pcache.valid && pcache.rows == n_prompt_rows &&
-        pcache.ids == prefix_key) {
-        llama_memory_seq_cp(kv_mem, 1, 0, -1, -1);
-        prefix_hit = true;
-    } else {
-        // seq 1 holds the previous prompt's pages.  They must be released
-        // before a new prompt can receive consecutive cells from cell 0; a
-        // seq_rm(seq 0) alone leaves those pages owned by seq 1 and shifts the
-        // new prefill to high physical cells, which breaks seqstate's page
-        // boundaries.
-        llama_memory_seq_rm(kv_mem, 1, -1, -1);
+    if (codes_path.empty()) {
+        for (size_t i = 0; i < pcache.size(); ++i) {
+            if (pcache[i].rows == n_prompt_rows && pcache[i].ids == prefix_key) {
+                const size_t got = llama_state_seq_set_data(
+                        ctx, pcache[i].state.data(), pcache[i].state.size(), 0);
+                if (got == pcache[i].state.size()) {
+                    prefix_hit = true;
+                    prefix_hit_idx = i;
+                    pcache[i].used = ++pcache_tick;
+                }
+                break;
+            }
+        }
     }
     if (codes_path.empty() && getenv("COSY_LLM_PROBE")) {
-        fprintf(stderr, "[llm-cache] valid=%d rows=%d/%d ids_match=%d key=%zu\n",
-                pcache.valid ? 1 : 0, pcache.rows, n_prompt_rows, prefix_ids_match ? 1 : 0,
-                prefix_key.size());
+        fprintf(stderr, "[llm-cache] entries=%zu rows=%d hit=%d key=%zu\n",
+                pcache.size(), n_prompt_rows, prefix_hit ? 1 : 0, prefix_key.size());
     }
     const double t_kv_hit = sec(t_kv_hit0, std::chrono::steady_clock::now());
 
     std::vector<float> h;
     llama_batch_guard batch(512, n_embd);
     const bool streaming = (bool) stream_cb && incremental;
-    const int stream_tok_cap = flow_loop_npu ? (int) flow_loop_npu->input_elems("tokens") : 0;
-    const int stream_mel_cap = flow_loop_npu ? (int) (flow_loop_npu->input_elems("noise") / 80) : 0;
-    const int stream_prompt_n = std::min((int) prompt_tok.size(), std::max(0, stream_tok_cap - 16));
-    const int stream_prompt_mel = 2 * stream_prompt_n;
+    const int est_tok_cap = flow_npu ? (int) (flow_npu->input_elems("x") / (2 * 80)) : 0;
+    const int stream_tok_cap = flow_loop_npu ? (int) flow_loop_npu->input_elems("tokens") : est_tok_cap;
+    const int stream_prompt_n = std::min((int) prompt_tok.size(), std::max(0, stream_tok_cap - 48));
+    const int stream_overlap = 4;
+    const int stream_chunk_cap = std::max(1, stream_tok_cap - stream_prompt_n - stream_overlap);
     std::vector<int> stream_flow_codes;
     int stream_out_codes = 0;
     int stream_silent_run = 0;
@@ -1840,78 +1910,129 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         const int available = (int) stream_flow_codes.size();
         if (stream_out_codes >= available) return true;
         if (!flow_loop_npu || !hift_npu || !have_native_hift) {
-            stream_error = "streaming requires merged flow and native HiFT";
+            stream_error = "streaming requires the merged flow kernel and native HiFT";
             return false;
         }
-        // Official streaming semantics: rerun the flow window from position
-        // zero on the token prefix generated so far, then emit only the mel
-        // frames past the previous offset.  The fixed window is never
-        // continued from an independent left-context window, so the result is
-        // exactly the non-stream output for everything emitted so far.
-        if (stream_prompt_n + available > stream_tok_cap) {
-            stream_error = "streaming segment exceeds the flow window";
+        // CosyVoice3's streaming path re-runs the complete prefix for every
+        // token chunk and returns only the newly produced mel frames.  Keeping
+        // the prompt region frozen at its initial noise makes the prompt
+        // condition wrong, so the whole fixed-capacity window follows the
+        // Euler trajectory.  The merged kernel owns CFG and all Euler updates,
+        // so one call produces one complete prefix window.  Long utterances
+        // slide that window and keep the prompt at its head.
+        const int tok_cap = (int) flow_loop_npu->input_elems("tokens");
+        const int mel_cap = (int) (flow_loop_npu->input_elems("noise") / 80);
+        if (tok_cap <= stream_prompt_n + 16 || mel_cap != 2 * tok_cap) {
+            stream_error = "streaming flow window is too small";
             return false;
         }
-        std::vector<int32_t> tokens(stream_tok_cap, 0);
+        const int max_codes = tok_cap - stream_prompt_n - 4;
+        const int begin = std::max(0, available - max_codes);
+        const int G = available - begin;
+        const int Tw = 2 * (stream_prompt_n + G);
+        const int new_start = 2 * (stream_out_codes - begin);
+        const int new_frames = 2 * (available - stream_out_codes);
+        const int total_tokens = stream_prompt_n + G;
+        std::vector<int32_t> tokens((size_t) tok_cap, 0);
         for (int i = 0; i < stream_prompt_n; i++) tokens[i] = prompt_tok[i];
-        for (int i = 0; i < available; i++) tokens[stream_prompt_n + i] = stream_flow_codes[i];
-        const int32_t gen_len_i = available;
-        const int32_t prompt_len_i = stream_prompt_n;
-        const int valid_tokens = stream_prompt_n + available;
-        const bool mask_inputs = flow_loop_npu->input_elems("token_mask") > 0;
-        std::vector<float> token_mask(mask_inputs ? stream_tok_cap : 0, 0.0f);
-        std::vector<float> mel_mask(mask_inputs ? stream_mel_cap : 0, 0.0f);
-        if (mask_inputs) {
-            std::fill_n(token_mask.begin(), valid_tokens, 1.0f);
-            std::fill_n(mel_mask.begin(), 2 * valid_tokens, 1.0f);
-        }
-
-        std::vector<float> pfeat((size_t) stream_mel_cap * 80, 0.0f);
-        const int pframes = std::min({(int) rf.flow_frames, stream_prompt_mel, stream_mel_cap});
+        for (int i = 0; i < G; i++) tokens[stream_prompt_n + i] = stream_flow_codes[begin + i];
+        std::vector<float> token_mask((size_t) tok_cap, 0.0f);
+        std::vector<float> mel_mask((size_t) mel_cap, 0.0f);
+        std::fill_n(token_mask.begin(), total_tokens, 1.0f);
+        std::fill_n(mel_mask.begin(), Tw, 1.0f);
+        std::vector<float> pfeat((size_t) mel_cap * 80, 0.0f);
+        const int pframes = std::min({(int) rf.flow_frames, Tw, mel_cap});
         memcpy(pfeat.data(), rf.flowfeat.data(), (size_t) pframes * 80 * sizeof(float));
-        std::vector<float> noise((size_t) 80 * stream_mel_cap, 0.0f);
-        for (int c = 0; c < 80; c++) {
-            memcpy(noise.data() + (size_t) c * stream_mel_cap,
-                   tab.flow_noise.data() + (size_t) c * 15000, (size_t) stream_mel_cap * sizeof(float));
-        }
+        std::vector<float> noise((size_t) mel_cap * 80, 0.0f);
         std::vector<float> emb = rf.embedding;
-        auto tf0 = std::chrono::steady_clock::now();
-        bool flow_ok = flow_loop_npu->set_input("tokens", tokens.data(), tokens.size() * 4);
-        if (flow_ok && mask_inputs) {
-            flow_ok = flow_loop_npu->set_input("token_mask", token_mask.data(), token_mask.size() * 4) &&
-                      flow_loop_npu->set_input("mel_mask", mel_mask.data(), mel_mask.size() * 4);
-        } else if (flow_ok) {
-            flow_ok = flow_loop_npu->set_input("gen_len", &gen_len_i, 4) &&
-                      flow_loop_npu->set_input("prompt_len", &prompt_len_i, 4);
+        const int gen0 = 2 * stream_prompt_n;
+        for (int c = 0; c < 80; c++) {
+            for (int t = 0; t < Tw; t++) {
+                const size_t noise_t = t < gen0
+                        ? (size_t) t
+                        : (size_t) gen0 + (size_t) 2 * begin + (t - gen0);
+                noise[(size_t) c * mel_cap + t] = tab.flow_noise[(size_t) c * 15000 + noise_t];
+            }
         }
-        flow_ok = flow_ok &&
-                  flow_loop_npu->set_input("prompt_feat", pfeat.data(), pfeat.size() * 4) &&
-                  flow_loop_npu->set_input("embedding", emb.data(), emb.size() * 4) &&
-                  flow_loop_npu->set_input("noise", noise.data(), noise.size() * 4) &&
-                  flow_loop_npu->run();
-        if (!flow_ok) {
+        const auto tf0 = std::chrono::steady_clock::now();
+        if (!flow_loop_npu->set_input("tokens", tokens.data(), tokens.size() * 4) ||
+            !flow_loop_npu->set_input("token_mask", token_mask.data(), token_mask.size() * 4) ||
+            !flow_loop_npu->set_input("mel_mask", mel_mask.data(), mel_mask.size() * 4) ||
+            !flow_loop_npu->set_input("prompt_feat", pfeat.data(), pfeat.size() * 4) ||
+            !flow_loop_npu->set_input("embedding", emb.data(), emb.size() * 4) ||
+            !flow_loop_npu->set_input("noise", noise.data(), noise.size() * 4) ||
+            (flow_loop_npu->input_elems("noise_state") > 0 &&
+             !flow_loop_npu->set_input("noise_state", noise.data(), noise.size() * 4)) ||
+            (flow_loop_npu->input_elems("noise_est") > 0 &&
+             !flow_loop_npu->set_input("noise_est", noise.data(), noise.size() * 4)) ||
+            (flow_loop_npu->input_elems("noise_est2") > 0 &&
+             !flow_loop_npu->set_input("noise_est2", noise.data(), noise.size() * 4)) ||
+            !flow_loop_npu->run()) {
             stream_error = "streaming flow kernel failed";
             return false;
         }
-        const float * out = flow_loop_npu->output_f32((size_t) 80 * stream_mel_cap);
-        if (!out) {
+        const float * loop_out = flow_loop_npu->output_f32((size_t) 80 * mel_cap, flow_out_idx);
+        if (!loop_out) {
             stream_error = "streaming flow produced no output";
             return false;
         }
         stream_flow_s += sec(tf0, std::chrono::steady_clock::now());
-        const int out_start = stream_prompt_mel + 2 * stream_out_codes;
-        const int new_frames = 2 * (available - stream_out_codes);
+        std::vector<float> out_buf((size_t) Tw * 80);
+        for (int c = 0; c < 80; c++) {
+            for (int t = 0; t < Tw; t++) {
+                float v = loop_out[(size_t) c * mel_cap + t];
+                if (t >= gen0) v = flow_mel_value(tab, c, v);
+                out_buf[(size_t) t * 80 + c] = v;
+            }
+        }
+        const float * out = out_buf.data();
         const int old_frames = (int) stream_mel_ch[0].size();
         const int history_start = std::max(0, old_frames - a.hift_left);
         const int history = old_frames - history_start;
         const int dst_off = a.hift_left - history;
 
+        const int cap = (int) (hift_npu->input_elems("mel") / 80);
+        if (cap <= 64) {
+            stream_error = "streaming HiFT kernel has an invalid window";
+            return false;
+        }
+        const int s_frames = cap * 120 + 1;
         std::vector<float> front_mel((size_t) 80 * (history + new_frames));
         for (int c = 0; c < 80; c++) {
             if (history) memcpy(front_mel.data() + (size_t) c * (history + new_frames),
                                 stream_mel_ch[c].data() + history_start, (size_t) history * 4);
-            memcpy(front_mel.data() + (size_t) c * (history + new_frames) + history,
-                   out + (size_t) c * stream_mel_cap + out_start, (size_t) new_frames * 4);
+            for (int i = 0; i < new_frames; i++)
+                front_mel[(size_t) c * (history + new_frames) + history + i] =
+                    out[(size_t) (gen0 + new_start + i) * 80 + c];
+        }
+        std::vector<float> hmel((size_t) 80 * cap, 0.0f);
+        std::vector<float> s_chunk((size_t) 18 * s_frames, 0.0f);
+        for (int c = 0; c < 80; c++) {
+            if (history) memcpy(hmel.data() + (size_t) c * cap + dst_off,
+                                stream_mel_ch[c].data() + history_start, (size_t) history * 4);
+            for (int i = 0; i < new_frames; i++)
+                hmel[(size_t) c * cap + 64 + i] = out[(size_t) (gen0 + new_start + i) * 80 + c];
+        }
+        // The f0 predictor now lives in the HiFT AXModel.  Run it on the same
+        // window first (the decoder half of that pass is discarded), then feed
+        // its f0 to the host source/STFT and run the decoder for real.
+        std::vector<float> f0w;
+        const int f0_idx = hift_npu->output_index("f0") >= 0 ? hift_npu->output_index("f0")
+                                                  : hift_npu->output_index("f0_out");
+        if (f0_idx >= 0) {
+            const auto tz0 = std::chrono::steady_clock::now();
+            if (!hift_npu->set_input("mel", hmel.data(), hmel.size() * 4) ||
+                !hift_npu->set_input("s_stft", s_chunk.data(), s_chunk.size() * 4) || !hift_npu->run()) {
+                stream_error = "streaming HiFT f0 pass failed";
+                return false;
+            }
+            const float * f0p = hift_npu->output_f32(cap, f0_idx);
+            if (!f0p) {
+                stream_error = "streaming HiFT f0 output missing";
+                return false;
+            }
+            f0w.assign(f0p, f0p + cap);
+            stream_front_s += sec(tz0, std::chrono::steady_clock::now());
         }
         std::vector<float> s_front;
         int s_front_frames = 0;
@@ -1920,26 +2041,12 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
                                               : nullptr;
         const auto tfront0 = std::chrono::steady_clock::now();
         hift_front_native(native_hift, front_mel.data(), history + new_frames, s_front, s_front_frames,
-                          phase0, nullptr, (size_t) history_start * 480, s_phase.data());
+                          phase0, nullptr, (size_t) history_start * 480, s_phase.data(),
+                          f0w.empty() ? nullptr : f0w.data() + dst_off);
         stream_front_s += sec(tfront0, std::chrono::steady_clock::now());
         stream_phase_frames.resize((size_t) (old_frames + new_frames) * 9);
         memcpy(stream_phase_frames.data() + (size_t) old_frames * 9,
                s_phase.data() + (size_t) history * 9, (size_t) new_frames * 9 * sizeof(double));
-
-        const int cap = (int) (hift_npu->input_elems("mel") / 80);
-        if (cap <= 64) {
-            stream_error = "streaming HiFT kernel has an invalid window";
-            return false;
-        }
-        const int s_frames = cap * 120 + 1;
-        std::vector<float> hmel((size_t) 80 * cap, 0.0f);
-        std::vector<float> s_chunk((size_t) 18 * s_frames, 0.0f);
-        for (int c = 0; c < 80; c++) {
-            if (history) memcpy(hmel.data() + (size_t) c * cap + dst_off,
-                                stream_mel_ch[c].data() + history_start, (size_t) history * 4);
-            memcpy(hmel.data() + (size_t) c * cap + 64,
-                   out + (size_t) c * stream_mel_cap + out_start, (size_t) new_frames * 4);
-        }
         for (int c = 0; c < 18; c++) {
             memcpy(s_chunk.data() + (size_t) c * s_frames + (size_t) dst_off * 120,
                    s_front.data() + (size_t) c * s_front_frames, (size_t) s_front_frames * 4);
@@ -1950,9 +2057,9 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             stream_error = "streaming HiFT kernel failed";
             return false;
         }
-        const size_t mp_bytes = hift_npu->output_bytes();
+        const size_t mp_bytes = hift_npu->output_bytes(0);
         const int mp_ch = mp_bytes ? (int) (mp_bytes / (sizeof(float) * (size_t) s_frames)) : 0;
-        const float * mp = hift_npu->output_f32((size_t) mp_ch * s_frames);
+        const float * mp = hift_npu->output_f32((size_t) mp_ch * s_frames, 0);
         if (!mp || mp_ch < 18) {
             stream_error = "streaming HiFT produced a bad output";
             return false;
@@ -1991,11 +2098,9 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         if (stream_first_s < 0.0) {
             stream_first_s = sec(t_req0, std::chrono::steady_clock::now());
         }
-        for (int c = 0; c < 80; c++) {
-            stream_mel_ch[c].insert(stream_mel_ch[c].end(),
-                                    out + (size_t) c * stream_mel_cap + out_start,
-                                    out + (size_t) c * stream_mel_cap + out_start + new_frames);
-        }
+        for (int c = 0; c < 80; c++)
+            for (int i = 0; i < new_frames; i++)
+                stream_mel_ch[c].push_back(out[(size_t) (gen0 + new_start + i) * 80 + c]);
         stream_hift_calls++;
         stream_out_codes = available;
         return true;
@@ -2032,7 +2137,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     double t_logits_initial = 0.0, t_cache_cp = 0.0;
     if (codes_path.empty()) {
         if (prefix_hit) {
-            logits = pcache.logits;
+            logits = pcache[prefix_hit_idx].logits;
             fprintf(stderr, "[llm] prefix cache hit rows=%d\n", n_prompt_rows);
         } else {
             const auto t_l0 = std::chrono::steady_clock::now();
@@ -2042,13 +2147,27 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             }
             t_logits_initial = sec(t_l0, std::chrono::steady_clock::now());
             const auto t_c0 = std::chrono::steady_clock::now();
-            llama_memory_seq_rm(kv_mem, 1, -1, -1);
-            llama_memory_seq_cp(kv_mem, 0, 1, 0, n_prompt_rows);
+            prompt_kv_cache entry;
+            entry.rows = n_prompt_rows;
+            entry.ids = prefix_key;
+            entry.logits = logits;
+            const size_t state_size = llama_state_seq_get_size(ctx, 0);
+            if (state_size > 0) {
+                entry.state.resize(state_size);
+                const size_t got = llama_state_seq_get_data(
+                        ctx, entry.state.data(), entry.state.size(), 0);
+                if (got != entry.state.size()) entry.state.clear();
+            }
+            if (!entry.state.empty()) {
+                entry.used = ++pcache_tick;
+                pcache.push_back(std::move(entry));
+                if (pcache.size() > PCACHE_MAX) {
+                    auto oldest = std::min_element(pcache.begin(), pcache.end(),
+                            [](const auto & a, const auto & b) { return a.used < b.used; });
+                    pcache.erase(oldest);
+                }
+            }
             t_cache_cp = sec(t_c0, std::chrono::steady_clock::now());
-            pcache.valid = true;
-            pcache.rows = n_prompt_rows;
-            pcache.ids = std::move(prefix_key);
-            pcache.logits = logits;
         }
     }
     if (codes_path.empty()) {
@@ -2068,13 +2187,10 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         sampler smp(req_seed, a.greedy);
         int max_len = (int) text_tok.size() * 20;
         if (flow_loop_npu) {
-            // One flow call covers the complete token prefix.  Leave room for
-            // the minimum reference prefix; the flow window itself trims the
-            // reference as needed instead of forcing an extra full call.
+            // The flow window is reused for every chunk of a long sentence, so
+            // the decoded length is bounded by the text, not by the window.
             const int tok_cap = (int) flow_loop_npu->input_elems("tokens");
-            const int prompt_floor = std::min((int) prompt_tok.size(),
-                                              std::max(8, a.flow_prompt_min));
-            max_len = std::min(max_len, std::max(1, tok_cap - prompt_floor - 4));
+            max_len = std::max(max_len, tok_cap);
         }
         const int min_len = std::min((int) text_tok.size() * 2, max_len);
         int n_past = n_prompt_rows;
@@ -2087,8 +2203,10 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             codes.push_back(tok);
             if (streaming) {
                 if (!flow_silent_token(tok, stream_silent_run)) stream_flow_codes.push_back(tok);
-                const int threshold = stream_out_codes == 0 ? 4 : 64;
-                if ((int) stream_flow_codes.size() - stream_out_codes >= threshold && !run_stream_window()) {
+                const int pending = (int) stream_flow_codes.size() - stream_out_codes;
+                const int threshold = stream_out_codes == 0 ? 2 : std::min(64, stream_chunk_cap);
+                const bool full = pending >= stream_chunk_cap;
+                if ((pending >= threshold || full) && !run_stream_window()) {
                     fprintf(stderr, "streaming synthesis failed: %s\n", stream_error.c_str());
                     return 1;
                 }
@@ -2113,6 +2231,19 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
                 fprintf(stderr, "streaming synthesis failed: %s\n", stream_error.c_str());
                 return 1;
             }
+        }
+    }
+    if (streaming && std::getenv("COSY_STREAM_DUMP")) {
+        const int Tn = (int) stream_mel_ch[0].size();
+        FILE * f = fopen("/tmp/stream_mel.f32", "wb");
+        if (f) {
+            for (int c = 0; c < 80; c++) fwrite(stream_mel_ch[c].data(), 4, Tn, f);
+            fclose(f);
+        }
+        f = fopen("/tmp/stream_codes.bin", "wb");
+        if (f) {
+            for (int v : stream_flow_codes) { int32_t w = v; fwrite(&w, 4, 1, f); }
+            fclose(f);
         }
     }
     auto t_gen1 = std::chrono::steady_clock::now();
@@ -2163,18 +2294,29 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             return 1;
         }
         const int full_prompt_n = (int) prompt_tok.size();
-        // Keep the longest reference prefix that leaves room for this
-        // sentence, with --flow-prompt-min as the lower bound.  The speaker
-        // embedding and the language-model prompt remain complete.
+        // Keep the longest reference prefix that leaves a useful chunk, with
+        // --flow-prompt-min as the lower bound.  The speaker embedding and the
+        // language-model prompt remain complete.
         const int prompt_floor = std::min(full_prompt_n, std::max(8, a.flow_prompt_min));
-        const int prompt_n = std::min(full_prompt_n,
-                                      std::max(prompt_floor, tok_cap - (int) flow_codes.size() - 4));
+        const int n_codes = (int) flow_codes.size();
+        // Keep the whole reference prefix when the generated codes leave room.
+        // When they do not, trim only as much of the prompt as needed so this
+        // segment still fits in one flow window, never below --flow-prompt-min.
+        const int prompt_need = tok_cap - n_codes - 4;
+        int prompt_n = full_prompt_n;
+        if (prompt_need < full_prompt_n) {
+            prompt_n = std::min(full_prompt_n, std::max(prompt_floor, prompt_need));
+        }
         const int prompt_mel = 2 * prompt_n;
         if (full_prompt_n > prompt_n) {
             fprintf(stderr, "[flow] reference prompt %d tokens truncated to %d for the merged window\n",
                     full_prompt_n, prompt_n);
         }
-        Tgen = 2 * (int) flow_codes.size();
+        const int chunk_cap = std::max(1, tok_cap - prompt_n - 4);
+        // An independent window cannot continue the previous one, so keep a
+        // few tokens of left context and drop their duplicated mel frames.
+        const int overlap = std::min(4, chunk_cap / 4);
+        Tgen = 2 * n_codes;
         T_total = prompt_mel + Tgen;
         mel.assign((size_t) 80 * Tgen, 0.0f);
         std::vector<int32_t> tokens(tok_cap, 0);
@@ -2184,51 +2326,73 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         std::vector<float> noise((size_t) 80 * mel_cap, 0.0f);
         std::vector<float> emb = rf.embedding;
         if ((int) emb.size() != 192) { fprintf(stderr, "flow embedding has %zu values\n", emb.size()); return 1; }
-        const int total_tokens = prompt_n + (int) flow_codes.size();
-        if (total_tokens > tok_cap) {
-            fprintf(stderr, "[flow] segment needs %d tokens, window holds %d; split the text first\n",
-                    total_tokens, tok_cap);
-            return 1;
-        }
-        std::fill(tokens.begin(), tokens.end(), 0);
-        for (int i = 0; i < prompt_n; i++) tokens[i] = prompt_tok[i];
-        for (size_t i = 0; i < flow_codes.size(); i++) tokens[prompt_n + i] = flow_codes[i];
         const bool mask_inputs = flow_loop_npu->input_elems("token_mask") > 0;
         std::vector<float> token_mask(mask_inputs ? tok_cap : 0, 0.0f);
         std::vector<float> mel_mask(mask_inputs ? mel_cap : 0, 0.0f);
-        if (mask_inputs) {
-            std::fill_n(token_mask.begin(), total_tokens, 1.0f);
-            std::fill_n(mel_mask.begin(), 2 * total_tokens, 1.0f);
-        }
-        const int32_t gen_len_i = (int32_t) flow_codes.size();
-        const int32_t prompt_len_i = prompt_n;
         for (int c = 0; c < 80; c++) {
             const float * src = tab.flow_noise.data() + (size_t) c * noise_cap;
             memcpy(noise.data() + (size_t) c * mel_cap, src, (size_t) mel_cap * sizeof(float));
         }
-        fprintf(stderr, "[flow-win] pn=%d gen=%zu total=%d cap=%d\n",
-                prompt_n, flow_codes.size(), total_tokens, tok_cap);
-        bool flow_ok = flow_loop_npu->set_input("tokens", tokens.data(), tokens.size() * 4);
-        if (flow_ok && mask_inputs) {
-            flow_ok = flow_loop_npu->set_input("token_mask", token_mask.data(), token_mask.size() * 4) &&
-                      flow_loop_npu->set_input("mel_mask", mel_mask.data(), mel_mask.size() * 4);
-        } else if (flow_ok) {
-            flow_ok = flow_loop_npu->set_input("gen_len", &gen_len_i, 4) &&
-                      flow_loop_npu->set_input("prompt_len", &prompt_len_i, 4);
+        int windows = 0;
+        for (int start = 0; start < n_codes; ) {
+            const int ctx = start == 0 ? 0 : std::min(overlap, start);
+            const int begin = start - ctx;
+            const int end = std::min(n_codes, begin + chunk_cap);
+            const int window_codes = end - begin;
+            const int new_codes = end - start;
+            if (window_codes <= 0 || new_codes <= 0) {
+                fprintf(stderr, "[flow] chunking stalled at %d/%d\n", start, n_codes);
+                return 1;
+            }
+            const int total_tokens = prompt_n + window_codes;
+            std::fill(tokens.begin(), tokens.end(), 0);
+            for (int i = 0; i < prompt_n; i++) tokens[i] = prompt_tok[i];
+            for (int i = 0; i < window_codes; i++) tokens[prompt_n + i] = flow_codes[begin + i];
+            if (mask_inputs) {
+                std::fill(token_mask.begin(), token_mask.end(), 0.0f);
+                std::fill(mel_mask.begin(), mel_mask.end(), 0.0f);
+                std::fill_n(token_mask.begin(), total_tokens, 1.0f);
+                std::fill_n(mel_mask.begin(), 2 * total_tokens, 1.0f);
+            }
+            const int32_t gen_len_i = (int32_t) window_codes;
+            const int32_t prompt_len_i = prompt_n;
+            bool flow_ok = flow_loop_npu->set_input("tokens", tokens.data(), tokens.size() * 4);
+            if (flow_ok && mask_inputs) {
+                flow_ok = flow_loop_npu->set_input("token_mask", token_mask.data(), token_mask.size() * 4) &&
+                          flow_loop_npu->set_input("mel_mask", mel_mask.data(), mel_mask.size() * 4);
+            } else if (flow_ok) {
+                flow_ok = flow_loop_npu->set_input("gen_len", &gen_len_i, 4) &&
+                          flow_loop_npu->set_input("prompt_len", &prompt_len_i, 4);
+            }
+            flow_ok = flow_ok &&
+                      flow_loop_npu->set_input("prompt_feat", pfeat.data(), pfeat.size() * 4) &&
+                      flow_loop_npu->set_input("embedding", emb.data(), emb.size() * 4) &&
+                      flow_loop_npu->set_input("noise", noise.data(), noise.size() * 4) &&
+                      (flow_loop_npu->input_elems("noise_state") <= 0 ||
+                       flow_loop_npu->set_input("noise_state", noise.data(), noise.size() * 4)) &&
+                      (flow_loop_npu->input_elems("noise_est") <= 0 ||
+                       flow_loop_npu->set_input("noise_est", noise.data(), noise.size() * 4)) &&
+                      (flow_loop_npu->input_elems("noise_est2") <= 0 ||
+                       flow_loop_npu->set_input("noise_est2", noise.data(), noise.size() * 4)) &&
+                      flow_loop_npu->run();
+            if (!flow_ok) return 1;
+            const float * out = flow_loop_npu->output_f32((size_t) 80 * mel_cap, flow_out_idx);
+            if (!out) return 1;
+            const int src_frame = prompt_mel + 2 * ctx;
+            const int dst_frame = 2 * start;
+            const int frames = 2 * new_codes;
+            for (int c = 0; c < 80; c++) {
+                for (int t = 0; t < frames; t++) {
+                    mel[(size_t) c * Tgen + dst_frame + t] =
+                            flow_mel_value(tab, c, out[(size_t) c * mel_cap + src_frame + t]);
+                }
+            }
+            fprintf(stderr, "[flow-win] pn=%d ctx=%d new=%d total=%d cap=%d\n",
+                    prompt_n, ctx, new_codes, total_tokens, tok_cap);
+            start = end;
+            windows++;
         }
-        flow_ok = flow_ok &&
-                  flow_loop_npu->set_input("prompt_feat", pfeat.data(), pfeat.size() * 4) &&
-                  flow_loop_npu->set_input("embedding", emb.data(), emb.size() * 4) &&
-                  flow_loop_npu->set_input("noise", noise.data(), noise.size() * 4) &&
-                  flow_loop_npu->run();
-        if (!flow_ok) return 1;
-        const float * out = flow_loop_npu->output_f32((size_t) 80 * mel_cap);
-        if (!out) return 1;
-        for (int c = 0; c < 80; c++) {
-            memcpy(mel.data() + (size_t) c * Tgen,
-                   out + (size_t) c * mel_cap + prompt_mel, (size_t) Tgen * sizeof(float));
-        }
-        fprintf(stderr, "[flow] windows=1 cap_tokens=%d cap_mel=%d\n", tok_cap, mel_cap);
+        fprintf(stderr, "[flow] windows=%d cap_tokens=%d cap_mel=%d\n", windows, tok_cap, mel_cap);
         t_flow = std::chrono::steady_clock::now();
     } else {
     std::vector<int32_t> gen_tok(flow_codes.begin(), flow_codes.end());
@@ -2261,7 +2425,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     t_flowenc = std::chrono::steady_clock::now();
 
     // ---- Euler flow matching -------------------------------------------
-    const int steps = 10;
+    const int steps = a.flow_steps;
     npu_model * flow_model = flow_npu.get();
     int npu_flow_cap = a.flow_npu_cap;
     bool npu_flow_nlc = a.flow_npu_nlc;
@@ -2279,7 +2443,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
 
     // One Euler trajectory over Tw frames (Tw <= the kernel's capacity when it runs on NPU).
     auto euler = [&](std::vector<float> & xw, const float * muw, const float * condw,
-                     const float * maskw, int Tw) -> bool {
+                     const float * maskw, int Tw, int update_from = 0) -> bool {
         const int cap = flow_model ? npu_flow_cap : Tw;
         std::vector<float> x_in(2 * 80 * Tw), mu_in(2 * 80 * Tw), cond_in(2 * 80 * Tw);
         std::vector<float> mask_in(2 * Tw), spks_in(2 * 80), t_in(2);
@@ -2349,8 +2513,11 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
                 d = es_out[0].GetTensorData<float>();
             }
             const int dstride = flow_model ? cap : Tw;
+            // Frames left of update_from are real left context from the previous
+            // window.  They condition this window but must keep their value; only
+            // the new frames follow the Euler trajectory.
             for (int c = 0; c < 80; c++) {
-                for (int t = 0; t < Tw; t++) {
+                for (int t = update_from; t < Tw; t++) {
                     float dphi = 1.7f * d[(size_t) c * dstride + t] - 0.7f * d[(size_t) (80 + c) * dstride + t];
                     xw[(size_t) c * Tw + t] += (float) dt * dphi;
                 }
@@ -2387,7 +2554,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
                 memcpy(condw.data() + (size_t) c * take, cond.data() + (size_t) c * T + in0, (size_t) take * 4);
             }
             memcpy(maskw.data(), mask.data() + in0, (size_t) take * 4);
-            if (!euler(xw, muw.data(), condw.data(), maskw.data(), take)) return 1;
+            if (!euler(xw, muw.data(), condw.data(), maskw.data(), take, out0 - in0)) return 1;
             for (int c = 0; c < 80; c++) {
                 memcpy(x.data() + (size_t) c * T + out0, xw.data() + (size_t) c * take + (out0 - in0),
                        (size_t) (out1 - out0) * 4);
@@ -2442,14 +2609,48 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             return 1;
         }
         const int s_frames = cap * 480 / 4 + 1;
-        double t_front = 0.0, t_npu = 0.0, t_post = 0.0;
+        double t_front = 0.0, t_npu = 0.0, t_post = 0.0, t_f0npu = 0.0;
         int chunks = 0;
         std::vector<float> full_s;
+        std::vector<float> f0_all;
+        const int hift_f0_idx = !split ? -1 :
+            (hmodel->output_index("f0") >= 0 ? hmodel->output_index("f0") : hmodel->output_index("f0_out"));
+        if (hift_f0_idx >= 0) {
+            // The f0 predictor is part of the HiFT AXModel.  Sweep the same
+            // decoder windows once with a zero s_stft input to obtain f0 for
+            // the whole utterance; the host then only builds the sine source
+            // and its STFT.  Phase continuity stays exactly as before because
+            // the source runs once over the full mel.
+            auto tz0 = std::chrono::steady_clock::now();
+            f0_all.assign(Tgen, 0.0f);
+            std::vector<float> s_zero((size_t) 18 * s_frames, 0.0f);
+            std::vector<float> hmel((size_t) 80 * cap);
+            for (int start = 0; start < Tgen; start += stride) {
+                const int in_start = std::max(0, start - left);
+                const int dst_off = start == 0 ? left : 0;
+                const int take = std::min(cap - dst_off, Tgen - in_start);
+                std::fill(hmel.begin(), hmel.end(), 0.0f);
+                for (int c = 0; c < 80; c++) {
+                    memcpy(hmel.data() + (size_t) c * cap + dst_off,
+                           mel.data() + (size_t) c * Tgen + in_start, (size_t) take * 4);
+                }
+                if (!hmodel->set_input("mel", hmel.data(), hmel.size() * 4) ||
+                    !hmodel->set_input("s_stft", s_zero.data(), s_zero.size() * 4) || !hmodel->run()) {
+                    fprintf(stderr, "hift f0 sweep failed\n");
+                    return 1;
+                }
+                const float * f0p = hmodel->output_f32(cap, hift_f0_idx);
+                if (!f0p) return 1;
+                memcpy(f0_all.data() + in_start, f0p + dst_off, (size_t) take * 4);
+            }
+            t_f0npu = sec(tz0, std::chrono::steady_clock::now());
+        }
         if (split) {
             auto t0 = std::chrono::steady_clock::now();
             if (native) {
                 int nf_native = 0;
-                hift_front_native(native_hift, mel.data(), Tgen, full_s, nf_native);
+                hift_front_native(native_hift, mel.data(), Tgen, full_s, nf_native,
+                                  nullptr, nullptr, 0, nullptr, f0_all.empty() ? nullptr : f0_all.data());
                 if (nf_native != Tgen * 120 + 1 || full_s.size() != (size_t) 18 * nf_native) {
                     fprintf(stderr, "native hift front produced a bad shape for %d frames\\n", Tgen);
                     return 1;
@@ -2584,8 +2785,8 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             fprintf(stderr, "hift produced %zu samples, expected %zu\n", pcm.size(), (size_t) Tgen * 480);
             return 1;
         }
-        fprintf(stderr, "[hift] chunks=%d cap=%d front=%.3fs npu=%.3fs post=%.3fs\n",
-                chunks, cap, t_front, t_npu, t_post);
+        fprintf(stderr, "[hift] chunks=%d cap=%d front=%.3fs f0npu=%.3fs npu=%.3fs post=%.3fs\n",
+                chunks, cap, t_front, t_f0npu, t_npu, t_post);
         hift_calls = chunks;
     } else {
         std::vector<int64_t> hmel_shape{1, 80, Tgen};
@@ -2700,6 +2901,18 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             if (warm) {
                 const std::string warm_out = "/tmp/cosy_service_warmup.wav";
                 generate("你好。", warm_text, warm_out, *warm, a.seed, std::string(), 0.0, 0.0, false, {});
+                unlink(warm_out.c_str());
+            }
+        }
+        // A second bundled reference is a common first request (the shipped
+        // English prompt).  Its speaker/tokenizer features and ONNX sessions
+        // are built here so /health only becomes ready with both refs warm.
+        if (!a.warm_prompt2.empty()) {
+            auto warm2 = prepare_ref(a.warm_prompt2);
+            if (warm2) {
+                const std::string warm_out = "/tmp/cosy_service_warmup2.wav";
+                const std::string t2 = a.warm_text2.empty() ? warm_text : a.warm_text2;
+                generate("Hello.", t2, warm_out, *warm2, a.seed, std::string(), 0.0, 0.0, false, {});
                 unlink(warm_out.c_str());
             }
         }

@@ -114,7 +114,7 @@ static bool server_cosy_tts_start(std::string & error) {
         "--tables", path("tables"),
         "--campplus", path("onnx/campplus.onnx"),
         "--tokenizer", path("onnx/speech_tokenizer_v3.onnx"),
-        "--flow-loop-npu", path("kernels/cosyvoice3_flow_loop_n224_s5_npu4.axmodel"),
+        "--flow-loop-npu", path("kernels/cosyvoice3_flow_loop_n256_s5_npu4.axmodel"),
         "--hift-npu", path("kernels/cosyvoice3_hift_dec_c256_npu4.axmodel"),
         "--feat-cache", path("cache"),
         "-p", "x", "--prompt-text", "x", "--prompt-wav", "/dev/null",
@@ -122,6 +122,9 @@ static bool server_cosy_tts_start(std::string & error) {
         "--warm-prompt-wav", path("examples/zero_shot_prompt.wav"),
         "--warm-prompt-text",
         "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。",
+        "--warm-prompt-wav2", path("examples/asr_en_5s.wav"),
+        "--warm-prompt-text2",
+        "You are a helpful assistant.<|endofprompt|>Mm-hmm. Oh, yeah, yeah. He wasn't even that big when I started listening.",
     };
     return cosyvoice3_service_start(args, error);
 }
