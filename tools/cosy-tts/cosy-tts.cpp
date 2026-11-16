@@ -82,18 +82,31 @@ static bool read_wav(const char * path, wav_data & out) {
     }
     fclose(f);
     if (!channels || !rate || !bits || data.empty()) { fprintf(stderr, "%s: missing fmt/data\n", path); return false; }
-    size_t n = 0;
-    if (fmt == 1 && bits == 16) n = data.size() / 2;
-    else if (fmt == 3 && bits == 32) n = data.size() / 4;
-    else { fprintf(stderr, "%s: unsupported wav fmt=%u bits=%u\n", path, fmt, bits); return false; }
+    const int bytes = bits / 8;
+    if (!bytes || (fmt != 1 && fmt != 3) || (fmt == 1 && bits != 8 && bits != 16 && bits != 24 && bits != 32) ||
+        (fmt == 3 && bits != 32 && bits != 64)) {
+        fprintf(stderr, "%s: unsupported wav fmt=%u bits=%u\n", path, fmt, bits); return false;
+    }
+    const size_t n = data.size() / (size_t) bytes;
     out.pcm.resize(n / channels);
+    auto sample = [&](size_t j) -> float {
+        const uint8_t * p8 = data.data() + j * (size_t) bytes;
+        if (fmt == 3) {
+            if (bits == 32) { float v; memcpy(&v, p8, 4); return v; }
+            double v; memcpy(&v, p8, 8); return (float) v;
+        }
+        if (bits == 8)  return (p8[0] - 128) / 128.0f;
+        if (bits == 16) { int16_t v; memcpy(&v, p8, 2); return v / 32768.0f; }
+        if (bits == 24) {
+            int32_t v = (int32_t) (((uint32_t) p8[0] << 8) | ((uint32_t) p8[1] << 16) | ((uint32_t) p8[2] << 24));
+            return (float) (v / 8388608.0);
+        }
+        int32_t v; memcpy(&v, p8, 4);
+        return (float) ((double) v / 2147483648.0);
+    };
     for (size_t i = 0; i < out.pcm.size(); i++) {
         float acc = 0;
-        for (uint16_t c = 0; c < channels; c++) {
-            size_t j = i * channels + c;
-            acc += (fmt == 1) ? ((const int16_t *) data.data())[j] / 32768.0f
-                              : ((const float *) data.data())[j];
-        }
+        for (uint16_t c = 0; c < channels; c++) acc += sample(i * channels + c);
         out.pcm[i] = acc / channels;
     }
     out.sample_rate = (int) rate;
@@ -1146,6 +1159,7 @@ static void hift_post_native(const float * mp, int nf, std::vector<float> & audi
 
 struct campplus_net {
     const gguf_asset_file * assets = nullptr;
+    mutable double acc_conv = 0, acc_bn = 0, acc_pool = 0, acc_copy = 0, acc_mac = 0;
 
     const ggml_tensor * t(const std::string & name) const {
         return assets ? assets->get(name.c_str()) : nullptr;
@@ -1172,6 +1186,7 @@ struct campplus_net {
     // F.conv2d on [IC][IH][IW] with symmetric padding.
     void conv2d(const std::vector<float> & x, int ic, int ih, int iw, const std::string & name,
                 int sh, int sw, int ph, int pw, std::vector<float> & y, int & oc, int & oh, int & ow) const {
+        const auto tc0 = std::chrono::steady_clock::now();
         const float * wt = w(name + ".weight");
         const float * bt = w(name + ".bias");
         // GGUF Conv2d weight [OC][IC][KH][KW] has KW as the fastest dimension.
@@ -1180,6 +1195,7 @@ struct campplus_net {
         oh = (ih + 2 * ph - kh) / sh + 1;
         ow = (iw + 2 * pw - kw) / sw + 1;
         y.assign((size_t) oc * oh * ow, 0.0f);
+        acc_mac += (double) oc * oh * ow * ic * kh * kw;
         // Output plane stays hot while the (ky,kx,ic) loop streams one
         // contiguous input row at a time, so the compiler can vectorise the
         // inner x loop.  The previous pixel-major loop reloaded the weights
@@ -1218,31 +1234,88 @@ struct campplus_net {
                 }
             }
         });
+        acc_conv += std::chrono::duration<double>(std::chrono::steady_clock::now() - tc0).count();
+    }
+
+    // C[oc][t] += A[oc][ic] * B[ic][t].  The activation matrix B is
+    // time-major, so a 4x8 register tile keeps 32 accumulators live while one
+    // eight-float activation vector feeds four output channels.  This is the
+    // inner loop of every TDNN layer; the previous per-channel loop reloaded
+    // and stored the output row for every input channel.
+    void gemm_acc(const float * A, int a_o, int a_c, const float * B, int b_c,
+                  float * C, int c_row, int M, int N, int K) const {
+        constexpr int MB = 4, NB = 8;
+        const int nblk = (N + NB - 1) / NB;
+        const int oblks = (M + MB - 1) / MB;
+        parallel_ranges(oblks * nblk, 16, [&](int q0, int q1) {
+            for (int q = q0; q < q1; q++) {
+                const int o = (q / nblk) * MB;
+                const int b = q % nblk;
+                const int t = b * NB;
+                const int nb = std::min(NB, N - t);
+                {
+                    const int mb = std::min(MB, M - o);
+                    float acc[MB][NB] = {};
+                    if (mb == MB && nb == NB) {
+                        for (int c = 0; c < K; c++) {
+                            const float * bp = B + (size_t) c * b_c + t;
+                            const float * ap = A + (size_t) o * a_o + (size_t) c * a_c;
+                            float bv[NB];
+                            #pragma GCC unroll 16
+                            for (int j = 0; j < NB; j++) bv[j] = bp[j];
+                            #pragma GCC unroll 4
+                            for (int i = 0; i < MB; i++) {
+                                const float w = ap[(size_t) i * a_o];
+                                #pragma GCC unroll 16
+                                for (int j = 0; j < NB; j++) acc[i][j] += w * bv[j];
+                            }
+                        }
+                    } else {
+                        for (int c = 0; c < K; c++) {
+                            const float * bp = B + (size_t) c * b_c + t;
+                            const float * ap = A + (size_t) o * a_o + (size_t) c * a_c;
+                            for (int i = 0; i < mb; i++) {
+                                const float w = ap[(size_t) i * a_o];
+                                for (int j = 0; j < nb; j++) acc[i][j] += w * bp[j];
+                            }
+                        }
+                    }
+                    for (int i = 0; i < mb; i++) {
+                        float * cp = C + (size_t) (o + i) * c_row + t;
+                        #pragma GCC unroll 16
+                        for (int j = 0; j < nb; j++) cp[j] += acc[i][j];
+                    }
+                }
+            }
+        });
     }
 
     // F.conv1d on [IC][T]; the kernel has no groups.
     void conv1d(const std::vector<float> & x, int ic, int T, const std::string & name,
                 int stride, int pad, int dil, std::vector<float> & y) const {
+        const auto tc0 = std::chrono::steady_clock::now();
         const float * wt = w(name + ".weight");
         const float * bt = w(name + ".bias");
         const int k = ne(name + ".weight", 0);
         const int oc = ne(name + ".weight", 2);
         const int ot = (T + 2 * pad - dil * (k - 1) - 1) / stride + 1;
         y.assign((size_t) oc * ot, 0.0f);
-        if (k == 1 && stride == 1 && pad == 0) {
-            parallel_ranges(oc, 64, [&](int c0, int c1) {
-                for (int o = c0; o < c1; o++) {
-                    float * dst = y.data() + (size_t) o * ot;
-                    if (bt) for (int q = 0; q < ot; q++) dst[q] = bt[o];
-                    else    for (int q = 0; q < ot; q++) dst[q] = 0.0f;
-                    for (int c = 0; c < ic; c++) {
-                        const float * src = x.data() + (size_t) c * T;
-                        const float wv = wt[(size_t) o * ic + c];
-                        #pragma GCC ivdep
-                        for (int q = 0; q < ot; q++) dst[q] += src[q] * wv;
-                    }
-                }
-            });
+        acc_mac += (double) oc * ot * ic * k;
+        if (stride == 1) {
+            for (int o = 0; o < oc; o++) {
+                float * dst = y.data() + (size_t) o * ot;
+                const float b = bt ? bt[o] : 0.0f;
+                for (int q = 0; q < ot; q++) dst[q] = b;
+            }
+            for (int kk = 0; kk < k; kk++) {
+                const int shift = kk * dil - pad;
+                const int q0 = std::max(0, -shift);
+                const int q1 = std::min(ot, T - shift);
+                if (q1 <= q0) continue;
+                gemm_acc(wt + kk, ic * k, k, x.data() + q0 + shift, T,
+                         y.data() + q0, ot, oc, q1 - q0, ic);
+            }
+            acc_conv += std::chrono::duration<double>(std::chrono::steady_clock::now() - tc0).count();
             return;
         }
         parallel_ranges(oc, 16, [&](int c0, int c1) {
@@ -1272,9 +1345,11 @@ struct campplus_net {
                 }
             }
         });
+        acc_conv += std::chrono::duration<double>(std::chrono::steady_clock::now() - tc0).count();
     }
 
     void bn(std::vector<float> & x, int C, int T, const std::string & name) const {
+        const auto tb0 = std::chrono::steady_clock::now();
         const float * mean = w(name + ".mean");
         const float * var = w(name + ".var");
         const float * gamma = w(name + ".gamma");
@@ -1288,13 +1363,15 @@ struct campplus_net {
                 for (int q = 0; q < T; q++) row[q] = row[q] * scale + shift;
             }
         });
+        acc_bn += std::chrono::duration<double>(std::chrono::steady_clock::now() - tb0).count();
     }
 
     static void relu_inplace(std::vector<float> & x) {
         for (auto & v : x) v = std::max(v, 0.0f);
     }
 
-    static std::vector<float> seg_pool(const std::vector<float> & x, int C, int T) {
+    static std::vector<float> seg_pool(const std::vector<float> & x, int C, int T, double * acc = nullptr) {
+        const auto tp0 = std::chrono::steady_clock::now();
         std::vector<float> out(x.size());
         const int nseg = (T + 99) / 100;
         for (int c = 0; c < C; c++) {
@@ -1306,6 +1383,7 @@ struct campplus_net {
                 for (int q = a; q < b; q++) out[(size_t) c * T + q] = m;
             }
         }
+        if (acc) *acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         return out;
     }
 
@@ -1331,7 +1409,7 @@ struct campplus_net {
                 const float m = (float) (sum / T);
                 for (int q = 0; q < T; q++) ctx[(size_t) ch * T + q] = m;
             }
-            std::vector<float> sp = seg_pool(h, 128, T);
+            std::vector<float> sp = seg_pool(h, 128, T, &acc_pool);
             for (size_t q = 0; q < ctx.size(); q++) ctx[q] += sp[q];
             std::vector<float> c1; conv1d(ctx, 128, T, p + ".cam_layer.linear1", 1, 0, 1, c1);
             relu_inplace(c1);
@@ -1418,6 +1496,9 @@ struct campplus_net {
         bn(emb, 192, 1, "cam.xvector.dense.nonlinear.batchnorm");
         auto t3 = now();
         if (timings) { timings->push_back(el(t0, t1)); timings->push_back(el(t1, t2)); timings->push_back(el(t2, t3)); }
+        if (getenv("COSY_PROFILE")) {
+            fprintf(stderr, "[campplus-detail] conv=%.3f bn=%.3f pool=%.3f mac=%.1fM\n", acc_conv, acc_bn, acc_pool, acc_mac / 1e6);
+        }
         return emb;
     }
 };
@@ -2108,7 +2189,11 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         auto s0 = std::chrono::steady_clock::now();
         front_npu = std::make_unique<npu_model>();
         if (!front_npu->load(a.front_npu)) return 1;
+        const double load_s = sec(s0, std::chrono::steady_clock::now());
+        auto s1 = std::chrono::steady_clock::now();
         if (!upload_front_weights(*front_npu, front_assets)) return 1;
+        fprintf(stderr, "[front-npu] session=%.3fs upload=%.3fs\n", load_s,
+                sec(s1, std::chrono::steady_clock::now()));
         t_npu_load += sec(s0, std::chrono::steady_clock::now());
     }
     // The merged flow graph may expose the Euler state under its own name
