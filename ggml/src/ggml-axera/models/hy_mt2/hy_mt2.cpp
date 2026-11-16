@@ -149,6 +149,7 @@ class hy_mt2 final : public model, public seq_model {
     void bind_calls(std::vector<call> & calls, const kernel & k, const char * tag, bool prefill);
     void run_prefill_page(int64_t cell, int rows, const uint16_t * x, const int32_t * p4, int64_t batch_cell0,
                           bool need_head);
+    void dump_x(const axera_cmm & b, int rows, int64_t cell, int call_index);
     void dump_hidden(const axera_cmm & b, int rows, int64_t cell, int call_index);
     void open_route_dump();
     void dump_routes(int64_t cell, int rows, int layer_stride);
@@ -690,6 +691,21 @@ void hy_mt2::dump_routes(int64_t cell, int rows, int layer_stride) {
     fflush(route_file);
 }
 
+void hy_mt2::dump_x(const axera_cmm & b, int rows, int64_t cell, int call_index) {
+    const char * p = getenv("GGML_AXERA_HY_MT2_X_DUMP");
+    if (!p || !*p) return;
+    const size_t n = (size_t) rows * H * sizeof(uint16_t);
+    b->invalidate(b->vir, n);
+    FILE * f = fopen(p, "ab");
+    if (!f) return;
+    const uint32_t magic = 0x58334854u;  // "TH3X"
+    const int32_t  h[4] = { rows, (int32_t) cell, call_index, 0 };
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(h, sizeof(h), 1, f);
+    fwrite(b->vir, 1, n, f);
+    fclose(f);
+}
+
 void hy_mt2::dump_hidden(const axera_cmm & b, int rows, int64_t cell, int call_index) {
     const char * p = getenv("GGML_AXERA_HY_MT2_HIDDEN_DUMP");
     if (!p || !*p) return;
@@ -712,7 +728,20 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
     GGML_ASSERT(xi != io.end() && oi != io.end());
     std::vector<uint16_t> xb((size_t) wp * H, 0);
     memcpy(xb.data(), x, (size_t) rows * H * sizeof(uint16_t));
+    if (const char * hp = getenv("GGML_AXERA_HY_MT2_XHOST_DUMP"); hp && *hp) {
+        FILE * hf = fopen(hp, "ab");
+        if (hf) {
+            const uint32_t magic = 0x58334854u;
+            const int32_t  h[4] = { rows, (int32_t) cell, 99, 0 };
+            fwrite(&magic, sizeof(magic), 1, hf);
+            fwrite(h, sizeof(h), 1, hf);
+            fwrite(xb.data(), sizeof(uint16_t), (size_t) rows * H, hf);
+            fclose(hf);
+        }
+    }
     memcpy(xi->second->vir, xb.data(), xb.size() * sizeof(uint16_t));
+    xi->second->flush();
+    dump_x(xi->second, rows, cell, 0);
     auto pi = io.find("position_ids");
     int32_t * pos = (int32_t *) pi->second->vir;
     // Padded rows continue the position sequence instead of repeating 0.
@@ -753,8 +782,10 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
 
     const bool prof = getenv("GGML_AXERA_HY_MT2_PROF") != nullptr;
     const bool dump = getenv("GGML_AXERA_HY_MT2_HIDDEN_DUMP") != nullptr;
+    // The 4096-row page computes the head unconditionally (a runtime range
+    // around its gather never wrote head_x on this backend); only the decode
+    // graph carries the 0/1 gate.
     auto head_run = io.find("head_run");
-    GGML_ASSERT(head_run != io.end());
     auto layer0_run = io.find("layer0_run");
     auto body_run   = io.find("body_run");
     if (wp == WP_MAX) {
@@ -779,8 +810,10 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
             layer0_run->second->flush();
             body_run->second->flush();
         }
-        *(int32_t *) head_run->second->vir = need_head && ci + 1 == (int) pre.size() ? 1 : 0;
-        head_run->second->flush();
+        if (head_run != io.end()) {
+            *(int32_t *) head_run->second->vir = need_head && ci + 1 == (int) pre.size() ? 1 : 0;
+            head_run->second->flush();
+        }
         const int64_t t0   = prof ? ggml_time_us() : 0;
         pre[ci].k->run(pre[ci].in, pre[ci].out, "prefill");
         if (prof) {
@@ -802,6 +835,32 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
     small_head = false;
     axera_cmm & hl = io.at("head_logits");
     hl->invalidate(hl->vir, (size_t) HEAD_ROWS * VOCAB * sizeof(float));
+    if (const char * gp = getenv("GGML_AXERA_HY_MT2_HEADX_DUMP"); gp && *gp) {
+        auto hx = io.find("head_x");
+        if (hx != io.end()) {
+            hx->second->invalidate(hx->second->vir, hx->second->size);
+            FILE * gf = fopen(gp, "ab");
+            if (gf) {
+                const uint32_t magic = 0x47334854u;  // "TH3G"
+                const int32_t  gh[4] = { HEAD_ROWS, head_first, head_n, 0 };
+                fwrite(&magic, sizeof(magic), 1, gf);
+                fwrite(gh, sizeof(gh), 1, gf);
+                fwrite(hx->second->vir, 1, hx->second->size, gf);
+                fclose(gf);
+            }
+        }
+    }
+    if (const char * hp = getenv("GGML_AXERA_HY_MT2_HEAD_DUMP"); hp && *hp) {
+        FILE * hf = fopen(hp, "ab");
+        if (hf) {
+            const uint32_t magic = 0x4c334854u;  // "TH3L"
+            const int32_t  hh[4] = { rows, (int32_t) cell, head_first, head_n };
+            fwrite(&magic, sizeof(magic), 1, hf);
+            fwrite(hh, sizeof(hh), 1, hf);
+            fwrite(hl->vir, sizeof(float), (size_t) HEAD_ROWS * VOCAB, hf);
+            fclose(hf);
+        }
+    }
 }
 
 void hy_mt2::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4) {
@@ -855,6 +914,9 @@ void hy_mt2::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4
         }
     }
     dump_routes(cell, 1, 8);
+    if (getenv("GGML_AXERA_HY_MT2_HIDDEN_DUMP") != nullptr) {
+        dump_hidden(io.at("output"), 1, cell, (int) dec.size() - 1);
+    }
     axera_cmm & hl = io.at("head_logits");
     hl->invalidate(hl->vir, VOCAB * sizeof(float));
     head_first = 0;  // the decode batch is one row: its logits row is batch row 0
@@ -863,6 +925,10 @@ void hy_mt2::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4
 }
 
 bool hy_mt2::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t * p4, int batch0, seq_snap * snap) {
+    if (getenv("GGML_AXERA_HY_MT2_PATHS")) {
+        GGML_LOG_INFO("axera hy_mt2: pages cell=%lld n=%d batch0=%d wp=%d small=%d\n",
+                      (long long) c0, n, batch0, wp, n < SMALL_BATCH ? 1 : 0);
+    }
     const uint16_t * xr = x;
     if (!xr) {
         GGML_ASSERT(batch0 == 0);
@@ -1022,6 +1088,21 @@ ggml_status hy_mt2::compute(ggml_cgraph * g) {
     axera_host_pool().run(T, [&](int64_t r) {
         ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]), xb.data() + (size_t) r * H, H);
     });
+    if (const char * ip = getenv("GGML_AXERA_HY_MT2_IDS_DUMP"); ip && *ip) {
+        FILE * idf = fopen(ip, "wb");
+        if (idf) {
+            const uint32_t magic = 0x49334854u;  // "TH3I"
+            const int32_t  h[4] = { T, 0, 0, 0 };
+            fwrite(&magic, sizeof(magic), 1, idf);
+            fwrite(h, sizeof(h), 1, idf);
+            if (x0->op == GGML_OP_GET_ROWS && x0->src[1] && x0->src[1]->type == GGML_TYPE_I32) {
+                fwrite(x0->src[1]->data, sizeof(int32_t), (size_t) T, idf);
+            }
+            fwrite((const char *) x0->data + (size_t) (T - 1) * x0->nb[1], sizeof(float), (size_t) H, idf);
+            fwrite(xb.data() + (size_t) (T - 1) * H, sizeof(uint16_t), (size_t) H, idf);
+            fclose(idf);
+        }
+    }
     batch_rows = xb.data();
     last_seq_status = 0;
     const int64_t c0 = kv.cell_of(0);
