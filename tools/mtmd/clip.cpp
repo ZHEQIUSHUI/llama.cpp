@@ -1792,7 +1792,7 @@ struct clip_model_loader {
                         if (hparams.image_min_pixels < warn_min_pixels) {
                             LOG_WRN("%s: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks\n", __func__);
                             LOG_WRN("%s: if you encounter problems with accuracy, try adding --image-min-tokens 1024\n", __func__);
-                            LOG_WRN("%s: more info: https://github.com/ZHEQIUSHUI/llama.cpp/issues/16842\n\n", __func__);
+                            LOG_WRN("%s: more info: https://github.com/ggml-org/llama.cpp/issues/16842\n\n", __func__);
                         }
                     } break;
                 case PROJECTOR_TYPE_MINIMAX_M3:
@@ -4058,7 +4058,7 @@ struct clip_model_loader {
                 LOG_WRN("%s: flash attention is %s\n", __func__,
                     (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) ? "enabled" : "disabled");
                 LOG_WRN("%s: please report this on github as an issue\n", __func__);
-                LOG_WRN("%s: ref: https://github.com/ZHEQIUSHUI/llama.cpp/pull/16837#issuecomment-3461676118\n", __func__);
+                LOG_WRN("%s: ref: https://github.com/ggml-org/llama.cpp/pull/16837#issuecomment-3461676118\n", __func__);
                 LOG_WRN("%s: *****************************************************************\n", __func__);
             }
         }

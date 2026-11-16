@@ -1694,7 +1694,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--swa-full"},
         string_format("use full-size SWA cache (default: %s)\n"
-            "[(more info)](https://github.com/ZHEQIUSHUI/llama.cpp/pull/13194#issuecomment-2868343055)", params.swa_full ? "true" : "false"),
+            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)", params.swa_full ? "true" : "false"),
         [](common_params & params) {
             params.swa_full = true;
         }
@@ -1702,7 +1702,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
         string_format("max number of context checkpoints to create per slot (default: %d)"
-            "[(more info)](https://github.com/ZHEQIUSHUI/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
+            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
         [](common_params & params, int value) {
             params.n_ctx_checkpoints = value;
         }
@@ -1720,7 +1720,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
-            "[(more info)](https://github.com/ZHEQIUSHUI/llama.cpp/pull/16391)", params.cache_ram_mib),
+            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
             params.cache_ram_mib = value;
             params.cache_ram_explicit = true;
@@ -2200,7 +2200,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--adaptive-target"}, "N",
         string_format("adaptive-p: select tokens near this probability (valid range 0.0 "
                       "to 1.0; negative = disabled) (default: %.2f)\n"
-                      "[(more info)](https://github.com/ZHEQIUSHUI/llama.cpp/pull/17927)",
+                      "[(more info)](https://github.com/ggml-org/llama.cpp/pull/17927)",
                       (double)params.sampling.adaptive_target),
         [](common_params & params, const std::string & value) {
             params.sampling.adaptive_target = std::stof(value);
@@ -2739,7 +2739,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- isolate: only spawn threads on CPUs on the node that execution started on\n"
         "- numactl: use the CPU map provided by numactl\n"
         "if run without this previously, it is recommended to drop the system page cache before using this\n"
-        "see https://github.com/ZHEQIUSHUI/llama.cpp/issues/1437",
+        "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
             else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }

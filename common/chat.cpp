@@ -381,7 +381,7 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
                 } else if (!content.is_null()) {
                     throw std::invalid_argument("Invalid 'content' type: expected string or array, got " +
                                                 content.dump() +
-                                                " (ref: https://github.com/ZHEQIUSHUI/llama.cpp/issues/8367)");
+                                                " (ref: https://github.com/ggml-org/llama.cpp/issues/8367)");
                 }
             }
             if (has_tool_calls) {
@@ -416,8 +416,8 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
             }
             if (!has_content && !has_tool_calls) {
                 throw std::invalid_argument(
-                    "Expected 'content' or 'tool_calls' (ref: https://github.com/ZHEQIUSHUI/llama.cpp/issues/8367 & "
-                    "https://github.com/ZHEQIUSHUI/llama.cpp/issues/12279)");
+                    "Expected 'content' or 'tool_calls' (ref: https://github.com/ggml-org/llama.cpp/issues/8367 & "
+                    "https://github.com/ggml-org/llama.cpp/issues/12279)");
             }
             if (message.contains("reasoning_content")) {
                 msg.reasoning_content = message.at("reasoning_content");
@@ -758,7 +758,7 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
     }
 
     // TODO @ngxson : this is a temporary hack to prevent chat template from throwing an error
-    // Ref: https://github.com/ZHEQIUSHUI/llama.cpp/pull/15230#issuecomment-3173959633
+    // Ref: https://github.com/ggml-org/llama.cpp/pull/15230#issuecomment-3173959633
     if (default_template_src.find("<|channel|>") != std::string::npos
         // search for the error message and patch it
         && default_template_src.find("in message.content or") != std::string::npos) {
@@ -769,7 +769,7 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
     }
 
     // TODO @aldehir : this is a temporary fix, pending Minja changes
-    // Ref: https://github.com/ZHEQIUSHUI/llama.cpp/pull/17713#issuecomment-3631342664
+    // Ref: https://github.com/ggml-org/llama.cpp/pull/17713#issuecomment-3631342664
     if (default_template_src.find("[TOOL_CALLS]") != std::string::npos
         // search for the error message and patch it
         && default_template_src.find("if (message['content'] is none or") != std::string::npos) {
