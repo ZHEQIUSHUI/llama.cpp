@@ -14,7 +14,6 @@
 #include "mtmd-audio.h"
 #include "cosy-tts-runtime.h"
 
-#include "onnxruntime_cxx_api.h"
 #ifdef COSY_TTS_HAVE_AXERA
 #include "ax_engine_api.h"
 #include "ax_sys_api.h"
@@ -371,48 +370,7 @@ static bool concat_wav_parts(const std::vector<std::string> & parts, const std::
 }
 
 // ---------------------------------------------------------------------------
-// ONNX Runtime helpers
-
-struct ort_session {
-    Ort::Session session{nullptr};
-    std::vector<std::string> in_names, out_names;
-    std::vector<const char *> in_c, out_c;
-
-    ort_session() = default;
-    ort_session(Ort::Env & env, const std::string & path,
-                GraphOptimizationLevel level = GraphOptimizationLevel::ORT_ENABLE_ALL) {
-        Ort::SessionOptions opt;
-        opt.SetGraphOptimizationLevel(level);
-        opt.SetIntraOpNumThreads(16);
-        session = Ort::Session(env, path.c_str(), opt);
-        for (size_t i = 0; i < session.GetInputCount(); i++) {
-            auto n = session.GetInputNameAllocated(i, Ort::AllocatorWithDefaultOptions());
-            in_names.emplace_back(n.get());
-        }
-        for (size_t i = 0; i < session.GetOutputCount(); i++) {
-            auto n = session.GetOutputNameAllocated(i, Ort::AllocatorWithDefaultOptions());
-            out_names.emplace_back(n.get());
-        }
-        for (auto & n : in_names) in_c.push_back(n.c_str());
-        for (auto & n : out_names) out_c.push_back(n.c_str());
-    }
-
-    std::vector<Ort::Value> run(std::vector<Ort::Value> inputs) {
-        return session.Run(Ort::RunOptions{nullptr}, in_c.data(), inputs.data(), inputs.size(), out_c.data(), out_c.size());
-    }
-};
-
-struct ort_alloc {
-    Ort::MemoryInfo info{nullptr};
-    ort_alloc() : info(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {}
-    template <typename T>
-    Ort::Value make(std::vector<T> & data, const std::vector<int64_t> & shape) {
-        return Ort::Value::CreateTensor<T>(info, data.data(), data.size(), shape.data(), shape.size());
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Load a compiled AXModel whose weights and IO layout are fixed at build time.
+// AXERA engine wrapper
 
 #ifdef COSY_TTS_HAVE_AXERA
 struct npu_model {
@@ -505,6 +463,16 @@ struct npu_model {
         return true;
     }
 
+    void * input_ptr(const char * name) {
+        const int i = input_index(name);
+        return i >= 0 ? in[i].pVirAddr : nullptr;
+    }
+
+    size_t input_bytes(const char * name) const {
+        const int i = input_index(name);
+        return i >= 0 ? (size_t) in[i].nSize : 0;
+    }
+
     bool run() {
         // The output buffers are zeroed by the CPU at load time.  Flush those
         // dirty lines before the first device write, otherwise the first NPU
@@ -554,6 +522,10 @@ struct npu_model {
         fprintf(stderr, "this build has no AXERA support; rebuild with GGML_AXERA and GGML_AXERA_BSP_DIR\n");
         return false;
     }
+    void * input_ptr(const char *) { return nullptr; }
+    size_t input_bytes(const char *) const { return 0; }
+    int input_index(const char *) const { return -1; }
+    int output_index(const char *) const { return -1; }
     bool set_input(const char *, const void *, size_t) { return false; }
     bool run() { return false; }
     const float * output_f32(size_t) const { return nullptr; }
@@ -572,6 +544,193 @@ struct npu_model {
 // hundreds of milliseconds per request on them.  The weights and the
 // deterministic noise/shuffle tables are extracted once at pack time.
 
+// Read-only GGUF opened with tensor data resident in host memory.  The
+// front-end aux GGUF replaces the old tables/ directory and the ONNX graphs;
+// its tensors are the only weight source for the reference-audio encoders,
+// the HiFT f0 front and the host feature tables.
+struct gguf_asset_file {
+    gguf_context * ctx = nullptr;
+    ggml_context * tensors = nullptr;
+    bool opened = false;
+
+    gguf_asset_file() = default;
+    gguf_asset_file(const gguf_asset_file &) = delete;
+    gguf_asset_file & operator=(const gguf_asset_file &) = delete;
+
+    bool open(const std::string & path) {
+        if (opened) return true;
+        gguf_init_params p{};
+        p.no_alloc = false;
+        p.ctx = &tensors;
+        ctx = gguf_init_from_file(path.c_str(), p);
+        if (!ctx || !tensors) { fprintf(stderr, "failed to load %s\n", path.c_str()); return false; }
+        opened = true;
+        return true;
+    }
+
+    ggml_tensor * get(const char * name) const {
+        return tensors ? ggml_get_tensor(tensors, name) : nullptr;
+    }
+
+    const float * f32(const char * name, size_t expected = 0, int * ne_out = nullptr) const {
+        ggml_tensor * t = get(name);
+        if (!t || t->type != GGML_TYPE_F32) {
+            fprintf(stderr, "front GGUF: %s missing or not F32\n", name);
+            return nullptr;
+        }
+        if (expected && (size_t) ggml_nelements(t) != expected) {
+            fprintf(stderr, "front GGUF: %s has %lld elems, expected %zu\n", name, (long long) ggml_nelements(t), expected);
+            return nullptr;
+        }
+        if (ne_out) for (int i = 0; i < 4; i++) ne_out[i] = (int) t->ne[i];
+        return (const float *) t->data;
+    }
+
+    ~gguf_asset_file() {
+        if (ctx) gguf_free(ctx);
+    }
+};
+
+
+static std::string kernel_tensor_name(const std::string & name) {
+    std::string out = name;
+    for (char & c : out) if (c == '.') c = '_';
+    return out;
+}
+
+// The tokenizer AXModel exposes every weight as a runtime input, exactly like
+// the LLM weight banks.  Convert the GGUF tensors into the layouts the tiled
+// matmul primitives expect once at load time; the model file itself never
+// contains weights.
+static bool upload_front_weights(npu_model & m, gguf_asset_file & assets) {
+    const int64_t nt = (int64_t) gguf_get_n_tensors(assets.ctx);
+    int uploaded = 0;
+    for (int64_t i = 0; i < nt; i++) {
+        const char * raw = gguf_get_tensor_name(assets.ctx, i);
+        if (!raw || strncmp(raw, "tok.", 4) != 0) continue;
+        const std::string name = raw;
+        ggml_tensor * t = ggml_get_tensor(assets.tensors, raw);
+        if (!t) return false;
+        const size_t nelem = (size_t) ggml_nelements(t);
+        std::string in;
+        bool bf16_out = true;
+        if (name == "tok.qproj.weight") {
+            in = "tok_qproj_pad";
+        } else if (name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0) {
+            in = kernel_tensor_name(name.substr(0, name.size() - 7)) + "_mat";
+        } else {
+            in = kernel_tensor_name(name);
+        }
+        const int idx = m.input_index(in.c_str());
+        if (idx < 0) {
+            fprintf(stderr, "front AXModel: no input %s for GGUF %s\n", in.c_str(), raw);
+            return false;
+        }
+        if (name == "tok.qproj.weight") {
+            // Official graph projects 1280 -> 8.  A 32-wide matmul is the
+            // smallest shape the tiling primitive accepts; rows 8..31 stay zero.
+            if (t->type != GGML_TYPE_BF16 || t->ne[0] != 1280 || t->ne[1] != 8) {
+                fprintf(stderr, "front GGUF: unexpected qproj shape\n");
+                return false;
+            }
+            const uint16_t * src = (const uint16_t *) t->data;
+            std::vector<uint16_t> pad((size_t) 32 * 1280, 0);
+            for (int r = 0; r < 8; r++) for (int c = 0; c < 1280; c++) pad[(size_t) r * 1280 + c] = src[(size_t) c * 8 + r];
+            if (pad.size() * 2 != m.in[idx].nSize || !m.set_input(in.c_str(), pad.data(), pad.size() * 2)) return false;
+            uploaded++;
+            continue;
+        }
+        if (t->type == GGML_TYPE_F32) {
+            if (nelem * 4 != m.in[idx].nSize || !m.set_input(in.c_str(), t->data, nelem * 4)) {
+                fprintf(stderr, "front AXModel: %s expects %u bytes, got %zu\n", in.c_str(), m.in[idx].nSize, nelem * 4);
+                return false;
+            }
+            uploaded++;
+            continue;
+        }
+        if (t->type != GGML_TYPE_BF16) {
+            fprintf(stderr, "front GGUF: %s has unsupported type %d\n", raw, (int) t->type);
+            return false;
+        }
+        if (name == "tok.conv1.weight" || name == "tok.conv2.weight") {
+            const int K = (int) t->ne[0], IC = (int) t->ne[1], OC = (int) t->ne[2];
+            const uint16_t * src = (const uint16_t *) t->data;
+            std::vector<uint16_t> dst(nelem);
+            for (int oc = 0; oc < OC; oc++)
+                for (int ic = 0; ic < IC; ic++)
+                    for (int k = 0; k < K; k++)
+                        dst[((size_t) oc * K + k) * IC + ic] = src[((size_t) oc * IC + ic) * K + k];
+            if (dst.size() * 2 != m.in[idx].nSize || !m.set_input(in.c_str(), dst.data(), dst.size() * 2)) return false;
+        } else if (name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0 && ggml_n_dims(t) == 2) {
+            const int IC = (int) t->ne[0], OC = (int) t->ne[1];
+            const uint16_t * src = (const uint16_t *) t->data;
+            std::vector<uint16_t> dst(nelem);
+            for (int oc = 0; oc < OC; oc++)
+                for (int ic = 0; ic < IC; ic++)
+                    dst[(size_t) oc * IC + ic] = src[(size_t) ic * OC + oc];
+            if (dst.size() * 2 != m.in[idx].nSize || !m.set_input(in.c_str(), dst.data(), dst.size() * 2)) return false;
+        } else if (nelem * 2 != m.in[idx].nSize || !m.set_input(in.c_str(), t->data, nelem * 2)) {
+            fprintf(stderr, "front AXModel: %s expects %u bytes, got %zu\n", in.c_str(), m.in[idx].nSize, nelem * 2);
+            return false;
+        }
+        uploaded++;
+    }
+    fprintf(stderr, "[front-npu] uploaded %d tokenizer weight tensors\n", uploaded);
+    return uploaded > 0;
+}
+
+
+// Fixed 30 s reference-audio window: 3000 Whisper mel frames -> 750 language
+// model tokens.  Padding is zero (the same value the official feature
+// extractor uses for silence); anything longer is truncated like the official
+// front end.  All other inputs are computed here, so the AXModel only sees
+// plain tensors.
+static bool front_tokenize(npu_model & m, const std::vector<float> & wmel, int frames,
+                           std::vector<int32_t> & tokens) {
+    constexpr int WIN = 3000, TOK = 750;
+    const int valid = std::min(frames, WIN);
+    if (valid <= 0) { fprintf(stderr, "empty reference mel\\n"); return false; }
+    std::vector<ggml_bf16_t> mel((size_t) WIN * 128, ggml_bf16_t{0});
+    for (int c = 0; c < 128; c++)
+        for (int t = 0; t < valid; t++)
+            mel[(size_t) t * 128 + c] = ggml_fp32_to_bf16(wmel[(size_t) c * frames + t]);
+    const int ntok = std::min(TOK, (valid + 3) / 4);
+    std::vector<float> mask((size_t) TOK, 0.0f), bias((size_t) TOK, -1e9f);
+    for (int i = 0; i < ntok; i++) { mask[i] = 1.0f; bias[i] = 0.0f; }
+    std::vector<ggml_bf16_t> cosv((size_t) TOK * 64), sinv((size_t) TOK * 64);
+    for (int p = 0; p < TOK; p++) {
+        for (int j = 0; j < 32; j++) {
+            const double inv = 1.0 / std::pow(10000.0, (double) (2 * j) / 64.0);
+            const double ang = (double) p * inv;
+            const ggml_bf16_t cv = ggml_fp32_to_bf16((float) std::cos(ang));
+            const ggml_bf16_t sv = ggml_fp32_to_bf16((float) std::sin(ang));
+            cosv[(size_t) p * 64 + j] = cv;      cosv[(size_t) p * 64 + 32 + j] = cv;
+            sinv[(size_t) p * 64 + j] = sv;      sinv[(size_t) p * 64 + 32 + j] = sv;
+        }
+    }
+    std::vector<int32_t> tok_out((size_t) TOK, 0);
+    std::vector<ggml_bf16_t> hidden((size_t) TOK * 1280, ggml_bf16_t{0});
+    if (!m.set_input("mel", mel.data(), mel.size() * 2) ||
+        !m.set_input("mask", mask.data(), mask.size() * 4) ||
+        !m.set_input("attn_bias", bias.data(), bias.size() * 4) ||
+        !m.set_input("cos", cosv.data(), cosv.size() * 2) ||
+        !m.set_input("sin", sinv.data(), sinv.size() * 2) ||
+        !m.set_input("tokens", tok_out.data(), tok_out.size() * 4) ||
+        !m.set_input("hidden", hidden.data(), hidden.size() * 2) || !m.run()) {
+        return false;
+    }
+    const int32_t * result = nullptr;
+    const int oi = m.output_index("tokens");
+    if (oi >= 0 && m.output_bytes(oi) >= tok_out.size() * 4) {
+        result = (const int32_t *) m.out[oi].pVirAddr;
+    } else {
+        result = (const int32_t *) m.input_ptr("tokens");
+    }
+    if (!result) { fprintf(stderr, "front AXModel produced no token output\\n"); return false; }
+    tokens.assign(result, result + ntok);
+    return true;
+}
+
 struct hift_native {
     struct layer {
         int out_c, in_c, k;
@@ -588,39 +747,27 @@ struct hift_native {
     const float * rand_ini = nullptr;
     const float * noise = nullptr;
     size_t noise_samples = 0;
-    const uint8_t * map = nullptr;
-    size_t map_size = 0;
 
-    ~hift_native() {
-        if (map) munmap((void *) map, map_size);
-    }
-
-    bool load(const std::string & path) {
-        int fd = open(path.c_str(), O_RDONLY);
-        if (fd < 0) return false;
-        struct stat st{};
-        if (fstat(fd, &st) != 0 || st.st_size < 64) { close(fd); return false; }
-        map_size = (size_t) st.st_size;
-        map = (const uint8_t *) mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (map == MAP_FAILED) { map = nullptr; return false; }
-        const uint8_t * p = map;
-        const uint8_t * end = map + map_size;
-        auto take = [&](size_t n) { const float * r = (const float *) p; p += n; return r; };
-        if (memcmp(p, "CHFTNAT2", 8) != 0) { fprintf(stderr, "bad native HiFT table\n"); return false; }
-        p += 8;
-        uint32_t n = *(const uint32_t *) p; p += 4;
+    bool load(gguf_asset_file & g) {
+        char name[64];
         layers.clear();
-        for (uint32_t i = 0; i < n; i++) {
-            if (p + 12 > end) return false;
+        for (int i = 0; ; i++) {
+            snprintf(name, sizeof(name), "hift.front.l%d.w", i);
+            ggml_tensor * tw = g.get(name);
+            if (!tw) break;
+            snprintf(name, sizeof(name), "hift.front.l%d.b", i);
+            ggml_tensor * tb = g.get(name);
+            if (!tb || tw->type != GGML_TYPE_F32 || tb->type != GGML_TYPE_F32) {
+                fprintf(stderr, "front GGUF: bad HiFT f0 layer %d\n", i);
+                return false;
+            }
             layer l;
-            l.out_c = (int) *(const uint32_t *) (p + 0);
-            l.in_c  = (int) *(const uint32_t *) (p + 4);
-            l.k     = (int) *(const uint32_t *) (p + 8);
-            p += 12;
+            l.k = (int) tw->ne[0];
+            l.in_c = (int) tw->ne[1];
+            l.out_c = (int) tw->ne[2];
+            l.w = (const float *) tw->data;
+            l.b = (const float *) tb->data;
             const size_t wb = (size_t) l.out_c * l.in_c * l.k;
-            l.w = take(wb * 4);
-            l.b = take((size_t) l.out_c * 4);
             l.wt.resize(wb);
             for (int ic = 0; ic < l.in_c; ic++) {
                 for (int k = 0; k < l.k; k++) {
@@ -632,16 +779,21 @@ struct hift_native {
             }
             layers.push_back(l);
         }
-        classifier_w = take(512 * 4);
-        classifier_b = take(4);
-        linear_w = take(9 * 4);
-        linear_b = take(4);
-        rand_ini = take(9 * 4);
-        if (p + 8 > end) return false;
-        noise_samples = *(const uint64_t *) p; p += 8;
-        noise = take(noise_samples * 9 * 4);
-        if (p > end) return false;
-        fprintf(stderr, "[hift-native] loaded %u layers, noise_samples=%zu\n", n, noise_samples);
+        if (layers.empty()) { fprintf(stderr, "front GGUF: no HiFT f0 layers\n"); return false; }
+        classifier_w = g.f32("hift.front.classifier.w", 512);
+        classifier_b = g.f32("hift.front.classifier.b", 1);
+        linear_w = g.f32("hift.front.linear.w", 9);
+        linear_b = g.f32("hift.front.linear.b", 1);
+        rand_ini = g.f32("hift.front.rand_ini", 9);
+        ggml_tensor * tn = g.get("hift.front.noise");
+        if (!classifier_w || !classifier_b || !linear_w || !linear_b || !rand_ini ||
+            !tn || tn->type != GGML_TYPE_F32 || tn->ne[0] != 9) {
+            fprintf(stderr, "front GGUF: missing HiFT source tensors\n");
+            return false;
+        }
+        noise_samples = (size_t) tn->ne[1];
+        noise = (const float *) tn->data;
+        fprintf(stderr, "[hift-native] loaded %zu layers, noise_samples=%zu from GGUF\n", layers.size(), noise_samples);
         return true;
     }
 };
@@ -918,6 +1070,267 @@ static void hift_post_native(const float * mp, int nf, std::vector<float> & audi
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Campplus speaker encoder, ported 1:1 from the official ONNX graph.  The
+// network is small (about 6M parameters, 192-dim output) and only runs when
+// the reference recording changes, so it stays on the host in plain C++
+// instead of taking an NPU launch.  Weights are F32 tensors in the front GGUF.
+
+struct campplus_net {
+    const gguf_asset_file * assets = nullptr;
+
+    const ggml_tensor * t(const std::string & name) const {
+        return assets ? assets->get(name.c_str()) : nullptr;
+    }
+    const float * w(const std::string & name) const {
+        const ggml_tensor * x = t(name);
+        return x && x->type == GGML_TYPE_F32 ? (const float *) x->data : nullptr;
+    }
+    int ne(const std::string & name, int d) const {
+        const ggml_tensor * x = t(name);
+        return x ? (int) x->ne[d] : 0;
+    }
+
+    bool load(gguf_asset_file & g) {
+        assets = &g;
+        if (!w("cam.head.conv1.weight") || !w("cam.xvector.dense.linear.weight") ||
+            !w("cam.xvector.dense.nonlinear.batchnorm.mean")) {
+            fprintf(stderr, "front GGUF: Campplus tensors missing\n");
+            return false;
+        }
+        return true;
+    }
+
+    // F.conv2d on [IC][IH][IW] with symmetric padding.
+    void conv2d(const std::vector<float> & x, int ic, int ih, int iw, const std::string & name,
+                int sh, int sw, int ph, int pw, std::vector<float> & y, int & oc, int & oh, int & ow) const {
+        const float * wt = w(name + ".weight");
+        const float * bt = w(name + ".bias");
+        const int kh = ne(name + ".weight", 2), kw = ne(name + ".weight", 1);
+        oc = ne(name + ".weight", 3);
+        oh = (ih + 2 * ph - kh) / sh + 1;
+        ow = (iw + 2 * pw - kw) / sw + 1;
+        y.assign((size_t) oc * oh * ow, 0.0f);
+        parallel_ranges(oc, 16, [&](int c0, int c1) {
+            for (int o = c0; o < c1; o++) {
+                float * dst = y.data() + (size_t) o * oh * ow;
+                for (int yy = 0; yy < oh; yy++) {
+                    for (int xx = 0; xx < ow; xx++) {
+                        float acc = bt ? bt[o] : 0.0f;
+                        for (int ky = 0; ky < kh; ky++) {
+                            const int iy = yy * sh + ky - ph;
+                            if (iy < 0 || iy >= ih) continue;
+                            for (int kx = 0; kx < kw; kx++) {
+                                const int ix = xx * sw + kx - pw;
+                                if (ix < 0 || ix >= iw) continue;
+                                const float * src = x.data() + (size_t) iy * iw + ix;
+                                const float * ww = wt + (((size_t) o * ic) * kh + ky) * kw + kx;
+                                for (int c = 0; c < ic; c++) {
+                                    acc += src[(size_t) c * ih * iw] * ww[(size_t) c * kh * kw];
+                                }
+                            }
+                        }
+                        dst[(size_t) yy * ow + xx] = acc;
+                    }
+                }
+            }
+        });
+    }
+
+    // F.conv1d on [IC][T]; the kernel has no groups.
+    void conv1d(const std::vector<float> & x, int ic, int T, const std::string & name,
+                int stride, int pad, int dil, std::vector<float> & y) const {
+        const float * wt = w(name + ".weight");
+        const float * bt = w(name + ".bias");
+        const int k = ne(name + ".weight", 2);
+        const int oc = ne(name + ".weight", 3);
+        const int ot = (T + 2 * pad - dil * (k - 1) - 1) / stride + 1;
+        y.assign((size_t) oc * ot, 0.0f);
+        if (k == 1 && stride == 1 && pad == 0) {
+            parallel_ranges(oc, 64, [&](int c0, int c1) {
+                for (int o = c0; o < c1; o++) {
+                    float * dst = y.data() + (size_t) o * ot;
+                    if (bt) for (int q = 0; q < ot; q++) dst[q] = bt[o];
+                    else    for (int q = 0; q < ot; q++) dst[q] = 0.0f;
+                    for (int c = 0; c < ic; c++) {
+                        const float * src = x.data() + (size_t) c * T;
+                        const float wv = wt[(size_t) o * ic + c];
+                        #pragma GCC ivdep
+                        for (int q = 0; q < ot; q++) dst[q] += src[q] * wv;
+                    }
+                }
+            });
+            return;
+        }
+        parallel_ranges(oc, 64, [&](int c0, int c1) {
+            for (int o = c0; o < c1; o++) {
+                float * dst = y.data() + (size_t) o * ot;
+                for (int q = 0; q < ot; q++) {
+                    float acc = bt ? bt[o] : 0.0f;
+                    const int base = q * stride - pad;
+                    for (int c = 0; c < ic; c++) {
+                        const float * src = x.data() + (size_t) c * T;
+                        const float * ww = wt + ((size_t) o * ic + c) * k;
+                        for (int kk = 0; kk < k; kk++) {
+                            const int pos = base + kk * dil;
+                            if (pos >= 0 && pos < T) acc += src[pos] * ww[kk];
+                        }
+                    }
+                    dst[q] = acc;
+                }
+            }
+        });
+    }
+
+    void bn(std::vector<float> & x, int C, int T, const std::string & name) const {
+        const float * mean = w(name + ".mean");
+        const float * var = w(name + ".var");
+        const float * gamma = w(name + ".gamma");
+        const float * beta = w(name + ".beta");
+        const float eps = 1e-5f;
+        parallel_ranges(C, 16, [&](int c0, int c1) {
+            for (int c = c0; c < c1; c++) {
+                const float scale = (gamma ? gamma[c] : 1.0f) / std::sqrt(var[c] + eps);
+                const float shift = (beta ? beta[c] : 0.0f) - mean[c] * scale;
+                float * row = x.data() + (size_t) c * T;
+                for (int q = 0; q < T; q++) row[q] = row[q] * scale + shift;
+            }
+        });
+    }
+
+    static void relu_inplace(std::vector<float> & x) {
+        for (auto & v : x) v = std::max(v, 0.0f);
+    }
+
+    static std::vector<float> seg_pool(const std::vector<float> & x, int C, int T) {
+        std::vector<float> out(x.size());
+        const int nseg = (T + 99) / 100;
+        for (int c = 0; c < C; c++) {
+            for (int s = 0; s < nseg; s++) {
+                const int a = s * 100, b = std::min(T, a + 100);
+                double sum = 0.0;
+                for (int q = a; q < b; q++) sum += x[(size_t) c * T + q];
+                const float m = (float) (sum / (b - a));
+                for (int q = a; q < b; q++) out[(size_t) c * T + q] = m;
+            }
+        }
+        return out;
+    }
+
+    std::vector<float> block(const std::vector<float> & xin, int cin, int T, int n, const char * tag) const {
+        std::vector<float> x = xin;
+        int c = cin;
+        const int layers = n == 1 ? 12 : (n == 2 ? 24 : 16);
+        const int pad = n == 1 ? 1 : 2;
+        const int dil = n == 1 ? 1 : 2;
+        std::vector<float> b;
+        for (int i = 1; i <= layers; i++) {
+            const std::string p = std::string("cam.xvector.block") + tag + ".tdnnd" + std::to_string(i);
+            // h = relu(bn(x)); h = relu(conv1(h, linear1))
+            b = x; bn(b, c, T, p + ".nonlinear1.batchnorm"); relu_inplace(b);
+            std::vector<float> h; conv1d(b, c, T, p + ".linear1", 1, 0, 1, h);
+            relu_inplace(h);
+            std::vector<float> y; conv1d(h, 128, T, p + ".cam_layer.linear_local", 1, pad, dil, y);
+            // context = mean over time + segment means
+            std::vector<float> ctx((size_t) 128 * T);
+            for (int ch = 0; ch < 128; ch++) {
+                double sum = 0.0;
+                for (int q = 0; q < T; q++) sum += h[(size_t) ch * T + q];
+                const float m = (float) (sum / T);
+                for (int q = 0; q < T; q++) ctx[(size_t) ch * T + q] = m;
+            }
+            std::vector<float> sp = seg_pool(h, 128, T);
+            for (size_t q = 0; q < ctx.size(); q++) ctx[q] += sp[q];
+            std::vector<float> c1; conv1d(ctx, 128, T, p + ".cam_layer.linear1", 1, 0, 1, c1);
+            relu_inplace(c1);
+            std::vector<float> m; conv1d(c1, 64, T, p + ".cam_layer.linear2", 1, 0, 1, m);
+            for (auto & v : m) v = 1.0f / (1.0f + std::exp(-v));
+            std::vector<float> nx((size_t) (c + 32) * T);
+            std::memcpy(nx.data(), x.data(), (size_t) c * T * sizeof(float));
+            for (size_t q = 0; q < (size_t) 32 * T; q++) nx[(size_t) c * T + q] = y[q] * m[q];
+            x.swap(nx);
+            c += 32;
+        }
+        return x;
+    }
+
+    std::vector<float> forward(const std::vector<float> & feat, int T, const char * tag,
+                               std::vector<double> * timings = nullptr) const {
+        auto now = [] { return std::chrono::steady_clock::now(); };
+        auto el = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+        auto t0 = now();
+        // [T][80] -> [1][1][80][T]
+        std::vector<float> x((size_t) T * 80);
+        for (int c = 0; c < 80; c++) for (int q = 0; q < T; q++) x[(size_t) c * T + q] = feat[(size_t) q * 80 + c];
+        int ic = 1, ih = 80, iw = T, oc, oh, ow;
+        std::vector<float> y;
+        conv2d(x, ic, ih, iw, "cam.head.conv1", 1, 1, 1, 1, y, oc, oh, ow); relu_inplace(y);
+        for (int blk = 0; blk < 2; blk++) {
+            for (int i = 0; i < 2; i++) {
+                const std::string p = std::string("cam.head.layer") + (blk ? "2" : "1") + ".layer" +
+                                      (blk ? "2" : "1") + "." + std::to_string(i);
+                const int sh = i == 0 ? 2 : 1, sw = 1;
+                std::vector<float> h, y2, sc;
+                int hc, hh, hw;
+                conv2d(y, oc, oh, ow, p + ".conv1", sh, sw, 1, 1, h, hc, hh, hw); relu_inplace(h);
+                conv2d(h, hc, hh, hw, p + ".conv2", 1, 1, 1, 1, y2, oc, oh, ow);
+                if (i == 0) {
+                    conv2d(y, oc, ih, iw, p + ".shortcut.shortcut.0", sh, sw, 0, 0, sc, oc, oh, ow);
+                } else {
+                    sc = y;
+                }
+                for (size_t q = 0; q < y2.size(); q++) y2[q] += sc[q];
+                relu_inplace(y2);
+                y.swap(y2); ih = oh; iw = ow;
+            }
+        }
+        {
+            std::vector<float> y2;
+            conv2d(y, oc, oh, ow, "cam.head.conv2", 2, 1, 1, 1, y2, oc, oh, ow); relu_inplace(y2);
+            ih = oh; iw = ow; y.swap(y2);
+        }
+        // [1][C][H][W] -> [1][C*H][W]
+        const int ch = (int) (y.size() / iw);
+        std::vector<float> h;
+        conv1d(y, ch, iw, "cam.xvector.tdnn.linear", 2, 2, 1, h);
+        auto t1 = now();
+        int c = ne("cam.xvector.tdnn.linear.weight", 3);
+        int tt = (int) (h.size() / c);
+        for (int n = 1; n <= 3; n++) {
+            h = block(h, c, tt, n, std::to_string(n).c_str());
+            c += (n == 1 ? 12 : (n == 2 ? 24 : 16)) * 32;
+            const std::string tr = "cam.xvector.transit" + std::to_string(n);
+            bn(h, c, tt, tr + ".nonlinear.batchnorm"); relu_inplace(h);
+            std::vector<float> h2; conv1d(h, c, tt, tr + ".linear", 1, 0, 1, h2);
+            h.swap(h2);
+            c = ne(tr + ".linear.weight", 3);
+        }
+        relu_inplace(h);
+        auto t2 = now();
+        std::vector<float> mu(c), sd(c);
+        for (int ch2 = 0; ch2 < c; ch2++) {
+            const float * row = h.data() + (size_t) ch2 * tt;
+            double sum = 0.0;
+            for (int q = 0; q < tt; q++) sum += row[q];
+            const float m = (float) (sum / tt);
+            double sq = 0.0;
+            for (int q = 0; q < tt; q++) { const double d = row[q] - m; sq += d * d; }
+            mu[ch2] = m;
+            sd[ch2] = (float) std::sqrt(sq / std::max(1, tt - 1));
+        }
+        std::vector<float> st((size_t) 2 * c);
+        std::memcpy(st.data(), mu.data(), (size_t) c * sizeof(float));
+        std::memcpy(st.data() + c, sd.data(), (size_t) c * sizeof(float));
+        std::vector<float> emb;
+        conv1d(st, 2 * c, 1, "cam.xvector.dense.linear", 1, 0, 1, emb);
+        bn(emb, 192, 1, "cam.xvector.dense.nonlinear.batchnorm");
+        auto t3 = now();
+        if (timings) { timings->push_back(el(t0, t1)); timings->push_back(el(t1, t2)); timings->push_back(el(t2, t3)); }
+        return emb;
+    }
+};
+
 struct feature_tables {
     std::vector<float> whisper_mel;    // 128 x 201
     std::vector<float> kaldi_mel;      // 80 x 257
@@ -929,20 +1342,29 @@ struct feature_tables {
     std::vector<float> flow_affine;    // 80 gains + 80 biases
 };
 
-static feature_tables load_tables(const std::string & dir) {
-    feature_tables t;
-    t.whisper_mel  = load_f32(dir + "/whisper_mel_128x201.f32", 128 * 201);
-    t.kaldi_mel    = load_f32(dir + "/kaldi_mel_80x257.f32", 80 * 257);
-    t.whisper_hann = load_f32(dir + "/whisper_hann400.f32", 400);
-    t.kaldi_povey  = load_f32(dir + "/kaldi_povey512.f32", 512);
-    t.flow_noise   = load_f32(dir + "/flow_noise_1x80x15000.f32", 80 * 15000);
-    t.flow_mel     = load_f32(dir + "/flow_mel_80x961.f32", 80 * 961);
-    t.flow_hann    = load_f32(dir + "/flow_hann1920.f32", 1920);
+static bool load_tables_gguf(gguf_asset_file & g, feature_tables & t) {
+    auto cp = [&](const char * name, size_t n, std::vector<float> & dst) {
+        const float * p = g.f32(name, n);
+        if (!p) return false;
+        dst.assign(p, p + n);
+        return true;
+    };
+    if (!cp("table.whisper_mel_128x201", 128 * 201, t.whisper_mel) ||
+        !cp("table.kaldi_mel_80x257", 80 * 257, t.kaldi_mel) ||
+        !cp("table.whisper_hann400", 400, t.whisper_hann) ||
+        !cp("table.kaldi_povey512", 512, t.kaldi_povey) ||
+        !cp("table.flow_noise_1x80x15000", 80 * 15000, t.flow_noise) ||
+        !cp("table.flow_mel_80x961", 80 * 961, t.flow_mel) ||
+        !cp("table.flow_hann1920", 1920, t.flow_hann)) {
+        return false;
+    }
     // The merged flow kernel keeps its five Euler states in BF16.  The
     // calibration table removes the small, repeatable per-bin gain/bias error
     // without changing the kernel's single-call CFG/Euler contract.
-    t.flow_affine  = load_f32_optional(dir + "/flow_affine.f32", 160);
-    return t;
+    if (g.get("table.flow_affine")) {
+        if (!cp("table.flow_affine", 160, t.flow_affine)) return false;
+    }
+    return true;
 }
 
 static inline float flow_mel_value(const feature_tables & t, int c, float v) {
@@ -1308,12 +1730,10 @@ static void feat_cache_save(const std::string & path, const feat_cache & c) {
 // Main
 
 struct args {
-    std::string model, aux, tables;
-    std::string campplus, tokenizer, flow_encoder, flow_estimator, hift;
-    std::string flow_npu, flow_npu_long, flow_loop_npu, hift_npu, hift_front, hift_post;
-    std::string hift_npu_long, hift_front_long, hift_post_long;
+    std::string model, aux, front;
+    std::string flow_npu, flow_npu_long, flow_loop_npu, hift_npu, front_npu;
     bool flow_npu_nlc = false, flow_npu_long_nlc = false;
-    int flow_npu_cap = 512, flow_npu_long_cap = 1024, hift_npu_long_cap = 1024;
+    int flow_npu_cap = 512, flow_npu_long_cap = 1024;
     int flow_prompt_min = 32;
     int flow_steps = 10;
     int hift_left = 64;
@@ -1335,12 +1755,8 @@ static bool parse_args(int argc, char ** argv, args & a) {
         auto val = [&]() -> std::string { if (++i >= argc) { fprintf(stderr, "missing value for %s\n", k.c_str()); std::exit(1); } return argv[i]; };
         if (k == "-m" || k == "--model") a.model = val();
         else if (k == "--aux") a.aux = val();
-        else if (k == "--tables") a.tables = val();
-        else if (k == "--campplus") a.campplus = val();
-        else if (k == "--tokenizer") a.tokenizer = val();
-        else if (k == "--flow-encoder") a.flow_encoder = val();
-        else if (k == "--flow-estimator") a.flow_estimator = val();
-        else if (k == "--hift") a.hift = val();
+        else if (k == "--front") a.front = val();
+        else if (k == "--front-npu") a.front_npu = val();
         else if (k == "--flow-npu") a.flow_npu = val();
         else if (k == "--flow-loop-npu") a.flow_loop_npu = val();
         else if (k == "--flow-prompt-min") a.flow_prompt_min = std::max(0, std::stoi(val()));
@@ -1348,12 +1764,6 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (k == "--hift-left") a.hift_left = std::max(8, std::stoi(val()));
         else if (k == "--flow-npu-long") a.flow_npu_long = val();
         else if (k == "--hift-npu") a.hift_npu = val();
-        else if (k == "--hift-front") a.hift_front = val();
-        else if (k == "--hift-post") a.hift_post = val();
-        else if (k == "--hift-npu-long") a.hift_npu_long = val();
-        else if (k == "--hift-front-long") a.hift_front_long = val();
-        else if (k == "--hift-post-long") a.hift_post_long = val();
-        else if (k == "--hift-npu-long-cap") a.hift_npu_long_cap = std::stoi(val());
         else if (k == "--flow-npu-nlc") a.flow_npu_nlc = true;
         else if (k == "--flow-npu-long-nlc") a.flow_npu_long_nlc = true;
         else if (k == "--flow-npu-cap") a.flow_npu_cap = std::stoi(val());
@@ -1385,11 +1795,8 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (k == "--warm-prompt-text2") a.warm_text2 = val();
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return false; }
     }
-    return !a.model.empty() && !a.aux.empty() && !a.tables.empty() && !a.text.empty() && !a.prompt_wav.empty() &&
-           !a.campplus.empty() && !a.tokenizer.empty() &&
-           (!a.flow_loop_npu.empty() || (!a.flow_encoder.empty() &&
-            (!a.flow_npu.empty() || !a.flow_estimator.empty()))) &&
-           (!a.hift_npu.empty() || !a.hift.empty());
+    return !a.model.empty() && !a.aux.empty() && !a.front.empty() && !a.front_npu.empty() &&
+           !a.text.empty() && !a.prompt_wav.empty() && !a.flow_loop_npu.empty() && !a.hift_npu.empty();
 }
 
 static bool g_ax_engine_ready = false;
@@ -1490,11 +1897,9 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     args a;
     if (!parse_args(argc, argv, a)) {
         fprintf(stderr,
-            "usage: %s -m llm.gguf --aux aux.gguf --tables DIR --campplus campplus.onnx\n"
-            "  --tokenizer speech_tokenizer_v3.onnx --flow-encoder flow_encoder.onnx\n"
-            "  --flow-estimator flow.decoder.estimator.fp32.onnx --hift hift.onnx\n"
-            "  -p TEXT --prompt-text TEXT --prompt-wav ref.wav -o out.wav [-ngl N] [--dump-codes]\n"
-            "  (or --flow-npu flow.axmodel [--flow-npu-nlc] --hift-npu hift.axmodel instead of the ONNX stages)\n", argv[0]);
+            "usage: %s -m llm.gguf --aux aux.gguf --front front.gguf --front-npu front.axmodel\n"
+            "  --flow-loop-npu flow.axmodel --hift-npu hift.axmodel\n"
+            "  -p TEXT --prompt-text TEXT --prompt-wav ref.wav -o out.wav [-ngl N] [--dump-codes]\n", argv[0]);
         return 1;
     }
 
@@ -1556,38 +1961,32 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         return 0;
     }
 
-    feature_tables tab = load_tables(a.tables);
+    gguf_asset_file front_assets;
+    if (!front_assets.open(a.front)) return 1;
+    feature_tables tab;
+    if (!load_tables_gguf(front_assets, tab)) return 1;
     hift_native native_hift;
-    const bool have_native_hift = native_hift.load(a.tables + "/hift_front.bin");
-    fprintf(stderr, "[flow-cfg] prompt_min=%d hift_left=%d\n",
-            a.flow_prompt_min, a.hift_left);
-
-    Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "cosyvoice3");
-    Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-    auto make_session = [&](const std::string & path,
-                            GraphOptimizationLevel level = GraphOptimizationLevel::ORT_ENABLE_ALL) {
-        return std::make_unique<ort_session>(env, path, level);
-    };
+    if (!native_hift.load(front_assets)) return 1;
+    campplus_net campplus;
+    if (!campplus.load(front_assets)) return 1;
+    const bool have_native_hift = true;
     double t_sess = 0.0;
-    auto session = [&](std::unique_ptr<ort_session> & slot, const std::string & path,
-                       GraphOptimizationLevel level = GraphOptimizationLevel::ORT_ENABLE_ALL) -> ort_session & {
-        if (!slot) {
-            auto s0 = std::chrono::steady_clock::now();
-            slot = make_session(path, level);
-            t_sess += sec(s0, std::chrono::steady_clock::now());
-        }
-        return *slot;
-    };
-    // ORT >= 1.23 fuses this graph in a way that changes the FP32 result by
-    // ~1%; the reference path keeps its unoptimized computation.
-    std::unique_ptr<ort_session> campplus, tokenizer, flow_enc, estimator, hift, hift_front, hift_post;
-    std::unique_ptr<npu_model> flow_npu, flow_npu_long, flow_loop_npu, hift_npu, hift_npu_long;
+    std::unique_ptr<npu_model> front_npu;
+    std::unique_ptr<npu_model> flow_npu, flow_npu_long, flow_loop_npu, hift_npu;
     double t_npu_load = 0.0;
     if (!a.flow_loop_npu.empty()) {
         if (!axera_engine_init_once()) return 1;
         auto s0 = std::chrono::steady_clock::now();
         flow_loop_npu = std::make_unique<npu_model>();
         if (!flow_loop_npu->load(a.flow_loop_npu)) return 1;
+        t_npu_load += sec(s0, std::chrono::steady_clock::now());
+    }
+    if (!a.front_npu.empty()) {
+        if (!axera_engine_init_once()) return 1;
+        auto s0 = std::chrono::steady_clock::now();
+        front_npu = std::make_unique<npu_model>();
+        if (!front_npu->load(a.front_npu)) return 1;
+        if (!upload_front_weights(*front_npu, front_assets)) return 1;
         t_npu_load += sec(s0, std::chrono::steady_clock::now());
     }
     // The merged flow graph may expose the Euler state under its own name
@@ -1606,8 +2005,6 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         flow_npu = std::make_unique<npu_model>();
         if (!flow_npu->load(a.flow_npu)) return 1;
         t_npu_load += sec(s0, std::chrono::steady_clock::now());
-    } else if (a.flow_loop_npu.empty()) {
-        session(estimator, a.flow_estimator);
     }
     if (!a.flow_npu_long.empty()) {
         if (!axera_engine_init_once()) return 1;
@@ -1630,13 +2027,6 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         for (size_t i = 0; i < ws.size(); i++) ws[i] = 0.1f * std::cos((float) i * 0.007f);
         if (!hift_npu->set_input("mel", wm.data(), wm.size() * 4) ||
             !hift_npu->set_input("s_stft", ws.data(), ws.size() * 4) || !hift_npu->run()) return 1;
-        t_npu_load += sec(s0, std::chrono::steady_clock::now());
-    }
-    if (!a.hift_npu_long.empty()) {
-        if (!axera_engine_init_once()) return 1;
-        auto s0 = std::chrono::steady_clock::now();
-        hift_npu_long = std::make_unique<npu_model>();
-        if (!hift_npu_long->load(a.hift_npu_long)) return 1;
         t_npu_load += sec(s0, std::chrono::steady_clock::now());
     }
 
@@ -1688,28 +2078,20 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             auto t0 = now();
             rf->fbank = kaldi_fbank80(pcm16, rf->fbank_frames, tab);
             auto t1 = now();
-            std::vector<int64_t> spk_shape{1, rf->fbank_frames, 80};
-            Ort::Value spk_in = Ort::Value::CreateTensor<float>(mem, rf->fbank.data(), rf->fbank.size(), spk_shape.data(), spk_shape.size());
-            std::vector<Ort::Value> spk_inputs;
-            spk_inputs.emplace_back(std::move(spk_in));
-            auto spk_out = session(campplus, a.campplus, GraphOptimizationLevel::ORT_DISABLE_ALL).run(std::move(spk_inputs));
-            const float * spk_data = spk_out[0].GetTensorData<float>();
-            rf->embedding.assign(spk_data, spk_data + 192);
+            std::vector<double> cam_t;
+            rf->embedding = campplus.forward(rf->fbank, rf->fbank_frames, "ref", &cam_t);
+            if ((int) rf->embedding.size() != 192) {
+                fprintf(stderr, "Campplus produced %zu values\n", rf->embedding.size());
+                return nullptr;
+            }
             auto t2 = now();
             rf->wmel = whisper_mel(pcm16, rf->wmel_frames, tab);
             auto t3 = now();
-            std::vector<int64_t> wmel_shape{1, 128, rf->wmel_frames};
-            std::vector<int32_t> wmel_len{rf->wmel_frames};
-            std::vector<int64_t> one_shape{1};
-            std::vector<Ort::Value> tok_in;
-            tok_in.emplace_back(Ort::Value::CreateTensor<float>(mem, rf->wmel.data(), rf->wmel.size(), wmel_shape.data(), wmel_shape.size()));
-            tok_in.emplace_back(Ort::Value::CreateTensor<int32_t>(mem, wmel_len.data(), 1, one_shape.data(), one_shape.size()));
-            auto tok_out = session(tokenizer, a.tokenizer).run(std::move(tok_in));
-            const int32_t * tok_data = tok_out[0].GetTensorData<int32_t>();
-            auto tok_info = tok_out[0].GetTensorTypeAndShapeInfo();
-            size_t n_prompt_tok = 1;
-            for (auto d : tok_info.GetShape()) n_prompt_tok *= (size_t) d;
-            rf->tok.assign(tok_data, tok_data + n_prompt_tok);
+            if (!front_npu) {
+                fprintf(stderr, "reference-audio tokenizer AXModel was not loaded\n");
+                return nullptr;
+            }
+            if (!front_tokenize(*front_npu, rf->wmel, rf->wmel_frames, rf->tok)) return nullptr;
             auto t4 = now();
             rf->flowfeat = flow_mel24(pcm24, rf->flow_frames, tab);
             auto t5 = now();
@@ -2273,7 +2655,6 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     std::vector<int32_t> gen_tok(flow_codes.begin(), flow_codes.end());
     std::vector<float> mel;
     int Tgen = 0, T_total = 0;
-    auto shape_of = [](const Ort::Value & v) { return v.GetTensorTypeAndShapeInfo().GetShape(); };
     std::chrono::steady_clock::time_point t_flowenc, t_flow;
     if (streaming) {
         t_flowenc = std::chrono::steady_clock::now();
@@ -2395,180 +2776,8 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         fprintf(stderr, "[flow] windows=%d cap_tokens=%d cap_mel=%d\n", windows, tok_cap, mel_cap);
         t_flow = std::chrono::steady_clock::now();
     } else {
-    std::vector<int32_t> gen_tok(flow_codes.begin(), flow_codes.end());
-    std::vector<int64_t> tok_shape{1, (int64_t) gen_tok.size()};
-    std::vector<int64_t> ptok_shape{1, (int64_t) prompt_tok.size()};
-    std::vector<int64_t> pfeat_shape{1, rf.flow_frames, 80};
-    std::vector<int64_t> emb_shape{1, 192};
-    std::vector<Ort::Value> fe_in;
-    fe_in.emplace_back(Ort::Value::CreateTensor<int32_t>(mem, gen_tok.data(), gen_tok.size(), tok_shape.data(), tok_shape.size()));
-    fe_in.emplace_back(Ort::Value::CreateTensor<int32_t>(mem, const_cast<int32_t *>(prompt_tok.data()), prompt_tok.size(), ptok_shape.data(), ptok_shape.size()));
-    fe_in.emplace_back(Ort::Value::CreateTensor<float>(mem, const_cast<float *>(prompt_feat.data()), prompt_feat.size(), pfeat_shape.data(), pfeat_shape.size()));
-    fe_in.emplace_back(Ort::Value::CreateTensor<float>(mem, const_cast<float *>(embedding.data()), embedding.size(), emb_shape.data(), emb_shape.size()));
-    auto fe_out = session(flow_enc, a.flow_encoder).run(std::move(fe_in));
-    auto mu_shape = shape_of(fe_out[0]);
-    auto cond_shape = shape_of(fe_out[1]);
-    auto spks_shape = shape_of(fe_out[2]);
-    auto mask_shape = shape_of(fe_out[3]);
-    if (mu_shape.size() != 3) { fprintf(stderr, "bad flow mu shape\n"); return 1; }
-    const int T = (int) mu_shape[2];
-    T_total = T;
-    if (T != 2 * ((int) prompt_tok.size() + (int) flow_codes.size())) {
-        fprintf(stderr, "flow length mismatch T=%d prompt_tok=%zu codes=%zu\n", T, prompt_tok.size(), flow_codes.size());
+        fprintf(stderr, "the merged flow AXModel is required\n");
         return 1;
-    }
-    std::vector<float> mu(T * 80), cond(T * 80), spks(80), mask(T);
-    memcpy(mu.data(), fe_out[0].GetTensorData<float>(), mu.size() * 4);
-    memcpy(cond.data(), fe_out[1].GetTensorData<float>(), cond.size() * 4);
-    memcpy(spks.data(), fe_out[2].GetTensorData<float>(), 80 * 4);
-    memcpy(mask.data(), fe_out[3].GetTensorData<float>(), T * 4);
-    t_flowenc = std::chrono::steady_clock::now();
-
-    // ---- Euler flow matching -------------------------------------------
-    const int steps = a.flow_steps;
-    npu_model * flow_model = flow_npu.get();
-    int npu_flow_cap = a.flow_npu_cap;
-    bool npu_flow_nlc = a.flow_npu_nlc;
-    if (T > npu_flow_cap && flow_npu_long) {
-        flow_model = flow_npu_long.get();
-        npu_flow_cap = a.flow_npu_long_cap;
-        npu_flow_nlc = a.flow_npu_long_nlc;
-    }
-    std::vector<double> ts(steps + 1);
-    for (int i = 0; i <= steps; i++) ts[i] = 1.0 - std::cos(0.5 * M_PI * (double) i / steps);
-    std::vector<float> x((size_t) 80 * T);
-    for (int c = 0; c < 80; c++)
-        for (int t = 0; t < T; t++)
-            x[(size_t) c * T + t] = tab.flow_noise[(size_t) c * 15000 + t];
-
-    // One Euler trajectory over Tw frames (Tw <= the kernel's capacity when it runs on NPU).
-    auto euler = [&](std::vector<float> & xw, const float * muw, const float * condw,
-                     const float * maskw, int Tw, int update_from = 0) -> bool {
-        const int cap = flow_model ? npu_flow_cap : Tw;
-        std::vector<float> x_in(2 * 80 * Tw), mu_in(2 * 80 * Tw), cond_in(2 * 80 * Tw);
-        std::vector<float> mask_in(2 * Tw), spks_in(2 * 80), t_in(2);
-        std::vector<int64_t> x_shape{2, 80, Tw}, mask2_shape{2, 1, Tw}, spks2_shape{2, 80}, t2_shape{2};
-        double t_cur = ts[0], dt = ts[1] - ts[0];
-        for (int step = 1; step <= steps; step++) {
-            const float * d = nullptr;
-            std::vector<Ort::Value> es_out;
-            if (flow_model) {
-                const size_t plane = (size_t) 80 * cap;
-                std::vector<float> nx(2 * plane), nmu(2 * plane), ncond(2 * plane);
-                std::vector<float> nmask(2 * cap), nspks(2 * 80), nt(2);
-                if (npu_flow_nlc) {
-                    for (int t = 0; t < Tw; t++) {
-                        for (int c = 0; c < 80; c++) {
-                            const size_t src = (size_t) c * Tw + t;
-                            nx[(size_t) t * 80 + c] = xw[src];
-                            nx[plane + (size_t) t * 80 + c] = xw[src];
-                            nmu[(size_t) t * 80 + c] = muw[src];
-                            ncond[(size_t) t * 80 + c] = condw[src];
-                        }
-                    }
-                } else {
-                    for (int c = 0; c < 80; c++) {
-                        memcpy(nx.data() + (size_t) c * cap, xw.data() + (size_t) c * Tw, Tw * 4);
-                        memcpy(nmu.data() + (size_t) c * cap, muw + (size_t) c * Tw, Tw * 4);
-                        memcpy(ncond.data() + (size_t) c * cap, condw + (size_t) c * Tw, Tw * 4);
-                        memcpy(nx.data() + plane + (size_t) c * cap, xw.data() + (size_t) c * Tw, Tw * 4);
-                    }
-                }
-                memcpy(nmask.data(), maskw, (size_t) Tw * 4);
-                memcpy(nmask.data() + cap, maskw, (size_t) Tw * 4);
-                memcpy(nspks.data(), spks.data(), 80 * 4);
-                nt[0] = nt[1] = (float) t_cur;
-                if (!flow_model->set_input("x", nx.data(), nx.size() * 4) ||
-                    !flow_model->set_input("mask", nmask.data(), nmask.size() * 4) ||
-                    !flow_model->set_input("mu", nmu.data(), nmu.size() * 4) ||
-                    !flow_model->set_input("t", nt.data(), nt.size() * 4) ||
-                    !flow_model->set_input("spks", nspks.data(), nspks.size() * 4) ||
-                    !flow_model->set_input("cond", ncond.data(), ncond.size() * 4) || !flow_model->run()) {
-                    return false;
-                }
-                d = flow_model->output_f32(2 * plane);
-                if (!d) return false;
-            } else {
-                for (int c = 0; c < 80; c++) {
-                    memcpy(x_in.data() + (size_t) c * Tw, xw.data() + (size_t) c * Tw, Tw * 4);
-                    memcpy(x_in.data() + (size_t) (80 + c) * Tw, xw.data() + (size_t) c * Tw, Tw * 4);
-                    memcpy(mu_in.data() + (size_t) c * Tw, muw + (size_t) c * Tw, Tw * 4);
-                    memset(mu_in.data() + (size_t) (80 + c) * Tw, 0, Tw * 4);
-                    memcpy(cond_in.data() + (size_t) c * Tw, condw + (size_t) c * Tw, Tw * 4);
-                    memset(cond_in.data() + (size_t) (80 + c) * Tw, 0, Tw * 4);
-                }
-                memcpy(mask_in.data(), maskw, (size_t) Tw * 4);
-                memcpy(mask_in.data() + Tw, maskw, (size_t) Tw * 4);
-                memcpy(spks_in.data(), spks.data(), 80 * 4);
-                memset(spks_in.data() + 80, 0, 80 * 4);
-                t_in[0] = t_in[1] = (float) t_cur;
-                std::vector<Ort::Value> es_in;
-                es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, x_in.data(), x_in.size(), x_shape.data(), x_shape.size()));
-                es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mask_in.data(), mask_in.size(), mask2_shape.data(), mask2_shape.size()));
-                es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mu_in.data(), mu_in.size(), x_shape.data(), x_shape.size()));
-                es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, t_in.data(), 2, t2_shape.data(), t2_shape.size()));
-                es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, spks_in.data(), spks_in.size(), spks2_shape.data(), spks2_shape.size()));
-                es_in.emplace_back(Ort::Value::CreateTensor<float>(mem, cond_in.data(), cond_in.size(), x_shape.data(), x_shape.size()));
-                es_out = estimator->run(std::move(es_in));
-                d = es_out[0].GetTensorData<float>();
-            }
-            const int dstride = flow_model ? cap : Tw;
-            // Frames left of update_from are real left context from the previous
-            // window.  They condition this window but must keep their value; only
-            // the new frames follow the Euler trajectory.
-            for (int c = 0; c < 80; c++) {
-                for (int t = update_from; t < Tw; t++) {
-                    float dphi = 1.7f * d[(size_t) c * dstride + t] - 0.7f * d[(size_t) (80 + c) * dstride + t];
-                    xw[(size_t) c * Tw + t] += (float) dt * dphi;
-                }
-            }
-            t_cur += dt;
-            if (step < steps) dt = ts[step + 1] - t_cur;
-        }
-        return true;
-    };
-
-    if (!flow_model) {
-        if (!euler(x, mu.data(), cond.data(), mask.data(), T)) return 1;
-    } else if (T <= npu_flow_cap) {
-        if (!euler(x, mu.data(), cond.data(), mask.data(), T)) return 1;
-    } else {
-        // The estimator is causal with 50-frame chunks.  Run the one fixed c1024 kernel over windows:
-        // a later window keeps 256 frames of left real context, and its output stops at a chunk boundary
-        // unless it is the tail of the sequence.  This removes the old fixed-length limit without a second
-        // length-specific AXModel.
-        const int left = 256;
-        int out0 = 0;
-        while (out0 < T) {
-            const int in0   = std::max(0, out0 - left);
-            const int take  = std::min(npu_flow_cap, T - in0);
-            const int maxout = in0 + take;
-            int out1 = std::min(out0 + (npu_flow_cap - left), maxout);
-            if (out1 < T) out1 = (out1 / 50) * 50;
-            if (out1 <= out0) out1 = std::min(maxout, out0 + 1);
-            std::vector<float> xw((size_t) 80 * take), muw((size_t) 80 * take), condw((size_t) 80 * take),
-                                maskw((size_t) take);
-            for (int c = 0; c < 80; c++) {
-                memcpy(xw.data() + (size_t) c * take, x.data() + (size_t) c * T + in0, (size_t) take * 4);
-                memcpy(muw.data() + (size_t) c * take, mu.data() + (size_t) c * T + in0, (size_t) take * 4);
-                memcpy(condw.data() + (size_t) c * take, cond.data() + (size_t) c * T + in0, (size_t) take * 4);
-            }
-            memcpy(maskw.data(), mask.data() + in0, (size_t) take * 4);
-            if (!euler(xw, muw.data(), condw.data(), maskw.data(), take, out0 - in0)) return 1;
-            for (int c = 0; c < 80; c++) {
-                memcpy(x.data() + (size_t) c * T + out0, xw.data() + (size_t) c * take + (out0 - in0),
-                       (size_t) (out1 - out0) * 4);
-            }
-            out0 = out1;
-        }
-    }
-    t_flow = std::chrono::steady_clock::now();
-
-    const int prompt_mel = 2 * (int) prompt_tok.size();
-    Tgen = T - prompt_mel;
-    mel.assign((size_t) 80 * Tgen, 0.0f);
-    for (int c = 0; c < 80; c++)
-        memcpy(mel.data() + (size_t) c * Tgen, x.data() + (size_t) c * T + prompt_mel, (size_t) Tgen * 4);
     }
     if (!a.dump_mel.empty()) {
         FILE * f = fopen(a.dump_mel.c_str(), "wb");
@@ -2603,7 +2812,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         constexpr int right = 4;
         const int stride = cap - left - right;
         const bool native = have_native_hift;
-        const bool split = native || (!a.hift_front.empty() && !a.hift_post.empty());
+        const bool split = native;
         if (cap <= 64) {
             fprintf(stderr, "HiFT kernel has an invalid window %d\n", cap);
             return 1;
@@ -2647,28 +2856,12 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         }
         if (split) {
             auto t0 = std::chrono::steady_clock::now();
-            if (native) {
-                int nf_native = 0;
-                hift_front_native(native_hift, mel.data(), Tgen, full_s, nf_native,
-                                  nullptr, nullptr, 0, nullptr, f0_all.empty() ? nullptr : f0_all.data());
-                if (nf_native != Tgen * 120 + 1 || full_s.size() != (size_t) 18 * nf_native) {
-                    fprintf(stderr, "native hift front produced a bad shape for %d frames\\n", Tgen);
-                    return 1;
-                }
-            } else {
-                std::vector<int64_t> shape{1, 80, Tgen};
-                std::vector<Ort::Value> in;
-                in.emplace_back(Ort::Value::CreateTensor<float>(mem, mel.data(), mel.size(),
-                                                                shape.data(), shape.size()));
-                auto out = session(hift_front, a.hift_front).run(std::move(in));
-                auto got = shape_of(out[0]);
-                size_t n = 1;
-                for (auto d : got) n *= (size_t) d;
-                if (got.size() != 3 || got[1] != 18 || n != (size_t) 18 * (Tgen * 120 + 1)) {
-                    fprintf(stderr, "hift front produced a bad shape for %d frames\\n", Tgen);
-                    return 1;
-                }
-                full_s.assign(out[0].GetTensorData<float>(), out[0].GetTensorData<float>() + n);
+            int nf_native = 0;
+            hift_front_native(native_hift, mel.data(), Tgen, full_s, nf_native,
+                              nullptr, nullptr, 0, nullptr, f0_all.empty() ? nullptr : f0_all.data());
+            if (nf_native != Tgen * 120 + 1 || full_s.size() != (size_t) 18 * nf_native) {
+                fprintf(stderr, "native hift front produced a bad shape for %d frames\n", Tgen);
+                return 1;
             }
             if (!a.dump_hift_s.empty()) {
                 FILE * f = fopen(a.dump_hift_s.c_str(), "wb");
@@ -2744,38 +2937,11 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
                         return 1;
                     }
                     decoded.resize((size_t) valid_frames * 480);
-                } else {
-                    std::vector<int64_t> mp_shape{1, 18, s_frames};
-                    std::vector<Ort::Value> po_in;
-                    po_in.emplace_back(Ort::Value::CreateTensor<float>(mem, const_cast<float *>(mp),
-                                                                       (size_t) 18 * s_frames,
-                                                                       mp_shape.data(), mp_shape.size()));
-                    auto pr = session(hift_post, a.hift_post).run(std::move(po_in));
-                    auto pr_shape = shape_of(pr[0]);
-                    size_t n_samples = 1;
-                    for (auto d : pr_shape) n_samples *= (size_t) d;
-                    if (n_samples < (size_t) cap * 480) {
-                        fprintf(stderr, "hift post produced %zu samples, expected %d\\n", n_samples, cap * 480);
-                        return 1;
-                    }
-                    decoded.assign(pr[0].GetTensorData<float>(), pr[0].GetTensorData<float>() + (size_t) cap * 480);
                 }
                 audio = decoded.data();
                 auto th3 = std::chrono::steady_clock::now();
                 t_npu += sec(th1, th2);
                 t_post += sec(th2, th3);
-            } else {
-                auto th0 = std::chrono::steady_clock::now();
-                if (Tgen > cap) {
-                    fprintf(stderr, "shift-only HiFT needs the split front end above %d frames\\n", cap);
-                    return 1;
-                }
-                if (!hmodel->set_input("mel", hmel.data(), hmel.size() * 4) || !hmodel->run()) return 1;
-                const float * out = hmodel->output_f32((size_t) cap * 480);
-                if (!out) return 1;
-                decoded.assign(out, out + (size_t) cap * 480);
-                audio = decoded.data();
-                t_npu += sec(th0, std::chrono::steady_clock::now());
             }
             memcpy(audio_out.data() + (size_t) start * 480, audio + (size_t) off * 480, (size_t) valid * 480 * 4);
             chunks++;
@@ -2789,16 +2955,8 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
                 chunks, cap, t_front, t_f0npu, t_npu, t_post);
         hift_calls = chunks;
     } else {
-        std::vector<int64_t> hmel_shape{1, 80, Tgen};
-        std::vector<Ort::Value> hi_in;
-        hi_in.emplace_back(Ort::Value::CreateTensor<float>(mem, mel.data(), mel.size(), hmel_shape.data(), hmel_shape.size()));
-        auto hi_out = session(hift, a.hift).run(std::move(hi_in));
-        auto audio_shape = shape_of(hi_out[0]);
-        const float * audio = hi_out[0].GetTensorData<float>();
-        size_t n_samples = 1;
-        for (auto d : audio_shape) n_samples *= (size_t) d;
-        pcm.assign(audio, audio + n_samples);
-        hift_calls = 1;
+        fprintf(stderr, "the HiFT AXModel is required\n");
+        return 1;
     }
     auto t_hift = std::chrono::steady_clock::now();
     if (streaming) {

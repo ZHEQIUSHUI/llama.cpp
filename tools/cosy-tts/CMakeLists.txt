@@ -19,22 +19,3 @@ if(GGML_AXERA AND GGML_AXERA_BSP_DIR)
 else()
     message(STATUS "cosyvoice3-core: AXERA accelerator support disabled")
 endif()
-
-# ONNX Runtime remains only for the reference-audio encoders.  The unified
-# AX8860 build does not pass ONNXRUNTIME_ROOT, so use the BSP library and the
-# headers vendored beside this source file by default.
-if(NOT DEFINED ONNXRUNTIME_ROOT AND GGML_AXERA_BSP_DIR)
-    set(ONNXRUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime")
-    find_library(COSY_ORT_LIB onnxruntime PATHS "${GGML_AXERA_BSP_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
-endif()
-if(DEFINED ONNXRUNTIME_ROOT)
-    target_include_directories(${TARGET} PRIVATE ${ONNXRUNTIME_ROOT}/include)
-    if(COSY_ORT_LIB)
-        target_link_libraries(${TARGET} PUBLIC ${COSY_ORT_LIB})
-    else()
-        target_link_directories(${TARGET} PUBLIC ${ONNXRUNTIME_ROOT}/lib)
-        target_link_libraries(${TARGET} PUBLIC onnxruntime)
-    endif()
-else()
-    message(FATAL_ERROR "cosyvoice3-core requires -DONNXRUNTIME_ROOT=<onnxruntime sysroot>")
-endif()
