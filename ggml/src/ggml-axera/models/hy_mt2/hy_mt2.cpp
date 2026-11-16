@@ -875,14 +875,23 @@ bool hy_mt2::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t 
     // 4096 rows and waste 98% of the work, so replay them row by row through
     // the decode kernel and keep each row's logits.
     if (wp > PG && n < SMALL_BATCH) {
-        small_logits.resize((size_t) n * VOCAB);
+        // batch0 rows are the replay prefix that seqstate already recorded.
+        // They run to rebuild the model state, but this batch's logits are
+        // the T rows after them, renumbered from zero for publish_logits().
+        const int b0 = std::max(0, std::min(n, batch0));
+        const int T  = n - b0;
+        GGML_ASSERT(T > 0);
+        small_logits.resize((size_t) T * VOCAB);
         for (int i = 0; i < n; ++i) {
             run_decode_row(c0 + i, xr + (size_t) i * H, p4 + (size_t) i * 4);
-            const axera_cmm & hl = io.at("head_logits");
-            memcpy(small_logits.data() + (size_t) i * VOCAB, hl->vir, (size_t) VOCAB * sizeof(float));
+            if (i >= b0) {
+                const axera_cmm & hl = io.at("head_logits");
+                memcpy(small_logits.data() + (size_t) (i - b0) * VOCAB, hl->vir,
+                       (size_t) VOCAB * sizeof(float));
+            }
         }
         head_first = 0;
-        head_n = n;
+        head_n = T;
         small_head = true;
         if (snap) snap->deferred = false;
         return true;
