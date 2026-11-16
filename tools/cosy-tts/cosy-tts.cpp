@@ -518,18 +518,21 @@ struct npu_model {
 };
 #else
 struct npu_model {
+    struct io_buffer { uint32_t nSize = 0; void * pVirAddr = nullptr; };
+    std::vector<io_buffer> in, out;
     bool load(const std::string &) {
         fprintf(stderr, "this build has no AXERA support; rebuild with GGML_AXERA and GGML_AXERA_BSP_DIR\n");
         return false;
     }
     void * input_ptr(const char *) { return nullptr; }
     size_t input_bytes(const char *) const { return 0; }
+    size_t input_elems(const char *) const { return 0; }
     int input_index(const char *) const { return -1; }
     int output_index(const char *) const { return -1; }
     bool set_input(const char *, const void *, size_t) { return false; }
     bool run() { return false; }
-    const float * output_f32(size_t) const { return nullptr; }
-    size_t output_bytes() const { return 0; }
+    const float * output_f32(size_t, int = 0) const { return nullptr; }
+    size_t output_bytes(int = 0) const { return 0; }
 };
 #endif
 
@@ -604,6 +607,7 @@ static std::string kernel_tensor_name(const std::string & name) {
 // contains weights.
 static bool upload_front_weights(npu_model & m, gguf_asset_file & assets) {
     constexpr int LAYERS = 12;
+    fprintf(stderr, "[front-npu] upload start\n");
     auto upload = [&](const std::string & in, const void * data, size_t bytes) {
         const int idx = m.input_index(in.c_str());
         if (idx < 0) { fprintf(stderr, "front AXModel: no input %s\n", in.c_str()); return false; }
@@ -651,7 +655,11 @@ static bool upload_front_weights(npu_model & m, gguf_asset_file & assets) {
         // shape the tiling primitive accepts; rows 8..31 stay zero.
         ggml_tensor * qw = bf16_tensor("tok.qproj.weight");
         ggml_tensor * qb = bf16_tensor("tok.qproj.bias");
-        if (!qw || !qb || qw->ne[0] != 1280 || qw->ne[1] != 8) return false;
+        if (!qw || !qb || qw->ne[0] != 8 || qw->ne[1] != 1280) {
+            fprintf(stderr, "[front-npu] bad qproj: w=%p b=%p ne=(%lld,%lld)\n", (void *) qw, (void *) qb,
+                    qw ? (long long) qw->ne[0] : -1, qw ? (long long) qw->ne[1] : -1);
+            return false;
+        }
         const uint16_t * src = (const uint16_t *) qw->data;
         std::vector<uint16_t> pad((size_t) 32 * 1280, 0);
         for (int r = 0; r < 8; r++)
@@ -684,31 +692,47 @@ static bool upload_front_weights(npu_model & m, gguf_asset_file & assets) {
         const int idx = m.input_index(spec.in);
         if (idx < 0) { fprintf(stderr, "front AXModel: no input %s\n", spec.in); return false; }
         const size_t want = m.in[idx].nSize / 2;             // BF16 elements
-        const bool is_mat = std::string(spec.suffix).size() > 4 &&
-                            std::string(spec.suffix).compare(std::string(spec.suffix).size() - 4, 4, ".mat") == 0;
+        const std::string suffix = spec.suffix;
+        const bool is_mat = suffix.size() > 4 && suffix.compare(suffix.size() - 4, 4, ".mat") == 0;
+        // Kernel-side `*.mat` tensors are the GGUF `*.weight` initializers.
+        const std::string gguf_suffix = is_mat ? suffix.substr(0, suffix.size() - 3) + "weight" : suffix;
         std::vector<uint16_t> buf(want, 0);
         size_t at = 0;
+        fprintf(stderr, "[front-npu] bank %s <- 12 layers, want %zu\n", spec.suffix, want);
         for (int l = 0; l < LAYERS; l++) {
-            ggml_tensor * t = bf16_tensor("tok.blk" + std::to_string(l) + "." + spec.suffix);
+            ggml_tensor * t = bf16_tensor("tok.blk" + std::to_string(l) + "." + gguf_suffix);
             if (!t) return false;
             const uint16_t * src = (const uint16_t *) t->data;
             if (is_mat) {
-                const int IC = (int) t->ne[0], OC = (int) t->ne[1];
-                if (at + (size_t) IC * OC > want) return false;
+                // GGUF stores a linear weight with OC as the fastest dimension.
+                const int OC = (int) t->ne[0], IC = (int) t->ne[1];
+                if (at + (size_t) IC * OC > want) {
+                    fprintf(stderr, "[front-npu] %s overflow at layer %d: %zu + %d > %zu\n",
+                            spec.suffix, l, at, IC * OC, want);
+                    return false;
+                }
                 for (int oc = 0; oc < OC; oc++)
                     for (int ic = 0; ic < IC; ic++)
                         buf[at + (size_t) oc * IC + ic] = src[(size_t) ic * OC + oc];
                 at += (size_t) IC * OC;
             } else if (spec.pad) {
                 const int K = (int) t->ne[0], C = (int) t->ne[2];
-                if (at + (size_t) C * spec.pad > want) return false;
+                if (at + (size_t) C * spec.pad > want) {
+                    fprintf(stderr, "[front-npu] %s overflow at layer %d: %zu + %d > %zu\n",
+                            spec.suffix, l, at, C * spec.pad, want);
+                    return false;
+                }
                 for (int c = 0; c < C; c++)
                     for (int k = 0; k < K; k++)
                         buf[at + (size_t) c * spec.pad + k] = src[(size_t) c * K + k];
                 at += (size_t) C * spec.pad;
             } else {
                 const size_t n = (size_t) ggml_nelements(t);
-                if (at + n > want) return false;
+                if (at + n > want) {
+                    fprintf(stderr, "[front-npu] %s overflow at layer %d: %zu + %zu > %zu\n",
+                            spec.suffix, l, at, n, want);
+                    return false;
+                }
                 memcpy(&buf[at], src, n * 2);
                 at += n;
             }
@@ -759,9 +783,7 @@ static bool front_tokenize(npu_model & m, const std::vector<float> & wmel, int f
         !m.set_input("mask", mask.data(), mask.size() * 4) ||
         !m.set_input("attn_bias", bias.data(), bias.size() * 4) ||
         !m.set_input("cos", cosv.data(), cosv.size() * 2) ||
-        !m.set_input("sin", sinv.data(), sinv.size() * 2) ||
-        !m.set_input("tokens", tok_out.data(), tok_out.size() * 4) ||
-        !m.set_input("hidden", hidden.data(), hidden.size() * 2) || !m.run()) {
+        !m.set_input("sin", sinv.data(), sinv.size() * 2) || !m.run()) {
         return false;
     }
     const int32_t * result = nullptr;
@@ -1152,31 +1174,46 @@ struct campplus_net {
                 int sh, int sw, int ph, int pw, std::vector<float> & y, int & oc, int & oh, int & ow) const {
         const float * wt = w(name + ".weight");
         const float * bt = w(name + ".bias");
-        const int kh = ne(name + ".weight", 2), kw = ne(name + ".weight", 1);
+        // GGUF Conv2d weight [OC][IC][KH][KW] has KW as the fastest dimension.
+        const int kw = ne(name + ".weight", 0), kh = ne(name + ".weight", 1);
         oc = ne(name + ".weight", 3);
         oh = (ih + 2 * ph - kh) / sh + 1;
         ow = (iw + 2 * pw - kw) / sw + 1;
         y.assign((size_t) oc * oh * ow, 0.0f);
+        // Output plane stays hot while the (ky,kx,ic) loop streams one
+        // contiguous input row at a time, so the compiler can vectorise the
+        // inner x loop.  The previous pixel-major loop reloaded the weights
+        // for every output pixel and ran at scalar speed.
         parallel_ranges(oc, 16, [&](int c0, int c1) {
             for (int o = c0; o < c1; o++) {
                 float * dst = y.data() + (size_t) o * oh * ow;
                 for (int yy = 0; yy < oh; yy++) {
-                    for (int xx = 0; xx < ow; xx++) {
-                        float acc = bt ? bt[o] : 0.0f;
-                        for (int ky = 0; ky < kh; ky++) {
-                            const int iy = yy * sh + ky - ph;
-                            if (iy < 0 || iy >= ih) continue;
-                            for (int kx = 0; kx < kw; kx++) {
-                                const int ix = xx * sw + kx - pw;
-                                if (ix < 0 || ix >= iw) continue;
-                                const float * src = x.data() + (size_t) iy * iw + ix;
-                                const float * ww = wt + (((size_t) o * ic) * kh + ky) * kw + kx;
-                                for (int c = 0; c < ic; c++) {
-                                    acc += src[(size_t) c * ih * iw] * ww[(size_t) c * kh * kw];
+                    float * drow = dst + (size_t) yy * ow;
+                    const float b = bt ? bt[o] : 0.0f;
+                    for (int xx = 0; xx < ow; xx++) drow[xx] = b;
+                }
+                for (int ky = 0; ky < kh; ky++) {
+                    for (int kx = 0; kx < kw; kx++) {
+                        for (int c = 0; c < ic; c++) {
+                            const float wv = wt[(((size_t) o * ic + c) * kh + ky) * kw + kx];
+                            if (wv == 0.0f) continue;
+                            const float * src = x.data() + (size_t) c * ih * iw;
+                            for (int yy = 0; yy < oh; yy++) {
+                                const int iy = yy * sh + ky - ph;
+                                if (iy < 0 || iy >= ih) continue;
+                                const float * srow = src + (size_t) iy * iw;
+                                float * drow = dst + (size_t) yy * ow;
+                                int x0 = 0, x1 = ow;
+                                if (sw == 1) {
+                                    x0 = std::max(0, pw - kx);
+                                    x1 = std::min(ow, iw + pw - kx);
+                                }
+                                for (int xx = x0; xx < x1; xx++) {
+                                    const int ix = sw == 1 ? xx + kx - pw : xx * sw + kx - pw;
+                                    if (ix >= 0 && ix < iw) drow[xx] += wv * srow[ix];
                                 }
                             }
                         }
-                        dst[(size_t) yy * ow + xx] = acc;
                     }
                 }
             }
@@ -1188,8 +1225,8 @@ struct campplus_net {
                 int stride, int pad, int dil, std::vector<float> & y) const {
         const float * wt = w(name + ".weight");
         const float * bt = w(name + ".bias");
-        const int k = ne(name + ".weight", 2);
-        const int oc = ne(name + ".weight", 3);
+        const int k = ne(name + ".weight", 0);
+        const int oc = ne(name + ".weight", 2);
         const int ot = (T + 2 * pad - dil * (k - 1) - 1) / stride + 1;
         y.assign((size_t) oc * ot, 0.0f);
         if (k == 1 && stride == 1 && pad == 0) {
@@ -1208,21 +1245,30 @@ struct campplus_net {
             });
             return;
         }
-        parallel_ranges(oc, 64, [&](int c0, int c1) {
+        parallel_ranges(oc, 16, [&](int c0, int c1) {
             for (int o = c0; o < c1; o++) {
                 float * dst = y.data() + (size_t) o * ot;
-                for (int q = 0; q < ot; q++) {
-                    float acc = bt ? bt[o] : 0.0f;
-                    const int base = q * stride - pad;
+                const float b = bt ? bt[o] : 0.0f;
+                for (int q = 0; q < ot; q++) dst[q] = b;
+                for (int kk = 0; kk < k; kk++) {
+                    const int shift = kk * dil - pad;
                     for (int c = 0; c < ic; c++) {
+                        const float wv = wt[((size_t) o * ic + c) * k + kk];
+                        if (wv == 0.0f) continue;
                         const float * src = x.data() + (size_t) c * T;
-                        const float * ww = wt + ((size_t) o * ic + c) * k;
-                        for (int kk = 0; kk < k; kk++) {
-                            const int pos = base + kk * dil;
-                            if (pos >= 0 && pos < T) acc += src[pos] * ww[kk];
+                        int q0 = 0, q1 = ot;
+                        if (stride == 1) {
+                            q0 = std::max(0, -shift);
+                            q1 = std::min(ot, T - shift);
+                            #pragma GCC ivdep
+                            for (int q = q0; q < q1; q++) dst[q] += wv * src[q + shift];
+                        } else {
+                            for (int q = 0; q < ot; q++) {
+                                const int pos = q * stride + shift;
+                                if (pos >= 0 && pos < T) dst[q] += wv * src[pos];
+                            }
                         }
                     }
-                    dst[q] = acc;
                 }
             }
         });
@@ -1340,7 +1386,7 @@ struct campplus_net {
         std::vector<float> h;
         conv1d(y, ch, iw, "cam.xvector.tdnn.linear", 2, 2, 1, h);
         auto t1 = now();
-        int c = ne("cam.xvector.tdnn.linear.weight", 3);
+        int c = ne("cam.xvector.tdnn.linear.weight", 2);
         int tt = (int) (h.size() / c);
         for (int n = 1; n <= 3; n++) {
             h = block(h, c, tt, n, std::to_string(n).c_str());
@@ -1349,7 +1395,7 @@ struct campplus_net {
             bn(h, c, tt, tr + ".nonlinear.batchnorm"); relu_inplace(h);
             std::vector<float> h2; conv1d(h, c, tt, tr + ".linear", 1, 0, 1, h2);
             h.swap(h2);
-            c = ne(tr + ".linear.weight", 3);
+            c = ne(tr + ".linear.weight", 2);
         }
         relu_inplace(h);
         auto t2 = now();
@@ -1490,10 +1536,6 @@ static std::vector<float> flow_mel24(const std::vector<float> & pcm24, int & n_f
     cache.fill_sin_cos_table(1920);
     cache.hann_window = t.flow_hann;
     const int n_bins = 1920 / 2 + 1;
-    cache.filters.n_mel = n_bins;
-    cache.filters.n_fft = 1920;
-    cache.filters.data.assign((size_t) n_bins * n_bins, 0.0f);
-    for (int i = 0; i < n_bins; i++) cache.filters.data[(size_t) i * n_bins + i] = 1.0f;
 
     const int n_fft = 1920, hop = 480, pad = (n_fft - hop) / 2;
     std::vector<float> x(pcm24.size() + 2 * pad);
@@ -1503,23 +1545,20 @@ static std::vector<float> flow_mel24(const std::vector<float> & pcm24, int & n_f
 
     n_frames = (int) (pcm24.size() / hop);
     std::vector<float> feat((size_t) n_frames * 80);
-    std::vector<float> frame(n_fft), log_power(n_bins), magnitude(n_bins);
     const float floor_log = std::log(1e-5f);
-    for (int i = 0; i < n_frames; i++) {
-        std::copy(x.begin() + (size_t) i * hop, x.begin() + (size_t) i * hop + n_fft, frame.begin());
-        float * dst = feat.data() + (size_t) i * 80;
-        mtmd_audio_log_mel_frame(cache, frame.data(), n_fft, n_bins, log_power.data());
-        for (int k = 0; k < n_bins; k++) {
-            const float power = std::exp(2.302585092994046f * log_power[k]);
-            magnitude[k] = std::sqrt(power + 1e-9f);
+    parallel_ranges(n_frames, 16, [&](int f0, int f1) {
+        std::vector<float> power(n_bins);
+        for (int i = f0; i < f1; i++) {
+            mtmd_audio_power_frame(cache, x.data() + (size_t) i * hop, n_fft, power.data());
+            float * dst = feat.data() + (size_t) i * 80;
+            for (int m = 0; m < 80; m++) {
+                double sum = 0.0;
+                const float * filter = t.flow_mel.data() + (size_t) m * n_bins;
+                for (int k = 0; k < n_bins; k++) sum += (double) filter[k] * std::sqrt(power[k] + 1e-9f);
+                dst[m] = std::max(std::log((float) sum), floor_log);
+            }
         }
-        for (int m = 0; m < 80; m++) {
-            double sum = 0.0;
-            const float * filter = t.flow_mel.data() + (size_t) m * n_bins;
-            for (int k = 0; k < n_bins; k++) sum += (double) filter[k] * magnitude[k];
-            dst[m] = std::max(std::log((float) sum), floor_log);
-        }
-    }
+    });
     return feat;
 }
 
@@ -1786,7 +1825,7 @@ struct args {
     int ngl = 0, ctx = 4096, threads = 16;
     uint32_t seed = 1986;
     bool greedy = false;
-    bool dump_codes = false, mel_only = false;
+    bool dump_codes = false, mel_only = false, feat_only = false;
     bool worker = false;
     int repeat = 1;
     std::string parity_in, parity_out, dump_feats, codes_in, dump_mel, dump_hift_s, dump_hift_mp;
@@ -1824,6 +1863,7 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (k == "-g" || k == "--greedy") a.greedy = true;
         else if (k == "--dump-codes") a.dump_codes = true;
         else if (k == "--mel-only") a.mel_only = true;
+        else if (k == "--feat-only") a.feat_only = true;
         else if (k == "--worker") a.worker = true;
         else if (k == "--repeat") a.repeat = std::max(1, std::stoi(val()));
         else if (k == "--parity-in") a.parity_in = val();
@@ -1840,6 +1880,7 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (k == "--warm-prompt-text2") a.warm_text2 = val();
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return false; }
     }
+    if (a.feat_only) return !a.front.empty() && !a.prompt_wav.empty();
     return !a.model.empty() && !a.aux.empty() && !a.front.empty() && !a.front_npu.empty() &&
            !a.text.empty() && !a.prompt_wav.empty() && !a.flow_loop_npu.empty() && !a.hift_npu.empty();
 }
@@ -1870,7 +1911,8 @@ static double sec(std::chrono::steady_clock::time_point a, std::chrono::steady_c
 
 template <typename Fn>
 static void parallel_ranges(int n, int max_threads, Fn && fn) {
-    const int nt = std::max(1, std::min(max_threads, n));
+    static const int hw_threads = std::max(1u, std::thread::hardware_concurrency());
+    const int nt = std::max(1, std::min(std::min(max_threads, n), hw_threads));
     if (nt == 1) {
         fn(0, n);
         return;
@@ -2014,6 +2056,41 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     if (!native_hift.load(front_assets)) return 1;
     campplus_net campplus;
     if (!campplus.load(front_assets)) return 1;
+    if (a.feat_only) {
+        // Development aid: time only the host reference-audio front ends.
+        auto now = [] { return std::chrono::steady_clock::now(); };
+        auto el = [&](auto a0, auto b0) { return sec(a0, b0); };
+        wav_data wav;
+        if (!read_wav(a.prompt_wav.c_str(), wav)) return 1;
+        auto w0 = now();
+        auto pcm16 = resample_sinc(wav.pcm, wav.sample_rate, 16000);
+        auto pcm24 = resample_sinc(wav.pcm, wav.sample_rate, 24000);
+        auto w1 = now();
+        int nf = 0, nw = 0, nm = 0;
+        auto fb = kaldi_fbank80(pcm16, nf, tab);
+        auto w2 = now();
+        std::vector<double> ct;
+        auto emb = campplus.forward(fb, nf, "ref", &ct);
+        auto w3 = now();
+        auto wm = whisper_mel(pcm16, nw, tab);
+        auto w4 = now();
+        auto fm = flow_mel24(pcm24, nm, tab);
+        auto w5 = now();
+        fprintf(stderr, "[feat] resample=%.3f fbank=%.3f speaker=%.3f wmel=%.3f flow_mel=%.3f total=%.3f "
+                "fbank_T=%d wmel_T=%d flow_T=%d\n",
+                el(w0,w1), el(w1,w2), el(w2,w3), el(w3,w4), el(w4,w5), el(w0,w5), nf, nw, nm);
+        if (ct.size() == 3) fprintf(stderr, "[campplus] head=%.3f tdnn=%.3f stats=%.3f\n", ct[0], ct[1], ct[2]);
+        if (!a.dump_feats.empty()) {
+            auto dump = [&](const char * suffix, const void * data, size_t bytes) {
+                FILE * f = fopen((a.dump_feats + suffix).c_str(), "wb"); fwrite(data, 1, bytes, f); fclose(f);
+            };
+            dump(".fbank.f32", fb.data(), fb.size() * 4);
+            dump(".wmel.f32", wm.data(), wm.size() * 4);
+            dump(".flowfeat.f32", fm.data(), fm.size() * 4);
+            dump(".embedding.f32", emb.data(), emb.size() * 4);
+        }
+        return 0;
+    }
     const bool have_native_hift = true;
     double t_sess = 0.0;
     std::unique_ptr<npu_model> front_npu;
@@ -2125,6 +2202,9 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             auto t1 = now();
             std::vector<double> cam_t;
             rf->embedding = campplus.forward(rf->fbank, rf->fbank_frames, "ref", &cam_t);
+            if (getenv("COSY_PROFILE") && cam_t.size() == 3) {
+                fprintf(stderr, "[campplus] head=%.3fs tdnn=%.3fs stats=%.3fs\n", cam_t[0], cam_t[1], cam_t[2]);
+            }
             if ((int) rf->embedding.size() != 192) {
                 fprintf(stderr, "Campplus produced %zu values\n", rf->embedding.size());
                 return nullptr;

@@ -366,6 +366,21 @@ static void log_mel_spectrogram_worker_thread(int                        ith,
     }
 }
 
+void mtmd_audio_power_frame(const mtmd_audio_cache & cache, const float * samples, int n_fft, float * out) {
+    const int n_fft_bins = n_fft / 2 + 1;
+    GGML_ASSERT((int) cache.hann_window.size() == n_fft);
+
+    std::vector<float> fft_in(n_fft * 2, 0.0f);
+    std::vector<float> fft_out(n_fft * 2 * 2 * 2);
+    for (int j = 0; j < n_fft; j++) {
+        fft_in[j] = cache.hann_window[j] * samples[j];
+    }
+    fft(cache, fft_in.data(), n_fft, fft_out.data());
+    for (int j = 0; j < n_fft_bins; j++) {
+        out[j] = fft_out[2 * j + 0] * fft_out[2 * j + 0] + fft_out[2 * j + 1] * fft_out[2 * j + 1];
+    }
+}
+
 void mtmd_audio_log_mel_frame(const mtmd_audio_cache & cache, const float * samples, int n_fft, int n_mel, float * out) {
     const int n_fft_bins = n_fft / 2 + 1;
     GGML_ASSERT((int) cache.hann_window.size() == n_fft);
