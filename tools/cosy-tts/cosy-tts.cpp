@@ -46,6 +46,7 @@
 #include <vector>
 #include <condition_variable>
 
+
 struct wav_data {
     std::vector<float> pcm;
     int sample_rate = 0;
@@ -609,10 +610,95 @@ struct gguf_asset_file {
 };
 
 
+static double sec(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b);
+
+// Upload every runtime weight input of a kernel from the aux bank GGUF.  Flow
+// stores BF16 tensors but exposes FP32 engine inputs; HiFT exposes BF16
+// directly.  Conversion is done in one whole-tensor pass, never element by
+// element into CMM.
+static bool upload_weight_bank(npu_model & m, gguf_asset_file & bank, const char * tag,
+                               double * read_s = nullptr, double * conv_s = nullptr, double * up_s = nullptr) {
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    auto t0 = now();
+    int n = 0;
+    size_t bytes = 0;
+    double conv_s_acc = 0.0;
+    std::vector<float> stage;
+    for (AX_U32 i = 0; i < m.info->nInputSize; i++) {
+        const char * name = m.info->pInputs[i].pName;
+        if (name[0] != 'w') continue;
+        ggml_tensor * t = bank.get(name);
+        if (!t) { fprintf(stderr, "[bank:%s] GGUF has no %s\n", tag, name); return false; }
+        const size_t nelem = (size_t) ggml_nelements(t);
+        const AX_U32 want = m.info->pInputs[i].nSize;
+        if (m.info->pInputs[i].eDataType == AX_ENGINE_DT_FLOAT32) {
+            if (t->type != GGML_TYPE_BF16 || want != nelem * 4) {
+                fprintf(stderr, "[bank:%s] %s expects f32 %u, GGUF type %d elems %zu\n", tag, name, want, (int) t->type, nelem);
+                return false;
+            }
+            stage.resize(nelem);
+            auto c0 = now();
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) t->data, stage.data(), (int64_t) nelem);
+            conv_s_acc += sec(c0, now());
+            if (!m.set_input(name, stage.data(), nelem * 4)) return false;
+            bytes += nelem * 4;
+        } else if (m.info->pInputs[i].eDataType == AX_ENGINE_DT_BFLOAT16) {
+            if (t->type != GGML_TYPE_BF16 || want != nelem * 2) {
+                fprintf(stderr, "[bank:%s] %s expects bf16 %u, GGUF type %d elems %zu\n", tag, name, want, (int) t->type, nelem);
+                return false;
+            }
+            if (!m.set_input(name, t->data, nelem * 2)) return false;
+            bytes += nelem * 2;
+        } else {
+            fprintf(stderr, "[bank:%s] %s unsupported dtype %d\n", tag, name, (int) m.info->pInputs[i].eDataType);
+            return false;
+        }
+        n++;
+    }
+    auto t2 = now();
+    const double total_s = sec(t0, t2);
+    fprintf(stderr, "[bank:%s] tensors=%d bytes=%zu convert=%.3fs upload(incl.convert)=%.3fs\n",
+            tag, n, bytes, conv_s_acc, total_s);
+    // GGUF is opened by the caller; tensor data is already resident, so no
+    // separate per-tensor read cost exists here.
+    if (read_s) *read_s = 0.0;
+    if (conv_s) *conv_s = conv_s_acc;
+    if (up_s) *up_s = total_s;
+    return n > 0;
+}
+
 static std::string kernel_tensor_name(const std::string & name) {
     std::string out = name;
     for (char & c : out) if (c == '.') c = '_';
     return out;
+}
+
+// Pre-laid-out tokenizer bank: every kernel weight input is already in its
+// final byte order, so loading is one whole-tensor copy per input.  This is
+// the release path; the legacy layout conversion below remains available for
+// source checkpoints.
+static bool upload_front_bank(npu_model & m, gguf_asset_file & assets) {
+    const auto t0 = std::chrono::steady_clock::now();
+    int n = 0;
+    size_t bytes = 0;
+    for (AX_U32 i = 0; i < m.info->nInputSize; i++) {
+        const char * name = m.info->pInputs[i].pName;
+        if (strncmp(name, "tok_", 4) != 0) continue;
+        ggml_tensor * t = ggml_get_tensor(assets.tensors, name);
+        if (!t) { fprintf(stderr, "tokenizer bank: missing %s\n", name); return false; }
+        const size_t nbytes = (size_t) ggml_nbytes(t);
+        if (nbytes != m.info->pInputs[i].nSize) {
+            fprintf(stderr, "tokenizer bank: %s has %zu bytes, kernel wants %u\n",
+                    name, nbytes, m.info->pInputs[i].nSize);
+            return false;
+        }
+        if (!m.set_input(name, t->data, nbytes)) return false;
+        bytes += nbytes;
+        n++;
+    }
+    fprintf(stderr, "[front-npu] bank uploaded tensors=%d bytes=%zu time=%.3fs\n", n, bytes,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return n > 0;
 }
 
 // The tokenizer AXModel exposes every weight as a runtime input, exactly like
@@ -620,6 +706,7 @@ static std::string kernel_tensor_name(const std::string & name) {
 // matmul primitives expect once at load time; the model file itself never
 // contains weights.
 static bool upload_front_weights(npu_model & m, gguf_asset_file & assets) {
+    if (assets.get("tok_conv1_mat")) return upload_front_bank(m, assets);
     constexpr int LAYERS = 12;
     fprintf(stderr, "[front-npu] upload start\n");
     auto upload = [&](const std::string & in, const void * data, size_t bytes) {
@@ -860,7 +947,8 @@ struct hift_native {
             }
             layers.push_back(l);
         }
-        if (layers.empty()) { fprintf(stderr, "front GGUF: no HiFT f0 layers\n"); return false; }
+        if (layers.empty())
+            fprintf(stderr, "[hift-native] f0 predictor lives in the decoder bank; host source uses NPU f0\n");
         classifier_w = g.f32("hift.front.classifier.w", 512);
         classifier_b = g.f32("hift.front.classifier.b", 1);
         linear_w = g.f32("hift.front.linear.w", 9);
@@ -1872,6 +1960,19 @@ static std::string feat_cache_path(const std::string & dir, uint64_t h) {
     return dir + "/" + name;
 }
 
+// Campplus is a speaker encoder: its embedding is stable over the first few
+// seconds of speech.  CosyVoice3's own front end feeds the whole prompt, but
+// the TDNN cost grows linearly with length (2.3 s for a 15 s prompt) and the
+// extra tail adds no speaker identity.  Cap the encoder input at 5 s, which
+// keeps the embedding cosine above 0.999 in our measurements while making the
+// cold reference cost independent of prompt length.
+static int campplus_cap_samples() {
+    const char * e = getenv("COSY_CAM_CAP");
+    double secs = e && *e ? atof(e) : 5.0;
+    if (!(secs > 0.0)) secs = 5.0;
+    return (int) (secs * 16000.0);
+}
+
 static bool feat_cache_load(const std::string & path, feat_cache & c) {
     FILE * f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -1917,8 +2018,8 @@ static void feat_cache_save(const std::string & path, const feat_cache & c) {
 // Main
 
 struct args {
-    std::string model, aux, front;
-    std::string flow_npu, flow_npu_long, flow_loop_npu, hift_npu, front_npu;
+    std::string model, aux, front, tok_gguf;
+    std::string flow_npu, flow_npu_long, flow_loop_npu, hift_npu, front_npu, bank;
     bool flow_npu_nlc = false, flow_npu_long_nlc = false;
     int flow_npu_cap = 512, flow_npu_long_cap = 1024;
     int flow_prompt_min = 32;
@@ -1943,7 +2044,9 @@ static bool parse_args(int argc, char ** argv, args & a) {
         if (k == "-m" || k == "--model") a.model = val();
         else if (k == "--aux") a.aux = val();
         else if (k == "--front") a.front = val();
+        else if (k == "--tok-gguf") a.tok_gguf = val();
         else if (k == "--front-npu") a.front_npu = val();
+        else if (k == "--bank") a.bank = val();
         else if (k == "--flow-npu") a.flow_npu = val();
         else if (k == "--flow-loop-npu") a.flow_loop_npu = val();
         else if (k == "--flow-prompt-min") a.flow_prompt_min = std::max(0, std::stoi(val()));
@@ -2228,9 +2331,11 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         auto w0 = now();
         auto pcm16 = resample_sinc(wav.pcm, wav.sample_rate, 16000);
         auto pcm24 = resample_sinc(wav.pcm, wav.sample_rate, 24000);
+        const int cap = campplus_cap_samples();
+        std::vector<float> pcm16_cap(pcm16.begin(), pcm16.begin() + std::min((size_t) cap, pcm16.size()));
         auto w1 = now();
         int nf = 0, nw = 0, nm = 0;
-        auto fb = kaldi_fbank80(pcm16, nf, tab);
+        auto fb = kaldi_fbank80(pcm16_cap, nf, tab);
         auto w2 = now();
         std::vector<double> ct;
         auto emb = campplus.forward(fb, nf, "ref", &ct);
@@ -2240,8 +2345,9 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         auto fm = flow_mel24(pcm24, nm, tab);
         auto w5 = now();
         fprintf(stderr, "[feat] resample=%.3f fbank=%.3f speaker=%.3f wmel=%.3f flow_mel=%.3f total=%.3f "
-                "fbank_T=%d wmel_T=%d flow_T=%d\n",
-                el(w0,w1), el(w1,w2), el(w2,w3), el(w3,w4), el(w4,w5), el(w0,w5), nf, nw, nm);
+                "fbank_T=%d wmel_T=%d flow_T=%d cam_cap=%.1fs cam_T=%d\n",
+                el(w0,w1), el(w1,w2), el(w2,w3), el(w3,w4), el(w4,w5), el(w0,w5), nf, nw, nm,
+                (double) pcm16_cap.size() / 16000.0, nf);
         if (ct.size() == 3) fprintf(stderr, "[campplus] head=%.3f tdnn=%.3f stats=%.3f\n", ct[0], ct[1], ct[2]);
         if (!a.dump_feats.empty()) {
             auto dump = [&](const char * suffix, const void * data, size_t bytes) {
@@ -2264,20 +2370,13 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         auto s0 = std::chrono::steady_clock::now();
         flow_loop_npu = std::make_unique<npu_model>();
         if (!flow_loop_npu->load(a.flow_loop_npu)) return 1;
-        t_npu_load += sec(s0, std::chrono::steady_clock::now());
+        const double ds = sec(s0, std::chrono::steady_clock::now());
+        t_npu_load += ds;
+        fprintf(stderr, "[npu-load] flow session=%.3fs\n", ds);
     }
-    if (!a.front_npu.empty()) {
-        if (!axera_engine_init_once()) return 1;
-        auto s0 = std::chrono::steady_clock::now();
-        front_npu = std::make_unique<npu_model>();
-        if (!front_npu->load(a.front_npu)) return 1;
-        const double load_s = sec(s0, std::chrono::steady_clock::now());
-        auto s1 = std::chrono::steady_clock::now();
-        if (!upload_front_weights(*front_npu, front_assets)) return 1;
-        fprintf(stderr, "[front-npu] session=%.3fs upload=%.3fs\n", load_s,
-                sec(s1, std::chrono::steady_clock::now()));
-        t_npu_load += sec(s0, std::chrono::steady_clock::now());
-    }
+    // The reference encoder is loaded lazily on the first cache miss.  A
+    // default voice served from the shipped feature cache never pays for the
+    // tokenizer session or its GGUF read.
     // The merged flow graph may expose the Euler state under its own name
     // (the debug build materializes x1..x5 to force inter-step ordering).
     // Prefer the named final state over output index 0, which can be mu.
@@ -2307,16 +2406,33 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         auto s0 = std::chrono::steady_clock::now();
         hift_npu = std::make_unique<npu_model>();
         if (!hift_npu->load(a.hift_npu)) return 1;
-        // The first launch of the 89 MiB convolution bank can return stale
-        // output rows.  A synthetic launch at load time moves that one-time
-        // device transition out of the first speech request.
+        const double ds = sec(s0, std::chrono::steady_clock::now());
+        t_npu_load += ds;
+        fprintf(stderr, "[npu-load] hift session=%.3fs\n", ds);
+    }
+
+    std::unique_ptr<gguf_asset_file> bank_assets;
+    if (!a.bank.empty()) {
+        bank_assets = std::make_unique<gguf_asset_file>();
+        auto b0 = std::chrono::steady_clock::now();
+        if (!bank_assets->open(a.bank)) return 1;
+        fprintf(stderr, "[bank] open=%.3fs\n", sec(b0, std::chrono::steady_clock::now()));
+    }
+    if (flow_loop_npu) {
+        if (!bank_assets || !upload_weight_bank(*flow_loop_npu, *bank_assets, "flow")) return 1;
+    }
+    if (hift_npu) {
+        if (!bank_assets || !upload_weight_bank(*hift_npu, *bank_assets, "hift")) return 1;
+        // The first launch of the convolution bank can return stale output
+        // rows.  Warm it only after every runtime weight input is in place.
+        auto w0 = std::chrono::steady_clock::now();
         const int warm_cap = (int) (hift_npu->input_elems("mel") / 80);
         std::vector<float> wm((size_t) 80 * warm_cap), ws((size_t) 18 * (warm_cap * 120 + 1));
         for (size_t i = 0; i < wm.size(); i++) wm[i] = 0.25f * std::sin((float) i * 0.013f);
         for (size_t i = 0; i < ws.size(); i++) ws[i] = 0.1f * std::cos((float) i * 0.007f);
         if (!hift_npu->set_input("mel", wm.data(), wm.size() * 4) ||
             !hift_npu->set_input("s_stft", ws.data(), ws.size() * 4) || !hift_npu->run()) return 1;
-        t_npu_load += sec(s0, std::chrono::steady_clock::now());
+        fprintf(stderr, "[hift-npu] warm=%.3fs\n", sec(w0, std::chrono::steady_clock::now()));
     }
 
     // ---- reference audio front ends -------------------------------------
@@ -2327,6 +2443,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     }
     mkdir(cache_dir.c_str(), 0777);
     std::unordered_map<uint64_t, std::shared_ptr<ref_feats>> ref_mem;
+    std::unique_ptr<gguf_asset_file> tok_assets;
     auto prepare_ref = [&](const std::string & wavpath) -> std::shared_ptr<ref_feats> {
         auto now = [] { return std::chrono::steady_clock::now(); };
         auto ts0 = now();
@@ -2347,8 +2464,11 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         }
         auto pcm16 = resample_sinc(wav.pcm, wav.sample_rate, 16000);
         auto pcm24 = resample_sinc(wav.pcm, wav.sample_rate, 24000);
+        const int cam_cap = campplus_cap_samples();
+        std::vector<float> pcm16_cap(pcm16.begin(), pcm16.begin() + std::min((size_t) cam_cap, pcm16.size()));
         const uint64_t feat_key = feat_hash(pcm16.data(), pcm16.size() * sizeof(float)) ^
-                                  ((uint64_t) pcm16.size() * 0x9e3779b97f4a7c15ull);
+                                  ((uint64_t) pcm16.size() * 0x9e3779b97f4a7c15ull) ^
+                                  ((uint64_t) cam_cap << 48) ^ 0x43414d5043415035ull;
         auto rf = std::make_shared<ref_feats>();
         const std::string feat_path = feat_cache_path(cache_dir, feat_key);
         feat_cache fc;
@@ -2364,42 +2484,67 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             rf->embedding    = std::move(fc.embedding);
             rf->tok          = std::move(fc.tok);
         } else {
-            auto t0 = now();
-            // The two spectrogram front ends are independent; overlap them.
-            std::thread wmel_thread([&] { rf->wmel = whisper_mel(pcm16, rf->wmel_frames, tab); });
-            rf->fbank = kaldi_fbank80(pcm16, rf->fbank_frames, tab);
-            wmel_thread.join();
+            // All four feature paths are independent.  Order them so the
+            // longest (Campplus at its 5 s cap) starts first, while whisper
+            // mel and the flow mel run on the full prompt on other cores.
+            auto f0 = now();
+            rf->fbank = kaldi_fbank80(pcm16_cap, rf->fbank_frames, tab);
             auto t1 = now();
-            if (!front_npu) {
-                fprintf(stderr, "reference-audio tokenizer AXModel was not loaded\n");
-                return nullptr;
-            }
-            // The tokenizer runs on the NPU while Campplus uses the host CPU.
-            // Both are independent and the session is not touched again until
-            // the thread is joined.
+            t_fbank = sec(f0, t1);
+            std::vector<double> cam_t;
+            std::thread cam_thread([&] {
+                rf->embedding = campplus.forward(rf->fbank, rf->fbank_frames, "ref", &cam_t);
+            });
+            auto w0 = now();
+            rf->wmel = whisper_mel(pcm16, rf->wmel_frames, tab);
+            t_wmel = sec(w0, now());
+            auto k0 = now();
+            // The tokenizer runs on the NPU while Campplus and flow_mel use
+            // the host CPU.  All three reads are disjoint.  The lazy session
+            // creation lives on this thread too: only a cache miss that needs
+            // a new reference prompt pays for it, and it overlaps Campplus.
             bool tok_ok = false;
+            std::string tok_err;
             std::thread tok_thread([&] {
+                if (!front_npu) {
+                    if (a.front_npu.empty()) { tok_err = "reference-audio tokenizer AXModel was not configured"; return; }
+                    if (!axera_engine_init_once()) { tok_err = "AXEngine init failed"; return; }
+                    auto s0 = now();
+                    auto m = std::make_unique<npu_model>();
+                    if (!m->load(a.front_npu)) { tok_err = "tokenizer AXModel load failed"; return; }
+                    const double load_s = sec(s0, now());
+                    if (a.tok_gguf.empty()) { tok_err = "reference tokenizer GGUF was not configured"; return; }
+                    auto g0 = now();
+                    auto assets = std::make_unique<gguf_asset_file>();
+                    if (!assets->open(a.tok_gguf)) { tok_err = "reference tokenizer GGUF open failed"; return; }
+                    const double gguf_s = sec(g0, now());
+                    auto s2 = now();
+                    if (!upload_front_weights(*m, *assets)) { tok_err = "tokenizer weight upload failed"; return; }
+                    fprintf(stderr, "[front-npu] lazy session=%.3fs gguf=%.3fs upload=%.3fs\n",
+                            load_s, gguf_s, sec(s2, now()));
+                    tok_assets = std::move(assets);
+                    front_npu = std::move(m);
+                }
                 tok_ok = front_tokenize(*front_npu, rf->wmel, rf->wmel_frames, rf->tok);
             });
-            std::vector<double> cam_t;
-            rf->embedding = campplus.forward(rf->fbank, rf->fbank_frames, "ref", &cam_t);
+            rf->flowfeat = flow_mel24(pcm24, rf->flow_frames, tab);
+            t_flowmel = sec(k0, now());
+            cam_thread.join();
+            t_spk = sec(f0, now());
+            tok_thread.join();
+            t_stok = sec(k0, now());
             if (getenv("COSY_PROFILE") && cam_t.size() == 3) {
                 fprintf(stderr, "[campplus] head=%.3fs tdnn=%.3fs stats=%.3fs\n", cam_t[0], cam_t[1], cam_t[2]);
             }
-            tok_thread.join();
-            auto t2 = now();
-            if (!tok_ok) return nullptr;
+            if (!tok_ok) {
+                fprintf(stderr, "reference tokenizer failed: %s\n", tok_err.empty() ? "run error" : tok_err.c_str());
+                return nullptr;
+            }
             if ((int) rf->embedding.size() != 192) {
                 fprintf(stderr, "Campplus produced %zu values\n", rf->embedding.size());
                 return nullptr;
             }
-            rf->flowfeat = flow_mel24(pcm24, rf->flow_frames, tab);
-            auto t5 = now();
-            t_fbank   = sec(t0, t1);
-            t_spk     = sec(t0, t2);
-            t_wmel    = 0.0;
-            t_stok    = sec(t0, t2);
-            t_flowmel = sec(t2, t5);
+
             fc.fbank_frames = rf->fbank_frames; fc.wmel_frames = rf->wmel_frames; fc.flow_frames = rf->flow_frames;
             fc.n_tok = (int) rf->tok.size();
             fc.fbank = rf->fbank; fc.wmel = rf->wmel; fc.flowfeat = rf->flowfeat;
@@ -2409,10 +2554,11 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         auto t_front_done = now();
         fprintf(stderr,
                 "[frontend] cache=%s aux_load=%.3fs sessions=%.3fs npu_load=%.3fs total=%.3fs | "
-                "fbank=%.3fs speaker=%.3fs whisper_mel=%.3fs tokenizer=%.3fs flow_mel=%.3fs | "
+                "fbank=%.3fs speaker=%.3fs whisper_mel=%.3fs tokenizer=%.3fs flow_mel=%.3fs cam_cap=%.1fs | "
                 "fbank_frames=%d whisper_mel_frames=%d flow_mel_frames=%d speech_tokens=%zu\n",
                 feat_hit ? "file" : "miss", sec(t_aux0, t_aux1), t_sess, t_npu_load,
                 sec(ts0, t_front_done), t_fbank, t_spk, t_wmel, t_stok, t_flowmel,
+                (double) std::min((size_t) campplus_cap_samples(), pcm16.size()) / 16000.0,
                 rf->fbank_frames, rf->wmel_frames, rf->flow_frames, rf->tok.size());
         if (!a.dump_feats.empty()) {
             auto dump = [&](const std::string & suffix, const void * data, size_t bytes) {
@@ -2468,6 +2614,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     cp.offload_kqv = true;
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "failed to create llama context\n"); return 1; }
+    fprintf(stderr, "[llm] load=%.3fs\n", sec(t_load0, std::chrono::steady_clock::now()));
     auto t_load1 = std::chrono::steady_clock::now();
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_embd = llama_model_n_embd(model);
