@@ -872,12 +872,17 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     INDICES->flush();
 
     // The token embedding table is the one weight this adapter runs through the NPU's gather instead of the CPU's
-    // GET_ROWS. The two kernel images are part of the adapter (not the manifest): 4096 padded rows for a prefill
-    // chunk, one row for decode. The table is converted once; the output of the one-row kernel lands directly in DX.
+    // GET_ROWS. The manifest supplies the two vocabulary gathers when it names them; otherwise the adapter's embedded
+    // copies are used. 4096 padded rows serve a prefill chunk and one row serves decode. The table is converted once;
+    // the output of the one-row kernel lands directly in DX. A table that does not match either gather is fatal: this
+    // path has no host GET_ROWS fallback.
     {
         axera_timer te("init: token embedding");
         auto it = t.find("token_embd.weight");
-        if (it != t.end()) {
+        if (it == t.end()) {
+            GGML_ABORT("axera qwen35_35b_a3b: the model has no token_embd.weight for the NPU gather\n");
+        }
+        {
             const ggml_tensor * tw = it->second;
             const auto & k4 = man.has("vocab_embedding_4096") ? man.get("vocab_embedding_4096") :
                 man.load_memory("vocab_embedding_4096", std::vector<char>(
@@ -892,41 +897,39 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
             GGML_ASSERT(k4.in_bytes("input_flat") == WN * sizeof(int32_t) && ob == (size_t) WN * H * sizeof(ggml_bf16_t));
             GGML_ASSERT(k1.in_bytes("input_flat") == sizeof(int32_t) && k1.in_bytes("weight") == wb &&
                         k1.out_bytes("output_flat") == (size_t) H * sizeof(ggml_bf16_t));
-            // The embedded gather kernels have the published 35B-A3B table's row count. A checkpoint with a
-            // different vocabulary (MiniCPM-V 4.7: 248144 rows) keeps its table in the host mapping and lets
-            // llama.cpp's GET_ROWS feed the graph; no rows are padded or masked.
             if (tw->ne[0] != H || wb != (size_t) tw->ne[0] * tw->ne[1] * sizeof(ggml_bf16_t)) {
-                GGML_LOG_INFO("axera qwen35_35b_a3b: token embedding %lld rows uses host GET_ROWS (the NPU gather has %zu bytes)\n",
-                              (long long) tw->ne[1], wb);
-            } else {
-                EMBW = axera_cmm_alloc(wb);
-                if (tw->type == GGML_TYPE_BF16 && ggml_is_contiguous(tw) && ggml_nbytes(tw) == wb) {
-                    memcpy(EMBW->vir, tw->data, wb);
-                } else {
-                    axera_for_rows_f32(tw, [&](int64_t r, const float * row) {
-                        ggml_fp32_to_bf16_row(row, (ggml_bf16_t *) EMBW->vir + (size_t) r * H, H);
-                    });
-                }
-                EMBW->flush();
-                axera_drop_mapped(tw);
-                EMBI = axera_cmm_alloc(WN * sizeof(int32_t));
-                emb4k = {};
-                emb4k.k = &k4;
-                emb4k.in.assign(k4.info->nInputSize, {});
-                emb4k.out.assign(k4.info->nOutputSize, {});
-                emb4k.in[k4.input("input_flat")] = axera_io(EMBI, EMBI->size);
-                emb4k.in[k4.input("weight")]     = axera_io(EMBW, EMBW->size);
-                emb4k.out[k4.output("output_flat")] = axera_io(XB, (uint32_t) ob);
-                emb1 = {};
-                emb1.k = &k1;
-                emb1.in.assign(k1.info->nInputSize, {});
-                emb1.out.assign(k1.info->nOutputSize, {});
-                emb1.in[k1.input("input_flat")] = axera_io(EMBI, (uint32_t) k1.in_bytes("input_flat"));
-                emb1.in[k1.input("weight")]     = axera_io(EMBW, EMBW->size);
-                emb1.out[k1.output("output_flat")] = axera_io(DX, (uint32_t) k1.out_bytes("output_flat"));
-                emb = true;
-                GGML_LOG_INFO("axera qwen35_35b_a3b: token embedding %.2f GiB on the NPU\n", wb / 1073741824.0);
+                GGML_ABORT("axera qwen35_35b_a3b: token embedding [%lld, %lld] does not match the NPU gather (%zu bytes)\n",
+                           (long long) tw->ne[1], (long long) tw->ne[0], wb);
             }
+            EMBW = axera_cmm_alloc(wb);
+            if (tw->type == GGML_TYPE_BF16 && ggml_is_contiguous(tw) && ggml_nbytes(tw) == wb) {
+                memcpy(EMBW->vir, tw->data, wb);
+            } else {
+                axera_for_rows_f32(tw, [&](int64_t r, const float * row) {
+                    ggml_fp32_to_bf16_row(row, (ggml_bf16_t *) EMBW->vir + (size_t) r * H, H);
+                });
+            }
+            EMBW->flush();
+            axera_drop_mapped(tw);
+            EMBI = axera_cmm_alloc(WN * sizeof(int32_t));
+            emb4k = {};
+            emb4k.k = &k4;
+            emb4k.in.assign(k4.info->nInputSize, {});
+            emb4k.out.assign(k4.info->nOutputSize, {});
+            emb4k.in[k4.input("input_flat")] = axera_io(EMBI, EMBI->size);
+            emb4k.in[k4.input("weight")]     = axera_io(EMBW, EMBW->size);
+            emb4k.out[k4.output("output_flat")] = axera_io(XB, (uint32_t) ob);
+            emb1 = {};
+            emb1.k = &k1;
+            emb1.in.assign(k1.info->nInputSize, {});
+            emb1.out.assign(k1.info->nOutputSize, {});
+            emb1.in[k1.input("input_flat")] = axera_io(EMBI, (uint32_t) k1.in_bytes("input_flat"));
+            emb1.in[k1.input("weight")]     = axera_io(EMBW, EMBW->size);
+            emb1.out[k1.output("output_flat")] = axera_io(DX, (uint32_t) k1.out_bytes("output_flat"));
+            emb = true;
+            GGML_LOG_INFO("axera qwen35_35b_a3b: token embedding [%lld, %lld] %.2f GiB on the NPU via %s\n",
+                          (long long) tw->ne[1], (long long) tw->ne[0], wb / 1073741824.0,
+                          man.has("vocab_embedding_4096") ? "manifest kernels" : "embedded kernels");
         }
     }
 
