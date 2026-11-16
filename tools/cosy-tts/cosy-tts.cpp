@@ -98,7 +98,8 @@ static bool read_wav(const char * path, wav_data & out) {
         if (bits == 8)  return (p8[0] - 128) / 128.0f;
         if (bits == 16) { int16_t v; memcpy(&v, p8, 2); return v / 32768.0f; }
         if (bits == 24) {
-            int32_t v = (int32_t) (((uint32_t) p8[0] << 8) | ((uint32_t) p8[1] << 16) | ((uint32_t) p8[2] << 24));
+            int32_t v = (int32_t) (((uint32_t) p8[2] << 16) | ((uint32_t) p8[1] << 8) | (uint32_t) p8[0]);
+            if (v & 0x800000) v |= (int32_t) 0xff000000u;
             return (float) (v / 8388608.0);
         }
         int32_t v; memcpy(&v, p8, 4);
@@ -1196,40 +1197,63 @@ struct campplus_net {
         ow = (iw + 2 * pw - kw) / sw + 1;
         y.assign((size_t) oc * oh * ow, 0.0f);
         acc_mac += (double) oc * oh * ow * ic * kh * kw;
-        // Output plane stays hot while the (ky,kx,ic) loop streams one
-        // contiguous input row at a time, so the compiler can vectorise the
-        // inner x loop.  The previous pixel-major loop reloaded the weights
-        // for every output pixel and ran at scalar speed.
-        parallel_ranges(oc, 16, [&](int c0, int c1) {
-            for (int o = c0; o < c1; o++) {
-                float * dst = y.data() + (size_t) o * oh * ow;
-                for (int yy = 0; yy < oh; yy++) {
-                    float * drow = dst + (size_t) yy * ow;
-                    const float b = bt ? bt[o] : 0.0f;
-                    for (int xx = 0; xx < ow; xx++) drow[xx] = b;
-                }
-                for (int ky = 0; ky < kh; ky++) {
-                    for (int kx = 0; kx < kw; kx++) {
-                        for (int c = 0; c < ic; c++) {
-                            const float wv = wt[(((size_t) o * ic + c) * kh + ky) * kw + kx];
-                            if (wv == 0.0f) continue;
-                            const float * src = x.data() + (size_t) c * ih * iw;
-                            for (int yy = 0; yy < oh; yy++) {
-                                const int iy = yy * sh + ky - ph;
-                                if (iy < 0 || iy >= ih) continue;
-                                const float * srow = src + (size_t) iy * iw;
-                                float * drow = dst + (size_t) yy * ow;
-                                int x0 = 0, x1 = ow;
-                                if (sw == 1) {
-                                    x0 = std::max(0, pw - kx);
-                                    x1 = std::min(ow, iw + pw - kx);
-                                }
-                                for (int xx = x0; xx < x1; xx++) {
-                                    const int ix = sw == 1 ? xx + kx - pw : xx * sw + kx - pw;
-                                    if (ix >= 0 && ix < iw) drow[xx] += wv * srow[ix];
+        // Block eight output channels and eight x positions per accumulator
+        // tile.  The old channel-major loop streamed the whole input plane
+        // once per output channel, which is four gigabytes of reads for the
+        // head alone.  Reusing one input vector across eight output channels
+        // cuts that by eight and keeps the tile in registers.
+        constexpr int OB = 8, XB = 8;
+        const int ogroups = (oc + OB - 1) / OB;
+        parallel_ranges(ogroups * oh, 16, [&](int q0, int q1) {
+            for (int q = q0; q < q1; q++) {
+                const int o0 = (q / oh) * OB;
+                const int yy = q % oh;
+                const int ob = std::min(OB, oc - o0);
+                const int iy0 = yy * sh - ph;
+                for (int x0 = 0; x0 < ow; x0 += XB) {
+                    const int nb = std::min(XB, ow - x0);
+                    float acc[OB][XB];
+                    #pragma GCC unroll 8
+                    for (int i = 0; i < OB; i++) {
+                        const float b = bt ? bt[o0 + std::min(i, ob - 1)] : 0.0f;
+                        #pragma GCC unroll 8
+                        for (int v = 0; v < XB; v++) acc[i][v] = b;
+                    }
+                    for (int ky = 0; ky < kh; ky++) {
+                        const int iy = iy0 + ky;
+                        if (iy < 0 || iy >= ih) continue;
+                        for (int kx = 0; kx < kw; kx++) {
+                            const int base = x0 + kx - pw;
+                            const int lo = std::max(0, -base);
+                            const int hi = std::min(nb, iw - base);
+                            if (hi <= lo) continue;
+                            for (int c = 0; c < ic; c++) {
+                                float wv[OB];
+                                #pragma GCC unroll 8
+                                for (int i = 0; i < OB; i++)
+                                    wv[i] = wt[(((size_t) (o0 + std::min(i, ob - 1)) * ic + c) * kh + ky) * kw + kx];
+                                const float * srow = x.data() + ((size_t) c * ih + iy) * iw + base;
+                                if (lo == 0 && hi == XB) {
+                                    float xv[XB];
+                                    #pragma GCC unroll 8
+                                    for (int v = 0; v < XB; v++) xv[v] = srow[v];
+                                    #pragma GCC unroll 8
+                                    for (int i = 0; i < OB; i++) {
+                                        #pragma GCC unroll 8
+                                        for (int v = 0; v < XB; v++) acc[i][v] += wv[i] * xv[v];
+                                    }
+                                } else {
+                                    for (int v = lo; v < hi; v++)
+                                        for (int i = 0; i < OB; i++) acc[i][v] += wv[i] * srow[v];
                                 }
                             }
                         }
+                    }
+                    #pragma GCC unroll 8
+                    for (int i = 0; i < ob; i++) {
+                        float * drow = y.data() + (size_t) (o0 + i) * oh * ow + (size_t) yy * ow + x0;
+                        #pragma GCC unroll 8
+                        for (int v = 0; v < nb; v++) drow[v] = acc[i][v];
                     }
                 }
             }
@@ -1238,56 +1262,60 @@ struct campplus_net {
     }
 
     // C[oc][t] += A[oc][ic] * B[ic][t].  The activation matrix B is
-    // time-major, so a 4x8 register tile keeps 32 accumulators live while one
-    // eight-float activation vector feeds four output channels.  This is the
-    // inner loop of every TDNN layer; the previous per-channel loop reloaded
-    // and stored the output row for every input channel.
+    // time-major, so transpose A into [ic][oc] and run an 8x8 register tile:
+    // 16 vector registers hold all 64 accumulators, two hold eight A values
+    // and two hold eight B values.  The previous 4x8 tile kept its
+    // accumulators in stack memory and reloaded them on every FMA.
     void gemm_acc(const float * A, int a_o, int a_c, const float * B, int b_c,
                   float * C, int c_row, int M, int N, int K) const {
-        constexpr int MB = 4, NB = 8;
-        const int nblk = (N + NB - 1) / NB;
-        const int oblks = (M + MB - 1) / MB;
-        parallel_ranges(oblks * nblk, 16, [&](int q0, int q1) {
-            for (int q = q0; q < q1; q++) {
-                const int o = (q / nblk) * MB;
-                const int b = q % nblk;
-                const int t = b * NB;
-                const int nb = std::min(NB, N - t);
-                {
-                    const int mb = std::min(MB, M - o);
+        constexpr int MB = 8, NB = 8;
+        const int mp = (M + MB - 1) / MB * MB;
+        const int np = (N + 15) / 16 * 16;   // 64-byte rows: no false sharing
+        std::vector<float> at((size_t) K * mp, 0.0f);
+        std::vector<float> bp((size_t) K * np, 0.0f);
+        for (int c = 0; c < K; c++) {
+            float * dst = at.data() + (size_t) c * mp;
+            const float * src = A + (size_t) c * a_c;
+            for (int i = 0; i < M; i++) dst[i] = src[(size_t) i * a_o];
+            std::memcpy(bp.data() + (size_t) c * np, B + (size_t) c * b_c,
+                        (size_t) N * sizeof(float));
+        }
+        std::vector<float> cp((size_t) mp * np, 0.0f);
+        const int oblks = mp / MB, nblks = np / NB;
+        parallel_ranges(oblks, 16, [&](int b0, int b1) {
+            for (int ob = b0; ob < b1; ob++) {
+                const int o = ob * MB;
+                for (int tb = 0; tb < nblks; tb++) {
+                    const int t = tb * NB;
                     float acc[MB][NB] = {};
-                    if (mb == MB && nb == NB) {
-                        for (int c = 0; c < K; c++) {
-                            const float * bp = B + (size_t) c * b_c + t;
-                            const float * ap = A + (size_t) o * a_o + (size_t) c * a_c;
-                            float bv[NB];
-                            #pragma GCC unroll 16
-                            for (int j = 0; j < NB; j++) bv[j] = bp[j];
-                            #pragma GCC unroll 4
-                            for (int i = 0; i < MB; i++) {
-                                const float w = ap[(size_t) i * a_o];
-                                #pragma GCC unroll 16
-                                for (int j = 0; j < NB; j++) acc[i][j] += w * bv[j];
-                            }
-                        }
-                    } else {
-                        for (int c = 0; c < K; c++) {
-                            const float * bp = B + (size_t) c * b_c + t;
-                            const float * ap = A + (size_t) o * a_o + (size_t) c * a_c;
-                            for (int i = 0; i < mb; i++) {
-                                const float w = ap[(size_t) i * a_o];
-                                for (int j = 0; j < nb; j++) acc[i][j] += w * bp[j];
-                            }
+                    for (int c = 0; c < K; c++) {
+                        const float * ap = at.data() + (size_t) c * mp + o;
+                        const float * bq = bp.data() + (size_t) c * np + t;
+                        float av[MB], bv[NB];
+                        #pragma GCC unroll 8
+                        for (int i = 0; i < MB; i++) av[i] = ap[i];
+                        #pragma GCC unroll 8
+                        for (int j = 0; j < NB; j++) bv[j] = bq[j];
+                        #pragma GCC unroll 8
+                        for (int i = 0; i < MB; i++) {
+                            #pragma GCC unroll 8
+                            for (int j = 0; j < NB; j++) acc[i][j] += av[i] * bv[j];
                         }
                     }
-                    for (int i = 0; i < mb; i++) {
-                        float * cp = C + (size_t) (o + i) * c_row + t;
-                        #pragma GCC unroll 16
-                        for (int j = 0; j < nb; j++) cp[j] += acc[i][j];
+                    #pragma GCC unroll 8
+                    for (int i = 0; i < MB; i++) {
+                        float * dst = cp.data() + (size_t) (o + i) * np + t;
+                        #pragma GCC unroll 8
+                        for (int j = 0; j < NB; j++) dst[j] = acc[i][j];
                     }
                 }
             }
         });
+        for (int i = 0; i < M; i++) {
+            const float * src = cp.data() + (size_t) i * np;
+            float * dst = C + (size_t) i * c_row;
+            for (int t = 0; t < N; t++) dst[t] += src[t];
+        }
     }
 
     // F.conv1d on [IC][T]; the kernel has no groups.
@@ -1990,22 +2018,82 @@ static double sec(std::chrono::steady_clock::time_point a, std::chrono::steady_c
     return std::chrono::duration<double>(b - a).count();
 }
 
+static thread_local bool tl_range_worker = false;
+
+// One persistent team for the whole process.  The reference front end issues
+// hundreds of small convolutions; creating a sixteen-thread team for each one
+// costs more than the arithmetic on A55.
+class range_pool {
+public:
+    range_pool(int hw, int workers) : stop_(false), generation_(0), n_(0), nt_(1), finished_(0) {
+        (void) hw;
+        for (int i = 1; i < workers; i++) threads_.emplace_back([this, i] { worker(i); });
+        std::unique_lock<std::mutex> lk(state_mu_);
+        ready_cv_.wait(lk, [&] { return started_ == workers - 1; });
+    }
+    void run(int n, int nt, std::function<void(int, int)> f) {
+        std::unique_lock<std::mutex> job_lock(job_mu_);
+        {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            job_ = std::move(f);
+            n_ = n; nt_ = nt; finished_ = 0;
+            generation_++;
+        }
+        work_cv_.notify_all();
+        if (getenv("COSY_PROFILE")) fprintf(stderr, "[pool] run n=%d nt=%d\n", n, nt);
+        job_(0, n / nt);
+        {
+            std::unique_lock<std::mutex> lk(state_mu_);
+            done_cv_.wait(lk, [&] { return finished_ >= nt - 1; });
+        }
+        if (getenv("COSY_PROFILE")) fprintf(stderr, "[pool] done nt=%d\n", nt);
+    }
+private:
+    void worker(int idx) {
+        tl_range_worker = true;
+        uint64_t seen = 0;
+        {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            started_++;
+        }
+        ready_cv_.notify_one();
+        for (;;) {
+            int n, nt;
+            {
+                std::unique_lock<std::mutex> lk(state_mu_);
+                work_cv_.wait(lk, [&] { return stop_ || generation_ != seen; });
+                if (stop_) return;
+                seen = generation_;
+                n = n_; nt = nt_;
+            }
+            if (idx < nt) {
+                if (getenv("COSY_PROFILE")) fprintf(stderr, "[pool] worker %d range %d..%d n=%d nt=%d\n", idx, (n*idx)/nt, (n*(idx+1))/nt, n, nt);
+                job_((n * idx) / nt, (n * (idx + 1)) / nt);
+                {
+                    std::lock_guard<std::mutex> lk(state_mu_);
+                    finished_++;
+                }
+                done_cv_.notify_one();
+            }
+        }
+    }
+    std::mutex job_mu_, state_mu_;
+    std::condition_variable work_cv_, done_cv_, ready_cv_;
+    std::function<void(int, int)> job_;
+    int n_, nt_, finished_, started_ = 0;
+    uint64_t generation_;
+    bool stop_;
+    std::vector<std::thread> threads_;
+};
+
 template <typename Fn>
 static void parallel_ranges(int n, int max_threads, Fn && fn) {
+    if (n <= 0) return;
     static const int hw_threads = std::max(1u, std::thread::hardware_concurrency());
     const int nt = std::max(1, std::min(std::min(max_threads, n), hw_threads));
-    if (nt == 1) {
-        fn(0, n);
-        return;
-    }
-    std::vector<std::thread> workers;
-    workers.reserve(nt - 1);
-    for (int i = 1; i < nt; i++) {
-        const int a = (n * i) / nt, b = (n * (i + 1)) / nt;
-        workers.emplace_back([=, &fn] { fn(a, b); });
-    }
-    fn(0, n / nt);
-    for (auto & worker : workers) worker.join();
+    if (nt == 1 || tl_range_worker) { fn(0, n); return; }
+    static range_pool * pool = new range_pool(hw_threads, hw_threads);
+    pool->run(n, nt, std::function<void(int, int)>(std::forward<Fn>(fn)));
 }
 
 struct cosy_service_request {
@@ -2283,33 +2371,41 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             rf->tok          = std::move(fc.tok);
         } else {
             auto t0 = now();
+            // The two spectrogram front ends are independent; overlap them.
+            std::thread wmel_thread([&] { rf->wmel = whisper_mel(pcm16, rf->wmel_frames, tab); });
             rf->fbank = kaldi_fbank80(pcm16, rf->fbank_frames, tab);
+            wmel_thread.join();
             auto t1 = now();
+            if (!front_npu) {
+                fprintf(stderr, "reference-audio tokenizer AXModel was not loaded\n");
+                return nullptr;
+            }
+            // The tokenizer runs on the NPU while Campplus uses the host CPU.
+            // Both are independent and the session is not touched again until
+            // the thread is joined.
+            bool tok_ok = false;
+            std::thread tok_thread([&] {
+                tok_ok = front_tokenize(*front_npu, rf->wmel, rf->wmel_frames, rf->tok);
+            });
             std::vector<double> cam_t;
             rf->embedding = campplus.forward(rf->fbank, rf->fbank_frames, "ref", &cam_t);
             if (getenv("COSY_PROFILE") && cam_t.size() == 3) {
                 fprintf(stderr, "[campplus] head=%.3fs tdnn=%.3fs stats=%.3fs\n", cam_t[0], cam_t[1], cam_t[2]);
             }
+            tok_thread.join();
+            auto t2 = now();
+            if (!tok_ok) return nullptr;
             if ((int) rf->embedding.size() != 192) {
                 fprintf(stderr, "Campplus produced %zu values\n", rf->embedding.size());
                 return nullptr;
             }
-            auto t2 = now();
-            rf->wmel = whisper_mel(pcm16, rf->wmel_frames, tab);
-            auto t3 = now();
-            if (!front_npu) {
-                fprintf(stderr, "reference-audio tokenizer AXModel was not loaded\n");
-                return nullptr;
-            }
-            if (!front_tokenize(*front_npu, rf->wmel, rf->wmel_frames, rf->tok)) return nullptr;
-            auto t4 = now();
             rf->flowfeat = flow_mel24(pcm24, rf->flow_frames, tab);
             auto t5 = now();
             t_fbank   = sec(t0, t1);
-            t_spk     = sec(t1, t2);
-            t_wmel    = sec(t2, t3);
-            t_stok    = sec(t3, t4);
-            t_flowmel = sec(t4, t5);
+            t_spk     = sec(t0, t2);
+            t_wmel    = 0.0;
+            t_stok    = sec(t0, t2);
+            t_flowmel = sec(t2, t5);
             fc.fbank_frames = rf->fbank_frames; fc.wmel_frames = rf->wmel_frames; fc.flow_frames = rf->flow_frames;
             fc.n_tok = (int) rf->tok.size();
             fc.fbank = rf->fbank; fc.wmel = rf->wmel; fc.flowfeat = rf->flowfeat;
