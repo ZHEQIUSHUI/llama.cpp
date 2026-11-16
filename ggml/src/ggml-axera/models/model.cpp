@@ -46,16 +46,24 @@ struct composite final : model {
     int                    n = 0;
     model *                cur = nullptr;
 
+    model * select(const ggml_cgraph * g) {
+        return vit && (vit_graph(g) || minicpm_ocr_vit_graph(g)) ? vit.get() :
+               audio && qwen3_asr_graph(g)         ? audio.get() :
+               gen && !llm_graph(g)                ? gen.get() :
+                                                     llm.get();
+    }
+
     ggml_status compute(ggml_cgraph * g) override {
         if (g != last || g->n_nodes != n) {
             last = g;
             n    = g->n_nodes;
-            cur  = vit && (vit_graph(g) || minicpm_ocr_vit_graph(g)) ? vit.get() :
-                   audio && qwen3_asr_graph(g)         ? audio.get() :
-                   gen && !llm_graph(g)                ? gen.get() :
-                                                         llm.get();
+            cur  = select(g);
         }
         return cur->compute(g);
+    }
+
+    void prewarm(ggml_cgraph * g) override {
+        select(g)->prewarm(g);
     }
 
     size_t state_size(uint32_t flags) const override {
@@ -93,6 +101,8 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
         llm = make_qwen35_35b_a3b(m);
     } else if (m.model == "qwen35_moe_sgl") {
         llm = make_qwen35_moe_sgl(m);
+    } else if (m.model == "minicpmv4_7") {
+        llm = make_qwen35_moe_sgl(m);  // the text tower is the published 35B-A3B NVFP4 stack
     } else if (m.model == "hy_mt2") {
         llm = make_hy_mt2(m);
     } else if (m.model == "qwen3") {
@@ -118,7 +128,8 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
     }
     auto c   = std::make_shared<composite>();
     c->llm   = llm;
-    c->vit   = vision1 ? (m.model == "minicpm_ocr" ? make_minicpm_ocr_vit_full(m) : make_qwen35_vit_full(m)) :
+    c->vit   = vision1 ? (m.model == "minicpm_ocr" ? make_minicpm_ocr_vit_full(m) :
+                          m.model == "minicpmv4_7" ? make_minicpmv4_7_vit_full(m) : make_qwen35_vit_full(m)) :
                vision ? make_qwen35_vit(m) : nullptr;
     c->audio = audio ? make_qwen3_asr(m) : nullptr;
     c->gen   = gen ? make_qwen3_tts(m) : nullptr;

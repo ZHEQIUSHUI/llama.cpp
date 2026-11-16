@@ -872,12 +872,17 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     INDICES->flush();
 
     // The token embedding table is the one weight this adapter runs through the NPU's gather instead of the CPU's
-    // GET_ROWS. The two kernel images are part of the adapter (not the manifest): 4096 padded rows for a prefill
-    // chunk, one row for decode. The table is converted once; the output of the one-row kernel lands directly in DX.
+    // GET_ROWS. The manifest supplies the two vocabulary gathers when it names them; otherwise the adapter's embedded
+    // copies are used. 4096 padded rows serve a prefill chunk and one row serves decode. The table is converted once;
+    // the output of the one-row kernel lands directly in DX. A table that does not match either gather is fatal: this
+    // path has no host GET_ROWS fallback.
     {
         axera_timer te("init: token embedding");
         auto it = t.find("token_embd.weight");
-        if (it != t.end()) {
+        if (it == t.end()) {
+            GGML_ABORT("axera qwen35_35b_a3b: the model has no token_embd.weight for the NPU gather\n");
+        }
+        {
             const ggml_tensor * tw = it->second;
             const auto & k4 = man.has("vocab_embedding_4096") ? man.get("vocab_embedding_4096") :
                 man.load_memory("vocab_embedding_4096", std::vector<char>(
@@ -889,10 +894,13 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
                     (const char *) VOCAB_EMBEDDING_1_AXMODEL + VOCAB_EMBEDDING_1_AXMODEL_SIZE));
             const size_t wb = k4.in_bytes("weight");
             const size_t ob = k4.out_bytes("output_flat");
-            GGML_ASSERT(tw->ne[0] == H && wb == (size_t) tw->ne[0] * tw->ne[1] * sizeof(ggml_bf16_t));
             GGML_ASSERT(k4.in_bytes("input_flat") == WN * sizeof(int32_t) && ob == (size_t) WN * H * sizeof(ggml_bf16_t));
             GGML_ASSERT(k1.in_bytes("input_flat") == sizeof(int32_t) && k1.in_bytes("weight") == wb &&
                         k1.out_bytes("output_flat") == (size_t) H * sizeof(ggml_bf16_t));
+            if (tw->ne[0] != H || wb != (size_t) tw->ne[0] * tw->ne[1] * sizeof(ggml_bf16_t)) {
+                GGML_ABORT("axera qwen35_35b_a3b: token embedding [%lld, %lld] does not match the NPU gather (%zu bytes)\n",
+                           (long long) tw->ne[1], (long long) tw->ne[0], wb);
+            }
             EMBW = axera_cmm_alloc(wb);
             if (tw->type == GGML_TYPE_BF16 && ggml_is_contiguous(tw) && ggml_nbytes(tw) == wb) {
                 memcpy(EMBW->vir, tw->data, wb);
@@ -919,7 +927,9 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
             emb1.in[k1.input("weight")]     = axera_io(EMBW, EMBW->size);
             emb1.out[k1.output("output_flat")] = axera_io(DX, (uint32_t) k1.out_bytes("output_flat"));
             emb = true;
-            GGML_LOG_INFO("axera qwen35_35b_a3b: token embedding %.2f GiB on the NPU\n", wb / 1073741824.0);
+            GGML_LOG_INFO("axera qwen35_35b_a3b: token embedding [%lld, %lld] %.2f GiB on the NPU via %s\n",
+                          (long long) tw->ne[1], (long long) tw->ne[0], wb / 1073741824.0,
+                          man.has("vocab_embedding_4096") ? "manifest kernels" : "embedded kernels");
         }
     }
 
@@ -2606,9 +2616,10 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     // the NPU token-embedding path when xin really is the gather from that token tensor.
     const bool npu_emb = emb && inp_tokens && inp_tokens->type == GGML_TYPE_I32 && inp_tokens->ne[0] == T &&
                          xin->op == GGML_OP_GET_ROWS && xin->src[1] == inp_tokens;
-    // The table is a dropped file mapping here, so llama.cpp's CPU GET_ROWS faults a row in and walks the generic
-    // backend (0.18 ms/token, measured); the one-row NPU gather costs more (0.32 ms). Read the bf16 copy the loader
-    // already keeps on the NPU (EMBW) directly instead: one 4 KiB memcpy.
+    // One-row decode keeps the measured shortcut shared with Qwen3.6: a 4 KiB copy from the NPU table's host-visible
+    // bf16 copy. An NPU gather dispatch costs about 0.32 ms/token here; this path costs about 0.016 ms. Longer
+    // batches use the NPU gather. A table that does not match either gather is rejected in init(); this is not a
+    // GET_ROWS or row-count fallback.
     const bool cpu_embed = npu_emb && T == 1;
     std::vector<ggml_bf16_t> xb1;
     bool direct_embed = false;

@@ -49,6 +49,7 @@ std::shared_ptr<model> make_hymt(const manifest & m);  // Hy-MT2-1.8B: HunYuan d
 std::shared_ptr<model> make_qwen35_vit(const manifest & m);  // the mmproj vision encoder (roles vit.*)
 std::shared_ptr<model> make_qwen35_vit_full(const manifest & m);  // the same in one call (role vit)
 std::shared_ptr<model> make_minicpm_ocr_vit_full(const manifest & m);  // MiniCPM-OCR SigLIP tower (role vit)
+std::shared_ptr<model> make_minicpmv4_7_vit_full(const manifest & m);  // MiniCPM-V 4.7 SigLIP + window merger (role vit)
 std::shared_ptr<model> make_minicpm_ocr_text(const manifest & m);  // MiniCPM-OCR text decoder (core/seqstate)
 bool minicpm_ocr_vit_graph(const ggml_cgraph * g);
 std::shared_ptr<model> make_qwen3_asr(const manifest & m);  // the Qwen3-ASR audio encoder (roles audio.*)

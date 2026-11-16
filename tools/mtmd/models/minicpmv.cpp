@@ -146,7 +146,11 @@ ggml_cgraph * clip_graph_minicpmv4_6::build() {
         // so each window-major group of 4 tokens only attends to itself)
         vit_merger_window_idx     = add_i32_input("vit_merger_window_idx", n_pos);
         vit_merger_inv_window_idx = add_i32_input("vit_merger_inv_window_idx", n_pos);
-        vit_merger_window_mask    = build_inp_attn_mask(n_pos, n_pos);
+        // The Axera adapter consumes only the raw image, the position table, the weights and the output: its single
+        // kernel performs the window merge internally. Do not materialise a 4900x4900 mask for that backend.
+        if (!backend_is_axera) {
+            vit_merger_window_mask = build_inp_attn_mask(n_pos, n_pos);
+        }
 
         // ViT merger 2x2 downsample gather indices
         vit_merger_ds_idx_0 = add_i32_input("vit_merger_ds_idx_0", n_ds);

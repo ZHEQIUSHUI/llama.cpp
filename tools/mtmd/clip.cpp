@@ -29,6 +29,15 @@
 
 struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
 
+static bool clip_prof_on() {
+    static const bool on = getenv("GGML_AXERA_PROF") != nullptr;
+    return on;
+}
+
+static int64_t clip_prof_us() {
+    return ggml_time_us();
+}
+
 //#define CLIP_DEBUG_FUNCTIONS
 
 #ifdef CLIP_DEBUG_FUNCTIONS
@@ -268,7 +277,8 @@ clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
         n_mmproj_embd(clip_n_mmproj_embd(ctx)),
         eps(hparams.eps),
         kq_scale(d_head > 0 ? 1.0f / sqrtf((float)d_head) : 0.0f),
-        flash_attn_type(ctx->flash_attn_type) {
+        flash_attn_type(ctx->flash_attn_type),
+        backend_is_axera(std::string(ggml_backend_name(ctx->backend)) == "AXERA") {
     struct ggml_init_params params = {
         /*.mem_size   =*/ ctx->buf_compute_meta.size(),
         /*.mem_buffer =*/ ctx->buf_compute_meta.data(),
@@ -296,7 +306,8 @@ clip_graph::clip_graph(const clip_graph & parent) :
         n_mmproj_embd(parent.n_mmproj_embd),
         eps(parent.eps),
         kq_scale(parent.kq_scale),
-        flash_attn_type(parent.flash_attn_type) {
+        flash_attn_type(parent.flash_attn_type),
+        backend_is_axera(parent.backend_is_axera) {
     // reuse from parent
     ctx0 = parent.ctx0;
     gf   = parent.gf;
@@ -4065,9 +4076,43 @@ struct clip_model_loader {
     }
 
     // only initialize backend buffers, but do not allocate them yet
+    // Let an Axera adapter load its one-time weight banks while the model is opened, not inside the first image
+    // request. Adapters without host-side setup keep the default no-op prewarm.
+    static void prewarm_backend(clip_ctx & ctx_clip, ggml_cgraph * gf) {
+        if (!ctx_clip.backend || ctx_clip.backend == ctx_clip.backend_cpu) {
+            if (clip_prof_on()) {
+                fprintf(stderr, "clip prof: prewarm skipped (backend=%p cpu=%p)\n",
+                        (void *) ctx_clip.backend, (void *) ctx_clip.backend_cpu);
+            }
+            return;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(ctx_clip.backend));
+        auto fn = (void (*)(ggml_backend_t, ggml_cgraph *))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_axera_prewarm_graph");
+        const int64_t t0 = clip_prof_on() ? clip_prof_us() : 0;
+        if (fn) {
+            fn(ctx_clip.backend, gf);
+        }
+        if (clip_prof_on()) {
+            fprintf(stderr, "clip prof: prewarm backend=%s reg=%p fn=%p took %.3f ms\n",
+                    ggml_backend_name(ctx_clip.backend), (void *) reg, (void *) fn,
+                    (clip_prof_us() - t0) / 1e3);
+        }
+    }
+
     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
         ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
+        // reserve() only sizes the buffers; tensor data pointers are assigned by alloc_graph(). Let an Axera adapter
+        // load its weight banks from the allocated measurement graph, then release the allocation for real calls.
+        const bool alloc_ok = ggml_backend_sched_alloc_graph(ctx_clip.sched.get(), gf);
+        if (clip_prof_on()) {
+            fprintf(stderr, "clip prof: reserve alloc for prewarm=%d nodes=%d\n", (int) alloc_ok, ggml_graph_n_nodes(gf));
+        }
+        if (alloc_ok) {
+            prewarm_backend(ctx_clip, gf);
+            ggml_backend_sched_reset(ctx_clip.sched.get());
+        }
 
         ctx_clip.mem_compute.clear();
         for (size_t i = 0; i < ctx_clip.backend_ptrs.size(); ++i) {
@@ -4868,6 +4913,7 @@ void clip_enc_state_free(clip_enc_state * state) {
 }
 
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+    const int64_t t_call0 = clip_prof_us();
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
@@ -4891,22 +4937,27 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // parameters, still allocated)
     const bool gen_code = ctx->proj_type() == PROJECTOR_TYPE_QWEN3TTS_GEN && params->gen_process == CLIP_GEN_PROCESS_GEN_CODE;
     ggml_cgraph * gf = nullptr;
+    int64_t t_build0 = 0, t_build1 = 0, t_alloc1 = 0, t_input0 = 0, t_input1 = 0, t_compute1 = 0, t_out1 = 0;
     if (gen_code && ctx->gen_code_graph && ctx->gen_code_top_k == params->top_k && ctx->gen_code_top_p == params->top_p) {
         gf = ctx->gen_code_graph;
     } else {
         ctx->gen_code_graph = nullptr;
         ggml_backend_sched_reset(ctx->sched.get());
+        t_build0 = clip_prof_us();
         gf = clip_get_graph_builder(ctx, imgs, params)->build();
+        t_build1 = clip_prof_us();
         if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
             LOG_ERR("%s: failed to allocate compute graph\n", __func__);
             return false;
         }
+        t_alloc1 = clip_prof_us();
         if (gen_code) {
             ctx->gen_code_graph = gf;
             ctx->gen_code_top_k = params->top_k;
             ctx->gen_code_top_p = params->top_p;
         }
     }
+    t_input0 = clip_prof_us();
 
     // set inputs
     const auto & model   = ctx->model;
@@ -5007,6 +5058,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     // set input pixel values
     if (!imgs.is_audio) {
+        const int64_t t_raw0 = clip_prof_us();
         size_t nelem = 0;
         for (const auto & img : imgs.entries) {
             nelem += img.nx() * img.ny() * 3;
@@ -5046,7 +5098,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 }
             }
         }
+        const int64_t t_raw1 = clip_prof_us();
         set_input_f32("inp_raw", inp_raw);
+        if (clip_prof_on()) {
+            fprintf(stderr, "clip prof: inp_raw layout %.3f ms upload %.3f ms (%zu floats)\n",
+                    (t_raw1 - t_raw0) / 1e3, (clip_prof_us() - t_raw1) / 1e3, nelem);
+        }
 
     } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV) {
         // audio input. GEN_WAV is not here: it takes codes or feats, set in the switch below
@@ -5214,6 +5271,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         case PROJECTOR_TYPE_MINICPMV4_6:
         case PROJECTOR_TYPE_MINICPMV4_7:
             {
+                if (std::string(ggml_backend_name(ctx->backend)) == "AXERA") {
+                    break; // the Axera vision kernel builds its own window layout from inp_raw
+                }
                 const bool is_4x = hparams.n_merge == 2;
 
                 // SigLIP position buckets (same as resampler path)
@@ -5270,6 +5330,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                     // block-diagonal attention mask: tokens in the same 4-token
                     // window attend to each other (mask = 0), all other positions
                     // are masked out (-inf). matches the window-major reorder above.
+                    const int64_t t_mask0 = clip_prof_us();
                     std::vector<float> window_mask_data(n_pos * n_pos, std::numeric_limits<float>::lowest());
                     for (int wi = 0; wi < n_pos / 4; wi++) {
                         for (int i = 0; i < 4; i++) {
@@ -5278,7 +5339,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                             }
                         }
                     }
+                    const int64_t t_mask1 = clip_prof_us();
                     set_input_attn_mask(window_mask_data);
+                    if (clip_prof_on()) {
+                        fprintf(stderr, "clip prof: window mask n=%d fill %.3f ms upload %.3f ms\n", n_pos,
+                                (t_mask1 - t_mask0) / 1e3, (clip_prof_us() - t_mask1) / 1e3);
+                    }
 
                     // ViT merger 2x2 downsample indices
                     auto vit_merger_ds_0 = make_ds_idx(0, 0, half_h, half_w, pos_w);
@@ -6298,7 +6364,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
     }
 
+    t_input1 = clip_prof_us();
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    t_compute1 = clip_prof_us();
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
@@ -6331,6 +6399,14 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         } else {
             LOG_WRN("%s: output buffer is empty, skipping copy\n", __func__);
         }
+    }
+    t_out1 = clip_prof_us();
+    if (clip_prof_on()) {
+        fprintf(stderr,
+                "clip prof: call graph_build %.3f ms alloc %.3f ms inputs %.3f ms compute %.3f ms out_read %.3f ms total %.3f ms\n",
+                (t_build1 - t_build0) / 1e3, (t_alloc1 - t_build1) / 1e3,
+                (t_input1 - t_input0) / 1e3, (t_compute1 - t_input1) / 1e3,
+                (t_out1 - t_compute1) / 1e3, (t_out1 - t_call0) / 1e3);
     }
 
     //
