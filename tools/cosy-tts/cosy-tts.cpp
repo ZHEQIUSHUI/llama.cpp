@@ -1,11 +1,11 @@
 // Fun-CosyVoice3-0.5B-2512 end-to-end runner.
 //
 // The Qwen2 backbone is evaluated through llama.cpp (CPU or the AXERA backend).
-// The reference-audio encoders use the official ONNX graphs through ONNX
-// Runtime on the host.  The flow-matching decoder and HiFT vocoder use the
-// official ONNX graphs by default, or fixed-shape AXERA models with
-// --flow-npu/--hift-npu.  The speech token table/head are stored in a small
-// auxiliary GGUF next to the backbone GGUF.
+// The reference-audio speech tokenizer runs in one fixed-window AXModel and
+// Campplus runs as native host code; all of their weights come from the front
+// GGUF.  The flow-matching decoder and HiFT vocoder use merged AXModels, with
+// only the small STFT/ISTFT pieces left on the host.  The speech token
+// table/head are stored in a small auxiliary GGUF next to the backbone GGUF.
 
 #include "llama.h"
 #include "llama-ext.h"
@@ -1555,20 +1555,14 @@ static bool load_tables_gguf(gguf_asset_file & g, feature_tables & t) {
         !cp("table.kaldi_povey512", 512, t.kaldi_povey) ||
         !cp("table.flow_noise_1x80x15000", 80 * 15000, t.flow_noise) ||
         !cp("table.flow_mel_80x961", 80 * 961, t.flow_mel) ||
-        !cp("table.flow_hann1920", 1920, t.flow_hann)) {
+        !cp("table.flow_hann1920", 1920, t.flow_hann) ||
+        !cp("table.flow_affine", 160, t.flow_affine)) {
         return false;
-    }
-    // The merged flow kernel keeps its five Euler states in BF16.  The
-    // calibration table removes the small, repeatable per-bin gain/bias error
-    // without changing the kernel's single-call CFG/Euler contract.
-    if (g.get("table.flow_affine")) {
-        if (!cp("table.flow_affine", 160, t.flow_affine)) return false;
     }
     return true;
 }
 
 static inline float flow_mel_value(const feature_tables & t, int c, float v) {
-    if (t.flow_affine.size() != 160) return v;
     return t.flow_affine[(size_t) c] * v + t.flow_affine[(size_t) (80 + c)];
 }
 
