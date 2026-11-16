@@ -2487,17 +2487,21 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
     const size_t n_embd = batch->ctx->n_embd_out();
     const size_t n_entries = batch->entries.size();
     std::vector<std::shared_ptr<std::vector<float>>> cached(n_entries);
+    std::vector<std::string> cache_keys(n_entries);
     std::vector<const mtmd_input_chunk *> to_encode;
     size_t n_hit_chunks = 0;
     size_t n_hit_tokens = 0;
     size_t n_tokens_total = 0;
+    const bool cache_on = batch->ctx->embd_cache.limit_bytes > 0;
 
     for (size_t i = 0; i < n_entries; ++i) {
         const auto * chunk = batch->entries[i];
         const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
         n_tokens_total += n_tokens;
-        if (batch->ctx->embd_cache.limit_bytes > 0) {
-            cached[i] = batch->ctx->embd_cache.get(mtmd_chunk_cache_key(chunk));
+        if (cache_on) {
+            // The key walks the image pixels; compute it once and reuse it for the put below.
+            cache_keys[i] = mtmd_chunk_cache_key(chunk);
+            cached[i] = batch->ctx->embd_cache.get(cache_keys[i]);
             if (cached[i] && cached[i]->size() != n_tokens * n_embd) {
                 cached[i].reset();
             }
@@ -2560,7 +2564,9 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
         } else {
             std::copy(encoded.begin() + enc_offset, encoded.begin() + enc_offset + n_floats,
                       batch->output_embd.begin() + out_offset);
-            batch->ctx->embd_cache.put(mtmd_chunk_cache_key(chunk), encoded.data() + enc_offset, n_floats);
+            if (cache_on) {
+                batch->ctx->embd_cache.put(cache_keys[i], encoded.data() + enc_offset, n_floats);
+            }
             enc_offset += n_floats;
         }
         out_offset += n_floats;
