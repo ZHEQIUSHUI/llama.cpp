@@ -30,6 +30,7 @@
 #include <map>
 #include <regex>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 namespace axera {
@@ -151,6 +152,9 @@ class hy_mt2 final : public model, public seq_model {
                           bool need_head);
     void dump_x(const axera_cmm & b, int rows, int64_t cell, int call_index);
     void dump_hidden(const axera_cmm & b, int rows, int64_t cell, int call_index);
+    void dump_debug_call(int ci, int64_t cell, int rows, int64_t batch_cell0, int page,
+                         int first, int want, int take, int hr0, bool need_head);
+    void dump_debug_output(int ci, int rows, int64_t cell);
     void open_route_dump();
     void dump_routes(int64_t cell, int rows, int layer_stride);
     void run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4);
@@ -721,6 +725,152 @@ void hy_mt2::dump_hidden(const axera_cmm & b, int rows, int64_t cell, int call_i
     fclose(f);
 }
 
+static uint64_t dump_hash(const void * p, size_t n) {
+    const uint8_t * s = (const uint8_t *) p;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= s[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static bool debug_call_wanted(int ci) {
+    const char * p = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_CALLS");
+    if (!p || !*p) return true;
+    const std::string s = "," + std::string(p) + ",";
+    return s.find("," + std::to_string(ci) + ",") != std::string::npos;
+}
+
+void hy_mt2::dump_debug_call(int ci, int64_t cell, int rows, int64_t batch_cell0, int page,
+                             int first, int want, int take, int hr0, bool need_head) {
+    const char * base = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_PATH");
+    if (!base || !*base || !debug_call_wanted(ci)) return;
+    const char * rs = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_ROWS");
+    if (rs && *rs && atoi(rs) != rows) return;
+    const char * cs = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_CELL");
+    if (cs && *cs && strtoll(cs, nullptr, 10) != cell) return;
+
+    mkdir(base, 0777);
+    static uint64_t serial = 0;
+    const uint64_t id = serial++;
+    char pdir[4096];
+    snprintf(pdir, sizeof(pdir), "%s/page_%06lld_rows_%04d_seq_%05llu", base, (long long) cell, rows,
+             (unsigned long long) id);
+    mkdir(pdir, 0777);
+    char dir[4096];
+    snprintf(dir, sizeof(dir), "%s/call_%d", pdir, ci);
+    mkdir(dir, 0777);
+
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/meta.txt", dir);
+    FILE * mf = fopen(path, "w");
+    if (!mf) {
+        fprintf(stderr, "axera hy_mt2: debug dump fopen %s failed\n", path);
+        return;
+    }
+    fprintf(mf, "time_us=%lld\ncell=%lld\nrows=%d\nbatch_cell0=%lld\npage=%d\ncall=%d\n"
+                "first=%d\nwant=%d\ntake=%d\nhr0=%d\nneed_head=%d\n",
+            (long long) ggml_time_us(), (long long) cell, rows, (long long) batch_cell0, page, ci,
+            first, want, take, hr0, need_head ? 1 : 0);
+    auto scalar = [&](const char * name) -> int32_t {
+        auto it = io.find(name);
+        return it == io.end() ? 0 : *(const int32_t *) it->second->vir;
+    };
+    fprintf(mf, "head_run=%d\nlayer0_run=%d\nbody_run=%d\nvalid_tokens=%d\nlast_page_len=%d\n"
+                "indptr=[%d,%d]\ncache_location=[%d,%d]\n",
+            scalar("head_run"), scalar("layer0_run"), scalar("body_run"), scalar("valid_tokens"),
+            scalar("last_page_len"), ((const int32_t *) io.at("indptr")->vir)[0],
+            ((const int32_t *) io.at("indptr")->vir)[1], ((const int32_t *) io.at("cache_location")->vir)[0],
+            ((const int32_t *) io.at("cache_location")->vir)[1]);
+    fprintf(mf, "indices=");
+    const int32_t * ix = (const int32_t *) io.at("indices")->vir;
+    for (int i = 0; i <= page + wp / PG; ++i) fprintf(mf, "%s%d", i ? "," : "", ix[i]);
+    fprintf(mf, "\nhead_rows=");
+    const int32_t * hr = (const int32_t *) io.at("head_rows")->vir;
+    for (int i = 0; i < HEAD_ROWS; ++i) fprintf(mf, "%s%d", i ? "," : "", hr[i]);
+    fprintf(mf, "\n");
+
+    static const char * small_io[] = {
+        "x", "position_ids", "indptr", "indices", "last_page_len", "cache_location",
+        "head_x", "head_rows", "head_run", "layer0_run", "body_run", "valid_tokens",
+    };
+    for (size_t i = 0; i < pre[ci].k->desc->in.size(); ++i) {
+        const io_desc & d = pre[ci].k->desc->in[i];
+        bool small = false;
+        for (const char * n : small_io) small = small || d.name == n;
+        if (small) {
+            snprintf(path, sizeof(path), "%s/%s.bin", dir, d.name.c_str());
+            FILE * f = fopen(path, "wb");
+            GGML_ASSERT(f && pre[ci].in[i].pVirAddr);
+            fwrite(pre[ci].in[i].pVirAddr, 1, d.bytes, f);
+            fclose(f);
+            fprintf(mf, "io %s bytes=%u hash=%016llx file=%s.bin\n", d.name.c_str(), d.bytes,
+                    (unsigned long long) dump_hash(pre[ci].in[i].pVirAddr, d.bytes), d.name.c_str());
+        }
+    }
+
+    const bool dump_kv = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_KV") == nullptr ||
+                         atoi(getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_KV")) != 0;
+    if (dump_kv) {
+        std::vector<int> pages;
+        for (int p = 0; p <= page; ++p) pages.push_back(p);
+        for (int p : pages) {
+            for (size_t i = 0; i < pre[ci].k->desc->in.size(); ++i) {
+                const io_desc & d = pre[ci].k->desc->in[i];
+                if (d.name.size() < 3 || d.name.compare(d.name.size() - 3, 3, "_kv") != 0) continue;
+                const size_t stride = d.bytes / PAGES;
+                GGML_ASSERT(stride * PAGES == d.bytes && (size_t) p < PAGES);
+                snprintf(path, sizeof(path), "%s/%s.page_%03d.bin", dir, d.name.c_str(), p);
+                const uint8_t * src = (const uint8_t *) pre[ci].in[i].pVirAddr + (size_t) p * stride;
+                FILE * f = fopen(path, "wb");
+                GGML_ASSERT(f);
+                fwrite(src, 1, stride, f);
+                fclose(f);
+                fprintf(mf, "kv %s page=%d bytes=%zu hash=%016llx file=%s.page_%03d.bin\n",
+                        d.name.c_str(), p, stride, (unsigned long long) dump_hash(src, stride), d.name.c_str(), p);
+            }
+        }
+    }
+    for (size_t i = 0; i < pre[ci].k->desc->in.size(); ++i) {
+        const io_desc & d = pre[ci].k->desc->in[i];
+        bool small = false;
+        for (const char * n : small_io) small = small || d.name == n;
+        if (!small && !(dump_kv && d.name.size() >= 3 && d.name.compare(d.name.size() - 3, 3, "_kv") == 0)) {
+            fprintf(mf, "weight %s bytes=%u\n", d.name.c_str(), d.bytes);
+        }
+    }
+    fclose(mf);
+    GGML_LOG_INFO("axera hy_mt2: debug dump call cell %lld rows %d call %d -> %s\n",
+                  (long long) cell, rows, ci, dir);
+}
+
+void hy_mt2::dump_debug_output(int ci, int rows, int64_t cell) {
+    const char * base = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_PATH");
+    const char * out = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_OUT");
+    if (!base || !*base || !out || atoi(out) == 0 || !debug_call_wanted(ci)) return;
+    const char * rs = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_ROWS");
+    if (rs && *rs && atoi(rs) != rows) return;
+    const char * cs = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_CELL");
+    if (cs && *cs && strtoll(cs, nullptr, 10) != cell) return;
+    static uint64_t serial = 0;  // shares the call order with dump_debug_call
+    const uint64_t id = serial++;
+    char dir[4096], path[4096];
+    snprintf(dir, sizeof(dir), "%s/page_%06lld_rows_%04d_seq_%05llu/call_%d", base, (long long) cell, rows,
+             (unsigned long long) id, ci);
+    for (const auto & [name, cmm] : io) {
+        if (name != "output" && name != "hidden2" && name != "head_logits") continue;
+        const size_t n = name == "head_logits" ? (size_t) HEAD_ROWS * VOCAB * sizeof(float) : (size_t) rows * H * sizeof(uint16_t);
+        if (n > cmm->size) continue;
+        cmm->invalidate(cmm->vir, n);
+        snprintf(path, sizeof(path), "%s/out_%s.bin", dir, name.c_str());
+        FILE * f = fopen(path, "wb");
+        if (!f) continue;
+        fwrite(cmm->vir, 1, n, f);
+        fclose(f);
+    }
+}
+
 void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const int32_t * p4, int64_t batch_cell0,
                               bool need_head) {
     GGML_ASSERT(cell % PG == 0 && rows > 0 && rows <= wp);
@@ -799,7 +949,7 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
     auto layer0_run = io.find("layer0_run");
     auto body_run   = io.find("body_run");
     if (wp == WP_MAX) {
-        GGML_ASSERT(layer0_run != io.end() && body_run != io.end());
+        GGML_ASSERT(layer0_run != io.end());
     } else {
         // A 256-row graph does not use these inputs, but keep them defined if
         // the compiler left them in the IO table.
@@ -812,18 +962,23 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
     }
     for (int ci = 0; ci < (int) pre.size(); ++ci) {
         if (wp == WP_MAX) {
-            // The 2-body 4096 graph runs layer 0 only on the first call and
-            // stops the 12-layer MoE loop at 11 on the last call (47 layers).
-            const int remaining = (L - 1) - ci * pgroups[1].layers;
+            // The 2-body 4096 graph runs layer 0 only on the first call.  The
+            // 12-layer MoE body is traced statically, so its 4th call runs the
+            // adapter's zero-filled 12th bank slot as an exact identity
+            // instead of shortening a runtime loop.
             *(int32_t *) layer0_run->second->vir = ci == 0 ? 1 : 0;
-            *(int32_t *) body_run->second->vir = std::min(pgroups[1].layers, remaining);
             layer0_run->second->flush();
-            body_run->second->flush();
+            if (body_run != io.end()) {
+                const int remaining = (L - 1) - ci * pgroups[1].layers;
+                *(int32_t *) body_run->second->vir = std::min(pgroups[1].layers, remaining);
+                body_run->second->flush();
+            }
         }
         if (head_run != io.end()) {
             *(int32_t *) head_run->second->vir = need_head && ci + 1 == (int) pre.size() ? 1 : 0;
             head_run->second->flush();
         }
+        dump_debug_call(ci, cell, rows, batch_cell0, page, first, want, take, hr0, need_head);
         const int64_t t0   = prof ? ggml_time_us() : 0;
         pre[ci].k->run(pre[ci].in, pre[ci].out, "prefill");
         if (prof) {
@@ -834,6 +989,7 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
             const axera_cmm & b = ci % 2 == 0 ? io.at("output") : io.at("hidden2");
             dump_hidden(b, rows, cell, ci);
         }
+        dump_debug_output(ci, rows, cell);
     }
 
     oi->second->invalidate(oi->second->vir, (size_t) rows * H * sizeof(uint16_t));
