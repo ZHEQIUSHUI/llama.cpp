@@ -2265,6 +2265,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     embd_seq.clear();
 
+    if (t_compute_start_us == 0) {
+        t_compute_start_us = ggml_time_us();
+    }
+    n_queued_tokens += n_tokens_all;
+
     output_swaps.clear();
     embd_batch_idxs.clear();
 
@@ -2341,13 +2346,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // (a previous decode may have pointed logits.data at its graph's arena; the host buffer is the valid base here)
     logits.data = logits_host;
     const int64_t dp_t5 = dprof && dp_t0 ? ggml_time_us() : 0;
-
-    // Count this batch only once the host-side reservations are done: output_reserve() may synchronize (and thus
-    // settle the previous batch) or reallocate the output buffer, which used to be attributed to this prompt batch.
-    if (t_compute_start_us == 0) {
-        t_compute_start_us = ggml_time_us();
-    }
-    n_queued_tokens += n_tokens_all;
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
