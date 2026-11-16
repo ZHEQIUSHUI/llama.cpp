@@ -726,8 +726,18 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
     GGML_ASSERT(cell % PG == 0 && rows > 0 && rows <= wp);
     auto xi = io.find("x"), oi = io.find("output");
     GGML_ASSERT(xi != io.end() && oi != io.end());
+    // The 4096-row workspace is fixed for the released graph.  Keep the
+    // padding rows out of the all-zero router bucket (sigmoid + bias sends
+    // every zero row to the same eight experts, which makes a short replay
+    // look like a very overloaded expert).  The rows past `rows` are never
+    // visible to a valid query (attention is causal) or read by the head;
+    // cycling real rows through them only keeps the unused MoE work diverse.
     std::vector<uint16_t> xb((size_t) wp * H, 0);
     memcpy(xb.data(), x, (size_t) rows * H * sizeof(uint16_t));
+    for (int r = rows; r < wp; ++r) {
+        memcpy(xb.data() + (size_t) r * H, x + (size_t) (r % rows) * H,
+               H * sizeof(uint16_t));
+    }
     if (const char * hp = getenv("GGML_AXERA_HY_MT2_XHOST_DUMP"); hp && *hp) {
         FILE * hf = fopen(hp, "ab");
         if (hf) {
