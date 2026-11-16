@@ -603,79 +603,124 @@ static std::string kernel_tensor_name(const std::string & name) {
 // matmul primitives expect once at load time; the model file itself never
 // contains weights.
 static bool upload_front_weights(npu_model & m, gguf_asset_file & assets) {
-    const int64_t nt = (int64_t) gguf_get_n_tensors(assets.ctx);
-    int uploaded = 0;
-    for (int64_t i = 0; i < nt; i++) {
-        const char * raw = gguf_get_tensor_name(assets.ctx, i);
-        if (!raw || strncmp(raw, "tok.", 4) != 0) continue;
-        const std::string name = raw;
-        ggml_tensor * t = ggml_get_tensor(assets.tensors, raw);
-        if (!t) return false;
-        const size_t nelem = (size_t) ggml_nelements(t);
-        std::string in;
-        bool bf16_out = true;
-        if (name == "tok.qproj.weight") {
-            in = "tok_qproj_pad";
-        } else if (name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0) {
-            in = kernel_tensor_name(name.substr(0, name.size() - 7)) + "_mat";
-        } else {
-            in = kernel_tensor_name(name);
-        }
+    constexpr int LAYERS = 12;
+    auto upload = [&](const std::string & in, const void * data, size_t bytes) {
         const int idx = m.input_index(in.c_str());
-        if (idx < 0) {
-            fprintf(stderr, "front AXModel: no input %s for GGUF %s\n", in.c_str(), raw);
+        if (idx < 0) { fprintf(stderr, "front AXModel: no input %s\n", in.c_str()); return false; }
+        if (bytes != m.in[idx].nSize || !m.set_input(in.c_str(), data, bytes)) {
+            fprintf(stderr, "front AXModel: %s expects %u bytes, got %zu\n", in.c_str(), m.in[idx].nSize, bytes);
             return false;
         }
-        if (name == "tok.qproj.weight") {
-            // Official graph projects 1280 -> 8.  A 32-wide matmul is the
-            // smallest shape the tiling primitive accepts; rows 8..31 stay zero.
-            if (t->type != GGML_TYPE_BF16 || t->ne[0] != 1280 || t->ne[1] != 8) {
-                fprintf(stderr, "front GGUF: unexpected qproj shape\n");
-                return false;
-            }
-            const uint16_t * src = (const uint16_t *) t->data;
-            std::vector<uint16_t> pad((size_t) 32 * 1280, 0);
-            for (int r = 0; r < 8; r++) for (int c = 0; c < 1280; c++) pad[(size_t) r * 1280 + c] = src[(size_t) c * 8 + r];
-            if (pad.size() * 2 != m.in[idx].nSize || !m.set_input(in.c_str(), pad.data(), pad.size() * 2)) return false;
-            uploaded++;
-            continue;
+        return true;
+    };
+    auto bf16_tensor = [&](const std::string & name) -> ggml_tensor * {
+        ggml_tensor * t = ggml_get_tensor(assets.tensors, name.c_str());
+        if (!t || t->type != GGML_TYPE_BF16) {
+            fprintf(stderr, "front GGUF: missing or non-BF16 tensor %s\n", name.c_str());
+            return nullptr;
         }
-        if (t->type == GGML_TYPE_F32) {
-            if (nelem * 4 != m.in[idx].nSize || !m.set_input(in.c_str(), t->data, nelem * 4)) {
-                fprintf(stderr, "front AXModel: %s expects %u bytes, got %zu\n", in.c_str(), m.in[idx].nSize, nelem * 4);
-                return false;
-            }
-            uploaded++;
-            continue;
-        }
-        if (t->type != GGML_TYPE_BF16) {
-            fprintf(stderr, "front GGUF: %s has unsupported type %d\n", raw, (int) t->type);
-            return false;
-        }
-        if (name == "tok.conv1.weight" || name == "tok.conv2.weight") {
+        return t;
+    };
+
+    // Non-banked tensors: the two stride-2 convolutions, the FSQ projection and
+    // its constants.
+    int uploaded = 0;
+    for (const char * name : {"tok.conv1.weight", "tok.conv1.bias", "tok.conv2.weight", "tok.conv2.bias"}) {
+        ggml_tensor * t = ggml_get_tensor(assets.tensors, name);
+        if (!t) { fprintf(stderr, "front GGUF: missing %s\n", name); return false; }
+        const size_t nelem = (size_t) ggml_nelements(t);
+        std::string in = kernel_tensor_name(name);
+        in = in.substr(0, in.size() - 7) + "_mat";
+        if (std::string(name).find(".bias") != std::string::npos) in = kernel_tensor_name(name);
+        std::vector<uint16_t> buf(nelem);
+        if (std::string(name).find(".weight") != std::string::npos) {
             const int K = (int) t->ne[0], IC = (int) t->ne[1], OC = (int) t->ne[2];
             const uint16_t * src = (const uint16_t *) t->data;
-            std::vector<uint16_t> dst(nelem);
             for (int oc = 0; oc < OC; oc++)
                 for (int ic = 0; ic < IC; ic++)
                     for (int k = 0; k < K; k++)
-                        dst[((size_t) oc * K + k) * IC + ic] = src[((size_t) oc * IC + ic) * K + k];
-            if (dst.size() * 2 != m.in[idx].nSize || !m.set_input(in.c_str(), dst.data(), dst.size() * 2)) return false;
-        } else if (name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0 && ggml_n_dims(t) == 2) {
-            const int IC = (int) t->ne[0], OC = (int) t->ne[1];
-            const uint16_t * src = (const uint16_t *) t->data;
-            std::vector<uint16_t> dst(nelem);
-            for (int oc = 0; oc < OC; oc++)
-                for (int ic = 0; ic < IC; ic++)
-                    dst[(size_t) oc * IC + ic] = src[(size_t) ic * OC + oc];
-            if (dst.size() * 2 != m.in[idx].nSize || !m.set_input(in.c_str(), dst.data(), dst.size() * 2)) return false;
-        } else if (nelem * 2 != m.in[idx].nSize || !m.set_input(in.c_str(), t->data, nelem * 2)) {
-            fprintf(stderr, "front AXModel: %s expects %u bytes, got %zu\n", in.c_str(), m.in[idx].nSize, nelem * 2);
-            return false;
+                        buf[((size_t) oc * K + k) * IC + ic] = src[((size_t) oc * IC + ic) * K + k];
+        } else {
+            memcpy(buf.data(), t->data, nelem * 2);
         }
+        if (!upload(in, buf.data(), buf.size() * 2)) return false;
         uploaded++;
     }
-    fprintf(stderr, "[front-npu] uploaded %d tokenizer weight tensors\n", uploaded);
+    {
+        // Official graph projects 1280 -> 8.  A 32-wide matmul is the smallest
+        // shape the tiling primitive accepts; rows 8..31 stay zero.
+        ggml_tensor * qw = bf16_tensor("tok.qproj.weight");
+        ggml_tensor * qb = bf16_tensor("tok.qproj.bias");
+        if (!qw || !qb || qw->ne[0] != 1280 || qw->ne[1] != 8) return false;
+        const uint16_t * src = (const uint16_t *) qw->data;
+        std::vector<uint16_t> pad((size_t) 32 * 1280, 0);
+        for (int r = 0; r < 8; r++)
+            for (int c = 0; c < 1280; c++) pad[(size_t) r * 1280 + c] = src[(size_t) c * 8 + r];
+        if (!upload("tok_qproj_pad", pad.data(), pad.size() * 2)) return false;
+        if (!upload("tok_qproj_bias", qb->data, 8 * 2)) return false;
+        uploaded += 2;
+    }
+    for (const char * name : {"tok.fsq.Constant_6", "tok.fsq.Constant_10", "tok.fsq.Constant_11"}) {
+        ggml_tensor * t = ggml_get_tensor(assets.tensors, name);
+        if (!t || t->type != GGML_TYPE_F32) { fprintf(stderr, "front GGUF: missing %s\n", name); return false; }
+        if (!upload(kernel_tensor_name(name), t->data, (size_t) ggml_nelements(t) * 4)) return false;
+        uploaded++;
+    }
+
+    // Layer banks: every block weight is concatenated along rows, so the
+    // kernel selects a layer with one index_select and keeps a single body.
+    struct bank_spec { const char * in; const char * suffix; int pad; };
+    static const bank_spec banks[] = {
+        {"tok_blk_ln1_weight", "ln1.weight", 0}, {"tok_blk_ln1_bias", "ln1.bias", 0},
+        {"tok_blk_q_mat",      "q.mat",      0}, {"tok_blk_q_bias",   "q.bias",   0},
+        {"tok_blk_k_mat",      "k.mat",      0}, {"tok_blk_v_mat",    "v.mat",    0},
+        {"tok_blk_v_bias",     "v.bias",     0}, {"tok_blk_o_mat",    "o.mat",    0},
+        {"tok_blk_o_bias",     "o.bias",     0}, {"tok_blk_fsmn_weight", "fsmn.weight", 32},
+        {"tok_blk_ln2_weight", "ln2.weight", 0}, {"tok_blk_ln2_bias", "ln2.bias", 0},
+        {"tok_blk_ff1_mat",    "ff1.mat",    0}, {"tok_blk_ff1_bias", "ff1.bias", 0},
+        {"tok_blk_ff2_mat",    "ff2.mat",    0}, {"tok_blk_ff2_bias", "ff2.bias", 0},
+    };
+    for (const auto & spec : banks) {
+        const int idx = m.input_index(spec.in);
+        if (idx < 0) { fprintf(stderr, "front AXModel: no input %s\n", spec.in); return false; }
+        const size_t want = m.in[idx].nSize / 2;             // BF16 elements
+        const bool is_mat = std::string(spec.suffix).size() > 4 &&
+                            std::string(spec.suffix).compare(std::string(spec.suffix).size() - 4, 4, ".mat") == 0;
+        std::vector<uint16_t> buf(want, 0);
+        size_t at = 0;
+        for (int l = 0; l < LAYERS; l++) {
+            ggml_tensor * t = bf16_tensor("tok.blk" + std::to_string(l) + "." + spec.suffix);
+            if (!t) return false;
+            const uint16_t * src = (const uint16_t *) t->data;
+            if (is_mat) {
+                const int IC = (int) t->ne[0], OC = (int) t->ne[1];
+                if (at + (size_t) IC * OC > want) return false;
+                for (int oc = 0; oc < OC; oc++)
+                    for (int ic = 0; ic < IC; ic++)
+                        buf[at + (size_t) oc * IC + ic] = src[(size_t) ic * OC + oc];
+                at += (size_t) IC * OC;
+            } else if (spec.pad) {
+                const int K = (int) t->ne[0], C = (int) t->ne[2];
+                if (at + (size_t) C * spec.pad > want) return false;
+                for (int c = 0; c < C; c++)
+                    for (int k = 0; k < K; k++)
+                        buf[at + (size_t) c * spec.pad + k] = src[(size_t) c * K + k];
+                at += (size_t) C * spec.pad;
+            } else {
+                const size_t n = (size_t) ggml_nelements(t);
+                if (at + n > want) return false;
+                memcpy(&buf[at], src, n * 2);
+                at += n;
+            }
+        }
+        if (at != want) {
+            fprintf(stderr, "front GGUF: bank %s has %zu elements, kernel wants %zu\n", spec.suffix, at, want);
+            return false;
+        }
+        if (!upload(spec.in, buf.data(), buf.size() * 2)) return false;
+        uploaded++;
+    }
+    fprintf(stderr, "[front-npu] uploaded %d tokenizer tensors (12-layer banks)\n", uploaded);
     return uploaded > 0;
 }
 
