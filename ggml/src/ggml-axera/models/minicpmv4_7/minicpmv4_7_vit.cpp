@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace axera {
@@ -20,12 +21,15 @@ class minicpmv4_7_vit_full final : public model {
   public:
     explicit minicpmv4_7_vit_full(const manifest & m) : man(m), k(man.get("vit")) {}
     ggml_status compute(ggml_cgraph * g) override;
+    void        prewarm(ggml_cgraph * g) override { GGML_ASSERT(prepare(g)); }
 
   private:
     const manifest &                 man;
     const kernel &                   k;
     graph_names                      names;
     std::map<std::string, axera_cmm> buf;
+    std::vector<AX_ENGINE_IO_BUFFER_T> in, outs;
+    bool                             io_bound = false;
     const void *                     bound = nullptr;
     int                              N = 0, N2 = 0, QB = 0, BC = 0, QB2 = 0, BC2 = 0, HD = 0;
     int                              gh_ = -1, gw_ = -1;
@@ -40,6 +44,8 @@ class minicpmv4_7_vit_full final : public model {
 
     void weights(int L, int H);
     void tables(int gh, int gw, int n, const ggml_tensor * pe, int H);
+    void bind_io();
+    bool prepare(ggml_cgraph * g);
 };
 
 void to_bf16(const ggml_tensor * w, ggml_bf16_t * dst) {
@@ -206,11 +212,10 @@ void minicpmv4_7_vit_full::tables(int gh, int gw, int n, const ggml_tensor * pe,
     io("kmask2")->flush();
 }
 
-ggml_status minicpmv4_7_vit_full::compute(ggml_cgraph * g) {
+bool minicpmv4_7_vit_full::prepare(ggml_cgraph * g) {
     names.of(g);
     ggml_tensor * raw = names.at("inp_raw");
     ggml_tensor * pe  = names.at("v.position_embd.weight");
-    ggml_tensor * out = g->nodes[g->n_nodes - 1];
     const int     H = (int) pe->ne[0], PS = (int) names.at("v.patch_embd.weight")->ne[0], CP = 3 * PS * PS;
     const int     gw = (int) raw->ne[0] / PS, gh = (int) raw->ne[1] / PS, n = gw * gh;
     int           L = 0;
@@ -233,7 +238,7 @@ ggml_status minicpmv4_7_vit_full::compute(ggml_cgraph * g) {
     if (raw->ne[3] != 1 || gw % 4 || gh % 4 || n > N || L != 27) {
         GGML_LOG_ERROR("axera minicpmv4_7_vit_full: %d frame(s) of %d x %d patches, %d layers, at most %d patches\n",
                        (int) raw->ne[3], gw, gh, L, N);
-        return GGML_STATUS_FAILED;
+        return false;
     }
     const ggml_tensor * w0 = names.at("v.blk.0.ln1.weight");
     if (bound != w0->data) {
@@ -246,8 +251,36 @@ ggml_status minicpmv4_7_vit_full::compute(ggml_cgraph * g) {
         gh_ = gh;
         gw_ = gw;
     }
+    if (!io_bound) {
+        bind_io();
+    }
+    return true;
+}
+
+void minicpmv4_7_vit_full::bind_io() {
+    in.resize(k.info->nInputSize);
+    outs.resize(k.info->nOutputSize);
+    for (uint32_t i = 0; i < k.info->nInputSize; ++i) {
+        const AX_ENGINE_IOMETA_T & m = k.info->pInputs[i];
+        in[i]                        = axera_io(io(m.pName), m.nSize);
+    }
+    for (uint32_t i = 0; i < k.info->nOutputSize; ++i) {
+        const AX_ENGINE_IOMETA_T & m = k.info->pOutputs[i];
+        outs[i]                      = axera_io(io(m.pName), m.nSize);
+    }
+    io_bound = true;
+}
+
+ggml_status minicpmv4_7_vit_full::compute(ggml_cgraph * g) {
+    if (!prepare(g)) {
+        return GGML_STATUS_FAILED;
+    }
+    ggml_tensor * raw = names.at("inp_raw");
+    ggml_tensor * out = g->nodes[g->n_nodes - 1];
+    const int     PS = (int) names.at("v.patch_embd.weight")->ne[0], CP = 3 * PS * PS;
+    const int     gw = (int) raw->ne[0] / PS, gh = (int) raw->ne[1] / PS, n = gw * gh;
     {
-        axera_timer   tm("minicpmv4_7 vit patches (cpu)");
+        axera_timer   tm("minicpmv4_7 vit patch pack (cpu)");
         const float * img = (const float *) raw->data;
         const int64_t W = raw->ne[0], HI = raw->ne[1];
         auto *        pxb = (ggml_bf16_t *) io("px")->vir;
@@ -267,16 +300,10 @@ ggml_status minicpmv4_7_vit_full::compute(ggml_cgraph * g) {
                 }
             }
         });
+    }
+    {
+        axera_timer tm("minicpmv4_7 vit patch pack flush");
         io("px")->flush();
-    }
-    std::vector<AX_ENGINE_IO_BUFFER_T> in(k.info->nInputSize), outs(k.info->nOutputSize);
-    for (uint32_t i = 0; i < k.info->nInputSize; ++i) {
-        const AX_ENGINE_IOMETA_T & m = k.info->pInputs[i];
-        in[i]                        = axera_io(io(m.pName), m.nSize);
-    }
-    for (uint32_t i = 0; i < k.info->nOutputSize; ++i) {
-        const AX_ENGINE_IOMETA_T & m = k.info->pOutputs[i];
-        outs[i]                      = axera_io(io(m.pName), m.nSize);
     }
     {
         axera_timer tm("minicpmv4_7 vit (one call)");
@@ -288,8 +315,14 @@ ggml_status minicpmv4_7_vit_full::compute(ggml_cgraph * g) {
     const int   nout  = n / 16;
     GGML_ASSERT(OUTD == 2048 && out->type == GGML_TYPE_F32 && out->ne[0] == OUTD && out->ne[1] >= nout);
     const size_t bytes = (size_t) nout * OUTD * sizeof(float);
-    o->invalidate(o->vir, bytes);
-    memcpy(out->data, o->vir, bytes);
+    {
+        axera_timer tm("minicpmv4_7 vit output invalidate");
+        o->invalidate(o->vir, bytes);
+    }
+    {
+        axera_timer tm("minicpmv4_7 vit output memcpy");
+        memcpy(out->data, o->vir, bytes);
+    }
 
     // build_suffix() appends rows of v.tok_embd_sep in the order the graph's
     // views appear; reproduce that tail from the same mmproj tensor.

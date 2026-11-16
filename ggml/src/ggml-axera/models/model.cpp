@@ -46,16 +46,24 @@ struct composite final : model {
     int                    n = 0;
     model *                cur = nullptr;
 
+    model * select(const ggml_cgraph * g) {
+        return vit && (vit_graph(g) || minicpm_ocr_vit_graph(g)) ? vit.get() :
+               audio && qwen3_asr_graph(g)         ? audio.get() :
+               gen && !llm_graph(g)                ? gen.get() :
+                                                     llm.get();
+    }
+
     ggml_status compute(ggml_cgraph * g) override {
         if (g != last || g->n_nodes != n) {
             last = g;
             n    = g->n_nodes;
-            cur  = vit && (vit_graph(g) || minicpm_ocr_vit_graph(g)) ? vit.get() :
-                   audio && qwen3_asr_graph(g)         ? audio.get() :
-                   gen && !llm_graph(g)                ? gen.get() :
-                                                         llm.get();
+            cur  = select(g);
         }
         return cur->compute(g);
+    }
+
+    void prewarm(ggml_cgraph * g) override {
+        select(g)->prewarm(g);
     }
 
     size_t state_size(uint32_t flags) const override {

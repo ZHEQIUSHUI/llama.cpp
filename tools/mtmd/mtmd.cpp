@@ -35,6 +35,11 @@
 
 #include "ggml-backend.h"
 
+static bool mtmd_prof_on() {
+    static const bool on = getenv("GGML_AXERA_PROF") != nullptr;
+    return on;
+}
+
 // remember to bump this if the serialization format changes
 #define MTMD_SERIALIZATION_VERSION 3
 
@@ -2383,6 +2388,8 @@ static int32_t mtmd_batch_encode_entries(
         mtmd_context * ctx,
         const std::vector<const mtmd_input_chunk *> & entries,
         std::vector<float> & output_embd) {
+    const bool    prof = mtmd_prof_on();
+    const int64_t t_clone0 = prof ? ggml_time_us() : 0;
     // represent the whole batch as one single chunk
     mtmd::input_chunk_ptr batch_chunk(mtmd_input_chunk_copy(entries[0]));
     if (batch_chunk->tokens_image) {
@@ -2414,9 +2421,16 @@ static int32_t mtmd_batch_encode_entries(
         return 1;
     }
 
+    const int64_t t_clone1 = prof ? ggml_time_us() : 0;
     LOG_DBG("%s: encoding batch with %zu entries and total %zu tokens\n",
             __func__, entries.size(), mtmd_input_chunk_get_n_tokens(batch_chunk.get()));
-    return mtmd_encode_chunk_impl(ctx, batch_chunk.get(), output_embd);
+    const int32_t ret = mtmd_encode_chunk_impl(ctx, batch_chunk.get(), output_embd);
+    if (prof) {
+        const int64_t t_end = ggml_time_us();
+        fprintf(stderr, "mtmd prof: batch clone %.3f ms encode %.3f ms (%zu entries)\n",
+                (t_clone1 - t_clone0) / 1e3, (t_end - t_clone1) / 1e3, entries.size());
+    }
+    return ret;
 }
 
 static uint64_t mtmd_hash_bytes(uint64_t hash, const void * data, size_t size) {
@@ -2467,7 +2481,9 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
     }
 
     static const bool perf = getenv("PERF1112_PROF") != nullptr;
+    const bool prof = mtmd_prof_on();
     const int64_t t_start = perf ? ggml_time_us() : 0;
+    const int64_t t_lookup0 = prof ? ggml_time_us() : 0;
     const size_t n_embd = batch->ctx->n_embd_out();
     const size_t n_entries = batch->entries.size();
     std::vector<std::shared_ptr<std::vector<float>>> cached(n_entries);
@@ -2492,6 +2508,10 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
         } else {
             to_encode.push_back(chunk);
         }
+    }
+    if (prof) {
+        fprintf(stderr, "mtmd prof: cache key lookup %.3f ms (chunks=%zu hits=%zu)\n",
+                (ggml_time_us() - t_lookup0) / 1e3, n_entries, n_hit_chunks);
     }
 
     static const bool cache_check = getenv("LLAMA_MTMD_EMBED_CACHE_CHECK") != nullptr;
@@ -2527,6 +2547,7 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
         }
     }
 
+    const int64_t t_out0 = prof ? ggml_time_us() : 0;
     batch->output_embd.resize(n_tokens_total * n_embd);
     size_t out_offset = 0;
     size_t enc_offset = 0;
@@ -2543,6 +2564,10 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
             enc_offset += n_floats;
         }
         out_offset += n_floats;
+    }
+    if (prof) {
+        fprintf(stderr, "mtmd prof: output gather/cache put %.3f ms (%zu tokens)\n",
+                (ggml_time_us() - t_out0) / 1e3, n_tokens_total);
     }
 
     if (perf) {

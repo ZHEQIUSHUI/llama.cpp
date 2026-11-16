@@ -2616,10 +2616,11 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     // the NPU token-embedding path when xin really is the gather from that token tensor.
     const bool npu_emb = emb && inp_tokens && inp_tokens->type == GGML_TYPE_I32 && inp_tokens->ne[0] == T &&
                          xin->op == GGML_OP_GET_ROWS && xin->src[1] == inp_tokens;
-    // The table is a dropped file mapping here, so llama.cpp's CPU GET_ROWS faults a row in and walks the generic
-    // backend (0.18 ms/token, measured); the one-row NPU gather costs more (0.32 ms). Read the bf16 copy the loader
-    // already keeps on the NPU (EMBW) directly instead: one 4 KiB memcpy.
-    const bool cpu_embed = npu_emb && T == 1;
+    // The published Qwen3.6 adapter keeps its measured one-row decode shortcut (a 4 KiB copy from the NPU table's
+    // host-visible bf16 copy) so its timing does not change. MiniCPM-V 4.7 uses the one-row NPU gather. The manifest
+    // names the adapter, so this is a model choice, not a row-count fallback; a table that does not match the gather
+    // is rejected in init().
+    const bool cpu_embed = npu_emb && T == 1 && man.model != "minicpmv4_7";
     std::vector<ggml_bf16_t> xb1;
     bool direct_embed = false;
     if (!npu_emb || cpu_embed) {

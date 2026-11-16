@@ -1,14 +1,28 @@
 #include "mtmd-image.h"
+#include "ggml.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
+static bool mtmd_image_prof_on() {
+    static const bool on = getenv("GGML_AXERA_PROF") != nullptr;
+    return on;
+}
+
 void mtmd_image_preproc_out::append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized) {
+    const int64_t t0 = ggml_time_us();
     clip_image_f32 dst;
     dst.from_u8(img);
+    const int64_t t1 = ggml_time_us();
     if (normalized) {
         dst.normalize(hparams.image_mean, hparams.image_std);
+    }
+    if (mtmd_image_prof_on()) {
+        fprintf(stderr, "mtmd image prof: append %dx%d from_u8 %.3f ms normalize %.3f ms\n",
+                img.get_size().width, img.get_size().height, (t1 - t0) / 1e3, (ggml_time_us() - t1) / 1e3);
     }
     entries.push_back(std::move(dst));
 }
@@ -27,9 +41,15 @@ void mtmd_image_preproc_out::append(const clip_hparams & hparams, clip_image_f32
 }
 
 void mtmd_image_preproc_out::append_overview(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized) {
+    const int64_t t0 = ggml_time_us();
     overview.from_u8(img);
+    const int64_t t1 = ggml_time_us();
     if (normalized) {
         overview.normalize(hparams.image_mean, hparams.image_std);
+    }
+    if (mtmd_image_prof_on()) {
+        fprintf(stderr, "mtmd image prof: append overview %dx%d from_u8 %.3f ms normalize %.3f ms\n",
+                img.get_size().width, img.get_size().height, (t1 - t0) / 1e3, (ggml_time_us() - t1) / 1e3);
     }
 }
 
@@ -492,13 +512,22 @@ private:
 //
 
 mtmd_image_preproc_out mtmd_image_preprocessor_llava_uhd::preprocess(const clip_image_u8 & img) const {
+    const int64_t t0 = ggml_time_us();
     const clip_image_size original_size = img.get_size();
     auto const inst = get_slice_instructions(original_size);
+    const int64_t t1 = ggml_time_us();
     auto sliced = slice_image(img, inst);
+    const int64_t t2 = ggml_time_us();
 
     mtmd_image_preproc_out output;
     output.append_overview(hparams, sliced.overview, true);
+    const int64_t t3 = ggml_time_us();
     output.append(hparams, sliced.slices, true);
+    if (mtmd_image_prof_on()) {
+        fprintf(stderr, "mtmd image prof: %dx%d instructions %.3f ms resize+crop %.3f ms overview_norm %.3f ms slices_norm %.3f ms total %.3f ms\n",
+                original_size.width, original_size.height, (t1 - t0) / 1e3, (t2 - t1) / 1e3,
+                (t3 - t2) / 1e3, (ggml_time_us() - t3) / 1e3, (ggml_time_us() - t0) / 1e3);
+    }
     output.grid_x = inst.grid_size.width;
     output.grid_y = inst.grid_size.height;
 
