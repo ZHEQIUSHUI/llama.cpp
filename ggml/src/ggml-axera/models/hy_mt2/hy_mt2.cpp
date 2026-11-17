@@ -1,10 +1,12 @@
 // Axera NPU backend: Hy-MT2-30B-A3B (HYV3), a 48-layer GQA MoE translation model.
 //
 // The manifest has two merged kernels:
-//   prefill  the whole model for one 256-row page, the 48 layers in a runtime loop over
-//            contiguous weight banks, layer 0 dense and layers 1..47 MoE, plus the
-//            final RMSNorm and NVFP4 output head for up to eight output rows.
-//   decode   the same model for one token and one output row.
+//   prefill  layer 0 dense plus one 12-layer MoE runtime body for a 4096-row workspace.
+//            The host launches it four times over bank offsets 1..47, gating layer 0 to
+//            the first call and the MoE loop to 11 layers on the last, then the final
+//            RMSNorm and NVFP4 output head for up to eight rows.
+//   decode   all 48 layers statically expanded (1+12+12+12+11) for one token, then the
+//            same final RMSNorm and output head.
 // The weights come from a bf16 GGUF quantized once to standard GGML NVFP4 blocks with
 // one F32 .scale sidecar per quantization slice. Loading copies the codewords and the
 // per-16-input UE4M3 scales straight into the kernels' pair-major banks; the sidecar is
@@ -28,12 +30,14 @@
 #include <map>
 #include <regex>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 namespace axera {
 namespace {
 
 constexpr int PG = 256;
+constexpr int WP_MAX = 4096;
 constexpr int H = 2048;
 constexpr int HQ = 32;
 constexpr int KVH = 4;
@@ -43,6 +47,7 @@ constexpr int TOPK = 8;
 constexpr int VOCAB = 120832;
 constexpr int PAGES = 513;  // 131328 cells, enough for -c 131072
 constexpr int HEAD_ROWS = 8;
+constexpr int SMALL_BATCH = 64;  // rows below this replay the decode kernel
 
 struct call {
     const kernel *                     k = nullptr;
@@ -112,12 +117,14 @@ class hy_mt2 final : public model, public seq_model {
     using bmap = std::map<std::string, axera_cmm>;
     bmap                                  gbank;   // head / RoPE tables
     bmap                                  dense;   // layer 0
-    bmap                                  dense0;  // all-zero layer 0: an identity on calls 1..3
-    std::vector<bmap>                     chunks;  // one 12-layer MoE bank per call
+    std::vector<bmap>                     chunks;  // one 12-layer bank per prefill call
     std::map<std::string, axera_cmm>      io;
     std::map<std::string, uint32_t>       bank_n, bank_dtype, bank_slot;
-    std::vector<group_info>               groups;
-    int                                   per_chunk = 0, nchunks = 0;
+    std::vector<group_info>               groups;   // weight/decode bank groups
+    std::vector<group_info>               pgroups;  // prefill graph groups
+    int                                   nchunks = 1;   // weight banks
+    int                                   pre_calls = 1; // prefill host launches
+    int                                   wp = PG;  // prefill rows: 256 or 4096, from the manifest
 
     std::vector<call> pre, dec;
     std::vector<axera_cmm> route_cmm;  // one per call: that call's top-k expert ids
@@ -133,6 +140,10 @@ class hy_mt2 final : public model, public seq_model {
 
     // the output head computed by the last kernel call
     int head_first = 0, head_n = 0;
+    // A batch too small for the big prefill workspace is replayed one row at a
+    // time through the decode kernel; its per-row logits are collected here.
+    std::vector<float> small_logits;
+    bool               small_head = false;
 
     void init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node,
               const ggml_tensor * inp_pos);
@@ -141,7 +152,11 @@ class hy_mt2 final : public model, public seq_model {
     void bind_calls(std::vector<call> & calls, const kernel & k, const char * tag, bool prefill);
     void run_prefill_page(int64_t cell, int rows, const uint16_t * x, const int32_t * p4, int64_t batch_cell0,
                           bool need_head);
+    void dump_x(const axera_cmm & b, int rows, int64_t cell, int call_index);
     void dump_hidden(const axera_cmm & b, int rows, int64_t cell, int call_index);
+    void dump_debug_call(int ci, int64_t cell, int rows, int64_t batch_cell0, int page,
+                         int first, int want, int take, int hr0, bool need_head);
+    void dump_debug_output(int ci, int rows, int64_t cell);
     void open_route_dump();
     void dump_routes(int64_t cell, int rows, int layer_stride);
     void run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4);
@@ -194,48 +209,69 @@ static const ggml_tensor * nv_scale(const std::map<std::string, ggml_tensor *> &
 static bool io_name(const std::string & n) {
     return n == "x" || n == "position_ids" || n == "indptr" || n == "indices" || n == "last_page_len" ||
            n == "cache_location" || n == "head_x" || n == "head_rows" || n == "head_run" ||
+           n == "layer0_run" || n == "body_run" ||
            n == "head_logits" || n == "head_ids" ||
            n == "head_topk_v" || n == "head_topk_i" || n == "head_vmax" || n == "head_sumexp" ||
            n == "valid_tokens";
 }
 
-static bool starts_with(const std::string & n, const char * p) {
-    const size_t k = strlen(p);
-    return n.size() >= k && n.compare(0, k, p) == 0;
+static bool starts_with(const std::string & n, const std::string & p) {
+    return n.size() >= p.size() && n.compare(0, p.size(), p) == 0;
 }
 
 void hy_mt2::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node,
                   const ggml_tensor * inp_pos) {
     const kernel & pk = man.get("prefill");
     const kernel & dk = man.get("decode");
-    // The decode graph has no valid_tokens input (T=1); every other input name
-    // is shared, so the two IO tables differ by exactly that one entry.
-    GGML_ASSERT(pk.desc->in.size() == dk.desc->in.size() + 1);
-
-    groups.clear();
-    int first = 0;
-    for (int gi = 0;; ++gi) {
-        const std::string pre = "g" + std::to_string(gi) + "_b0_";
-        auto it = std::find_if(pk.desc->in.begin(), pk.desc->in.end(), [&](const io_desc & d) {
-            return d.name == pre + "attn_w_q";
-        });
-        if (it == pk.desc->in.end() || it->shape.empty()) {
-            break;
+    auto scan_groups = [](const kernel & k, std::vector<group_info> & out) {
+        out.clear();
+        int first = 0;
+        for (int gi = 0;; ++gi) {
+            const std::string pre = "g" + std::to_string(gi) + "_b0_";
+            auto it = std::find_if(k.desc->in.begin(), k.desc->in.end(), [&](const io_desc & d) {
+                return d.name == pre + "attn_w_q";
+            });
+            if (it == k.desc->in.end() || it->shape.empty()) {
+                break;
+            }
+            const int n = (int) it->shape[0];
+            const bool dense = std::any_of(k.desc->in.begin(), k.desc->in.end(), [&](const io_desc & d) {
+                return d.name == pre + "mlp_w_norm";
+            });
+            out.push_back({ first, n, dense, pre });
+            first += n;
         }
-        const int n = (int) it->shape[0];
-        const bool dense = std::any_of(pk.desc->in.begin(), pk.desc->in.end(), [&](const io_desc & d) {
-            return d.name == pre + "mlp_w_norm";
-        });
-        groups.push_back({ first, n, dense, pre });
-        first += n;
+    };
+    scan_groups(pk, pgroups);
+    scan_groups(dk, groups);
+    GGML_ASSERT(groups.size() >= 2 && groups[0].layers == 1 && groups[0].dense);
+    GGML_ASSERT(pgroups.size() >= 2 && pgroups[0].layers == 1 && pgroups[0].dense);
+    int grouped_layers = 0;
+    for (size_t gi = 0; gi < groups.size(); ++gi) {
+        GGML_ASSERT(groups[gi].layers > 0 && groups[gi].layers <= 15);
+        GGML_ASSERT((gi == 0) == groups[gi].dense);
+        grouped_layers += groups[gi].layers;
     }
-    GGML_ASSERT(groups.size() == 2 && groups[0].layers == 1 && groups[0].dense && !groups[1].dense);
-    per_chunk = groups[1].layers;
-    nchunks = (L - 1 + per_chunk - 1) / per_chunk;
-    GGML_ASSERT(per_chunk > 0 && per_chunk <= 15 && nchunks * per_chunk >= L - 1);
-    chunks.resize((size_t) nchunks);
+    GGML_ASSERT(grouped_layers == 48);
+    chunks.resize(groups.size() - 1);
+    nchunks = (int) chunks.size();
+    if (pgroups.size() == 2) {
+        // The 4096-row prefill graph deliberately contains only the dense
+        // body and one 12-layer MoE body.  The host launches it four times
+        // with different weight/KV banks; layer 0 is gated off after call 0.
+        GGML_ASSERT(pgroups[1].layers == groups[1].layers);
+        pre_calls = (48 - 1 + pgroups[1].layers - 1) / pgroups[1].layers;
+    } else {
+        pre_calls = 1;
+    }
+    GGML_ASSERT(pre_calls > 0 && pre_calls <= nchunks);
 
-    for (const auto & d : pk.desc->in) {
+    // Decode's manifest carries every weight bank; the prefill graph is a
+    // subset with the same g0/g1 names.  A 2-body prefill reuses its g1
+    // 12-layer bank for all four host calls, while decode's last bank has 11
+    // layers.  Size each bank from the union of both manifests.
+    std::vector<std::map<std::string, uint32_t>> cbytes((size_t) nchunks);
+    for (const auto & d : dk.desc->in) {
         bank_n[d.name]     = d.bytes;
         bank_dtype[d.name] = d.dtype;
         // Only a g<group>_b<slot>_* bank has a leading layer axis.  Global banks such as
@@ -249,17 +285,55 @@ void hy_mt2::init(const std::map<std::string, ggml_tensor *> & t, const ggml_ten
             continue;
         }
         if (starts_with(d.name, "g0_")) {
-            dense[d.name]  = axera_cmm_alloc(d.bytes);
-            dense0[d.name] = axera_cmm_alloc(d.bytes);  // zeroed by the allocator: identity on later calls
-        } else if (starts_with(d.name, "g1_")) {
-            for (auto & c : chunks) {
-                c[d.name] = axera_cmm_alloc(d.bytes);
-            }
-            if (d.name == groups[1].pre + "b0_kv") {
-                GGML_ASSERT(d.shape.size() >= 1 && (int) d.shape[0] == per_chunk);
-            }
+            dense[d.name] = axera_cmm_alloc(d.bytes);
         } else {
-            gbank[d.name] = axera_cmm_alloc(d.bytes);
+            bool grouped = false;
+            for (size_t gi = 1; gi < groups.size(); ++gi) {
+                if (starts_with(d.name, groups[gi].pre)) {
+                    cbytes[gi - 1][d.name] = std::max(cbytes[gi - 1][d.name], d.bytes);
+                    if (d.name == groups[gi].pre + "b0_kv") {
+                        GGML_ASSERT(d.shape.size() >= 1 && (int) d.shape[0] == groups[gi].layers);
+                    }
+                    grouped = true;
+                    break;
+                }
+            }
+            if (!grouped) {
+                gbank[d.name] = axera_cmm_alloc(d.bytes);
+            }
+        }
+    }
+    if (pgroups.size() == 2) {
+        for (const auto & d : pk.desc->in) {
+            if (!starts_with(d.name, pgroups[1].pre)) {
+                continue;
+            }
+            const std::string suffix = d.name.substr(pgroups[1].pre.size());
+            for (size_t ci = 0; ci < cbytes.size(); ++ci) {
+                const std::string mapped = groups[ci + 1].pre + suffix;
+                auto it = cbytes[ci].find(mapped);
+                if (it != cbytes[ci].end()) {
+                    it->second = std::max(it->second, d.bytes);
+                }
+            }
+        }
+    } else {
+        for (size_t gi = 1; gi < pgroups.size(); ++gi) {
+            for (const auto & d : pk.desc->in) {
+                if (!starts_with(d.name, pgroups[gi].pre)) {
+                    continue;
+                }
+                const std::string mapped = groups[gi].pre + d.name.substr(pgroups[gi].pre.size());
+                auto it = cbytes[gi - 1].find(mapped);
+                if (it != cbytes[gi - 1].end()) {
+                    it->second = std::max(it->second, d.bytes);
+                }
+            }
+        }
+    }
+    for (size_t ci = 0; ci < cbytes.size(); ++ci) {
+        for (const auto & [name, bytes] : cbytes[ci]) {
+            chunks[ci][name] = axera_cmm_alloc(bytes);
         }
     }
     GGML_ASSERT(gbank.count("cos") && gbank.count("sin"));
@@ -285,13 +359,28 @@ void hy_mt2::init(const std::map<std::string, ggml_tensor *> & t, const ggml_ten
     const uint32_t hidden_b = std::max<uint32_t>(pk.desc->out[0].bytes, dk.desc->out[0].bytes);
     io["output"]  = axera_cmm_alloc(hidden_b);
     io["hidden2"] = axera_cmm_alloc(hidden_b);
-    for (const io_desc & d : pk.desc->out) {
-        if (d.name == "route_ids") {
-            for (int c = 0; c < nchunks; ++c) route_cmm.push_back(axera_cmm_alloc(d.bytes));
+    uint32_t route_bytes = 0;
+    for (const auto * desc : { pk.desc, dk.desc }) {
+        for (const io_desc & d : desc->out) {
+            if (d.name == "route_ids") {
+                route_bytes = std::max(route_bytes, d.bytes);
+            }
         }
+    }
+    if (route_bytes) {
+        route_cmm.push_back(axera_cmm_alloc(route_bytes));
     }
     open_route_dump();
 
+    {
+        auto it = io.find("x");
+        GGML_ASSERT(it != io.end());
+        wp = (int) (it->second->size / (H * sizeof(uint16_t)));
+        GGML_ASSERT((wp == PG || wp == WP_MAX) && wp <= WP_MAX);
+        if (wp == WP_MAX) {
+            GGML_ASSERT(pgroups.size() == 2 && pre_calls == 4);
+        }
+    }
     bind_calls(pre, pk, "prefill", true);
     bind_calls(dec, dk, "decode", false);
 
@@ -313,8 +402,8 @@ void hy_mt2::init(const std::map<std::string, ggml_tensor *> & t, const ggml_ten
     for (const auto & c : chunks) {
         for (const auto & [n, b] : c) bytes += b->size;
     }
-    GGML_LOG_INFO("axera hy_mt2: %d layers, %d bodies, %d calls/page, banks %.2f GiB, %lld cells\n", L,
-                  (int) groups.size(), nchunks, bytes / 1073741824.0, (long long) cells);
+    GGML_LOG_INFO("axera hy_mt2: %d layers, %d prefill bodies, %d calls/page, banks %.2f GiB, %lld cells\n", L,
+                  (int) pgroups.size(), pre_calls, bytes / 1073741824.0, (long long) cells);
     inited = true;
 }
 
@@ -354,7 +443,7 @@ void hy_mt2::fill_bank(const std::map<std::string, ggml_tensor *> & t, const ggm
     // the GGUF, exactly like the released 27B/35B packages; its 35B path quantizes the head
     // once while loading into the kernel's NVFP4 layout, so do the same here.
     auto put_nv_whole = [&](bmap & bm, const std::string & qn, const std::string & sn, const std::string & zn,
-                            const ggml_tensor * w, int b) {
+                            const ggml_tensor * w, int b, float s2_scale = 1.0f) {
         const int64_t K = w->ne[0], N = ggml_nrows(w);
         GGML_ASSERT(w->ne[2] == 1 && K % 64 == 0);
         uint8_t * q = slot(bm, qn, b);
@@ -369,10 +458,11 @@ void hy_mt2::fill_bank(const std::map<std::string, ggml_tensor *> & t, const ggm
         } else {
             s2 = axera_quantize_nvfp4_slice(w, 0, N, q, K / 2, s, K / 16);
         }
-        fill_f32(bm, zn, b, s2);
+        fill_f32(bm, zn, b, s2 * s2_scale);
     };
     auto put_nv_rows = [&](bmap & bm, const std::string & qn, const std::string & sn, const std::string & zn,
-                           const ggml_tensor * w, int64_t r0, int64_t nr, int b, int64_t row0, int64_t s2i) {
+                           const ggml_tensor * w, int64_t r0, int64_t nr, int b, int64_t row0, int64_t s2dst,
+                           int64_t s2src) {
         GGML_ASSERT(w->type == GGML_TYPE_NVFP4);
         const int64_t K = w->ne[0];
         uint8_t * q = slot(bm, qn, b) + (size_t) row0 * (K / 2);
@@ -380,7 +470,7 @@ void hy_mt2::fill_bank(const std::map<std::string, ggml_tensor *> & t, const ggm
         axera_copy_nvfp4_slice(w, r0, nr, q, K / 2, s, K / 16);
         const ggml_tensor * ws = nv_scale(t, w);
         const float * v = (const float *) ws->data;
-        ((float *) slot(bm, zn, b))[s2i] = v[ggml_nelements(ws) == 1 ? 0 : s2i];
+        ((float *) slot(bm, zn, b))[s2dst] = v[ggml_nelements(ws) == 1 ? 0 : s2src];
     };
     auto drop = [&](const std::vector<const ggml_tensor *> & read) {
         if (!axera_keep_pages()) {
@@ -428,32 +518,47 @@ void hy_mt2::fill_bank(const std::map<std::string, ggml_tensor *> & t, const ggm
             const ggml_tensor * wd = W("ffn_down_exps.weight");
             GGML_ASSERT(wg->ne[1] == wu->ne[1] && wg->ne[2] == E && wu->ne[2] == E && wd->ne[2] == E);
             for (int e = 0; e < E; ++e) {
+                // FusedMoE layout: gate [0,I) and up [I,2I) share one bank
+                // and one [E,2] scale2 slot per expert.
+                const int64_t I = wg->ne[1];
                 put_nv_rows(bm, pm + "w_gate", pm + "w_scale_gate", pm + "w_scale2_gate", wg,
-                            (int64_t) e * wg->ne[1], wg->ne[1], b, (int64_t) e * wg->ne[1], e);
-                put_nv_rows(bm, pm + "w_up", pm + "w_scale_up", pm + "w_scale2_up", wu,
-                            (int64_t) e * wu->ne[1], wu->ne[1], b, (int64_t) e * wu->ne[1], e);
+                            (int64_t) e * I, I, b, (int64_t) e * 2 * I, e * 2, e);
+                put_nv_rows(bm, pm + "w_gate", pm + "w_scale_gate", pm + "w_scale2_gate", wu,
+                            (int64_t) e * I, I, b, (int64_t) e * 2 * I + I, e * 2 + 1, e);
                 put_nv_rows(bm, pm + "w_down", pm + "w_scale_down", pm + "w_scale2_down", wd,
-                            (int64_t) e * wd->ne[1], wd->ne[1], b, (int64_t) e * wd->ne[1], e);
+                            (int64_t) e * wd->ne[1], wd->ne[1], b, (int64_t) e * wd->ne[1], e, e);
             }
             const char * sn[3] = { "gate", "up", "down" };
             const char * wn[3] = { "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight" };
+            // HYV3 has no shared-expert sigmoid.  The kernel uses the upstream
+            // gated branch with a zero gate (sigmoid(0) = 0.5) and a 2x down
+            // scale2, which is exactly the un-gated shared expert.
+            fill_zero(bm, pm + "shared_expert_gate", b);
             for (int j = 0; j < 3; ++j) {
                 const std::string base = std::string("w_shared_expert_mlp_") + sn[j];
                 put_nv_whole(bm, pm + base, pm + "w_scale_shared_expert_mlp_" + sn[j],
-                             pm + "w_scale2_shared_expert_mlp_" + sn[j], W(wn[j]), b);
+                             pm + "w_scale2_shared_expert_mlp_" + sn[j], W(wn[j]), b,
+                             j == 2 ? 2.0f : 1.0f);
             }
         }
         drop(read);
     };
 
-    const group_info & gd = groups[0];
-    const group_info & gm = groups[1];
-    fill_layer(gd, dense, 0, 0);
-    for (int ci = 0; ci < nchunks; ++ci) {
-        for (int b = 0; b < per_chunk; ++b) {
-            const int il = 1 + ci * per_chunk + b;
-            if (il < L) {
-                fill_layer(gm, chunks[ci], b, il);
+    for (size_t gi = 0; gi < groups.size(); ++gi) {
+        bmap & bank = gi == 0 ? dense : chunks[gi - 1];
+        for (int b = 0; b < groups[gi].layers; ++b) {
+            fill_layer(groups[gi], bank, b, groups[gi].first + b);
+        }
+        if (pgroups.size() == 2 && gi > 0 && pgroups[1].layers > groups[gi].layers) {
+            // The 2-body prefill bank is padded to 12 layers while decode's
+            // last group has 11.  The runtime body stops at 11, but zero the
+            // unused slot so a compiler prefetch cannot observe CMM garbage.
+            for (const auto & [name, cmm] : bank) {
+                auto sl = bank_slot.find(name);
+                GGML_ASSERT(sl != bank_slot.end());
+                for (int b = groups[gi].layers; b < pgroups[1].layers; ++b) {
+                    memset(slot(bank, name, b), 0, sl->second);
+                }
             }
         }
     }
@@ -495,13 +600,17 @@ seq_caps hy_mt2::seq_get_caps() const {
 }
 
 void hy_mt2::bind_calls(std::vector<call> & calls, const kernel & k, const char * tag, bool prefill) {
-    (void) prefill;
-    calls.assign((size_t) nchunks, {});
-    for (int c = 0; c < nchunks; ++c) {
+    (void) tag;
+    const int count = prefill ? pre_calls : 1;
+    calls.assign((size_t) count, {});
+    for (int c = 0; c < count; ++c) {
         call & cl = calls[c];
         cl.k      = &k;
-        axera_cmm & src = c == 0 ? io.at("x") : (c % 2 ? io.at("output") : io.at("hidden2"));
-        axera_cmm & dst = c % 2 == 0 ? io.at("output") : io.at("hidden2");
+        // Prefill alternates the two graph IO buffers across its four calls;
+        // decode is one call with every layer bank in the same graph.
+        axera_cmm & src = !prefill || c == 0 ? io.at("x")
+                          : (c % 2 ? io.at("output") : io.at("hidden2"));
+        axera_cmm & dst = !prefill || c % 2 == 0 ? io.at("output") : io.at("hidden2");
         cl.in.resize(k.desc->in.size());
         for (size_t i = 0; i < k.desc->in.size(); ++i) {
             const io_desc & d = k.desc->in[i];
@@ -509,7 +618,7 @@ void hy_mt2::bind_calls(std::vector<call> & calls, const kernel & k, const char 
             if (d.name == "x") {
                 b = &src;
             } else if (d.name == "output") {
-                b = &dst;  // (an in-place graph input)
+                b = &dst;  // an in-place graph input
             } else if (io_name(d.name)) {
                 auto it = io.find(d.name);
                 if (it == io.end()) {
@@ -517,13 +626,31 @@ void hy_mt2::bind_calls(std::vector<call> & calls, const kernel & k, const char 
                 }
                 b = &it->second;
             } else if (starts_with(d.name, "g0_")) {
-                b = &at(c == 0 ? dense : dense0, d.name);
-            } else if (starts_with(d.name, "g1_")) {
-                b = &at(chunks[c], d.name);
-            } else if (d.name == "route_ids" && c < (int) route_cmm.size()) {
-                b = &route_cmm[c];
+                b = &at(dense, d.name);
             } else {
-                b = &at(gbank, d.name);
+                bool grouped = false;
+                if (prefill) {
+                    if (starts_with(d.name, pgroups[1].pre)) {
+                        GGML_ASSERT(c + 1 < (int) groups.size());
+                        const std::string mapped = groups[c + 1].pre +
+                            d.name.substr(pgroups[1].pre.size());
+                        b = &at(chunks[c], mapped);
+                        grouped = true;
+                    }
+                } else {
+                    for (size_t gi = 1; gi < groups.size(); ++gi) {
+                        if (starts_with(d.name, groups[gi].pre)) {
+                            b = &at(chunks[gi - 1], d.name);
+                            grouped = true;
+                            break;
+                        }
+                    }
+                }
+                if (!grouped && d.name == "route_ids" && !route_cmm.empty()) {
+                    b = &route_cmm[0];
+                } else if (!grouped) {
+                    b = &at(gbank, d.name);
+                }
             }
             cl.in[i] = axera_io(*b, d.bytes);
         }
@@ -532,8 +659,8 @@ void hy_mt2::bind_calls(std::vector<call> & calls, const kernel & k, const char 
             const io_desc & d = k.desc->out[i];
             if (d.name == "output") {
                 cl.out[i] = axera_io(dst, d.bytes);
-            } else if (d.name == "route_ids" && c < (int) route_cmm.size()) {
-                cl.out[i] = axera_io(route_cmm[c], d.bytes);
+            } else if (d.name == "route_ids" && !route_cmm.empty()) {
+                cl.out[i] = axera_io(route_cmm[0], d.bytes);
             } else {
                 GGML_ABORT("axera hy_mt2: %s: unexpected output %s\n", tag, d.name.c_str());
             }
@@ -562,13 +689,27 @@ void hy_mt2::dump_routes(int64_t cell, int rows, int layer_stride) {
     } h = { magic, rows, cell, 47, 8 };
     fwrite(&h, sizeof(h), 1, route_file);
     for (int il = 1; il < 48; ++il) {
-        const int ci = (il - 1) / per_chunk, b = (il - 1) % per_chunk;
-        axera_cmm & r = route_cmm[ci];
+        axera_cmm & r = route_cmm[0];
         r->invalidate(r->vir, r->size);
-        const int32_t * src = (const int32_t *) r->vir + (size_t) b * layer_stride;
+        const int32_t * src = (const int32_t *) r->vir + (size_t) (il - 1) * layer_stride;
         fwrite(src, sizeof(int32_t), (size_t) rows * 8, route_file);
     }
     fflush(route_file);
+}
+
+void hy_mt2::dump_x(const axera_cmm & b, int rows, int64_t cell, int call_index) {
+    const char * p = getenv("GGML_AXERA_HY_MT2_X_DUMP");
+    if (!p || !*p) return;
+    const size_t n = (size_t) rows * H * sizeof(uint16_t);
+    b->invalidate(b->vir, n);
+    FILE * f = fopen(p, "ab");
+    if (!f) return;
+    const uint32_t magic = 0x58334854u;  // "TH3X"
+    const int32_t  h[4] = { rows, (int32_t) cell, call_index, 0 };
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(h, sizeof(h), 1, f);
+    fwrite(b->vir, 1, n, f);
+    fclose(f);
 }
 
 void hy_mt2::dump_hidden(const axera_cmm & b, int rows, int64_t cell, int call_index) {
@@ -586,17 +727,205 @@ void hy_mt2::dump_hidden(const axera_cmm & b, int rows, int64_t cell, int call_i
     fclose(f);
 }
 
+static uint64_t dump_hash(const void * p, size_t n) {
+    const uint8_t * s = (const uint8_t *) p;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= s[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static bool debug_call_wanted(int ci) {
+    const char * p = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_CALLS");
+    if (!p || !*p) return true;
+    const std::string s = "," + std::string(p) + ",";
+    return s.find("," + std::to_string(ci) + ",") != std::string::npos;
+}
+
+void hy_mt2::dump_debug_call(int ci, int64_t cell, int rows, int64_t batch_cell0, int page,
+                             int first, int want, int take, int hr0, bool need_head) {
+    const char * base = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_PATH");
+    if (!base || !*base || !debug_call_wanted(ci)) return;
+    const char * rs = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_ROWS");
+    if (rs && *rs && atoi(rs) != rows) return;
+    const char * cs = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_CELL");
+    if (cs && *cs && strtoll(cs, nullptr, 10) != cell) return;
+
+    mkdir(base, 0777);
+    static uint64_t serial = 0;
+    const uint64_t id = serial++;
+    char pdir[4096];
+    snprintf(pdir, sizeof(pdir), "%s/page_%06lld_rows_%04d_seq_%05llu", base, (long long) cell, rows,
+             (unsigned long long) id);
+    mkdir(pdir, 0777);
+    char dir[4096];
+    snprintf(dir, sizeof(dir), "%s/call_%d", pdir, ci);
+    mkdir(dir, 0777);
+
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/meta.txt", dir);
+    FILE * mf = fopen(path, "w");
+    if (!mf) {
+        fprintf(stderr, "axera hy_mt2: debug dump fopen %s failed\n", path);
+        return;
+    }
+    fprintf(mf, "time_us=%lld\ncell=%lld\nrows=%d\nbatch_cell0=%lld\npage=%d\ncall=%d\n"
+                "first=%d\nwant=%d\ntake=%d\nhr0=%d\nneed_head=%d\n",
+            (long long) ggml_time_us(), (long long) cell, rows, (long long) batch_cell0, page, ci,
+            first, want, take, hr0, need_head ? 1 : 0);
+    auto scalar = [&](const char * name) -> int32_t {
+        auto it = io.find(name);
+        return it == io.end() ? 0 : *(const int32_t *) it->second->vir;
+    };
+    fprintf(mf, "head_run=%d\nlayer0_run=%d\nbody_run=%d\nvalid_tokens=%d\nlast_page_len=%d\n"
+                "indptr=[%d,%d]\ncache_location=[%d,%d]\n",
+            scalar("head_run"), scalar("layer0_run"), scalar("body_run"), scalar("valid_tokens"),
+            scalar("last_page_len"), ((const int32_t *) io.at("indptr")->vir)[0],
+            ((const int32_t *) io.at("indptr")->vir)[1], ((const int32_t *) io.at("cache_location")->vir)[0],
+            ((const int32_t *) io.at("cache_location")->vir)[1]);
+    fprintf(mf, "indices=");
+    const int32_t * ix = (const int32_t *) io.at("indices")->vir;
+    for (int i = 0; i <= page + wp / PG; ++i) fprintf(mf, "%s%d", i ? "," : "", ix[i]);
+    fprintf(mf, "\nhead_rows=");
+    const int32_t * hr = (const int32_t *) io.at("head_rows")->vir;
+    for (int i = 0; i < HEAD_ROWS; ++i) fprintf(mf, "%s%d", i ? "," : "", hr[i]);
+    fprintf(mf, "\n");
+
+    static const char * small_io[] = {
+        "x", "position_ids", "indptr", "indices", "last_page_len", "cache_location",
+        "head_x", "head_rows", "head_run", "layer0_run", "body_run", "valid_tokens",
+    };
+    for (size_t i = 0; i < pre[ci].k->desc->in.size(); ++i) {
+        const io_desc & d = pre[ci].k->desc->in[i];
+        bool small = false;
+        for (const char * n : small_io) small = small || d.name == n;
+        if (small) {
+            snprintf(path, sizeof(path), "%s/%s.bin", dir, d.name.c_str());
+            FILE * f = fopen(path, "wb");
+            GGML_ASSERT(f && pre[ci].in[i].pVirAddr);
+            fwrite(pre[ci].in[i].pVirAddr, 1, d.bytes, f);
+            fclose(f);
+            fprintf(mf, "io %s bytes=%u hash=%016llx file=%s.bin\n", d.name.c_str(), d.bytes,
+                    (unsigned long long) dump_hash(pre[ci].in[i].pVirAddr, d.bytes), d.name.c_str());
+        }
+    }
+
+    const bool dump_kv = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_KV") == nullptr ||
+                         atoi(getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_KV")) != 0;
+    if (dump_kv) {
+        std::vector<int> pages;
+        // A 4096-row prefill call writes wp/PG sub-pages.  `page` is only the
+        // first one (the replay's history end), so dumping 0..page saved just
+        // page 0 and made a short-page replay depend on reconstructed pages.
+        // Save every page the call's `indices` can touch, capped by the bank.
+        const int last_page = std::min(PAGES - 1, page + wp / PG);
+        for (int p = 0; p <= last_page; ++p) pages.push_back(p);
+        for (int p : pages) {
+            for (size_t i = 0; i < pre[ci].k->desc->in.size(); ++i) {
+                const io_desc & d = pre[ci].k->desc->in[i];
+                if (d.name.size() < 3 || d.name.compare(d.name.size() - 3, 3, "_kv") != 0) continue;
+                // The KV input is [layers, PAGES, 2, 256, 4, 128], not a flat
+                // page array.  The old bytes/PAGES slice was 12 pages of layer
+                // 0 for g1, so layers 2..12 were never dumped.  A per-layer
+                // page slice is 2*256*4*128*2 = 512 KiB.
+                const size_t page_bytes = (size_t) 2 * 256 * 4 * 128 * sizeof(uint16_t);
+                GGML_ASSERT(d.bytes % (page_bytes * (size_t) PAGES) == 0);
+                const size_t layers = d.bytes / (page_bytes * (size_t) PAGES);
+                for (size_t l = 0; l < layers; ++l) {
+                    snprintf(path, sizeof(path), "%s/%s.layer_%02zu.page_%03d.bin", dir, d.name.c_str(), l, p);
+                    const uint8_t * src = (const uint8_t *) pre[ci].in[i].pVirAddr +
+                                          (((size_t) l * (size_t) PAGES + (size_t) p) * page_bytes);
+                    FILE * f = fopen(path, "wb");
+                    GGML_ASSERT(f);
+                    fwrite(src, 1, page_bytes, f);
+                    fclose(f);
+                    fprintf(mf, "kv %s layer=%zu page=%d bytes=%zu hash=%016llx file=%s.layer_%02zu.page_%03d.bin\n",
+                            d.name.c_str(), l, p, page_bytes, (unsigned long long) dump_hash(src, page_bytes),
+                            d.name.c_str(), l, p);
+                }
+                continue;
+            }
+        }
+    }
+    for (size_t i = 0; i < pre[ci].k->desc->in.size(); ++i) {
+        const io_desc & d = pre[ci].k->desc->in[i];
+        bool small = false;
+        for (const char * n : small_io) small = small || d.name == n;
+        if (!small && !(dump_kv && d.name.size() >= 3 && d.name.compare(d.name.size() - 3, 3, "_kv") == 0)) {
+            fprintf(mf, "weight %s bytes=%u\n", d.name.c_str(), d.bytes);
+        }
+    }
+    fclose(mf);
+    GGML_LOG_INFO("axera hy_mt2: debug dump call cell %lld rows %d call %d -> %s\n",
+                  (long long) cell, rows, ci, dir);
+}
+
+void hy_mt2::dump_debug_output(int ci, int rows, int64_t cell) {
+    const char * base = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_PATH");
+    const char * out = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_OUT");
+    if (!base || !*base || !out || atoi(out) == 0 || !debug_call_wanted(ci)) return;
+    const char * rs = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_ROWS");
+    if (rs && *rs && atoi(rs) != rows) return;
+    const char * cs = getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_CELL");
+    if (cs && *cs && strtoll(cs, nullptr, 10) != cell) return;
+    static uint64_t serial = 0;  // shares the call order with dump_debug_call
+    const uint64_t id = serial++;
+    char dir[4096], path[4096];
+    snprintf(dir, sizeof(dir), "%s/page_%06lld_rows_%04d_seq_%05llu/call_%d", base, (long long) cell, rows,
+             (unsigned long long) id, ci);
+    for (const auto & [name, cmm] : io) {
+        if (name != "output" && name != "hidden2" && name != "head_logits") continue;
+        const size_t n = name == "head_logits" ? (size_t) HEAD_ROWS * VOCAB * sizeof(float) : (size_t) rows * H * sizeof(uint16_t);
+        if (n > cmm->size) continue;
+        cmm->invalidate(cmm->vir, n);
+        snprintf(path, sizeof(path), "%s/out_%s.bin", dir, name.c_str());
+        FILE * f = fopen(path, "wb");
+        if (!f) continue;
+        fwrite(cmm->vir, 1, n, f);
+        fclose(f);
+    }
+}
+
 void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const int32_t * p4, int64_t batch_cell0,
                               bool need_head) {
-    GGML_ASSERT(cell % PG == 0 && rows > 0 && rows <= PG);
+    GGML_ASSERT(cell % PG == 0 && rows > 0 && rows <= wp);
     auto xi = io.find("x"), oi = io.find("output");
     GGML_ASSERT(xi != io.end() && oi != io.end());
-    std::vector<uint16_t> xb((size_t) PG * H, 0);
+    // The 4096-row workspace is fixed for the released graph.  Keep the
+    // padding rows out of the all-zero router bucket (sigmoid + bias sends
+    // every zero row to the same eight experts, which makes a short replay
+    // look like a very overloaded expert).  The rows past `rows` are never
+    // visible to a valid query (attention is causal) or read by the head;
+    // cycling real rows through them only keeps the unused MoE work diverse.
+    std::vector<uint16_t> xb((size_t) wp * H, 0);
     memcpy(xb.data(), x, (size_t) rows * H * sizeof(uint16_t));
+    for (int r = rows; r < wp; ++r) {
+        memcpy(xb.data() + (size_t) r * H, x + (size_t) (r % rows) * H,
+               H * sizeof(uint16_t));
+    }
+    if (const char * hp = getenv("GGML_AXERA_HY_MT2_XHOST_DUMP"); hp && *hp) {
+        FILE * hf = fopen(hp, "ab");
+        if (hf) {
+            const uint32_t magic = 0x58334854u;
+            const int32_t  h[4] = { rows, (int32_t) cell, 99, 0 };
+            fwrite(&magic, sizeof(magic), 1, hf);
+            fwrite(h, sizeof(h), 1, hf);
+            fwrite(xb.data(), sizeof(uint16_t), (size_t) rows * H, hf);
+            fclose(hf);
+        }
+    }
     memcpy(xi->second->vir, xb.data(), xb.size() * sizeof(uint16_t));
+    xi->second->flush();
+    dump_x(xi->second, rows, cell, 0);
     auto pi = io.find("position_ids");
     int32_t * pos = (int32_t *) pi->second->vir;
-    for (int r = 0; r < PG; ++r) pos[r] = r < rows ? p4[(size_t) r * 4] : 0;
+    // Padded rows continue the position sequence instead of repeating 0.
+    // Repeating 0 makes every padded row overwrite KV slot 0; a sequential
+    // position keeps them past the valid tail (masked for valid queries and
+    // beyond last_page_len for the later decode).
+    for (int r = 0; r < wp; ++r) pos[r] = r < rows ? p4[(size_t) r * 4] : (int32_t) (cell + r);
     const int page = (int) (cell / PG);
     auto ind = io.find("indptr"), idx = io.find("indices"), last = io.find("last_page_len"), cl = io.find("cache_location");
     auto vt = io.find("valid_tokens");
@@ -604,9 +933,9 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
     // being written is cache_location, not part of indptr.
     ((int32_t *) ind->second->vir)[0] = 0;
     ((int32_t *) ind->second->vir)[1] = page;
-    GGML_ASSERT((size_t) page * sizeof(int32_t) <= idx->second->size);
+    GGML_ASSERT((size_t) (page + wp / PG) * sizeof(int32_t) <= idx->second->size);
     int32_t * ix = (int32_t *) idx->second->vir;
-    for (int i = 0; i <= page; ++i) ix[i] = i;
+    for (int i = 0; i <= page + wp / PG; ++i) ix[i] = i;
     *(int32_t *) last->second->vir = 0;  // the prefill graph does not read it
     ((int32_t *) cl->second->vir)[0] = page;
     ((int32_t *) cl->second->vir)[1] = 0;
@@ -630,11 +959,43 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
 
     const bool prof = getenv("GGML_AXERA_HY_MT2_PROF") != nullptr;
     const bool dump = getenv("GGML_AXERA_HY_MT2_HIDDEN_DUMP") != nullptr;
+    // The 4096-row page computes the head unconditionally (a runtime range
+    // around its gather never wrote head_x on this backend); only the decode
+    // graph carries the 0/1 gate.
     auto head_run = io.find("head_run");
-    GGML_ASSERT(head_run != io.end());
-    for (int ci = 0; ci < nchunks; ++ci) {
-        *(int32_t *) head_run->second->vir = need_head && ci + 1 == nchunks ? 1 : 0;
-        head_run->second->flush();
+    auto layer0_run = io.find("layer0_run");
+    auto body_run   = io.find("body_run");
+    if (wp == WP_MAX) {
+        GGML_ASSERT(layer0_run != io.end());
+    } else {
+        // A 256-row graph does not use these inputs, but keep them defined if
+        // the compiler left them in the IO table.
+        for (auto * it : { &layer0_run, &body_run }) {
+            if (*it != io.end()) {
+                *(int32_t *) (*it)->second->vir = 1;
+                (*it)->second->flush();
+            }
+        }
+    }
+    for (int ci = 0; ci < (int) pre.size(); ++ci) {
+        if (wp == WP_MAX) {
+            // The 2-body 4096 graph runs layer 0 only on the first call.  The
+            // 12-layer MoE body is traced statically, so its 4th call runs the
+            // adapter's zero-filled 12th bank slot as an exact identity
+            // instead of shortening a runtime loop.
+            *(int32_t *) layer0_run->second->vir = ci == 0 ? 1 : 0;
+            layer0_run->second->flush();
+            if (body_run != io.end()) {
+                const int remaining = (L - 1) - ci * pgroups[1].layers;
+                *(int32_t *) body_run->second->vir = std::min(pgroups[1].layers, remaining);
+                body_run->second->flush();
+            }
+        }
+        if (head_run != io.end()) {
+            *(int32_t *) head_run->second->vir = need_head && ci + 1 == (int) pre.size() ? 1 : 0;
+            head_run->second->flush();
+        }
+        dump_debug_call(ci, cell, rows, batch_cell0, page, first, want, take, hr0, need_head);
         const int64_t t0   = prof ? ggml_time_us() : 0;
         pre[ci].k->run(pre[ci].in, pre[ci].out, "prefill");
         if (prof) {
@@ -645,14 +1006,44 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
             const axera_cmm & b = ci % 2 == 0 ? io.at("output") : io.at("hidden2");
             dump_hidden(b, rows, cell, ci);
         }
+        dump_debug_output(ci, rows, cell);
     }
 
     oi->second->invalidate(oi->second->vir, (size_t) rows * H * sizeof(uint16_t));
-    dump_routes(cell, rows, PG * 8);
+    if (wp == PG) {
+        dump_routes(cell, rows, rows * 8);
+    }
     head_first = (int) (cell + hr0 - batch_cell0);
     head_n = take;
+    small_head = false;
     axera_cmm & hl = io.at("head_logits");
     hl->invalidate(hl->vir, (size_t) HEAD_ROWS * VOCAB * sizeof(float));
+    if (const char * gp = getenv("GGML_AXERA_HY_MT2_HEADX_DUMP"); gp && *gp) {
+        auto hx = io.find("head_x");
+        if (hx != io.end()) {
+            hx->second->invalidate(hx->second->vir, hx->second->size);
+            FILE * gf = fopen(gp, "ab");
+            if (gf) {
+                const uint32_t magic = 0x47334854u;  // "TH3G"
+                const int32_t  gh[4] = { HEAD_ROWS, head_first, head_n, 0 };
+                fwrite(&magic, sizeof(magic), 1, gf);
+                fwrite(gh, sizeof(gh), 1, gf);
+                fwrite(hx->second->vir, 1, hx->second->size, gf);
+                fclose(gf);
+            }
+        }
+    }
+    if (const char * hp = getenv("GGML_AXERA_HY_MT2_HEAD_DUMP"); hp && *hp) {
+        FILE * hf = fopen(hp, "ab");
+        if (hf) {
+            const uint32_t magic = 0x4c334854u;  // "TH3L"
+            const int32_t  hh[4] = { rows, (int32_t) cell, head_first, head_n };
+            fwrite(&magic, sizeof(magic), 1, hf);
+            fwrite(hh, sizeof(hh), 1, hf);
+            fwrite(hl->vir, sizeof(float), (size_t) HEAD_ROWS * VOCAB, hf);
+            fclose(hf);
+        }
+    }
 }
 
 void hy_mt2::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4) {
@@ -688,6 +1079,13 @@ void hy_mt2::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4
     const bool prof = getenv("GGML_AXERA_HY_MT2_PROF") != nullptr;
     auto head_run = io.find("head_run");
     GGML_ASSERT(head_run != io.end());
+    for (const char * n : { "layer0_run", "body_run" }) {
+        auto it = io.find(n);
+        if (it != io.end()) {
+            *(int32_t *) it->second->vir = 1;
+            it->second->flush();
+        }
+    }
     for (int ci = 0; ci < (int) dec.size(); ++ci) {
         *(int32_t *) head_run->second->vir = ci + 1 == (int) dec.size() ? 1 : 0;
         head_run->second->flush();
@@ -699,13 +1097,21 @@ void hy_mt2::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4
         }
     }
     dump_routes(cell, 1, 8);
+    if (getenv("GGML_AXERA_HY_MT2_HIDDEN_DUMP") != nullptr) {
+        dump_hidden(io.at("output"), 1, cell, (int) dec.size() - 1);
+    }
     axera_cmm & hl = io.at("head_logits");
     hl->invalidate(hl->vir, VOCAB * sizeof(float));
     head_first = 0;  // the decode batch is one row: its logits row is batch row 0
     head_n = 1;
+    small_head = false;
 }
 
 bool hy_mt2::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t * p4, int batch0, seq_snap * snap) {
+    if (getenv("GGML_AXERA_HY_MT2_PATHS")) {
+        GGML_LOG_INFO("axera hy_mt2: pages cell=%lld n=%d batch0=%d wp=%d small=%d\n",
+                      (long long) c0, n, batch0, wp, n < SMALL_BATCH ? 1 : 0);
+    }
     const uint16_t * xr = x;
     if (!xr) {
         GGML_ASSERT(batch0 == 0);
@@ -713,10 +1119,36 @@ bool hy_mt2::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t 
         seq_rows(0, n, (uint16_t *) xbuf.data());
         xr = xbuf.data();
     }
-    for (int off = 0; off < n; off += PG) {
-        const int rows = std::min(PG, n - off);
+    // The 4096-row prefill workspace is the released shape and is what a bulk
+    // prompt uses.  Small batches (PPL -ub 4, short chat prompts) would pad to
+    // 4096 rows and waste 98% of the work, so replay them row by row through
+    // the decode kernel and keep each row's logits.
+    if (wp > PG && n < SMALL_BATCH) {
+        // batch0 rows are the replay prefix that seqstate already recorded.
+        // They run to rebuild the model state, but this batch's logits are
+        // the T rows after them, renumbered from zero for publish_logits().
+        const int b0 = std::max(0, std::min(n, batch0));
+        const int T  = n - b0;
+        GGML_ASSERT(T > 0);
+        small_logits.resize((size_t) T * VOCAB);
+        for (int i = 0; i < n; ++i) {
+            run_decode_row(c0 + i, xr + (size_t) i * H, p4 + (size_t) i * 4);
+            if (i >= b0) {
+                const axera_cmm & hl = io.at("head_logits");
+                memcpy(small_logits.data() + (size_t) (i - b0) * VOCAB, hl->vir,
+                       (size_t) VOCAB * sizeof(float));
+            }
+        }
+        head_first = 0;
+        head_n = T;
+        small_head = true;
+        if (snap) snap->deferred = false;
+        return true;
+    }
+    for (int off = 0; off < n; off += wp) {
+        const int rows = std::min(wp, n - off);
         run_prefill_page(c0 + off, rows, xr + (size_t) off * H, p4 + (size_t) off * 4, c0 + batch0,
-                         off + PG >= n);
+                         off + wp >= n);
     }
     if (snap) snap->deferred = false;
     return true;
@@ -760,6 +1192,7 @@ void hy_mt2::publish_logits(ggml_cgraph * g, ggml_tensor * logits, int T) {
     }
     if (n_out < T && !out_ids) GGML_ABORT("axera hy_mt2: %d of %d output rows without row indices\n", n_out, T);
     const axera_cmm & hl = io.at("head_logits");
+    const float *    head_src = small_head ? small_logits.data() : (const float *) hl->vir;
     auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
     for (int r = 0; r < n_out; ++r) {
         const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : r;
@@ -768,7 +1201,7 @@ void hy_mt2::publish_logits(ggml_cgraph * g, ggml_tensor * logits, int T) {
                        head_first + head_n - 1);
         }
         float * o = (float *) ((char *) logits->data + (size_t) r * logits->nb[1]);
-        memcpy(o, (const float *) hl->vir + (size_t) (row - head_first) * VOCAB, VOCAB * sizeof(float));
+        memcpy(o, head_src + (size_t) (row - head_first) * VOCAB, VOCAB * sizeof(float));
         dctx->flush(o, VOCAB * sizeof(float));
         dctx->clean_p = o;
         dctx->clean_n = VOCAB * sizeof(float);
@@ -838,6 +1271,21 @@ ggml_status hy_mt2::compute(ggml_cgraph * g) {
     axera_host_pool().run(T, [&](int64_t r) {
         ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]), xb.data() + (size_t) r * H, H);
     });
+    if (const char * ip = getenv("GGML_AXERA_HY_MT2_IDS_DUMP"); ip && *ip) {
+        FILE * idf = fopen(ip, "wb");
+        if (idf) {
+            const uint32_t magic = 0x49334854u;  // "TH3I"
+            const int32_t  h[4] = { T, 0, 0, 0 };
+            fwrite(&magic, sizeof(magic), 1, idf);
+            fwrite(h, sizeof(h), 1, idf);
+            if (x0->op == GGML_OP_GET_ROWS && x0->src[1] && x0->src[1]->type == GGML_TYPE_I32) {
+                fwrite(x0->src[1]->data, sizeof(int32_t), (size_t) T, idf);
+            }
+            fwrite((const char *) x0->data + (size_t) (T - 1) * x0->nb[1], sizeof(float), (size_t) H, idf);
+            fwrite(xb.data() + (size_t) (T - 1) * H, sizeof(uint16_t), (size_t) H, idf);
+            fclose(idf);
+        }
+    }
     batch_rows = xb.data();
     last_seq_status = 0;
     const int64_t c0 = kv.cell_of(0);
@@ -865,7 +1313,9 @@ size_t hy_mt2::state_size(uint32_t flags) const {
     size_t page_b = 0;
     if (!partial) {
         page_b = bank_n.at(groups[0].pre + "kv") / PAGES;  // one layer in the dense body
-        GGML_ASSERT(bank_n.at(groups[1].pre + "kv") / per_chunk / PAGES == page_b);
+        for (size_t gi = 1; gi < groups.size(); ++gi) {
+            GGML_ASSERT(bank_n.at(groups[gi].pre + "kv") / groups[gi].layers / PAGES == page_b);
+        }
     }
     const int64_t cell = std::max<int64_t>(0, seq->cell());
     const int nkv = partial ? 0 : (int) std::min<int64_t>(PAGES, (cell + PG - 1) / PG);
@@ -884,9 +1334,9 @@ size_t hy_mt2::state_write(void * dst, size_t size, uint32_t flags) {
 
     state_header h{};
     memcpy(h.magic, "HYMT2S1", state_magic_n - 1);
-    h.version = 2;
+    h.version = 3;
     h.partial = partial;
-    h.ngroups = (uint32_t) (1 + nchunks);
+    h.ngroups = (uint32_t) groups.size();
     h.state_cell = seq->cell();
     h.nkv_pages = (uint32_t) nkv;
     h.kv_page_b = (uint32_t) page_b;
@@ -904,12 +1354,12 @@ size_t hy_mt2::state_write(void * dst, size_t size, uint32_t flags) {
             memcpy(p, src, n);
             p += n;
         };
-        const std::string dk = groups[0].pre + "kv", mk = groups[1].pre + "kv";
-        copy_out(dense, dk, 0);
-        int done = 1;
-        for (int ci = 0; ci < nchunks; ++ci) {
-            for (int b = 0; b < per_chunk && done < L; ++b, ++done) {
-                copy_out(chunks[ci], mk, b);
+        int done = 0;
+        for (size_t gi = 0; gi < groups.size(); ++gi) {
+            bmap & bank = gi == 0 ? dense : chunks[gi - 1];
+            const std::string kn = groups[gi].pre + "kv";
+            for (int b = 0; b < groups[gi].layers; ++b, ++done) {
+                copy_out(bank, kn, b);
             }
         }
         GGML_ASSERT(done == L);
@@ -926,8 +1376,8 @@ size_t hy_mt2::state_read(const void * src, size_t size, uint32_t flags) {
     state_header h{};
     memcpy(&h, src, sizeof(h));
     const size_t page_b = bank_n.at(groups[0].pre + "kv") / PAGES;
-    if (memcmp(h.magic, "HYMT2S1", state_magic_n - 1) != 0 || h.version != 2 || h.partial != partial ||
-        h.ngroups != (uint32_t) (1 + nchunks) || !h.seq_n || h.state_cell < -1 || h.state_cell > cells ||
+    if (memcmp(h.magic, "HYMT2S1", state_magic_n - 1) != 0 || h.version != 3 || h.partial != partial ||
+        h.ngroups != (uint32_t) groups.size() || !h.seq_n || h.state_cell < -1 || h.state_cell > cells ||
         h.nkv_pages > (uint32_t) PAGES) {
         return 0;
     }
@@ -943,12 +1393,12 @@ size_t hy_mt2::state_read(const void * src, size_t size, uint32_t flags) {
             c->flush(d, n);
             p += n;
         };
-        const std::string dk = groups[0].pre + "kv", mk = groups[1].pre + "kv";
-        copy_in(dense, dk, 0);
-        int done = 1;
-        for (int ci = 0; ci < nchunks; ++ci) {
-            for (int b = 0; b < per_chunk && done < L; ++b, ++done) {
-                copy_in(chunks[ci], mk, b);
+        int done = 0;
+        for (size_t gi = 0; gi < groups.size(); ++gi) {
+            bmap & bank = gi == 0 ? dense : chunks[gi - 1];
+            const std::string kn = groups[gi].pre + "kv";
+            for (int b = 0; b < groups[gi].layers; ++b, ++done) {
+                copy_in(bank, kn, b);
             }
         }
         GGML_ASSERT(done == L);
