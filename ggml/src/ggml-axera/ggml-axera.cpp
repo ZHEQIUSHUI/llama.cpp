@@ -1,5 +1,6 @@
 // Axera NPU backend: backend, device and registry (the design: ggml-axera-impl.h)
 
+#include <cstdlib>
 #include "ggml-axera-impl.h"
 #include "core/manifest.h"
 #include "core/npu_sampling.h"
@@ -284,7 +285,24 @@ static const char * ggml_backend_axera_reg_get_name(ggml_backend_reg_t reg) {
 
 static size_t ggml_backend_axera_reg_get_device_count(ggml_backend_reg_t reg) {
     // the manifest's kernels loaded before the model's tensors; no manifest, no device
-    if (!axera_runtime_init() || !axera::kernels()) {
+    //
+    // A kernel directory given explicitly asks for the NPU: without it the model would run on the CPU, far too slow
+    // to be what anyone meant, so a directory that cannot be used is an error, not a silent fallback. (A kernel file
+    // the manifest names but the directory lacks already aborts in the loader.)
+    const char * dir      = std::getenv("GGML_AXERA_KERNEL_DIR");
+    const bool   explicit_dir = dir && dir[0];
+    if (!axera_runtime_init()) {
+        if (explicit_dir) {
+            GGML_ABORT("axera: GGML_AXERA_KERNEL_DIR=%s is set but the NPU runtime failed to initialize; "
+                       "refusing to run on the CPU (unset GGML_AXERA_KERNEL_DIR to allow it)\n", dir);
+        }
+        return 0;
+    }
+    if (!axera::kernels()) {
+        if (explicit_dir) {
+            GGML_ABORT("axera: GGML_AXERA_KERNEL_DIR=%s has no manifest.json (wrong path or incomplete package); "
+                       "refusing to run on the CPU (unset GGML_AXERA_KERNEL_DIR to allow it)\n", dir);
+        }
         return 0;
     }
     return 1;
