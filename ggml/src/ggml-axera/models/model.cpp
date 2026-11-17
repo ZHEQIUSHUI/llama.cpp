@@ -46,20 +46,11 @@ struct composite final : model {
     int                    n = 0;
     model *                cur = nullptr;
 
-    model * select(const ggml_cgraph * g) const {
+    model * select(const ggml_cgraph * g) {
         return vit && (vit_graph(g) || minicpm_ocr_vit_graph(g)) ? vit.get() :
                audio && qwen3_asr_graph(g)         ? audio.get() :
                gen && !llm_graph(g)                ? gen.get() :
                                                      llm.get();
-    }
-
-    bool scheduler_tensor_needs_device_memory(const ggml_cgraph * g, const ggml_tensor * t) const override {
-        const model * m = select(g);
-        return m ? m->scheduler_tensor_needs_device_memory(g, t) : true;
-    }
-
-    bool owns_kv_cache() const override {
-        return llm && llm->owns_kv_cache();
     }
 
     ggml_status compute(ggml_cgraph * g) override {
@@ -94,7 +85,7 @@ struct composite final : model {
 
 }  // namespace
 
-static std::shared_ptr<model> make_model_of(const manifest & m, bool text_only) {
+static std::shared_ptr<model> make_model_of(const manifest & m) {
     std::shared_ptr<model> llm;
     if (m.model == "qwen35_moe") {
         llm = make_qwen35_moe(m);
@@ -125,10 +116,6 @@ static std::shared_ptr<model> make_model_of(const manifest & m, bool text_only) 
     } else {
         GGML_ABORT("axera: %s/manifest.json: no adapter for model %s\n", m.dir.c_str(), m.model.c_str());
     }
-    if (text_only) {
-        return llm;
-    }
-
     bool vision = false, vision1 = false, audio = false, gen = false;
     for (const auto & [role, k] : m.kernels) {
         vision  = vision || role.rfind("vit.", 0) == 0;
@@ -157,21 +144,24 @@ std::shared_ptr<model> make_model(const manifest & m) {
     std::lock_guard<std::mutex>                                 lock(mu);
     std::shared_ptr<model>                                      p = made[&m].lock();
     if (!p) {
-        p        = make_model_of(m, false);
+        p        = make_model_of(m);
         made[&m] = p;
     }
     return p;
 }
 
-std::shared_ptr<model> make_text_model(const manifest & m) {
-    static std::mutex                                            mu;
-    static std::map<const manifest *, std::shared_ptr<model>>    made;
-    std::lock_guard<std::mutex>                                  lock(mu);
-    auto                                                        it = made.find(&m);
-    if (it == made.end()) {
-        it = made.emplace(&m, make_model_of(m, true)).first;
+// (next to the factory above: the same model names)
+model_caps model_caps_of(const manifest & m) {
+    model_caps c;
+    const std::string & n = m.model;
+    c.owns_kv_cache = n == "qwen38_27b" || n == "qwen35_whole" || n == "qwen35_moe_sgl" || n == "minicpmv4_7" ||
+                      n == "cpm5" || n == "hymt" || n == "hy_mt2";
+    c.sched_io_only = n == "qwen38_27b" || n == "qwen35_moe_sgl" || n == "minicpmv4_7" || n == "hy_mt2";
+    // VoxCPM2's base LM: on the NPU only when the manifest carries its prefill kernel (else llama.cpp runs it on the CPU)
+    if (n == "voxcpm2_base" && m.has("prefill")) {
+        c.owns_kv_cache = c.sched_io_only = true;
     }
-    return it->second;
+    return c;
 }
 
 bool mmproj_host_weights(const manifest & m) {

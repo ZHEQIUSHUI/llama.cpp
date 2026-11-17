@@ -17,16 +17,6 @@ constexpr uint32_t state_flags_partial_only = 1;
 
 struct model {
     virtual ~model() = default;
-    // A whole-graph adapter may leave a scheduler tensor unused: its kernels read the graph's inputs and write its
-    // outputs, or keep their working state in private banks. False lets the scheduler put that tensor in lazily-backed
-    // host memory instead of CMM. The default keeps every tensor in CMM.
-    virtual bool scheduler_tensor_needs_device_memory(const ggml_cgraph * g, const ggml_tensor * t) const {
-        (void) g;
-        (void) t;
-        return true;
-    }
-    // True when the adapter keeps the KV cache in its own CMM pools and llama.cpp's cache tensors are unused.
-    virtual bool owns_kv_cache() const { return false; }
     // llama.cpp's sequence state (context checkpoints / prompt cache). An adapter whose caches are private CMM pools
     // overrides these: the backend appends the blob to the state stream, so a checkpoint restore puts the state the
     // kernels actually read back. The default is no state, which is also the CPU-backend behaviour.
@@ -45,8 +35,16 @@ struct model {
 
 // the adapter of the manifest's model; aborts for a model this backend has no adapter for
 std::shared_ptr<model> make_model(const manifest & m);
-// the language-model part only, for declarations that need no kernels or CMM (scheduler and cache capabilities)
-std::shared_ptr<model> make_text_model(const manifest & m);
+// What llama.cpp may assume about the manifest's language-model adapter, known without making it (an adapter's
+// constructor may allocate CMM):
+//   owns_kv_cache  it keeps the KV cache in its own CMM pools, llama.cpp's cache tensors are unused (lazy host memory)
+//   sched_io_only  of a language-model graph it reads the inputs and writes the outputs only; every other tensor the
+//                  scheduler plans is unused and can live in lazy host memory instead of CMM
+struct model_caps {
+    bool owns_kv_cache = false;
+    bool sched_io_only = false;
+};
+model_caps model_caps_of(const manifest & m);
 // the manifest's vision adapter copies the mmproj weights its kernel reads into its own CMM (one kernel for the whole
 // encoder): mtmd may then keep the mmproj as a file mapping. Adapters that bind weight tensors in place need CMM.
 bool mmproj_host_weights(const manifest & m);

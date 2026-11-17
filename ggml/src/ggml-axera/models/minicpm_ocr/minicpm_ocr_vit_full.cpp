@@ -51,6 +51,7 @@ void to_bf16(const ggml_tensor * w, ggml_bf16_t * dst) {
         ggml_get_type_traits(w->type)->to_float(w->data, f.data(), ne);
         ggml_fp32_to_bf16_row(f.data(), dst, ne);
     }
+    axera_drop_mapped(w);  // (an mmproj mapped by mtmd: the copy is the only one kept)
 }
 
 void minicpm_ocr_vit_full::weights(int L, int H, int CP) {
@@ -121,6 +122,9 @@ void minicpm_ocr_vit_full::weights(int L, int H, int CP) {
     const std::vector<float> & ws = pemb.weight_still();
     GGML_ASSERT(ws.size() * sizeof(ggml_bf16_t) == k.in_bytes("w_patch"));
     ggml_fp32_to_bf16_row(ws.data(), (ggml_bf16_t *) io("w_patch")->vir, (int64_t) ws.size());
+    axera_drop_mapped(wp);
+    axera_flush_file_pages();
+    axera_keep_mapped(names.at("v.position_embd.weight"));  // (tables() reads it per image size)
     io("w_patch")->flush();
 }
 

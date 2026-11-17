@@ -518,21 +518,21 @@ static bool ggml_backend_axera_sched_whole_graph(const struct ggml_cgraph * g) {
     return true;
 }
 
-// The adapter declares which tensors of a whole graph it materializes; the rest (1 here) can use scheduler host
-// memory. One call per graph: only a language-model graph has such tensors.
+// The tensors of a whole graph the adapter leaves unused (1 here) can use scheduler host memory: every tensor but the
+// inputs and outputs when the adapter says so (model_caps). One call per graph.
 static void ggml_backend_axera_sched_whole_graph_lanes(const struct ggml_cgraph * g, int * node_host, int * leaf_host) {
     memset(node_host, 0, (size_t) g->n_nodes * sizeof(int));
     memset(leaf_host, 0, (size_t) g->n_leafs * sizeof(int));
     const axera::manifest * m = axera::kernels();
-    if (!m || !axera::scheduler_llm_graph(g)) {
+    if (!m || !axera::model_caps_of(*m).sched_io_only || !axera::scheduler_llm_graph(g)) {
         return;
     }
-    const std::shared_ptr<axera::model> a = axera::make_text_model(*m);
+    const int io = GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT;
     for (int i = 0; i < g->n_nodes; ++i) {
-        node_host[i] = !a->scheduler_tensor_needs_device_memory(g, g->nodes[i]);
+        node_host[i] = (g->nodes[i]->flags & io) == 0;
     }
     for (int i = 0; i < g->n_leafs; ++i) {
-        leaf_host[i] = !a->scheduler_tensor_needs_device_memory(g, g->leafs[i]);
+        leaf_host[i] = (g->leafs[i]->flags & io) == 0;
     }
 }
 
