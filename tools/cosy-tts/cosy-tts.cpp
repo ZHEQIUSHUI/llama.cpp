@@ -41,6 +41,7 @@
 #include <unistd.h>
 #include <mutex>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -617,6 +618,7 @@ static double sec(std::chrono::steady_clock::time_point a, std::chrono::steady_c
 // directly.  Conversion is done in one whole-tensor pass, never element by
 // element into CMM.
 static bool upload_weight_bank(npu_model & m, gguf_asset_file & bank, const char * tag,
+                               const std::string & layout_path = std::string(),
                                double * read_s = nullptr, double * conv_s = nullptr, double * up_s = nullptr) {
     const auto now = [] { return std::chrono::steady_clock::now(); };
     auto t0 = now();
@@ -624,6 +626,137 @@ static bool upload_weight_bank(npu_model & m, gguf_asset_file & bank, const char
     size_t bytes = 0;
     double conv_s_acc = 0.0;
     std::vector<float> stage;
+    // Grouped flow banks: a handful of engine inputs, each holding the tensors
+    // of one weight shape (chunked).  The layout is a text file next to the
+    // AXModel: "<input> <count> <w-index>...".  This keeps the engine input
+    // table small while every weight byte still comes from the aux GGUF.
+    bool grouped = false;
+    for (AX_U32 i = 0; i < m.info->nInputSize; i++) {
+        if (!strncmp(m.info->pInputs[i].pName, "wbank_", 6)) { grouped = true; break; }
+    }
+    if (grouped) {
+        std::ifstream lf(layout_path);
+        if (!lf) {
+            fprintf(stderr, "[bank:%s] cannot open bank layout %s\n", tag, layout_path.c_str());
+            return false;
+        }
+        std::string line;
+        int nbank = 0;
+        while (std::getline(lf, line)) {
+            std::istringstream ls(line);
+            std::string name;
+            int count = 0;
+            if (!(ls >> name >> count) || count <= 0) continue;
+            const int bi = m.input_index(name.c_str());
+            if (bi < 0) { fprintf(stderr, "[bank:%s] kernel has no input %s\n", tag, name.c_str()); return false; }
+            const AX_ENGINE_DATA_TYPE_T dt = m.info->pInputs[bi].eDataType;
+            const bool f32 = dt == AX_ENGINE_DT_FLOAT32;
+            const bool bf16 = dt == AX_ENGINE_DT_BFLOAT16;
+            if (!f32 && !bf16) {
+                fprintf(stderr, "[bank:%s] %s dtype %d is neither F32 nor BF16\n", tag, name.c_str(), (int) dt);
+                return false;
+            }
+            const size_t esize = f32 ? 4 : 2;
+            const size_t total = m.in[bi].nSize / esize;
+            std::vector<uint16_t> stage_bf16;
+            if (f32) stage.resize(total); else stage_bf16.resize(total);
+            size_t at = 0;
+            for (int k = 0; k < count; k++) {
+                int idx = -1;
+                if (!(ls >> idx) || idx < 0) { fprintf(stderr, "[bank:%s] bad layout for %s\n", tag, name.c_str()); return false; }
+                char tname[16];
+                snprintf(tname, sizeof(tname), "w%04d", idx);
+                ggml_tensor * t = bank.get(tname);
+                if (!t || t->type != GGML_TYPE_BF16) {
+                    fprintf(stderr, "[bank:%s] %s needs BF16 %s\n", tag, name.c_str(), tname);
+                    return false;
+                }
+                const size_t nelem = (size_t) ggml_nelements(t);
+                if (at + nelem > total) {
+                    fprintf(stderr, "[bank:%s] %s overflows %s: %zu + %zu > %zu\n", tag, tname, name.c_str(), at, nelem, total);
+                    return false;
+                }
+                auto c0 = now();
+                if (f32) ggml_bf16_to_fp32_row((const ggml_bf16_t *) t->data, stage.data() + at, (int64_t) nelem);
+                else memcpy(stage_bf16.data() + at, t->data, nelem * 2);
+                conv_s_acc += sec(c0, now());
+                at += nelem;
+                n++;
+            }
+            if (at != total) {
+                fprintf(stderr, "[bank:%s] %s has %zu elems, input wants %zu\n", tag, name.c_str(), at, total);
+                return false;
+            }
+            if (!m.set_input(name.c_str(), f32 ? (const void *) stage.data() : (const void *) stage_bf16.data(), total * esize)) {
+                return false;
+            }
+            bytes += total * esize;
+            nbank++;
+        }
+        const double total_s = sec(t0, now());
+        fprintf(stderr, "[bank:%s] banks=%d tensors=%d bytes=%zu convert=%.3fs upload(incl.convert)=%.3fs\n",
+                tag, nbank, n, bytes, conv_s_acc, total_s);
+        if (read_s) *read_s = 0.0;
+        if (conv_s) *conv_s = conv_s_acc;
+        if (up_s) *up_s = total_s;
+        return nbank > 0 && n > 0;
+    }
+    // Packed flow bank: one F32 input holding every runtime weight in w0000..
+    // order.  This avoids creating a separate engine input per tensor, which
+    // made session creation slow and the board runtime stall.
+    const int wb = m.input_index("wbank");
+    if (wb >= 0) {
+        const AX_ENGINE_DATA_TYPE_T dt = m.info->pInputs[wb].eDataType;
+        const bool f32 = dt == AX_ENGINE_DT_FLOAT32;
+        const bool bf16 = dt == AX_ENGINE_DT_BFLOAT16;
+        if (!f32 && !bf16) {
+            fprintf(stderr, "[bank:%s] wbank dtype %d is neither F32 nor BF16\n", tag, (int) dt);
+            return false;
+        }
+        const size_t esize = f32 ? 4 : 2;
+        const size_t total = m.in[wb].nSize / esize;
+        std::vector<uint16_t> stage_bf16;
+        if (f32) stage.resize(total); else stage_bf16.resize(total);
+        size_t at = 0;
+        for (int idx = 0; at < total; idx++) {
+            char name[16];
+            snprintf(name, sizeof(name), "w%04d", idx);
+            ggml_tensor * t = bank.get(name);
+            if (!t || t->type != GGML_TYPE_BF16) {
+                fprintf(stderr, "[bank:%s] packed bank needs BF16 %s\n", tag, name);
+                return false;
+            }
+            const size_t nelem = (size_t) ggml_nelements(t);
+            if (at + nelem > total) {
+                fprintf(stderr, "[bank:%s] %s overflows packed bank: %zu + %zu > %zu\n", tag, name, at, nelem, total);
+                return false;
+            }
+            auto c0 = now();
+            if (f32) {
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) t->data, stage.data() + at, (int64_t) nelem);
+            } else {
+                memcpy(stage_bf16.data() + at, t->data, nelem * 2);
+            }
+            conv_s_acc += sec(c0, now());
+            at += nelem;
+            n++;
+        }
+        if (at != total) {
+            fprintf(stderr, "[bank:%s] packed bank has %zu elems, input wants %zu\n", tag, at, total);
+            return false;
+        }
+        if (!m.set_input("wbank", f32 ? (const void *) stage.data() : (const void *) stage_bf16.data(), total * esize)) {
+            return false;
+        }
+        bytes = total * esize;
+        const double total_s = sec(t0, now());
+        fprintf(stderr, "[bank:%s] tensors=%d bytes=%zu convert=%.3fs upload(incl.convert)=%.3fs\n",
+                tag, n, bytes, conv_s_acc, total_s);
+        if (read_s) *read_s = 0.0;
+        if (conv_s) *conv_s = conv_s_acc;
+        if (up_s) *up_s = total_s;
+        return true;
+    }
     for (AX_U32 i = 0; i < m.info->nInputSize; i++) {
         const char * name = m.info->pInputs[i].pName;
         if (name[0] != 'w') continue;
@@ -2274,7 +2407,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         if (!model) { fprintf(stderr, "failed to load %s\n", a.model.c_str()); return 1; }
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = a.ctx;
-        cp.n_batch = 512;
+        cp.n_batch = a.ctx;
         cp.n_ubatch = 256;
         cp.n_threads = a.threads;
         cp.n_threads_batch = a.threads;
@@ -2349,6 +2482,25 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
                 el(w0,w1), el(w1,w2), el(w2,w3), el(w3,w4), el(w4,w5), el(w0,w5), nf, nw, nm,
                 (double) pcm16_cap.size() / 16000.0, nf);
         if (ct.size() == 3) fprintf(stderr, "[campplus] head=%.3f tdnn=%.3f stats=%.3f\n", ct[0], ct[1], ct[2]);
+        if (!a.front_npu.empty() && !a.tok_gguf.empty()) {
+            // Development aid: include the reference tokenizer AXModel so the
+            // warm reference-encoding time can be measured without flow/HiFT.
+            if (!axera_engine_init_once()) return 1;
+            npu_model fm;
+            auto l0 = now();
+            if (!fm.load(a.front_npu)) return 1;
+            auto tg = std::make_unique<gguf_asset_file>();
+            if (!tg->open(a.tok_gguf)) return 1;
+            if (!upload_front_weights(fm, *tg)) return 1;
+            fprintf(stderr, "[feat-npu] load=%.3fs\n", el(l0, now()));
+            std::vector<int32_t> tok;
+            for (int it = 0; it < 2; it++) {
+                tok.clear();
+                auto n0 = now();
+                if (!front_tokenize(fm, wm, nw, tok)) return 1;
+                fprintf(stderr, "[feat-npu] run%d=%.3fs tokens=%zu\n", it, el(n0, now()), tok.size());
+            }
+        }
         if (!a.dump_feats.empty()) {
             auto dump = [&](const char * suffix, const void * data, size_t bytes) {
                 FILE * f = fopen((a.dump_feats + suffix).c_str(), "wb"); fwrite(data, 1, bytes, f); fclose(f);
@@ -2419,7 +2571,11 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         fprintf(stderr, "[bank] open=%.3fs\n", sec(b0, std::chrono::steady_clock::now()));
     }
     if (flow_loop_npu) {
-        if (!bank_assets || !upload_weight_bank(*flow_loop_npu, *bank_assets, "flow")) return 1;
+        std::string flow_banks;
+        const size_t slash = a.flow_loop_npu.find_last_of('/');
+        flow_banks = (slash == std::string::npos ? std::string() : a.flow_loop_npu.substr(0, slash + 1))
+                   + "cosyvoice3_flow_banks.txt";
+        if (!bank_assets || !upload_weight_bank(*flow_loop_npu, *bank_assets, "flow", flow_banks)) return 1;
     }
     if (hift_npu) {
         if (!bank_assets || !upload_weight_bank(*hift_npu, *bank_assets, "hift")) return 1;
@@ -2474,6 +2630,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         feat_cache fc;
         const bool feat_hit = feat_cache_load(feat_path, fc);
         double t_fbank = 0, t_spk = 0, t_wmel = 0, t_stok = 0, t_flowmel = 0;
+        double t_front_load = 0, t_tok_run = 0;
         if (feat_hit) {
             rf->fbank_frames = fc.fbank_frames;
             rf->wmel_frames  = fc.wmel_frames;
@@ -2492,6 +2649,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
             auto t1 = now();
             t_fbank = sec(f0, t1);
             std::vector<double> cam_t;
+            auto c0 = now();
             std::thread cam_thread([&] {
                 rf->embedding = campplus.forward(rf->fbank, rf->fbank_frames, "ref", &cam_t);
             });
@@ -2520,19 +2678,24 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
                     const double gguf_s = sec(g0, now());
                     auto s2 = now();
                     if (!upload_front_weights(*m, *assets)) { tok_err = "tokenizer weight upload failed"; return; }
-                    fprintf(stderr, "[front-npu] lazy session=%.3fs gguf=%.3fs upload=%.3fs\n",
-                            load_s, gguf_s, sec(s2, now()));
+                    const double upload_s = sec(s2, now());
+                    t_front_load = load_s + gguf_s + upload_s;
+                    fprintf(stderr, "[front-npu] lazy session=%.3fs gguf=%.3fs upload=%.3fs total=%.3fs\n",
+                            load_s, gguf_s, upload_s, t_front_load);
                     tok_assets = std::move(assets);
                     front_npu = std::move(m);
                 }
+                auto tk0 = now();
                 tok_ok = front_tokenize(*front_npu, rf->wmel, rf->wmel_frames, rf->tok);
+                t_tok_run = sec(tk0, now());
             });
+            auto fm0 = now();
             rf->flowfeat = flow_mel24(pcm24, rf->flow_frames, tab);
-            t_flowmel = sec(k0, now());
+            t_flowmel = sec(fm0, now());
             cam_thread.join();
-            t_spk = sec(f0, now());
+            t_spk = sec(c0, now());
             tok_thread.join();
-            t_stok = sec(k0, now());
+            t_stok = t_tok_run;
             if (getenv("COSY_PROFILE") && cam_t.size() == 3) {
                 fprintf(stderr, "[campplus] head=%.3fs tdnn=%.3fs stats=%.3fs\n", cam_t[0], cam_t[1], cam_t[2]);
             }
@@ -2553,10 +2716,10 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
         }
         auto t_front_done = now();
         fprintf(stderr,
-                "[frontend] cache=%s aux_load=%.3fs sessions=%.3fs npu_load=%.3fs total=%.3fs | "
+                "[frontend] cache=%s aux_load=%.3fs front_load=%.3fs total=%.3fs | "
                 "fbank=%.3fs speaker=%.3fs whisper_mel=%.3fs tokenizer=%.3fs flow_mel=%.3fs cam_cap=%.1fs | "
                 "fbank_frames=%d whisper_mel_frames=%d flow_mel_frames=%d speech_tokens=%zu\n",
-                feat_hit ? "file" : "miss", sec(t_aux0, t_aux1), t_sess, t_npu_load,
+                feat_hit ? "file" : "miss", sec(t_aux0, t_aux1), t_front_load,
                 sec(ts0, t_front_done), t_fbank, t_spk, t_wmel, t_stok, t_flowmel,
                 (double) std::min((size_t) campplus_cap_samples(), pcm16.size()) / 16000.0,
                 rf->fbank_frames, rf->wmel_frames, rf->flow_frames, rf->tok.size());
@@ -2606,7 +2769,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     if (!model) { fprintf(stderr, "failed to load %s\n", a.model.c_str()); return 1; }
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = a.ctx;
-    cp.n_batch = 512;
+    cp.n_batch = a.ctx;
     cp.n_ubatch = 256;
     cp.n_threads = a.threads;
     cp.n_threads_batch = a.threads;
@@ -2719,7 +2882,7 @@ static int cosy_tts_main_impl(int argc, char ** argv, bool service_mode) {
     const double t_kv_hit = sec(t_kv_hit0, std::chrono::steady_clock::now());
 
     std::vector<float> h;
-    llama_batch_guard batch(512, n_embd);
+    llama_batch_guard batch(a.ctx, n_embd);
     const bool streaming = (bool) stream_cb && incremental;
     const int est_tok_cap = flow_npu ? (int) (flow_npu->input_elems("x") / (2 * 80)) : 0;
     const int stream_tok_cap = flow_loop_npu ? (int) flow_loop_npu->input_elems("tokens") : est_tok_cap;
