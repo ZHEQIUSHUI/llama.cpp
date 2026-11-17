@@ -1469,8 +1469,11 @@ void llama_context::set_warmup(bool value) {
 
     // A warmup graph is small and may replace the worst-case plan of a whole-graph backend. Restore it before the
     // first real batch. Other backends keep their current plan, as before.
+    // Reserve now rather than in the first decode: the worst-case graphs take about a second to build on a small
+    // host CPU, which belongs to startup, not to the first prompt.
     if (!value && ggml_backend_sched_reserve_outputs(sched.get()) > 0) {
         SCHED_NEED_RESERVE();
+        sched_reserve();
     }
 }
 
