@@ -185,6 +185,7 @@ static ggml_backend_buffer_t ggml_backend_axera_buffer_type_alloc_buffer(ggml_ba
         delete ctx;
         return nullptr;
     }
+    axera_mem_trace("alloc", "ggml", ctx->phy, ctx->size);
     return ggml_backend_buffer_init(buft, ggml_backend_axera_buffer_i, ctx, size);
 }
 

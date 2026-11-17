@@ -69,6 +69,9 @@ struct axera_mapped_drop_guard {
 uint32_t axera_n_seq_max();
 
 // a CMM range: a ggml buffer's (the model's tensors), or the backend's own (axera_cmm)
+// GGML_AXERA_MEM_TRACE=1: every CMM block allocated or freed, with the call stack (resolve with nm)
+void axera_mem_trace(const char * ev, const char * tag, uint64_t phy, size_t size);
+
 struct ggml_backend_axera_buffer_context {
     AX_U64 phy  = 0;
     void * vir  = nullptr;
@@ -87,6 +90,7 @@ struct ggml_backend_axera_buffer_context {
                 AX_SYS_MflushCache(phy, vir, (AX_U32) size);
                 AX_SYS_MinvalidateCache(phy, vir, (AX_U32) size);
             }
+            axera_mem_trace("free", nc ? "nc" : "c", phy, size);
             AX_SYS_MemFree(phy, vir);
         }
     }

@@ -305,6 +305,24 @@ void axera_cmm_memory(size_t * free, size_t * total) {
     }
 }
 
+#include <execinfo.h>
+void axera_mem_trace(const char * ev, const char * tag, uint64_t phy, size_t size) {
+    static const bool on = getenv("GGML_AXERA_MEM_TRACE") != nullptr;
+    if (!on) {
+        return;
+    }
+    void *      bt[14];
+    const int   n = backtrace(bt, 14);
+    std::string s;
+    char        b[32];
+    for (int i = 1; i < n; ++i) {
+        snprintf(b, sizeof(b), " %p", bt[i]);
+        s += b;
+    }
+    fprintf(stderr, "[axera-mem] %s %s phy=0x%llx size=%zu ref=%p bt=%s\n", ev, tag, (unsigned long long) phy, size,
+            (void *) &axera_mem_trace, s.c_str());
+}
+
 axera_cmm axera_cmm_alloc(size_t size) {
     auto b  = std::make_unique<ggml_backend_axera_buffer_context>();
     b->size = GGML_PAD(std::max<size_t>(size, 1), AXERA_ALIGNMENT);
@@ -313,6 +331,7 @@ axera_cmm axera_cmm_alloc(size_t size) {
     }
     memset(b->vir, 0, b->size);
     b->flush(b->vir, b->size);
+    axera_mem_trace("alloc", "alloc", b->phy, b->size);
     return b;
 }
 
@@ -322,6 +341,7 @@ axera_cmm axera_cmm_alloc_raw(size_t size) {
     if (AX_SYS_MemAllocCached(&b->phy, &b->vir, (AX_U32) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera") != 0) {
         GGML_ABORT("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
     }
+    axera_mem_trace("alloc", "raw", b->phy, b->size);
     return b;
 }
 
@@ -332,6 +352,7 @@ axera_cmm axera_cmm_alloc_nc(size_t size) {
     if (AX_SYS_MemAlloc(&b->phy, &b->vir, (AX_U32) b->size, AXERA_ALIGNMENT, (const AX_S8 *) "ggml-axera-nc") != 0) {
         GGML_ABORT("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
     }
+    axera_mem_trace("alloc", "nc", b->phy, b->size);
     return b;
 }
 
