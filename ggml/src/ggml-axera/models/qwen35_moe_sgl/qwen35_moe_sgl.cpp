@@ -26,6 +26,10 @@
 #include "vocab_embedding_axmodel.h"
 #include "fused_head_axmodel.h"
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -274,6 +278,9 @@ class qwen35_moe_sgl final : public model, public seq_model {
     // and a decode token; when absent compute() falls back to the graph's CPU GET_ROWS
     bool      emb = false;
     axera_cmm EMBW, EMBI;
+    const ggml_tensor * tok_w = nullptr;  // the GGUF table: rows are read from it on the CPU until EMBW exists
+    void embw_make();                                      // the bf16 table in CMM, when an NPU gather needs it (MTP)
+    void embed_row(int64_t id, ggml_bf16_t * dst) const;  // one row, from EMBW or the GGUF table
     call      emb4k, emb1;
     // the upstream fused RMSNorm + projection head, for one-row decodes (see output_head::bind_fused)
     bool      fh_loaded = false;
@@ -901,33 +908,28 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
                 GGML_ABORT("axera qwen35_35b_a3b: token embedding [%lld, %lld] does not match the NPU gather (%zu bytes)\n",
                            (long long) tw->ne[1], (long long) tw->ne[0], wb);
             }
-            EMBW = axera_cmm_alloc(wb);
-            if (tw->type == GGML_TYPE_BF16 && ggml_is_contiguous(tw) && ggml_nbytes(tw) == wb) {
-                memcpy(EMBW->vir, tw->data, wb);
-            } else {
-                axera_for_rows_f32(tw, [&](int64_t r, const float * row) {
-                    ggml_fp32_to_bf16_row(row, (ggml_bf16_t *) EMBW->vir + (size_t) r * H, H);
-                });
-            }
-            EMBW->flush();
-            axera_drop_mapped(tw);
+            tok_w = tw;  // (embw_make() builds the NPU table on first use)
+            EMBW.reset();
             EMBI = axera_cmm_alloc(WN * sizeof(int32_t));
             emb4k = {};
             emb4k.k = &k4;
             emb4k.in.assign(k4.info->nInputSize, {});
             emb4k.out.assign(k4.info->nOutputSize, {});
             emb4k.in[k4.input("input_flat")] = axera_io(EMBI, EMBI->size);
-            emb4k.in[k4.input("weight")]     = axera_io(EMBW, EMBW->size);
             emb4k.out[k4.output("output_flat")] = axera_io(XB, (uint32_t) ob);
             emb1 = {};
             emb1.k = &k1;
             emb1.in.assign(k1.info->nInputSize, {});
             emb1.out.assign(k1.info->nOutputSize, {});
             emb1.in[k1.input("input_flat")] = axera_io(EMBI, (uint32_t) k1.in_bytes("input_flat"));
-            emb1.in[k1.input("weight")]     = axera_io(EMBW, EMBW->size);
             emb1.out[k1.output("output_flat")] = axera_io(DX, (uint32_t) k1.out_bytes("output_flat"));
             emb = true;
-            GGML_LOG_INFO("axera qwen35_35b_a3b: token embedding [%lld, %lld] %.2f GiB on the NPU via %s\n",
+            // GGML_AXERA_EMBED_NPU=1: the NPU table and gather from the start (a 4096-row chunk's embedding takes
+            // 0.7 ms instead of about 10 ms on the CPU, for 0.97 GiB of CMM) even when MTP never asks for it
+            if (getenv("GGML_AXERA_EMBED_NPU") != nullptr) {
+                embw_make();
+            }
+            GGML_LOG_INFO("axera qwen35_35b_a3b: token embedding [%lld, %lld] read on the CPU; %.2f GiB on the NPU (%s) once MTP needs it\n",
                           (long long) tw->ne[1], (long long) tw->ne[0], wb / 1073741824.0,
                           man.has("vocab_embedding_4096") ? "manifest kernels" : "embedded kernels");
         }
@@ -1651,8 +1653,8 @@ void qwen35_moe_sgl::seq_rows(int batch_row0, int n, uint16_t * dst) {
         for (int i = 0; i < n; ++i) {
             const int64_t id = batch_tokens[batch_row0 + i];
             const size_t  o  = (size_t) i * H * sizeof(uint16_t);
-            if (id >= 0 && (size_t) id * H * sizeof(ggml_bf16_t) + H * sizeof(ggml_bf16_t) <= EMBW->size) {
-                memcpy((char *) dst + o, (const ggml_bf16_t *) EMBW->vir + (size_t) id * H, H * sizeof(ggml_bf16_t));
+            if (id >= 0 && id < tok_w->ne[1]) {
+                embed_row(id, (ggml_bf16_t *) ((char *) dst + o));
             } else {
                 memset((char *) dst + o, 0, H * sizeof(ggml_bf16_t));
             }
@@ -2314,9 +2316,101 @@ void qwen35_moe_sgl::paging(int64_t hist, int64_t write_cell) {
     ((int32_t *) ((char *) META->vir + META_CLOC))[1]   = (int32_t) (write_cell % PG);
 }
 
+// One row of the token embedding as bf16: from the NPU table's host-visible copy when it exists, else converted from
+// the GGUF table (the same conversion embw_make() does, so both give the same row).
+void qwen35_moe_sgl::embed_row(int64_t id, ggml_bf16_t * dst) const {
+    if (EMBW) {
+        memcpy(dst, (const ggml_bf16_t *) EMBW->vir + (size_t) id * H, H * sizeof(ggml_bf16_t));
+        return;
+    }
+    const char * row = (const char *) tok_w->data + (size_t) id * tok_w->nb[1];
+    auto generic = [&](ggml_bf16_t * o) {
+        float f[8192];
+        GGML_ASSERT(H <= 8192);
+        ggml_get_type_traits(tok_w->type)->to_float(row, f, H);
+        ggml_fp32_to_bf16_row(f, o, H);
+    };
+    if (tok_w->type == GGML_TYPE_BF16) {
+        memcpy(dst, row, H * sizeof(ggml_bf16_t));
+    } else if (tok_w->type == GGML_TYPE_F32) {
+        ggml_fp32_to_bf16_row((const float *) row, dst, H);
+#if defined(__ARM_NEON)
+    } else if (tok_w->type == GGML_TYPE_Q8_0 && H % 32 == 0) {
+        // Q8_0 blocks (fp16 scale, 32 x int8) straight to bf16, bit for bit what to_float + ggml_fp32_to_bf16 give
+        // (round to nearest even; a subnormal becomes a signed zero): a 4096-row chunk in about a millisecond
+        const uint8_t * b = (const uint8_t *) row;
+        auto *          o = (uint16_t *) dst;
+        for (int k = 0; k < H / 32; ++k, b += 34, o += 32) {
+            ggml_fp16_t dh;
+            memcpy(&dh, b, sizeof(dh));
+            const float32x4_t d = vdupq_n_f32(ggml_fp16_to_fp32(dh));
+            for (int j = 0; j < 32; j += 8) {
+                const int16x8_t q = vmovl_s8(vld1_s8((const int8_t *) b + 2 + j));
+                uint16x4_t      r2[2];
+                for (int h = 0; h < 2; ++h) {
+                    const int32x4_t  qi  = vmovl_s16(h ? vget_high_s16(q) : vget_low_s16(q));
+                    const uint32x4_t u   = vreinterpretq_u32_f32(vmulq_f32(vcvtq_f32_s32(qi), d));
+                    const uint32x4_t hi  = vshrq_n_u32(u, 16);
+                    const uint32x4_t r   = vshrq_n_u32(vaddq_u32(u, vaddq_u32(vdupq_n_u32(0x7fff), vandq_u32(hi, vdupq_n_u32(1)))), 16);
+                    const uint32x4_t sub = vceqq_u32(vandq_u32(u, vdupq_n_u32(0x7f800000)), vdupq_n_u32(0));
+                    r2[h]                = vmovn_u32(vbslq_u32(sub, vandq_u32(hi, vdupq_n_u32(0x8000)), r));
+                }
+                vst1q_u16(o + j, vcombine_u16(r2[0], r2[1]));
+            }
+        }
+        static std::atomic<int> checked{ 0 };  // the first rows against the generic conversion
+        if (checked.load(std::memory_order_relaxed) < 64 && checked.fetch_add(1) < 64) {
+            std::vector<ggml_bf16_t> ref(H);
+            generic(ref.data());
+            GGML_ASSERT(memcmp(ref.data(), dst, H * sizeof(ggml_bf16_t)) == 0 && "Q8_0 token row: NEON and generic differ");
+        }
+#endif
+    } else {
+        generic(dst);
+    }
+}
+
+// The bf16 table in CMM and the two gathers bound to it: only the MTP draft path reads the table on the NPU, so it is
+// built when that path is set up (0.97 GiB for a 248k x 2048 table that plain decoding does not need).
+void qwen35_moe_sgl::embw_make() {
+    if (EMBW) {
+        return;
+    }
+    axera_timer    te("init: token embedding table (npu)");
+    const size_t   wb = emb4k.k->in_bytes("weight");
+    EMBW = axera_cmm_alloc(wb);
+    if (tok_w->type == GGML_TYPE_BF16 && ggml_is_contiguous(tok_w) && ggml_nbytes(tok_w) == wb) {
+        memcpy(EMBW->vir, tok_w->data, wb);
+    } else {
+        axera_for_rows_f32(tok_w, [&](int64_t r, const float * row) {
+            ggml_fp32_to_bf16_row(row, (ggml_bf16_t *) EMBW->vir + (size_t) r * H, H);
+        });
+    }
+    EMBW->flush();
+    emb4k.in[emb4k.k->input("weight")] = axera_io(EMBW, EMBW->size);
+    emb1.in[emb1.k->input("weight")]   = axera_io(EMBW, EMBW->size);
+}
+
 // n token ids (1 .. 4096) through the 4096-row gather; the pad rows repeat the last id, the caller reads only its n
 void qwen35_moe_sgl::embed_tokens(const int32_t * toks, int n) {
     GGML_ASSERT(emb && n > 0 && n <= WN);
+    if (!EMBW) {  // no NPU table (it exists once MTP runs): the n rows on the host workers, straight into the chunk input
+        axera_timer te("token embedding (cpu)");
+        auto *      xb = (ggml_bf16_t *) XB->vir;
+        // in parts on the host workers, each flushing its own rows (one flush of the 17 MB chunk costs more than the
+        // conversion); the pad rows repeat the last id, as the NPU gather's do
+        const int parts = 16, per = WN / parts;
+        GGML_ASSERT(per * parts == WN);
+        axera_host_pool().run(parts, [&](int64_t c) {
+            for (int i = (int) c * per; i < ((int) c + 1) * per; ++i) {
+                const int64_t id = toks[std::min(i, n - 1)];
+                GGML_ASSERT(id >= 0 && id < tok_w->ne[1]);
+                embed_row(id, xb + (size_t) i * H);
+            }
+            XB->flush(xb + (size_t) c * per * H, (size_t) per * H * sizeof(ggml_bf16_t));
+        });
+        return;
+    }
     auto * ti = (int32_t *) EMBI->vir;
     for (int i = 0; i < WN; ++i) {
         ti[i] = toks[std::min(i, n - 1)];
@@ -2627,9 +2721,9 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
         GGML_ASSERT(xin->type == GGML_TYPE_F32 && ggml_is_contiguous(xin));
         if (cpu_embed && emb) {  // the token's row of the NPU table's host-visible bf16 copy
             const int64_t id = ((const int32_t *) inp_tokens->data)[0];
-            GGML_ASSERT(id >= 0 && (size_t) id * H * sizeof(ggml_bf16_t) + H * sizeof(ggml_bf16_t) <= EMBW->size);
+            GGML_ASSERT(id >= 0 && id < tok_w->ne[1]);
             xb1.resize(H);
-            memcpy(xb1.data(), (const ggml_bf16_t *) EMBW->vir + (size_t) id * H, H * sizeof(ggml_bf16_t));
+            embed_row(id, xb1.data());
             direct_embed = true;
         } else if (cpu_embed && xin->op == GGML_OP_GET_ROWS && xin->src[0] && xin->src[1] &&
             xin->src[0]->type == GGML_TYPE_F32 && xin->src[0]->ne[0] == H) {
@@ -2777,11 +2871,17 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     }
     const bool npu_decode = token_ids && T == 1 && c0 > 0 && seq->cell() == c0;
     if (npu_decode) {
-        uint32_t one = (uint32_t) *token_ids;
-        memcpy(EMBI->vir, &one, sizeof(one));
-        EMBI->flush(EMBI->vir, sizeof(one));
-        axera_timer te("token embedding (decode)");
-        emb1.k->run(emb1.in, emb1.out, "token embedding (decode)");
+        if (EMBW) {
+            uint32_t one = (uint32_t) *token_ids;
+            memcpy(EMBI->vir, &one, sizeof(one));
+            EMBI->flush(EMBI->vir, sizeof(one));
+            axera_timer te("token embedding (decode)");
+            emb1.k->run(emb1.in, emb1.out, "token embedding (decode)");
+        } else {
+            GGML_ASSERT(*token_ids >= 0 && *token_ids < tok_w->ne[1]);
+            embed_row(*token_ids, (ggml_bf16_t *) DX->vir);
+            DX->flush(DX->vir, H * sizeof(ggml_bf16_t));
+        }
     }
     batch_rows    = direct_embed ? (const ggml_bf16_t *) xb1.data() : nullptr;
     batch_tokens  = token_ids;
@@ -3108,6 +3208,9 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
     };
     bind(mtp1, k1);
     // the fused draft chain gathers the next draft token's embedding straight into the MTP row input
+    if (emb1.k) {
+        embw_make();  // (the draft gathers and the chain kernel read the table on the NPU)
+    }
     if (emb1.k && mtp1.e) {
         emb_mtp = {};
         emb_mtp.k = emb1.k;
