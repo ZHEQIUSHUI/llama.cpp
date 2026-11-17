@@ -824,16 +824,26 @@ void hy_mt2::dump_debug_call(int ci, int64_t cell, int rows, int64_t batch_cell0
             for (size_t i = 0; i < pre[ci].k->desc->in.size(); ++i) {
                 const io_desc & d = pre[ci].k->desc->in[i];
                 if (d.name.size() < 3 || d.name.compare(d.name.size() - 3, 3, "_kv") != 0) continue;
-                const size_t stride = d.bytes / PAGES;
-                GGML_ASSERT(stride * PAGES == d.bytes && (size_t) p < PAGES);
-                snprintf(path, sizeof(path), "%s/%s.page_%03d.bin", dir, d.name.c_str(), p);
-                const uint8_t * src = (const uint8_t *) pre[ci].in[i].pVirAddr + (size_t) p * stride;
-                FILE * f = fopen(path, "wb");
-                GGML_ASSERT(f);
-                fwrite(src, 1, stride, f);
-                fclose(f);
-                fprintf(mf, "kv %s page=%d bytes=%zu hash=%016llx file=%s.page_%03d.bin\n",
-                        d.name.c_str(), p, stride, (unsigned long long) dump_hash(src, stride), d.name.c_str(), p);
+                // The KV input is [layers, PAGES, 2, 256, 4, 128], not a flat
+                // page array.  The old bytes/PAGES slice was 12 pages of layer
+                // 0 for g1, so layers 2..12 were never dumped.  A per-layer
+                // page slice is 2*256*4*128*2 = 512 KiB.
+                const size_t page_bytes = (size_t) 2 * 256 * 4 * 128 * sizeof(uint16_t);
+                GGML_ASSERT(d.bytes % (page_bytes * (size_t) PAGES) == 0);
+                const size_t layers = d.bytes / (page_bytes * (size_t) PAGES);
+                for (size_t l = 0; l < layers; ++l) {
+                    snprintf(path, sizeof(path), "%s/%s.layer_%02zu.page_%03d.bin", dir, d.name.c_str(), l, p);
+                    const uint8_t * src = (const uint8_t *) pre[ci].in[i].pVirAddr +
+                                          (((size_t) l * (size_t) PAGES + (size_t) p) * page_bytes);
+                    FILE * f = fopen(path, "wb");
+                    GGML_ASSERT(f);
+                    fwrite(src, 1, page_bytes, f);
+                    fclose(f);
+                    fprintf(mf, "kv %s layer=%zu page=%d bytes=%zu hash=%016llx file=%s.layer_%02zu.page_%03d.bin\n",
+                            d.name.c_str(), l, p, page_bytes, (unsigned long long) dump_hash(src, page_bytes),
+                            d.name.c_str(), l, p);
+                }
+                continue;
             }
         }
     }
