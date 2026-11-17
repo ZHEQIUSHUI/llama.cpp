@@ -46,11 +46,20 @@ struct composite final : model {
     int                    n = 0;
     model *                cur = nullptr;
 
-    model * select(const ggml_cgraph * g) {
+    model * select(const ggml_cgraph * g) const {
         return vit && (vit_graph(g) || minicpm_ocr_vit_graph(g)) ? vit.get() :
                audio && qwen3_asr_graph(g)         ? audio.get() :
                gen && !llm_graph(g)                ? gen.get() :
                                                      llm.get();
+    }
+
+    bool scheduler_tensor_needs_device_memory(const ggml_cgraph * g, const ggml_tensor * t) const override {
+        const model * m = select(g);
+        return m ? m->scheduler_tensor_needs_device_memory(g, t) : true;
+    }
+
+    bool owns_kv_cache() const override {
+        return llm && llm->owns_kv_cache();
     }
 
     ggml_status compute(ggml_cgraph * g) override {
@@ -85,7 +94,7 @@ struct composite final : model {
 
 }  // namespace
 
-static std::shared_ptr<model> make_model_of(const manifest & m) {
+static std::shared_ptr<model> make_model_of(const manifest & m, bool text_only) {
     std::shared_ptr<model> llm;
     if (m.model == "qwen35_moe") {
         llm = make_qwen35_moe(m);
@@ -116,6 +125,10 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
     } else {
         GGML_ABORT("axera: %s/manifest.json: no adapter for model %s\n", m.dir.c_str(), m.model.c_str());
     }
+    if (text_only) {
+        return llm;
+    }
+
     bool vision = false, vision1 = false, audio = false, gen = false;
     for (const auto & [role, k] : m.kernels) {
         vision  = vision || role.rfind("vit.", 0) == 0;
@@ -144,10 +157,34 @@ std::shared_ptr<model> make_model(const manifest & m) {
     std::lock_guard<std::mutex>                                 lock(mu);
     std::shared_ptr<model>                                      p = made[&m].lock();
     if (!p) {
-        p        = make_model_of(m);
+        p        = make_model_of(m, false);
         made[&m] = p;
     }
     return p;
+}
+
+std::shared_ptr<model> make_text_model(const manifest & m) {
+    static std::mutex                                            mu;
+    static std::map<const manifest *, std::shared_ptr<model>>    made;
+    std::lock_guard<std::mutex>                                  lock(mu);
+    auto                                                        it = made.find(&m);
+    if (it == made.end()) {
+        it = made.emplace(&m, make_model_of(m, true)).first;
+    }
+    return it->second;
+}
+
+bool mmproj_host_weights(const manifest & m) {
+    bool whole = false, other = false;
+    for (const auto & [role, k] : m.kernels) {
+        whole = whole || role == "vit";
+        other = other || role.rfind("vit.", 0) == 0 || role.rfind("audio.", 0) == 0 || role.rfind("cp.", 0) == 0;
+    }
+    return whole && !other;
+}
+
+bool scheduler_llm_graph(const ggml_cgraph * g) {
+    return llm_graph(g);
 }
 
 }  // namespace axera

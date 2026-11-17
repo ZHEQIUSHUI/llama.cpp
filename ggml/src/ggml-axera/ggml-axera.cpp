@@ -518,6 +518,34 @@ static bool ggml_backend_axera_sched_whole_graph(const struct ggml_cgraph * g) {
     return true;
 }
 
+// The adapter declares which tensors of a whole graph it materializes; the rest (1 here) can use scheduler host
+// memory. One call per graph: only a language-model graph has such tensors.
+static void ggml_backend_axera_sched_whole_graph_lanes(const struct ggml_cgraph * g, int * node_host, int * leaf_host) {
+    memset(node_host, 0, (size_t) g->n_nodes * sizeof(int));
+    memset(leaf_host, 0, (size_t) g->n_leafs * sizeof(int));
+    const axera::manifest * m = axera::kernels();
+    if (!m || !axera::scheduler_llm_graph(g)) {
+        return;
+    }
+    const std::shared_ptr<axera::model> a = axera::make_text_model(*m);
+    for (int i = 0; i < g->n_nodes; ++i) {
+        node_host[i] = !a->scheduler_tensor_needs_device_memory(g, g->nodes[i]);
+    }
+    for (int i = 0; i < g->n_leafs; ++i) {
+        leaf_host[i] = !a->scheduler_tensor_needs_device_memory(g, g->leafs[i]);
+    }
+}
+
+// The scheduler's second buffer lane for the tensors above. It is not device memory and needs no cache maintenance.
+static ggml_backend_buffer_type_t ggml_backend_axera_sched_whole_graph_host_buft(void) {
+    return ggml_backend_axera_lazy_buffer_type();
+}
+
+static bool ggml_backend_axera_mmproj_host_weights(void) {
+    const axera::manifest * m = axera::kernels();
+    return m && axera::mmproj_host_weights(*m);
+}
+
 // A prompt graph has fewer output rows than tokens and therefore an out_ids input; the generic reserve graph with all
 // rows as outputs does not. Ask for one output row so the last reserve plan has the prompt graph's topology.
 static int ggml_backend_axera_sched_reserve_outputs(void) {
@@ -570,6 +598,15 @@ static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_sched_whole_graph") == 0) {
         return (void *) ggml_backend_axera_sched_whole_graph;
+    }
+    if (strcmp(name, "ggml_backend_sched_whole_graph_lanes") == 0) {
+        return (void *) ggml_backend_axera_sched_whole_graph_lanes;
+    }
+    if (strcmp(name, "ggml_backend_sched_whole_graph_host_buft") == 0) {
+        return (void *) ggml_backend_axera_sched_whole_graph_host_buft;
+    }
+    if (strcmp(name, "ggml_backend_mmproj_host_weights") == 0) {
+        return (void *) ggml_backend_axera_mmproj_host_weights;
     }
     if (strcmp(name, "ggml_backend_sched_reserve_outputs") == 0) {
         return (void *) ggml_backend_axera_sched_reserve_outputs;

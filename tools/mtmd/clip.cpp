@@ -26,6 +26,13 @@
 #include <array>
 #include <functional>
 #include <float.h>
+#include <memory>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
 
@@ -166,6 +173,7 @@ struct clip_ctx {
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
+    std::shared_ptr<void> weights_map;  // the mmproj file mapping when it is the weights (unmapped after buf)
     ggml_backend_buffer_ptr buf;
 
 
@@ -1234,6 +1242,50 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
 //
 // clip_model_loader
 //
+
+// Map the mmproj file and place its tensors in the mapping (ggml-axera only: its device wraps a host mapping as weights).
+// False leaves everything untouched and the caller allocates and reads as usual.
+static bool clip_map_weights(clip_ctx & ctx_clip, const std::string & fname, const std::vector<ggml_tensor *> & tensors,
+                             const std::map<std::string, size_t> & offsets) {
+#if defined(__linux__)
+    // the backend says whether its vision adapter copies the weights its kernel reads (else they are bound in place)
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(ctx_clip.backend));
+    auto * host_weights = reg ? (bool (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_mmproj_host_weights") : nullptr;
+    if (!host_weights || !host_weights()) {
+        return false;
+    }
+    const int fd = open(fname.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    struct stat st;
+    void *      base = fstat(fd, &st) == 0 ? mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
+    close(fd);
+    if (base == MAP_FAILED) {
+        return false;
+    }
+    const size_t size = (size_t) st.st_size;
+    ggml_backend_buffer_t buf =
+        ggml_backend_dev_buffer_from_host_ptr(ggml_backend_get_device(ctx_clip.backend), base, size, size);
+    if (!buf) {
+        munmap(base, size);
+        return false;
+    }
+    ctx_clip.weights_map = std::shared_ptr<void>(base, [size](void * p) { munmap(p, size); });
+    ctx_clip.buf.reset(buf);
+    for (ggml_tensor * t : tensors) {
+        ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
+        GGML_ASSERT(cur && "tensor not found in ctx_data");
+        const auto it = offsets.find(t->name);
+        GGML_ASSERT(it != offsets.end() && it->second + ggml_nbytes(cur) <= size && "tensor outside the mmproj file");
+        ggml_backend_tensor_alloc(buf, cur, (char *) base + it->second);
+    }
+    return true;
+#else
+    (void) ctx_clip; (void) fname; (void) tensors; (void) offsets;
+    return false;
+#endif
+}
 
 struct clip_model_loader {
     ggml_context_ptr ctx_meta;
@@ -3914,10 +3966,18 @@ struct clip_model_loader {
 
             // alloc memory and offload data
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
-            ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+            // ggml-axera: the file mapped as the weights, as llama.cpp maps the model. An adapter copies what its
+            // kernels read into device memory and drops the pages, so the weights are not held twice (device memory
+            // is the board's RAM); a tensor read on the CPU later faults its pages in again.
+            const bool mapped = !ctx_clip.no_alloc && clip_map_weights(ctx_clip, fname, tensors_to_load, tensor_offset);
+            if (!mapped) {
+                ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+            }
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
-            if (!ctx_clip.no_alloc) {
+            if (mapped) {
+                LOG_DBG("%s: mapped %zu tensors of %s\n", __func__, tensors_to_load.size(), fname.c_str());
+            } else if (!ctx_clip.no_alloc) {
                 size_t data_loaded = 0;
                 for (auto & t : tensors_to_load) {
                     ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
@@ -4110,7 +4170,9 @@ struct clip_model_loader {
             fprintf(stderr, "clip prof: reserve alloc for prewarm=%d nodes=%d\n", (int) alloc_ok, ggml_graph_n_nodes(gf));
         }
         if (alloc_ok) {
-            prewarm_backend(ctx_clip, gf);
+            if (!ctx_clip.no_alloc) {  // (a measuring context has no weight data to load)
+                prewarm_backend(ctx_clip, gf);
+            }
             ggml_backend_sched_reset(ctx_clip.sched.get());
         }
 

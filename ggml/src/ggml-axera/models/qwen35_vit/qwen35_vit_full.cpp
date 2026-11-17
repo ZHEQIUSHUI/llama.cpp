@@ -28,6 +28,7 @@ class qwen35_vit_full final : public model {
         }
     }
     ggml_status compute(ggml_cgraph * g) override;
+    void        prewarm(ggml_cgraph * g) override;
 
   private:
     const manifest &                  man;
@@ -49,6 +50,7 @@ class qwen35_vit_full final : public model {
         }
         return c;
     }
+    void shapes(int CP);
     void weights(int L, int H);
     void patch_weight(int frames);
     void tables(int gh, int gw, int n, const ggml_tensor * pe, int H);
@@ -84,6 +86,7 @@ void qwen35_vit_full::weights(int L, int H) {
             const ggml_tensor * w = names.at("v.blk." + std::to_string(l) + "." + t);
             GGML_ASSERT((size_t) ggml_nelements(w) * sizeof(ggml_bf16_t) == k.in_bytes(in) / L);
             to_bf16(w, (ggml_bf16_t *) ((char *) c->vir + l * (k.in_bytes(in) / L)));
+            axera_drop_mapped(w);  // (an mmproj mapped by mtmd: the copy above is the only one kept)
         });
         c->flush();
     }
@@ -96,7 +99,10 @@ void qwen35_vit_full::weights(int L, int H) {
         GGML_ASSERT((size_t) ggml_nelements(w) * sizeof(ggml_bf16_t) == k.in_bytes(in));
         to_bf16(w, (ggml_bf16_t *) io(in)->vir);
         io(in)->flush();
+        axera_drop_mapped(w);
     }
+    axera_flush_file_pages();
+    axera_keep_mapped(names.at("v.position_embd.weight"));  // (tables() reads it per image size)
     // the patch projection [H][3][PS][PS] x 2 frames: w_patch itself is filled per frame count (patch_weight)
     const ggml_tensor * w0 = names.at("v.patch_embd.weight"), *w1 = names.at("v.patch_embd.weight.1");
     const int           CP = (int) (ggml_nelements(w0) / H);
@@ -198,6 +204,43 @@ void qwen35_vit_full::tables(int gh, int gw, int n, const ggml_tensor * pe, int 
     io("kmask")->flush();
 }
 
+// the kernel's sizes, once
+void qwen35_vit_full::shapes(int CP) {
+    if (N != 0) {
+        return;
+    }
+        const AX_ENGINE_IOMETA_T & km = k.info->pInputs[k.input("kmask")];  // [N / BC, QB, BC]
+        const AX_ENGINE_IOMETA_T & cm = k.info->pInputs[k.input("cos")];    // [N, HD / 2]
+        GGML_ASSERT(km.nShapeSize == 3 && cm.nShapeSize == 2);
+        N  = (int) cm.pShape[0];
+        QB = (int) km.pShape[1];
+        BC = (int) km.pShape[2];
+        HD = 2 * (int) cm.pShape[1];
+        GGML_ASSERT(km.pShape[0] * BC == N && (k.in_bytes("px") == (size_t) N * CP * sizeof(ggml_bf16_t) ||
+                                               k.in_bytes("px") == (size_t) N * 2 * CP * sizeof(ggml_bf16_t)));
+    }
+
+// mtmd opened the model: load the weights now (seconds of file reads and conversion), not inside the first image
+void qwen35_vit_full::prewarm(ggml_cgraph * g) {
+    names.of(g);
+    if (!names.find("v.position_embd.weight") || !names.find("v.patch_embd.weight") || !names.find("v.blk.0.ln1.weight")) {
+        return;
+    }
+    const int H = (int) names.at("v.position_embd.weight")->ne[0], PS = (int) names.at("v.patch_embd.weight")->ne[0];
+    int       L = 0;
+    while (names.find("v.blk." + std::to_string(L) + ".ln1.weight")) {
+        ++L;
+    }
+    const ggml_tensor * w0 = names.at("v.blk.0.ln1.weight");
+    if (!w0->data || bound == w0->data) {
+        return;
+    }
+    shapes(3 * PS * PS);
+    weights(L, H);
+    bound = w0->data;
+    gh_ = gw_ = -1;
+}
+
 ggml_status qwen35_vit_full::compute(ggml_cgraph * g) {
     names.of(g);
     ggml_tensor * raw = names.at("inp_raw");  // [W, H, 3, frames] f32, normalized
@@ -209,17 +252,7 @@ ggml_status qwen35_vit_full::compute(ggml_cgraph * g) {
     while (names.find("v.blk." + std::to_string(L) + ".ln1.weight")) {
         ++L;
     }
-    if (N == 0) {
-        const AX_ENGINE_IOMETA_T & km = k.info->pInputs[k.input("kmask")];  // [N / BC, QB, BC]
-        const AX_ENGINE_IOMETA_T & cm = k.info->pInputs[k.input("cos")];    // [N, HD / 2]
-        GGML_ASSERT(km.nShapeSize == 3 && cm.nShapeSize == 2);
-        N  = (int) cm.pShape[0];
-        QB = (int) km.pShape[1];
-        BC = (int) km.pShape[2];
-        HD = 2 * (int) cm.pShape[1];
-        GGML_ASSERT(km.pShape[0] * BC == N && (k.in_bytes("px") == (size_t) N * CP * sizeof(ggml_bf16_t) ||
-                                               k.in_bytes("px") == (size_t) N * 2 * CP * sizeof(ggml_bf16_t)));
-    }
+    shapes(CP);
     const int frames = (int) raw->ne[3];  // 1: a still image, 2: a pair of video frames
     if (frames < 1 || frames > 2 || gw % 2 || gh % 2 || n > N) {
         GGML_LOG_ERROR("axera qwen35_vit_full: %d frame(s) of %d x %d patches: one image or a pair of video frames, even patch "

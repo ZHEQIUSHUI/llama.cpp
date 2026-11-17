@@ -17,6 +17,16 @@ constexpr uint32_t state_flags_partial_only = 1;
 
 struct model {
     virtual ~model() = default;
+    // A whole-graph adapter may leave a scheduler tensor unused: its kernels read the graph's inputs and write its
+    // outputs, or keep their working state in private banks. False lets the scheduler put that tensor in lazily-backed
+    // host memory instead of CMM. The default keeps every tensor in CMM.
+    virtual bool scheduler_tensor_needs_device_memory(const ggml_cgraph * g, const ggml_tensor * t) const {
+        (void) g;
+        (void) t;
+        return true;
+    }
+    // True when the adapter keeps the KV cache in its own CMM pools and llama.cpp's cache tensors are unused.
+    virtual bool owns_kv_cache() const { return false; }
     // llama.cpp's sequence state (context checkpoints / prompt cache). An adapter whose caches are private CMM pools
     // overrides these: the backend appends the blob to the state stream, so a checkpoint restore puts the state the
     // kernels actually read back. The default is no state, which is also the CPU-backend behaviour.
@@ -35,6 +45,13 @@ struct model {
 
 // the adapter of the manifest's model; aborts for a model this backend has no adapter for
 std::shared_ptr<model> make_model(const manifest & m);
+// the language-model part only, for declarations that need no kernels or CMM (scheduler and cache capabilities)
+std::shared_ptr<model> make_text_model(const manifest & m);
+// the manifest's vision adapter copies the mmproj weights its kernel reads into its own CMM (one kernel for the whole
+// encoder): mtmd may then keep the mmproj as a file mapping. Adapters that bind weight tensors in place need CMM.
+bool mmproj_host_weights(const manifest & m);
+// a graph of the llama.cpp language model (not mtmd's vision, audio or generation graphs)
+bool scheduler_llm_graph(const ggml_cgraph * g);
 
 std::shared_ptr<model> make_qwen35_moe(const manifest & m);
 std::shared_ptr<model> make_qwen35_dense(const manifest & m);

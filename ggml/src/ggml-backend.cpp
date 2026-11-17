@@ -992,6 +992,9 @@ struct ggml_backend_sched {
 
     // a backend that runs the whole graph without copies or splits can provide this fast path
     bool (*whole_graph)(const struct ggml_cgraph * graph);
+    // fills 1 for the tensors of a whole graph that the backend leaves unused (they go to whole_graph_host_buft), else 0
+    void (*whole_graph_lanes)(const struct ggml_cgraph * graph, int * node_host, int * leaf_host);
+    ggml_backend_buffer_type_t whole_graph_host_buft;
     int whole_graph_backend;
     int (*reserve_outputs)(void);
     int runtime_outputs;
@@ -1310,8 +1313,7 @@ static void ggml_backend_sched_split_graph_whole(ggml_backend_sched_t sched, str
     const int graph_size = std::max(graph->n_nodes, graph->n_leafs);
     sched->prev_graph_size = sched->graph_size;
     sched->graph_size      = graph_size;
-    // There is one split and one buffer, so the allocator's NULL ids select buffer 0 for every tensor and the
-    // original graph arrays are already the sequence the allocator needs. No per-node copy or id array is used.
+    // There is one split. Tensors the adapter materializes use buffer 0; unused tensors use the optional host lane.
 
     struct ggml_backend_sched_split * split = &sched->splits[0];
     split->backend_id = backend_id;
@@ -1322,6 +1324,27 @@ static void ggml_backend_sched_split_graph_whole(ggml_backend_sched_t sched, str
     split->graph.uid  = ggml_graph_next_uid();
     split->graph.stable_uid =
         graph->stable_uid ? (graph->stable_uid << 8) | 1 : 0;
+
+    if (sched->whole_graph_host_buft && sched->whole_graph_lanes) {
+        const int host_id = sched->n_backends;
+        sched->whole_graph_lanes(graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            sched->node_backend_ids[i] = sched->node_backend_ids[i] ? host_id : backend_id;
+        }
+        for (int i = 0; i < graph->n_leafs; ++i) {
+            sched->leaf_backend_ids[i] = sched->leaf_backend_ids[i] ? host_id : backend_id;
+        }
+    }
+}
+
+static ggml_gallocr_t ggml_backend_sched_new_galloc(ggml_backend_sched_t sched) {
+    ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS + 1];
+    int n = sched->n_backends;
+    memcpy(bufts, sched->bufts, (size_t) n * sizeof(bufts[0]));
+    if (sched->whole_graph_host_buft) {
+        bufts[n++] = sched->whole_graph_host_buft;
+    }
+    return ggml_gallocr_new_n(bufts, n);
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
@@ -1383,7 +1406,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             if (!found && sched->n_plans < sched->max_plans) {
                 auto & p = sched->plans[sched->n_plans++];
                 p.key   = key;
-                p.galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+                p.galloc = ggml_backend_sched_new_galloc(sched);
                 p.used  = ++sched->plan_tick;
                 plan    = p.galloc;
                 if (pprof) {
@@ -2028,8 +2051,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched, struct g
         }
         const int64_t t_sync = prof ? ggml_time_us() : 0;
 
-        const int * node_ids = sched->last_whole_graph ? NULL : sched->node_backend_ids;
-        const int * leaf_ids = sched->last_whole_graph ? NULL : sched->leaf_backend_ids;
+        // a whole graph has buffer ids only when the backend gave a host lane for the tensors it leaves unused
+        const bool  no_ids   = sched->last_whole_graph && !sched->whole_graph_host_buft;
+        const int * node_ids = no_ids ? NULL : sched->node_backend_ids;
+        const int * leaf_ids = no_ids ? NULL : sched->leaf_backend_ids;
         if (!ggml_gallocr_reserve_n(sched->galloc, sched_graph, node_ids, leaf_ids)) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
@@ -2242,6 +2267,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
     sched->whole_graph         = NULL;
+    sched->whole_graph_lanes   = NULL;
+    sched->whole_graph_host_buft = NULL;
     sched->whole_graph_backend = -1;
     sched->reserve_outputs     = NULL;
     sched->runtime_outputs     = 0;
@@ -2259,6 +2286,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
         GGML_ASSERT(sched->whole_graph == NULL);
         sched->whole_graph         = fn;
         sched->whole_graph_backend = i;
+        sched->whole_graph_lanes = (void (*)(const struct ggml_cgraph *, int *, int *))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sched_whole_graph_lanes");
+        auto host_buft = (ggml_backend_buffer_type_t (*)(void))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sched_whole_graph_host_buft");
+        sched->whole_graph_host_buft = host_buft ? host_buft() : NULL;
+        if (sched->whole_graph_lanes == NULL || sched->whole_graph_host_buft == NULL) {
+            sched->whole_graph_lanes     = NULL;
+            sched->whole_graph_host_buft = NULL;
+        }
     }
     for (int i = 0; i < n_backends; ++i) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[i]));
@@ -2308,7 +2344,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
-    sched->galloc         = ggml_gallocr_new_n(sched->bufts, n_backends);
+    sched->galloc         = ggml_backend_sched_new_galloc(sched);
     sched->galloc_default = sched->galloc;
     sched->op_offload = op_offload;
 
@@ -2372,9 +2408,12 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
-    ggml_gallocr_reserve_n_size(sched->galloc, sched->last_whole_graph ? measure_graph : &sched->graph,
-            sched->last_whole_graph ? NULL : sched->node_backend_ids,
-            sched->last_whole_graph ? NULL : sched->leaf_backend_ids, sizes);
+    const bool whole = sched->last_whole_graph;
+    size_t all_sizes[GGML_SCHED_MAX_BACKENDS + 1] = {};
+    ggml_gallocr_reserve_n_size(sched->galloc, whole ? measure_graph : &sched->graph,
+            whole && sched->whole_graph_host_buft ? sched->node_backend_ids : NULL,
+            whole && sched->whole_graph_host_buft ? sched->leaf_backend_ids : NULL, all_sizes);
+    memcpy(sizes, all_sizes, (size_t) sched->n_backends * sizeof(sizes[0]));
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
@@ -2385,9 +2424,10 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
-    if (!ggml_gallocr_reserve_n(sched->galloc, sched->last_whole_graph ? measure_graph : &sched->graph,
-            sched->last_whole_graph ? NULL : sched->node_backend_ids,
-            sched->last_whole_graph ? NULL : sched->leaf_backend_ids)) {
+    const bool whole = sched->last_whole_graph;
+    if (!ggml_gallocr_reserve_n(sched->galloc, whole ? measure_graph : &sched->graph,
+            whole && sched->whole_graph_host_buft ? sched->node_backend_ids : NULL,
+            whole && sched->whole_graph_host_buft ? sched->leaf_backend_ids : NULL)) {
         return false;
     }
 

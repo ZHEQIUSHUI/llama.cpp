@@ -63,6 +63,8 @@ class cpm5 final : public model, public seq_model {
     size_t       state_read(const void * src, size_t size, uint32_t flags) override;
     int          last_state_status() const override { return last_seq_status; }
 
+    bool owns_kv_cache() const override { return true; }
+
     seq_caps seq_get_caps() const override;
     void     seq_state_save(uint8_t * dst) override { (void) dst; }  // KV-only: seqstate replays pages
     void     seq_state_load(const uint8_t * src) override { (void) src; }

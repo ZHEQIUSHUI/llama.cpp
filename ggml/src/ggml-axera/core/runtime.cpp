@@ -278,6 +278,17 @@ void axera_drop_mapped(const ggml_tensor * t, bool force) {
     axera_drop_file_pages(t);
 }
 
+void axera_keep_mapped(const ggml_tensor * t) {
+    const ggml_tensor * s = t->view_src ? t->view_src : t;
+    if (!s->buffer || strcmp(ggml_backend_buffer_name(s->buffer), GGML_AXERA_NAME "_Mapped") != 0 || !t->data) {
+        return;
+    }
+    static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t        a  = (uintptr_t) t->data & ~(pg - 1);
+    const uintptr_t        b  = ((uintptr_t) t->data + ggml_nbytes(t) + pg - 1) & ~(pg - 1);
+    madvise((void *) a, b - a, MADV_WILLNEED);
+}
+
 // CMM total / free from /proc/ax_proc/mem_cmm_info (sum over partitions)
 void axera_cmm_memory(size_t * free, size_t * total) {
     *free  = 0;

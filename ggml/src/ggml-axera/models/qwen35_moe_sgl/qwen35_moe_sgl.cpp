@@ -222,6 +222,12 @@ class qwen35_moe_sgl final : public model, public seq_model {
     size_t       state_read(const void * src, size_t size, uint32_t flags) override;
     int          last_state_status() const override { return last_seq_status; }
 
+    bool owns_kv_cache() const override { return true; }
+    bool scheduler_tensor_needs_device_memory(const ggml_cgraph * g, const ggml_tensor * t) const override {
+        (void) g;
+        return (t->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) != 0;
+    }
+
     seq_caps seq_get_caps() const override;
     void     seq_state_save(uint8_t * dst) override;
     void     seq_state_load(const uint8_t * src) override;

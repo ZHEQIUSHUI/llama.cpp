@@ -43,6 +43,8 @@ bool axera_keep_pages();
 // are the file's, read only: a later read faults them in again) and from the kernel page cache. Nothing for any other
 // buffer. Unless `force`, the token embedding tables stay mapped: their rows are read on demand on the CPU
 void axera_drop_mapped(const struct ggml_tensor * t, bool force = false);
+// a mapped weight that stays in use on the CPU (a table read per image size): ask the kernel to read it in now
+void axera_keep_mapped(const struct ggml_tensor * t);
 // queue the same pages for release from the kernel page cache (posix_fadvise DONTNEED), not from the process mapping
 void axera_drop_file_pages(const struct ggml_tensor * t);
 // coalesce and release the queued file-page ranges: the backend calls it after the model's first graph (its init)
