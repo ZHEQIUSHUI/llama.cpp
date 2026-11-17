@@ -814,7 +814,12 @@ void hy_mt2::dump_debug_call(int ci, int64_t cell, int rows, int64_t batch_cell0
                          atoi(getenv("GGML_AXERA_HY_MT2_DEBUG_DUMP_KV")) != 0;
     if (dump_kv) {
         std::vector<int> pages;
-        for (int p = 0; p <= page; ++p) pages.push_back(p);
+        // A 4096-row prefill call writes wp/PG sub-pages.  `page` is only the
+        // first one (the replay's history end), so dumping 0..page saved just
+        // page 0 and made a short-page replay depend on reconstructed pages.
+        // Save every page the call's `indices` can touch, capped by the bank.
+        const int last_page = std::min(PAGES - 1, page + wp / PG);
+        for (int p = 0; p <= last_page; ++p) pages.push_back(p);
         for (int p : pages) {
             for (size_t i = 0; i < pre[ci].k->desc->in.size(); ++i) {
                 const io_desc & d = pre[ci].k->desc->in[i];
