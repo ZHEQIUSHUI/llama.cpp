@@ -291,7 +291,9 @@ llama_kv_cache::llama_kv_cache(
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), llama_cache_buft(buft)); // real buffer
+            ggml_backend_buffer_type_t cache_buft = llama_cache_buft(buft);
+            data_external = data_external || cache_buft != buft;
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), cache_buft); // real buffer
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
@@ -2367,12 +2369,16 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     const auto & cells = v_cells[cr.strm];
 
     const uint32_t v_trans = this->v_trans ? 1 : 0;
-    const uint32_t n_layer = layers.size();
+    // no layers when the backend holds the data: the tensors are unused memory (zeros), not worth 20 KB per cell
+    const uint32_t n_layer = data_external ? 0 : layers.size();
 
     io.write(&v_trans, sizeof(v_trans));
     io.write(&n_layer, sizeof(n_layer));
     io.write(&n_rot_k, sizeof(n_rot_k));
     io.write(&n_rot_v, sizeof(n_rot_v));
+    if (data_external) {
+        return;
+    }
 
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
@@ -2672,6 +2678,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     io.read(&n_layer, sizeof(n_layer));
     io.read(&n_rot_k_ref, sizeof(n_rot_k_ref));
     io.read(&n_rot_v_ref, sizeof(n_rot_v_ref));
+
+    if (data_external && n_layer == 0) {  // a state saved without K / V rows (see state_write_data): nothing to read
+        if (cell_count > cells.size()) {
+            LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, cells.size());
+            return false;
+        }
+        return true;
+    }
 
     if (n_layer != layers.size()) {
         LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, (uint32_t) layers.size());

@@ -267,6 +267,9 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
+    // the backend keeps the cache data in its own pools (it replaced the buffer type of the tensors): the tensors hold
+    // nothing, so a saved state carries no K / V rows for them (ggml-axera adapters save theirs in the backend's blob)
+    bool data_external = false;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
