@@ -42,9 +42,17 @@ bool llm_graph(const ggml_cgraph * g) {
 // the language model, else (Qwen3-TTS) a generation graph)
 struct composite final : model {
     std::shared_ptr<model> llm, vit, audio, gen;
-    const ggml_cgraph *    last = nullptr;  // the last graph and its kind (llama.cpp reuses the decode graph)
-    int                    n = 0;
-    model *                cur = nullptr;
+
+    // The graphs seen lately and their adapters. llama.cpp reuses a context's graph, and with MTP two contexts take
+    // turns every round, so one remembered graph would scan every node's sources again on each call.
+    struct seen {
+        const ggml_cgraph * g = nullptr;
+        int                 n = 0;
+        const ggml_tensor * first = nullptr, * last = nullptr;
+        model *             m = nullptr;
+    };
+    seen   recent[4];
+    size_t next = 0;
 
     model * select(const ggml_cgraph * g) {
         return vit && (vit_graph(g) || minicpm_ocr_vit_graph(g)) ? vit.get() :
@@ -54,12 +62,16 @@ struct composite final : model {
     }
 
     ggml_status compute(ggml_cgraph * g) override {
-        if (g != last || g->n_nodes != n) {
-            last = g;
-            n    = g->n_nodes;
-            cur  = select(g);
+        const ggml_tensor * first = g->n_nodes > 0 ? g->nodes[0] : nullptr;
+        const ggml_tensor * last  = g->n_nodes > 0 ? g->nodes[g->n_nodes - 1] : nullptr;
+        for (const seen & e : recent) {
+            if (e.g == g && e.n == g->n_nodes && e.first == first && e.last == last && e.m) {
+                return e.m->compute(g);
+            }
         }
-        return cur->compute(g);
+        seen & e = recent[next++ % (sizeof(recent) / sizeof(recent[0]))];
+        e        = {g, g->n_nodes, first, last, select(g)};
+        return e.m->compute(g);
     }
 
     void prewarm(ggml_cgraph * g) override {
