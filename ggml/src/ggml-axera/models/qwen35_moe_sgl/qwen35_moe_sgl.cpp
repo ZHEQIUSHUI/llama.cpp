@@ -924,14 +924,17 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
             emb1.in[k1.input("input_flat")] = axera_io(EMBI, (uint32_t) k1.in_bytes("input_flat"));
             emb1.out[k1.output("output_flat")] = axera_io(DX, (uint32_t) k1.out_bytes("output_flat"));
             emb = true;
-            // GGML_AXERA_EMBED_NPU=1: the NPU table and gather from the start (a 4096-row chunk's embedding takes
-            // 0.7 ms instead of about 10 ms on the CPU, for 0.97 GiB of CMM) even when MTP never asks for it
-            if (getenv("GGML_AXERA_EMBED_NPU") != nullptr) {
+            // The NPU table and gather by default: a 4096-row chunk's embedding takes 0.7 ms instead of about 10 ms
+            // on the CPU. GGML_AXERA_EMBED_HOST=1 trades that for 0.97 GiB of CMM: rows are read from the GGUF on
+            // the CPU and the table is only built if MTP asks for it.
+            const bool host_rows = getenv("GGML_AXERA_EMBED_HOST") != nullptr;
+            if (!host_rows) {
                 embw_make();
             }
-            GGML_LOG_INFO("axera qwen35_35b_a3b: token embedding [%lld, %lld] read on the CPU; %.2f GiB on the NPU (%s) once MTP needs it\n",
-                          (long long) tw->ne[1], (long long) tw->ne[0], wb / 1073741824.0,
-                          man.has("vocab_embedding_4096") ? "manifest kernels" : "embedded kernels");
+            GGML_LOG_INFO("axera qwen35_35b_a3b: token embedding [%lld, %lld] %s; %.2f GiB on the NPU (%s)%s\n",
+                          (long long) tw->ne[1], (long long) tw->ne[0], host_rows ? "read on the CPU" : "gathered on the NPU",
+                          wb / 1073741824.0, man.has("vocab_embedding_4096") ? "manifest kernels" : "embedded kernels",
+                          host_rows ? " once MTP needs it" : "");
         }
     }
 
