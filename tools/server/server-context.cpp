@@ -401,9 +401,9 @@ struct server_slot {
         }
 
         GGML_ASSERT(cur->data);
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data->main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data->main_data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data->drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            llama_state_seq_get_data_ext(ctx_dft, cur->data->drft_data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
         if (prompt_cache.disk_enabled()) {

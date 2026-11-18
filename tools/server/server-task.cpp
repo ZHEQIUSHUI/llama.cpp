@@ -11,11 +11,19 @@
 #include "server-common.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 //
 // task_params
@@ -2064,7 +2072,192 @@ bool pc_read_file(const std::string & path, server_prompt_data & data, size_t ex
     return ifs.tellg() == file_size;
 }
 
+#ifndef _WIN32
+// The cache file of pc_write_file(), mapped: the header and the checkpoints are written here (their payloads are
+// freed as they go), the main and draft states are left for the caller to write in place.
+// reuse: a cache file this state replaces. Its blocks are written over in place: filling a mapping of a new file
+// allocates block by block and takes about three times as long.
+bool pc_map_create(const std::string & path, server_prompt_data & data, size_t size_main, size_t size_drft,
+                   std::list<common_prompt_checkpoint> & checkpoints, size_t file_size, const std::string & reuse) {
+    const std::string tmp = path + ".tmp";
+    const bool reused = !reuse.empty() && rename(reuse.c_str(), tmp.c_str()) == 0;
+    const int  fd     = open(tmp.c_str(), reused ? O_RDWR : O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        if (reused) {
+            unlink(tmp.c_str());
+        }
+        return false;
+    }
+    if (reused && ftruncate(fd, (off_t) file_size) != 0) {
+        close(fd);
+        unlink(tmp.c_str());
+        return false;
+    }
+    // reserve the blocks now: a full disk must fail here, not as a fault while the mapping is written
+    if (fallocate(fd, 0, 0, (off_t) file_size) != 0 && (errno == ENOSPC || ftruncate(fd, (off_t) file_size) != 0)) {
+        close(fd);
+        unlink(tmp.c_str());
+        return false;
+    }
+    void * p = mmap(nullptr, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) {
+        unlink(tmp.c_str());
+        return false;
+    }
+
+    uint8_t * o   = (uint8_t *) p;
+    const auto put = [&](const void * v, size_t n) {
+        if (n) {
+            memcpy(o, v, n);
+            o += n;
+        }
+    };
+    const uint32_t magic   = PROMPT_CACHE_FILE_MAGIC;
+    const uint32_t version = PROMPT_CACHE_FILE_VERSION;
+    const uint64_t n_main  = size_main;
+    const uint64_t n_drft  = size_drft;
+    const uint32_t n_ckpt  = (uint32_t) checkpoints.size();
+    put(&magic, sizeof(magic));
+    put(&version, sizeof(version));
+    put(&n_main, sizeof(n_main));
+    put(&n_drft, sizeof(n_drft));
+    put(&n_ckpt, sizeof(n_ckpt));
+    for (auto & ckpt : checkpoints) {
+        const int64_t  n_tokens = ckpt.n_tokens;
+        const int32_t  pos_min  = ckpt.pos_min;
+        const int32_t  pos_max  = ckpt.pos_max;
+        const uint64_t n_tgt    = ckpt.data_tgt.size();
+        const uint64_t n_dft    = ckpt.data_dft.size();
+        const uint64_t n_spec   = ckpt.data_spec.size();
+        put(&n_tokens, sizeof(n_tokens));
+        put(&pos_min, sizeof(pos_min));
+        put(&pos_max, sizeof(pos_max));
+        put(&n_tgt, sizeof(n_tgt));
+        put(&n_dft, sizeof(n_dft));
+        put(&n_spec, sizeof(n_spec));
+        put(ckpt.data_tgt.data(), n_tgt);
+        put(ckpt.data_dft.data(), n_dft);
+        put(ckpt.data_spec.data(), n_spec);
+        std::vector<uint8_t>().swap(ckpt.data_tgt);
+        std::vector<uint8_t>().swap(ckpt.data_dft);
+        std::vector<uint8_t>().swap(ckpt.data_spec);
+    }
+    GGML_ASSERT((size_t) (o - (uint8_t *) p) + size_main + size_drft == file_size);
+
+    data.map           = p;
+    data.map_size      = file_size;
+    data.map_main      = o;
+    data.map_drft      = o + size_main;
+    data.map_main_size = size_main;
+    data.map_drft_size = size_drft;
+    data.map_tmp       = tmp;
+    return true;
+}
+
+// the written mapping becomes the cache file
+bool pc_map_commit(server_prompt_data & data, const std::string & path) {
+    if (!data.map || data.map_tmp.empty()) {
+        return false;
+    }
+    munmap(data.map, data.map_size);
+    data.map = nullptr;
+    const std::string tmp = std::move(data.map_tmp);
+    data.map_tmp.clear();
+    if (rename(tmp.c_str(), path.c_str()) != 0) {
+        unlink(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+// a cache file mapped for a restore: the checkpoints are copied out (the slot keeps them), the states stay in the file
+bool pc_map_open(const std::string & path, server_prompt_data & data, size_t expected_size) {
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || (size_t) st.st_size != expected_size || expected_size == 0) {
+        close(fd);
+        return false;
+    }
+    void * p = mmap(nullptr, expected_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) {
+        return false;
+    }
+    madvise(p, expected_size, MADV_SEQUENTIAL);
+    data.map      = p;
+    data.map_size = expected_size;
+
+    const uint8_t * o   = (const uint8_t *) p;
+    const uint8_t * end = o + expected_size;
+    const auto get = [&](void * v, size_t n) {
+        if ((size_t) (end - o) < n) {
+            return false;
+        }
+        memcpy(v, o, n);
+        o += n;
+        return true;
+    };
+    uint32_t magic = 0, version = 0, n_ckpt = 0;
+    uint64_t size_main = 0, size_drft = 0;
+    if (!get(&magic, sizeof(magic)) || !get(&version, sizeof(version)) || !get(&size_main, sizeof(size_main)) ||
+        !get(&size_drft, sizeof(size_drft)) || !get(&n_ckpt, sizeof(n_ckpt)) ||
+        magic != PROMPT_CACHE_FILE_MAGIC || version != PROMPT_CACHE_FILE_VERSION) {
+        return false;
+    }
+    data.checkpoints.clear();
+    for (uint32_t i = 0; i < n_ckpt; ++i) {
+        int64_t  n_tokens = 0;
+        int32_t  pos_min = 0, pos_max = 0;
+        uint64_t n_tgt = 0, n_dft = 0, n_spec = 0;
+        if (!get(&n_tokens, sizeof(n_tokens)) || !get(&pos_min, sizeof(pos_min)) || !get(&pos_max, sizeof(pos_max)) ||
+            !get(&n_tgt, sizeof(n_tgt)) || !get(&n_dft, sizeof(n_dft)) || !get(&n_spec, sizeof(n_spec))) {
+            return false;
+        }
+        const uint64_t left = (uint64_t) (end - o);
+        if (n_tgt == 0 || n_tgt > left || n_dft > left - n_tgt || n_spec > left - n_tgt - n_dft) {
+            return false;
+        }
+        common_prompt_checkpoint ckpt;
+        ckpt.id_task  = -1;
+        ckpt.n_tokens = n_tokens;
+        ckpt.pos_min  = pos_min;
+        ckpt.pos_max  = pos_max;
+        ckpt.data_tgt.assign(o, o + n_tgt);
+        o += n_tgt;
+        ckpt.data_dft.assign(o, o + n_dft);
+        o += n_dft;
+        ckpt.data_spec.assign(o, o + n_spec);
+        o += n_spec;
+        data.checkpoints.push_back(std::move(ckpt));
+    }
+    const uint64_t left = (uint64_t) (end - o);
+    if (size_main > left || size_drft != left - size_main) {
+        return false;
+    }
+    data.map_main      = (uint8_t *) o;
+    data.map_drft      = (uint8_t *) o + size_main;
+    data.map_main_size = (size_t) size_main;
+    data.map_drft_size = (size_t) size_drft;
+    return true;
+}
+#endif
+
 } // namespace
+
+server_prompt_data::~server_prompt_data() {
+#ifndef _WIN32
+    if (map) {
+        munmap(map, map_size);
+    }
+    if (!map_tmp.empty()) {
+        unlink(map_tmp.c_str());
+    }
+#endif
+}
 
 std::string server_file_md5(const std::string & path) {
     std::ifstream ifs(std::filesystem::u8path(path), std::ios::binary);
@@ -2483,13 +2676,19 @@ server_prompt_cache_state * server_prompt_cache::alloc(server_prompt & prompt, s
     }
 
     // remove any cached prompts that are fully contained in the current prompt
+    std::string reuse_file;  // disk only: the file of one of them, for the new state to be written over
     for (auto it = states.begin(); it != states.end();) {
         const int len = (*it)->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (len == (int) (*it)->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
-            remove_state(it++);
+            if (disk_enabled() && !ram_enabled && reuse_file.empty() && (*it)->disk_ready && !(*it)->file.empty()) {
+                reuse_file = disk_dir + (*it)->file;
+                states.erase(it++);
+            } else {
+                remove_state(it++);
+            }
         } else {
             ++it;
         }
@@ -2548,10 +2747,32 @@ server_prompt_cache_state * server_prompt_cache::alloc(server_prompt & prompt, s
     state->keep_ram   = ram_enabled;
     state->disk_ready = false;
 
+    if (disk_enabled()) {
+        std::ostringstream ss;
+        ss << "state-" << std::chrono::steady_clock::now().time_since_epoch().count() << '-' << state->id << ".bin";
+        state->file      = ss.str();
+        state->file_size = file_size_new;
+    }
+
+    bool mapped = false;
     try {
         state->data = std::make_shared<server_prompt_data>();
-        state->data->main.resize(state_size_tgt);
-        state->data->drft.resize(state_size_dft);
+#ifndef _WIN32
+        // disk only: the state is written straight into the cache file
+        mapped = disk_enabled() && !ram_enabled &&
+                 pc_map_create(disk_dir + state->file, *state->data, state_size_tgt, state_size_dft, prompt.checkpoints, file_size_new, reuse_file);
+        if (mapped) {
+            reuse_file.clear();
+        }
+#endif
+        if (!mapped) {
+            state->data->main.resize(state_size_tgt);
+            state->data->drft.resize(state_size_dft);
+        }
+        if (!reuse_file.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::u8path(reuse_file), ec);
+        }
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -2586,13 +2807,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(server_prompt & prompt, s
     // take over the payloads instead of copying them: the slot still owns its
     // copy until prompt_load() replaces its prompt, so a copy would briefly
     // double the checkpoint memory outside the cache budget
-    state->data->checkpoints = std::move(prompt.checkpoints);
-
-    if (disk_enabled()) {
-        std::ostringstream ss;
-        ss << "state-" << std::chrono::steady_clock::now().time_since_epoch().count() << '-' << state->id << ".bin";
-        state->file      = ss.str();
-        state->file_size = file_size_new;
+    if (mapped) {
+        prompt.checkpoints.clear();  // already in the file
+    } else {
+        state->data->checkpoints = std::move(prompt.checkpoints);
     }
 
     states.push_back(std::move(state));
@@ -2605,6 +2823,26 @@ bool server_prompt_cache::store_disk(const server_prompt_cache_state & state) {
     if (!disk_enabled() || state.file.empty() || !state.data) {
         return false;
     }
+
+#ifndef _WIN32
+    if (state.data->map) {
+        // written in place by the caller: no copy for the writer thread to work through
+        auto it = std::find_if(states.begin(), states.end(), [&](const auto & s) { return s->id == state.id; });
+        if (it == states.end()) {
+            return false;
+        }
+        const bool ok = pc_map_commit(*(*it)->data, disk_dir + (*it)->file);
+        if (ok) {
+            (*it)->disk_ready = true;
+            (*it)->data.reset();
+        } else {
+            SRV_WRN("failed to write prompt cache state '%s'\n", (*it)->file.c_str());
+            states.erase(it);
+        }
+        write_index();
+        return ok;
+    }
+#endif
 
     job j;
     j.type     = job::SAVE;
@@ -2655,7 +2893,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         std::shared_ptr<server_prompt_data> data = (*it_best)->data;
         if (!data && (*it_best)->disk_ready) {
             data = std::make_shared<server_prompt_data>();
-            if (!pc_read_file(disk_dir + (*it_best)->file, *data, (*it_best)->file_size)) {
+#ifndef _WIN32
+            const bool read_ok = pc_map_open(disk_dir + (*it_best)->file, *data, (*it_best)->file_size);
+#else
+            const bool read_ok = pc_read_file(disk_dir + (*it_best)->file, *data, (*it_best)->file_size);
+#endif
+            if (!read_ok) {
                 SRV_WRN("failed to read prompt cache state '%s'\n", (*it_best)->file.c_str());
                 remove_state(it_best);
                 return false;
@@ -2668,15 +2911,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             return false;
         }
 
-        if ((ctx_dft != nullptr) != !data->drft.empty()) {
+        if ((ctx_dft != nullptr) != (data->drft_size() != 0)) {
             SRV_WRN("prompt cache state '%s' does not match the draft context\n", (*it_best)->file.c_str());
             remove_state(it_best);
             return false;
         }
 
         {
-            const size_t size = data->main.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data->main.data(), size, id_slot, 0);
+            const size_t size = data->main_size();
+            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data->main_data(), size, id_slot, 0);
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
                 remove_state(it_best);
@@ -2684,9 +2927,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
-        if (!data->drft.empty()) {
-            const size_t size = data->drft.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data->drft.data(), size, id_slot, 0);
+        if (data->drft_size() != 0) {
+            const size_t size = data->drft_size();
+            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data->drft_data(), size, id_slot, 0);
             if (n != size) {
                 SRV_WRN("failed to restore state with size %zu\n", size);
                 remove_state(it_best);

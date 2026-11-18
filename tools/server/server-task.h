@@ -728,6 +728,27 @@ struct server_prompt_data {
     std::vector<uint8_t> drft;
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // disk-only tier: the state is a range of the mapped cache file instead of main / drft, so saving or restoring
+    // a prompt never holds a second copy of it in host memory
+    void *      map           = nullptr;
+    size_t      map_size      = 0;
+    uint8_t *   map_main      = nullptr;
+    uint8_t *   map_drft      = nullptr;
+    size_t      map_main_size = 0;
+    size_t      map_drft_size = 0;
+    std::string map_tmp;  // a file still being written (store_disk() gives it its final name)
+
+    server_prompt_data() = default;
+    server_prompt_data(const server_prompt_data &) = delete;
+    server_prompt_data & operator=(const server_prompt_data &) = delete;
+    ~server_prompt_data();
+
+    uint8_t * main_data() { return map ? map_main : main.data(); }
+    uint8_t * drft_data() { return map ? map_drft : drft.data(); }
+    size_t    main_size() const { return map ? map_main_size : main.size(); }
+    size_t    drft_size() const { return map ? map_drft_size : drft.size(); }
+
+    // host memory held
     size_t size() const {
         size_t res = main.size() + drft.size();
         for (const auto & ckpt : checkpoints) {
