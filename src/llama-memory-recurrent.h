@@ -122,6 +122,7 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    bool data_external = false;  // the backend keeps the state itself: the tensors here are unused (see llama_cache_buft)
 
     // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;

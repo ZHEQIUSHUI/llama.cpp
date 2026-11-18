@@ -125,7 +125,9 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), llama_cache_buft(buft));
+        ggml_backend_buffer_type_t cache_buft = llama_cache_buft(buft);
+        data_external = data_external || cache_buft != buft;
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), cache_buft);
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for rs cache");
         }
@@ -927,10 +929,14 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
 
 void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
     const uint32_t s_trans = 0;
-    const uint32_t n_layer = hparams.n_layer();
+    // no layers when the backend holds the state: the tensors are unused memory (zeros), tens of MiB per checkpoint
+    const uint32_t n_layer = data_external ? 0 : hparams.n_layer();
 
     io.write(&s_trans, sizeof(s_trans));
     io.write(&n_layer, sizeof(n_layer));
+    if (data_external) {
+        return;
+    }
 
     // Iterate and write all the R tensors first, each row is a cell
     // Get whole range at a time
@@ -1126,6 +1132,14 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     uint32_t n_layer;
     io.read(&s_trans, sizeof(s_trans));
     io.read(&n_layer, sizeof(n_layer));
+
+    if (data_external && n_layer == 0) {  // a state saved without rows (see state_write_data): nothing to read
+        if (cell_count > size) {
+            LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, size);
+            return false;
+        }
+        return true;
+    }
 
     if (n_layer != hparams.n_layer()) {
         LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, hparams.n_layer());
