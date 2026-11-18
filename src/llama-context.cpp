@@ -4240,6 +4240,15 @@ void llama_context::state_write_backends(llama_io_write_i & io, llama_state_seq_
     }
 }
 
+void llama_context::state_flush_backends() {
+    for (auto & backend : backends) {
+        auto * flush_fn = (void (*)(ggml_backend_t)) llama_backend_state_proc(backend.get(), "ggml_backend_state_flush");
+        if (flush_fn) {
+            flush_fn(backend.get());
+        }
+    }
+}
+
 void llama_context::state_read_backends(llama_io_read_i & io, llama_state_seq_flags flags) {
     uint32_t count = 0;
     io.read(&count, sizeof(count));
@@ -5192,6 +5201,10 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
+void llama_state_seq_flush(llama_context * ctx) {
+    ctx->state_flush_backends();
+}
+
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ctx->synchronize();
 

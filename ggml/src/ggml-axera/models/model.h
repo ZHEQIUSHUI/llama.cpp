@@ -14,6 +14,8 @@ namespace axera {
 
 // llama.cpp's LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY. ggml does not include llama.h, so the value is repeated here.
 constexpr uint32_t state_flags_partial_only = 1;
+// llama.cpp's LLAMA_STATE_SEQ_FLAGS_DEFERRED: state_write may leave parts of dst to be filled until state_flush()
+constexpr uint32_t state_flags_deferred = 4;
 
 struct model {
     virtual ~model() = default;
@@ -23,6 +25,7 @@ struct model {
     virtual size_t state_size(uint32_t flags) const { (void) flags; return 0; }
     virtual size_t state_write(void * dst, size_t size, uint32_t flags) { (void) dst; (void) size; (void) flags; return 0; }
     virtual size_t state_read(const void * src, size_t size, uint32_t flags) { (void) src; (void) size; (void) flags; return 0; }
+    virtual void state_flush() {}  // every deferred state_write is complete on return (any thread)
     // The state machine's result for the graph that just failed (axera::seq_status; 0: no miss). llama.cpp turns a
     // seq miss into a retryable decode result so the server can discard the stale prompt and replay from cell 0.
     virtual int last_state_status() const { return 0; }

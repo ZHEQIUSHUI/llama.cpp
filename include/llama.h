@@ -931,7 +931,15 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// The backend may finish writing its part of the state after the call returns (a backend that keeps the KV cache in
+// device memory copies it out in the background, ahead of whatever overwrites it). The destination must stay valid
+// and unread until llama_state_seq_flush() returns.
+#define LLAMA_STATE_SEQ_FLAGS_DEFERRED 4
+
     typedef uint32_t llama_state_seq_flags;
+
+    // Every state gotten with LLAMA_STATE_SEQ_FLAGS_DEFERRED is complete when this returns. Thread-safe.
+    LLAMA_API void llama_state_seq_flush(struct llama_context * ctx);
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
             struct llama_context * ctx,

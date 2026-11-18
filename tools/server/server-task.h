@@ -8,6 +8,7 @@
 #include <list>
 #include <map>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <deque>
 #include <mutex>
@@ -737,6 +738,19 @@ struct server_prompt_data {
     size_t      map_main_size = 0;
     size_t      map_drft_size = 0;
     std::string map_tmp;  // a file still being written (store_disk() gives it its final name)
+    // the state was gotten with LLAMA_STATE_SEQ_FLAGS_DEFERRED: finish() calls it
+    std::function<void()> flush;
+    // checkpoint payloads the mapping has yet to receive (the slot gave them up; the cache thread copies them)
+    struct map_payload {
+        std::vector<uint8_t> bytes;
+        uint8_t *            dst = nullptr;
+    };
+    std::vector<map_payload> map_pending;
+    std::mutex               map_mutex;
+    // the mapping is complete on return (any thread); call before it is named or unmapped
+    void finish();
+    // only the checkpoint payloads (the deferred backend part stays on its way)
+    void finish_payloads();
 
     server_prompt_data() = default;
     server_prompt_data(const server_prompt_data &) = delete;
@@ -836,10 +850,14 @@ struct server_prompt_cache {
 
     void update();
 
+    // every state still being written is in its file on return (before the context goes away)
+    void finish_disk();
+
 private:
     struct job {
         enum type {
             SAVE,
+            COMMIT,  // a state written into its mapped file: wait for the deferred part, then name the file
             REMOVE,
         } type;
 
@@ -855,6 +873,7 @@ private:
     void enqueue(job && j);
     void worker_loop();
     bool save_file(const job & j) const;
+    bool commit_locked(std::list<std::shared_ptr<server_prompt_cache_state>>::iterator it);
 
     size_t size_locked() const;
     size_t disk_size_locked() const;

@@ -31,6 +31,11 @@
 #endif
 #include <atomic>
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <random>
+#include <thread>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -43,6 +48,7 @@ namespace axera {
 namespace {
 
 constexpr int PG = 256;          // cells per page = prefill rows per call
+constexpr size_t KVD_MARGIN = 16;  // pages past a run's last cell that count as written (a 4096-row call's padding)
 constexpr int WN = 4096;         // rows in the fixed MoE prefill workspace
 constexpr int KH = 16, VH = 32;  // key / value heads of a delta-net layer
 constexpr int REP = VH / KH;
@@ -79,7 +85,7 @@ struct sgl_state_header {
     uint32_t nkv_pages;
     uint32_t kv_total_pages;
     uint32_t kv_split;
-    uint32_t reserved;
+    uint32_t snap_id;  // 0, or the id of this full state among the adapter's KV snapshots (see kv_snap)
     int64_t  state_cell;
     uint64_t kv_page_b;
     uint64_t kv_n;
@@ -395,6 +401,40 @@ class qwen35_moe_sgl final : public model, public seq_model {
         }
         return axera_io(KVL.at(j).get(), KVL[j]->vir, bytes);  // (the kernel touches only the pages up to the history)
     }
+    // A deferred state_write (state_flags_deferred): the KV pages its blob still has to receive. A thread copies them
+    // out of the pools while the next sequence runs; whoever is about to write a page copies it first (kvd_finish).
+    std::mutex              kvd_mu;
+    std::condition_variable kvd_cv;
+    std::vector<uint8_t>    kvd_st;             // per page: 0 pending, 1 being copied, 2 in the blob
+    char *                  kvd_dst   = nullptr;  // the blob's KV area, [layer][page]
+    std::vector<std::pair<const axera_cmm *, char *>> kvd_src;  // per layer: its pool and page 0 (taken at the write)
+    size_t                  kvd_pages = 0;
+    std::atomic<size_t>     kvd_left{0};        // pages not yet in the blob
+    std::thread             kvd_thread;
+    bool                    kvd_stop = false;
+    void                    kvd_copy_page(size_t p);
+    void                    kvd_finish(size_t page0, size_t pages_end);  // the pages [page0, pages_end) are in the blob on return
+    void                    kvd_loop();
+    void                    state_flush() override { kvd_finish(0, SIZE_MAX); }
+    // The full states written lately and, per page, whether the pools still hold that state's page. A restore of
+    // one of them copies back only the pages written since: after a short side request that is a few pages of a
+    // long conversation's hundreds.
+    struct kv_snap {
+        uint32_t             id   = 0;
+        int64_t              cell = 0;
+        std::vector<uint8_t> dirty;
+    };
+    std::deque<kv_snap> kv_snaps;  // newest first
+    void                kv_written(size_t page0, size_t pages_end, const kv_snap * except = nullptr);
+    // pages [page0, pages_end) of the pools are about to be written
+    void kv_touch(size_t page0, size_t pages_end) {
+        kvd_finish(page0, pages_end);
+        kv_written(page0, pages_end);
+    }
+  public:
+    ~qwen35_moe_sgl() override;
+
+  private:
     void         states_swap();
     void         sync_dec_states();
     void         materialize_deltas();
@@ -1575,6 +1615,7 @@ void qwen35_moe_sgl::seq_state_load(const uint8_t * src) {
 }
 
 bool qwen35_moe_sgl::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t * p4, int batch0, seq_snap * snap) {
+    kv_touch((size_t) (c0 / PG), (size_t) ((c0 + n + PG - 1) / PG) + KVD_MARGIN);
     materialize_deltas();  // a verify's accepted prefix was still pending in the delta buffers
     const ggml_bf16_t * xb = (const ggml_bf16_t *) x;
     const float *       xf = nullptr;
@@ -1640,6 +1681,7 @@ bool qwen35_moe_sgl::seq_run_pages(int64_t c0, int n, const uint16_t * x, const 
 }
 
 bool qwen35_moe_sgl::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p4, int batch_row) {
+    kv_touch((size_t) (c / PG), (size_t) (c / PG) + 1 + KVD_MARGIN);
     (void) batch_row;
     materialize_deltas();  // a verify's accepted prefix was still pending in the delta buffers
     decode(c, (const ggml_bf16_t *) x, p4, decode_h);
@@ -1702,6 +1744,7 @@ void qwen35_moe_sgl::write_out_rows(int64_t first, int n, const float * src) {
 }
 
 bool qwen35_moe_sgl::seq_run_verify(int64_t c, int n, const uint16_t * x, const int32_t * p4, int batch_row0) {
+    kv_touch((size_t) (c / PG), (size_t) ((c + n + PG - 1) / PG) + KVD_MARGIN);
     const uint16_t * xr = x;
     if (!xr) {
         src_rows.resize((size_t) n * H);
@@ -1759,6 +1802,91 @@ void qwen35_moe_sgl::seq_verify_peek(int k, uint8_t * dst) {
 
 // llama.cpp's sequence state (prompt cache / context checkpoint). The KV pools and recurrent state live in CMM, not
 // in the llama.cpp cache tensors, so this blob carries the KV pages before the current cell and core/seqstate's blob.
+void qwen35_moe_sgl::kvd_copy_page(size_t p) {
+    for (size_t j = 0; j < kvd_src.size(); ++j) {
+        char * src = kvd_src[j].second + p * kv_page_b;
+        (*kvd_src[j].first)->invalidate(src, kv_page_b);
+        memcpy(kvd_dst + (j * kvd_pages + p) * kv_page_b, src, kv_page_b);
+    }
+}
+
+void qwen35_moe_sgl::kv_written(size_t page0, size_t pages_end, const kv_snap * except) {
+    for (kv_snap & s : kv_snaps) {
+        if (&s != except) {
+            for (size_t p = page0; p < std::min(pages_end, s.dirty.size()); ++p) {
+                s.dirty[p] = 1;
+            }
+        }
+    }
+}
+
+void qwen35_moe_sgl::kvd_finish(size_t page0, size_t pages_end) {
+    if (kvd_left.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(kvd_mu);
+    const size_t                 n = std::min(pages_end, kvd_st.size());
+    for (size_t p = page0; p < n; ++p) {
+        if (kvd_st[p] == 0) {
+            kvd_st[p] = 1;
+            lock.unlock();
+            kvd_copy_page(p);
+            lock.lock();
+            kvd_st[p] = 2;
+            kvd_left.fetch_sub(1, std::memory_order_release);
+        }
+    }
+    kvd_cv.notify_all();
+    kvd_cv.wait(lock, [&] {  // pages the thread had already taken
+        for (size_t p = page0; p < n; ++p) {
+            if (kvd_st[p] == 1) {
+                return false;
+            }
+        }
+        return true;
+    });
+}
+
+void qwen35_moe_sgl::kvd_loop() {
+    std::unique_lock<std::mutex> lock(kvd_mu);
+    for (;;) {
+        size_t p = 0;
+        kvd_cv.wait(lock, [&] {
+            if (kvd_stop) {
+                return true;
+            }
+            for (p = 0; p < kvd_st.size(); ++p) {
+                if (kvd_st[p] == 0) {
+                    return true;
+                }
+            }
+            return false;
+        });
+        if (kvd_stop) {
+            return;
+        }
+        kvd_st[p] = 1;
+        lock.unlock();
+        kvd_copy_page(p);
+        lock.lock();
+        kvd_st[p] = 2;
+        kvd_left.fetch_sub(1, std::memory_order_release);
+        kvd_cv.notify_all();
+    }
+}
+
+qwen35_moe_sgl::~qwen35_moe_sgl() {
+    kvd_finish(0, SIZE_MAX);
+    {
+        std::lock_guard<std::mutex> lock(kvd_mu);
+        kvd_stop = true;
+    }
+    kvd_cv.notify_all();
+    if (kvd_thread.joinable()) {
+        kvd_thread.join();
+    }
+}
+
 size_t qwen35_moe_sgl::state_size(uint32_t flags) const {
     if (!kv_page_b || !banks.count("b0_attn_state_in") || !seq) {
         return 0;
@@ -1799,6 +1927,20 @@ size_t qwen35_moe_sgl::state_write(void * dst, size_t size, uint32_t flags) {
     h.kv_total_pages = (uint32_t) kv_total_pages;
     h.kv_split       = kv_split;
     h.state_cell     = seq->cell();
+    if (!partial && nkv_pages > 0) {
+        static std::mt19937 rng{std::random_device{}()};
+        do {
+            h.snap_id = (uint32_t) rng();
+        } while (h.snap_id == 0);
+        kv_snap s;
+        s.id   = h.snap_id;
+        s.cell = h.state_cell;
+        s.dirty.assign(nkv_pages, 0);
+        kv_snaps.push_front(std::move(s));
+        if (kv_snaps.size() > 4) {
+            kv_snaps.pop_back();
+        }
+    }
     h.kv_page_b      = kv_page_b;
     h.kv_n           = partial ? 0 : (uint64_t) NB * nkv_pages * kv_page_b;
     h.seq_n          = seq_n;
@@ -1807,6 +1949,27 @@ size_t qwen35_moe_sgl::state_write(void * dst, size_t size, uint32_t flags) {
     memcpy(p, &h, sizeof(h));
     p += sizeof(h);
     if (!partial) {
+        kvd_finish(0, SIZE_MAX);  // an earlier deferred blob
+    }
+    if (!partial && (flags & state_flags_deferred) && nkv_pages > 0) {
+        {
+            std::lock_guard<std::mutex> lock(kvd_mu);
+            kvd_dst   = p;
+            kvd_pages = nkv_pages;
+            kvd_src.clear();
+            for (int j = 0; j < NB; ++j) {
+                const axera_cmm & c = kv_split ? KVL[j] : B("b3_kv");
+                kvd_src.emplace_back(&c, (char *) c->vir + (kv_split ? 0 : (size_t) j * kv_total_pages * kv_page_b));
+            }
+            kvd_st.assign(nkv_pages, 0);
+            kvd_left.store(nkv_pages, std::memory_order_release);
+            if (!kvd_thread.joinable()) {
+                kvd_thread = std::thread([this] { kvd_loop(); });
+            }
+        }
+        kvd_cv.notify_all();
+        p += (size_t) NB * nkv_pages * kv_page_b;
+    } else if (!partial) {
         const size_t page_n = nkv_pages * kv_page_b;
         if (kv_split) {
             for (const axera_cmm & c : KVL) {
@@ -1824,10 +1987,15 @@ size_t qwen35_moe_sgl::state_write(void * dst, size_t size, uint32_t flags) {
             }
         }
     }
+    const int64_t t_seq0 = ggml_time_us();
     if (seq->write((uint8_t *) p, seq_n, partial) != seq_n) {
         return 0;
     }
     p += seq_n;
+    if (getenv("GGML_AXERA_STATE_TIMES")) {
+        fprintf(stderr, "axera state write: %s, kv pages %zu%s, seq blob %.1f MiB in %.1f ms\n", partial ? "partial" : "full",
+                nkv_pages, (flags & state_flags_deferred) ? " deferred" : "", seq_n / 1048576.0, (ggml_time_us() - t_seq0) / 1000.0);
+    }
     return (size_t) (p - (char *) dst);
 }
 
@@ -1853,22 +2021,63 @@ size_t qwen35_moe_sgl::state_read(const void * src, size_t size, uint32_t flags)
     }
     const char * p = (const char *) src + sizeof(h);
     if (!h.partial) {
-        const size_t page_n = h.nkv_pages * h.kv_page_b;
-        if (kv_split) {
-            for (const axera_cmm & c : KVL) {
-                memcpy(c->vir, p, page_n);
-                c->flush(c->vir, page_n);
-                p += page_n;
-            }
-        } else {
-            const axera_cmm & c = B("b3_kv");
-            for (int j = 0; j < NB; ++j) {
-                char * d = (char *) c->vir + (size_t) j * kv_total_pages * kv_page_b;
-                memcpy(d, p, page_n);
-                c->flush(d, page_n);
-                p += page_n;
+        // the pools' pages that already hold this state stay (see kv_snap); src may be a deferred blob still being
+        // filled, whose pages are complete exactly where the pools were written since
+        kv_snap * snap = nullptr;
+        for (kv_snap & s : kv_snaps) {
+            if (h.snap_id != 0 && s.id == h.snap_id && s.cell == h.state_cell && s.dirty.size() == h.nkv_pages) {
+                snap = &s;
             }
         }
+        const bool check = snap && getenv("GGML_AXERA_STATE_CHECK") != nullptr;
+        if (!snap || check) {
+            kvd_finish(0, SIZE_MAX);
+        }
+        size_t copied = 0, wrong = 0;
+        for (size_t pg = 0; pg < h.nkv_pages; ++pg) {
+            bool take = !snap || snap->dirty[pg];
+            if (!take && check) {
+                for (int j = 0; j < NB && !take; ++j) {
+                    const axera_cmm & c = kv_split ? KVL[j] : B("b3_kv");
+                    char * d = (char *) c->vir + ((kv_split ? 0 : (size_t) j * kv_total_pages) + pg) * kv_page_b;
+                    c->invalidate(d, kv_page_b);
+                    take = memcmp(d, p + ((size_t) j * h.nkv_pages + pg) * kv_page_b, kv_page_b) != 0;
+                }
+                wrong += take;
+            }
+            if (!take) {
+                continue;
+            }
+            kvd_finish(pg, pg + 1);
+            for (int j = 0; j < NB; ++j) {
+                const axera_cmm & c = kv_split ? KVL[j] : B("b3_kv");
+                char * d = (char *) c->vir + ((kv_split ? 0 : (size_t) j * kv_total_pages) + pg) * kv_page_b;
+                memcpy(d, p + ((size_t) j * h.nkv_pages + pg) * kv_page_b, kv_page_b);
+                c->flush(d, kv_page_b);
+            }
+            kv_written(pg, pg + 1, snap);
+            ++copied;
+        }
+        if (wrong) {
+            GGML_LOG_ERROR("axera qwen35_35b_a3b: state restore found %zu KV pages changed without a record\n", wrong);
+        }
+        if (getenv("GGML_AXERA_STATE_TIMES")) {
+            fprintf(stderr, "axera state read: %zu of %u kv pages copied%s%s\n", copied, h.nkv_pages, snap ? " (snapshot)" : "",
+                    check ? (wrong ? ", CHECK FAILED" : ", check ok") : "");
+        }
+        if (snap) {
+            std::fill(snap->dirty.begin(), snap->dirty.end(), 0);
+        } else if (h.snap_id != 0) {
+            kv_snap s;
+            s.id   = h.snap_id;
+            s.cell = h.state_cell;
+            s.dirty.assign(h.nkv_pages, 0);
+            kv_snaps.push_front(std::move(s));
+            if (kv_snaps.size() > 4) {
+                kv_snaps.pop_back();
+            }
+        }
+        p += (size_t) NB * h.nkv_pages * h.kv_page_b;
     }
     if (seq->read((const uint8_t *) p, h.seq_n) != h.seq_n) {
         return 0;
@@ -1889,6 +2098,7 @@ size_t qwen35_moe_sgl::state_read(const void * src, size_t size, uint32_t flags)
 // T (2 - 4) consecutive tokens from cell c0 through the verification kernel. The recurrent state stays in its pool at
 // the entry cell; the accepted prefix is folded in by the next call. The hidden rows of all T rows land in ver_h.
 bool qwen35_moe_sgl::verify(int64_t c0, const ggml_bf16_t * xb, const int32_t * pb, int T) {
+    kv_touch((size_t) (c0 / PG), (size_t) ((c0 + T + PG - 1) / PG) + KVD_MARGIN);
     GGML_ASSERT(ver.k && T >= 1 && T <= ver_rows);
     {
         axera_timer tc("conv save");
@@ -2105,6 +2315,7 @@ void qwen35_moe_sgl::init_fused() {
 void qwen35_moe_sgl::prefill_fused(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h,
                                    int out0, seq_snap * snap) {
     GGML_ASSERT(c0 % PG == 0 && c0 + n <= kv_cells);
+    kv_touch((size_t) (c0 / PG), (size_t) ((c0 + n + PG - 1) / PG) + KVD_MARGIN);
     const size_t xr = (size_t) H * sizeof(ggml_bf16_t);
     const int    NR = (int) (XS->size / xr);
     for (int g0 = 0; g0 < n; g0 += NR) {
@@ -2429,6 +2640,7 @@ void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const flo
                              const int32_t * toks, const int32_t * p4, float * h,
                              const std::vector<int> & out_rows) {
     GGML_ASSERT(c0 % PG == 0 && c0 + n <= kv_cells);
+    kv_touch((size_t) (c0 / PG), (size_t) ((c0 + n + PG - 1) / PG) + KVD_MARGIN);
     GGML_ASSERT((x != nullptr) + (xf != nullptr) + (toks != nullptr) == 1);
     const size_t xr = (size_t) H * sizeof(ggml_bf16_t);
     for (int r0 = 0; r0 < n; r0 += WN) {
@@ -2585,6 +2797,7 @@ void qwen35_moe_sgl::prefill(int64_t c0, int n, const ggml_bf16_t * x, const flo
 
 // one token at cell c > 0, its history the c cells before it
 void qwen35_moe_sgl::decode(int64_t c, const ggml_bf16_t * x, const int32_t * p4, float * h) {
+    kv_touch((size_t) (c / PG), (size_t) (c / PG) + 1 + KVD_MARGIN);
     {
         axera_timer ts("decode host: sync states");
         sync_dec_states();

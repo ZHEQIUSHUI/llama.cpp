@@ -395,20 +395,32 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        const int64_t t_save0 = ggml_time_us();
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
         }
+        const int64_t t_save1 = ggml_time_us();
 
         GGML_ASSERT(cur->data);
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data->main_data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        // into a mapped cache file the backend may copy its KV pages after this returns (see store_disk)
+        llama_state_seq_flags flags_tgt = LLAMA_STATE_SEQ_FLAGS_NONE;
+        if (cur->data->map) {
+            llama_context * ctx = ctx_tgt;
+            cur->data->flush    = [ctx]() { llama_state_seq_flush(ctx); };
+            flags_tgt           = LLAMA_STATE_SEQ_FLAGS_DEFERRED;
+        }
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data->main_data(), cur_size_tgt, id, flags_tgt);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data->drft_data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
+        const bool mapped = cur->data->map != nullptr;
         if (prompt_cache.disk_enabled()) {
             prompt_cache.store_disk(*cur);
         }
+        SRV_INF("prompt cache save: %.1f MiB state%s, entry %.1f ms, state %.1f ms\n", cur_size / (1024.0 * 1024.0),
+                mapped ? " into the cache file" : "", (t_save1 - t_save0) / 1000.0, (ggml_time_us() - t_save1) / 1000.0);
 
         return true;
     }
@@ -1716,6 +1728,7 @@ private:
 
             const int64_t t_start = ggml_time_us();
             const bool saved = slot.prompt_save(*prompt_cache);
+            prompt_cache->finish_disk();
             prompt_cache->update();
             SRV_TRC("prompt cache shutdown save: slot %d, %d tokens, saved = %d, %.1f ms\n",
                     slot.id, slot.prompt.n_tokens(), saved ? 1 : 0, (ggml_time_us() - t_start) / 1000.0);

@@ -93,6 +93,12 @@ struct composite final : model {
     int last_state_status() const override {
         return llm ? llm->last_state_status() : 0;
     }
+
+    void state_flush() override {
+        if (llm) {
+            llm->state_flush();
+        }
+    }
 };
 
 }  // namespace
