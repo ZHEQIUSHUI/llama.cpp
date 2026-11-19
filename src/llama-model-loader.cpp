@@ -1126,6 +1126,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
+    // an NVFP4 scale sidecar that carries one global scale per quantized slice (a fused qkv) has one element per
+    // output row; the graph broadcasts it with ggml_mul.  Take the shape from the file when it is a vector.
+    std::vector<int64_t> ne_v(ne.begin(), ne.end());
+    if (flags & TENSOR_SCALE_VECTOR) {
+        const struct ggml_tensor * meta = get_tensor_meta(tn.str().c_str());
+        if (meta && meta->ne[0] > 1 && meta->ne[0] != ne_v[0]) {
+            ne_v.assign(1, meta->ne[0]);
+        }
+    }
+
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         const ctx_key key { buft, is_lazy };
 
@@ -1308,8 +1318,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // for tensors that are not required some of the dimensions can be invalid:
         if (flags & TENSOR_NOT_REQUIRED) {
-            for (size_t dim = 0; dim < ne.size(); dim++) {
-                if (ne.begin()[dim] <= 0) {
+            for (size_t dim = 0; dim < ne_v.size(); dim++) {
+                if (ne_v[dim] <= 0) {
                     return nullptr;
                 }
             }
@@ -1319,7 +1329,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         memset(&t_meta, 0, sizeof(ggml_tensor));
         t_meta.type = type;
         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-            t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+            t_meta.ne[dim] = dim < ne_v.size() ? ne_v[dim] : 1;
             GGML_ASSERT(t_meta.ne[dim] >= 1);
             if (dim == 0) {
                 t_meta.nb[dim] = ggml_type_size(type);
@@ -1341,7 +1351,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
-    const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
+    const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne_v, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
         return NULL;
     }
@@ -1354,7 +1364,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_tensor t_meta = *cur;
     if (flags & TENSOR_ALLOW_RESHAPE) {
         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-            t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+            t_meta.ne[dim] = dim < ne_v.size() ? ne_v[dim] : 1;
             if (dim == 0) {
                 t_meta.nb[dim] = ggml_type_size(t_meta.type);
             } else if (dim == 1) {
