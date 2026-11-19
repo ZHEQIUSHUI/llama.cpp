@@ -1149,18 +1149,28 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
     kv_blk_b = pkv.bytes / (size_t) KB;
     // [..][KB][pages][2][PG][KV heads][256]
     kv_pages = (int) pkv.shape[kd - 5];
-    kv_cells = man.context;
-    GGML_ASSERT((int64_t) kv_pages * PG >= (int64_t) man.context);
     NBLK = kv_pages;
+    GGML_ASSERT((int64_t) NBLK * PG >= (int64_t) man.context);
+    // A one-block bank has a fixed page stride and can hold only the pages the
+    // requested context needs, like the released 27B prefill.  A multi-block
+    // bank needs every page to keep the block stride in the compiled IO.
+    if (const int64_t cells = axera_kv_cells(); cells > 0 && KB == 1) {
+        kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(NBLK, (cells + PG - 1) / PG));
+    }
+    if (const char * e = getenv("GGML_AXERA_KV_PAGES")) {
+        kv_pages = std::max(1, std::min(NBLK, atoi(e)));
+    }
+    GGML_ASSERT(kv_pages == NBLK || KB == 1);
+    kv_cells = (int64_t) kv_pages * PG;
     ROT  = 64;
 
     kv_b      = pkv.bytes;  // one call's KV bank (KB blocks)
-    kv_alloc  = kv_b;
+    kv_alloc  = kv_b / (size_t) NBLK * (size_t) kv_pages;
     kvs_b     = 0;
     kvs_alloc = 0;
     KVC.resize(NC);
     for (int c = 0; c < NC; ++c) {
-        KVC[c] = axera_cmm_alloc(kv_b);
+        KVC[c] = axera_cmm_alloc(kv_alloc);
     }
     KVSC.clear();
     ST = axera_cmm_alloc(st_b * (size_t) NB * 3);
@@ -1238,7 +1248,7 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
                 } else if (n == "valid_tokens") {
                     c.in.push_back(axera_io(VALID, d.bytes));
                 } else if (n == "b3_kv") {
-                    GGML_ASSERT(d.bytes == kv_b);
+                    GGML_ASSERT(d.bytes == kv_b && KVC[ci]->size >= kv_alloc);
                     c.in.push_back(axera_io(KVC[ci], kv_b));
                 } else if (n.size() > 2 && n[0] == 'b' && n[1] >= '0' && n[1] <= '2' &&
                            (n.find("_state_in") != std::string::npos || n.find("_state_out") != std::string::npos ||
