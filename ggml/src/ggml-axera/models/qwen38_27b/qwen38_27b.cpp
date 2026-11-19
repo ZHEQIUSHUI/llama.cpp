@@ -1273,6 +1273,10 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
                 pk.in_bytes("position_ids") == 3 * (size_t) PG * sizeof(int32_t) &&
                 pk.out_bytes("output") == (size_t) PG * H * sizeof(ggml_bf16_t));
     bind(pk, P.calls, false);
+    // Consecutive calls alternate OUT[0] and OUT[1]. With more than one call
+    // (the 2-block grouping used by the 4 GiB KV limit) the page's final rows
+    // are in the last call's buffer, not always OUT[0].
+    P.result = (NC - 1) & 1;
     bind(dk, dec, true);
 
     ord.assign(L, 0);
