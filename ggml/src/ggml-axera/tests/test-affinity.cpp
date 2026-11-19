@@ -16,6 +16,17 @@ static void expect(const char * value, bool enabled, const std::vector<int> & co
     }
 }
 
+static void expect_mask(const char * value, int compiled, uint32_t mask, bool bad) {
+    std::string    error;
+    const auto     got = axera::parse_npu_cores(value, error);
+    const uint32_t m   = axera::kernel_affinity_mask(got, compiled, error);
+    if (error.empty() == bad || (!bad && m != mask)) {
+        std::fprintf(stderr, "mask(%s,%d)=0x%x error=%s, expected 0x%x bad=%d\n", value, compiled, m, error.c_str(), mask,
+                     bad);
+        ++failures;
+    }
+}
+
 int main() {
     expect(nullptr, false, {}, 0, false);
     expect("2", true, { 2 }, 0x30, false);
@@ -26,6 +37,12 @@ int main() {
     expect("4", true, {}, 0, true);
     expect("1,1", true, {}, 0, true);
     expect("1,x", true, {}, 0, true);
+
+    expect_mask("0,1", 2, 0x3, false);
+    expect_mask("0,2", 2, 0x30, false);
+    expect_mask("0,3", 2, 0xc0, false);
+    expect_mask("1,2", 2, 0, true);
+    expect_mask("0,1", 1, 0xf, false);
 
     const char * names[] = {
         "qwen35_2b_group12_gggagggaggga_mx8_kvc_c262144_npu1.axmodel",

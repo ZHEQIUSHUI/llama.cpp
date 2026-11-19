@@ -19,4 +19,10 @@ core_selection parse_npu_cores(const char * value, std::string & error);
 // The kernel file names end in _npu<count>. -1 means the name carries no count (e.g. an in-memory helper).
 int kernel_compiled_cores(const std::string & file);
 
+// Translate a physical-core selection into the SDK's affinity bitmap for a kernel compiled for `compiled` cores.
+// The AX8860 engine runs a 2-core model on core 0 plus the core named by the bitmap, so {0,1} is 0x3 and
+// {0,2}/{0,3} are 0x30/0xc0; 0xf (four VNPU bits) is rejected by the SDK. Returns 0 and sets error when the
+// selection cannot be expressed.
+uint32_t kernel_affinity_mask(const core_selection & sel, int compiled, std::string & error);
+
 }  // namespace axera

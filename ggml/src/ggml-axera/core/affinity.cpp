@@ -83,4 +83,17 @@ int kernel_compiled_cores(const std::string & file) {
     return n;
 }
 
+uint32_t kernel_affinity_mask(const core_selection & sel, int compiled, std::string & error) {
+    error.clear();
+    if (compiled == 2) {
+        if (sel.cores.size() != 2 || sel.cores[0] != 0) {
+            error = "2-core kernels on AX8860 run core 0 as master; valid selections are 0,1, 0,2 and 0,3";
+            return 0;
+        }
+        // Selecting core 0 makes the engine complete the pair with core 1; another second core is named directly.
+        return sel.cores[1] == 1 ? 0x3u : (3u << (2 * sel.cores[1]));
+    }
+    return sel.vnpu_mask;
+}
+
 }  // namespace axera

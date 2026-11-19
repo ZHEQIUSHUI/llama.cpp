@@ -157,16 +157,21 @@ void axera_npu_set_affinity(AX_ENGINE_HANDLE handle, const char * role, const ch
         return;
     }
     axera_npu_check_cores(role, file);
-    int ret = AX_ENGINE_SetAffinity(handle, sel.vnpu_mask);
+    const int compiled = axera::kernel_compiled_cores(file);
+    std::string error;
+    const uint32_t mask = axera::kernel_affinity_mask(sel, compiled, error);
+    if (!error.empty()) {
+        GGML_ABORT("axera: GGML_AXERA_NPU_CORES: %s (kernel %s, %s)\n", error.c_str(), role, file);
+    }
+    int ret = AX_ENGINE_SetAffinity(handle, mask);
     if (ret != 0) {
-        GGML_ABORT("axera: AX_ENGINE_SetAffinity(0x%x) failed for kernel %s (%s): 0x%x\n", sel.vnpu_mask, role, file,
-                   ret);
+        GGML_ABORT("axera: AX_ENGINE_SetAffinity(0x%x) failed for kernel %s (%s): 0x%x\n", mask, role, file, ret);
     }
     AX_ENGINE_NPU_SET_T got = 0;
     ret = AX_ENGINE_GetAffinity(handle, &got);
-    if (ret != 0 || got != sel.vnpu_mask) {
+    if (ret != 0 || got != mask) {
         GGML_ABORT("axera: AX_ENGINE_GetAffinity readback for kernel %s (%s) is 0x%x, expected 0x%x (ret 0x%x)\n", role,
-                   file, got, sel.vnpu_mask, ret);
+                   file, got, mask, ret);
     }
     GGML_LOG_INFO("axera: kernel %s (%s) affinity 0x%x\n", role, file, got);
 }
