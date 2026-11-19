@@ -5,6 +5,7 @@
 
 #include "model.h"
 
+#include <cstdlib>
 #include <map>
 #include <mutex>
 
@@ -175,11 +176,20 @@ model_caps model_caps_of(const manifest & m) {
     c.owns_kv_cache = n == "qwen38_27b" || n == "qwen35_whole" || n == "qwen35_moe_sgl" || n == "minicpmv4_7" ||
                       n == "cpm5" || n == "hymt" || n == "hy_mt2";
     c.sched_io_only = n == "qwen38_27b" || n == "qwen35_moe_sgl" || n == "minicpmv4_7" || n == "hy_mt2";
+    c.causal_cells  = n == "qwen38_27b";
     // VoxCPM2's base LM: on the NPU only when the manifest carries its prefill kernel (else llama.cpp runs it on the CPU)
     if (n == "voxcpm2_base" && m.has("prefill")) {
         c.owns_kv_cache = c.sched_io_only = true;
     }
     return c;
+}
+
+bool kq_mask_check() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_AXERA_KQ_MASK_CHECK");
+        return e && atoi(e) != 0;
+    }();
+    return on;
 }
 
 bool mmproj_host_weights(const manifest & m) {

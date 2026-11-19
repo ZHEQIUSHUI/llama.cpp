@@ -49,6 +49,9 @@ struct kv_view {
     int64_t             N = 0;   // cells per stream
     int                 BC = 0;  // KV block of the attention kernels' masks
     int64_t             W = 0;   // mask width: llama.cpp's n_kv rounded up to whole blocks (cells past n_kv hidden)
+    // llama.cpp left the mask a shape only (not an input, see model_caps.causal_cells): a token's row is the cells up
+    // to its own
+    bool                synth = false;
 
     kv_view() = default;
     kv_view(const ggml_tensor * k_idxs, const ggml_tensor * kqm, int64_t N, int BC);
@@ -57,6 +60,7 @@ struct kv_view {
     int64_t cell_of(int t) const { return ((const int64_t *) k_idxs->data)[t] % N; }
     // KQ mask row of token t -> bf16 over the first W cells (-3e38 hidden); returns the blocks to scan
     int mask_row(int t, ggml_bf16_t * dst) const;
+    int mask_row_llama(int t, ggml_bf16_t * dst) const;  // (the row as llama.cpp filled it)
     // the mask [nblk][R][BC] of a chunk of P = R rows from token it with n real tokens (the padding rows the last
     // one's): from two mask rows when the tokens are one sequence's consecutive cells (llama.cpp's causal mask), else
     // row by row. Returns nblk

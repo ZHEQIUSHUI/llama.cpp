@@ -1,5 +1,7 @@
 // Axera NPU backend ops: the graph's tensors by name, the KV cache and KQ mask, RoPE, the output head, CPU nodes
 
+#include <atomic>
+#include "../models/model.h"
 #include "ops.h"
 #include "../core/argmax_state.h"
 
@@ -291,9 +293,46 @@ const float * final_norm(const ggml_tensor * mul, int H, float * eps) {
 //
 
 kv_view::kv_view(const ggml_tensor * k_idxs, const ggml_tensor * kqm, int64_t N, int BC) :
-    k_idxs(k_idxs), kqm(kqm), N(N), BC(BC), W(std::min<int64_t>(N, (kqm->ne[0] + BC - 1) / BC * BC)) {}
+    k_idxs(k_idxs), kqm(kqm), N(N), BC(BC), W(std::min<int64_t>(N, (kqm->ne[0] + BC - 1) / BC * BC)),
+    synth((kqm->flags & GGML_TENSOR_FLAG_INPUT) == 0) {}
+
+// the row of a token whose sequence filled its cells in order: the cells up to its own
+static int kq_causal_row(const kv_view & kv, int t, uint16_t * d) {
+    const uint16_t ninf = ggml_fp32_to_bf16(-3e38f).bits;
+    const int64_t  c    = kv.cell_of(t);
+    GGML_ASSERT(c >= 0 && c < kv.W);
+    std::fill(d, d + c + 1, (uint16_t) 0);
+    std::fill(d + c + 1, d + kv.W, ninf);
+    return (int) (c / kv.BC + 1);
+}
 
 int kv_view::mask_row(int t, ggml_bf16_t * dst) const {
+    if (synth) {
+        return kq_causal_row(*this, t, (uint16_t *) dst);
+    }
+    const int nblk = mask_row_llama(t, dst);
+    if (kq_mask_check()) {
+        static std::atomic<int64_t> n_rows{ 0 };
+        std::vector<uint16_t>       ref(W);
+        const int                   nb = kq_causal_row(*this, t, ref.data());
+        if (nb != nblk || memcmp(ref.data(), dst, (size_t) W * sizeof(uint16_t)) != 0) {
+            int64_t c = 0;
+            while (c < W && ref[c] == ((const uint16_t *) dst)[c]) {
+                ++c;
+            }
+            fprintf(stderr, "axera: GGML_AXERA_KQ_MASK_CHECK: row %d (cell %lld, stream %lld) differs from the causal row at cell %lld "
+                            "(blocks %d vs %d)\n", t, (long long) cell_of(t), (long long) stream_of(t), (long long) c, nblk, nb);
+            GGML_ABORT("KQ mask check failed");
+        }
+        const int64_t n = ++n_rows;
+        if ((n & (n - 1)) == 0) {
+            fprintf(stderr, "axera: GGML_AXERA_KQ_MASK_CHECK: %lld rows equal (cell %lld)\n", (long long) n, (long long) cell_of(t));
+        }
+    }
+    return nblk;
+}
+
+int kv_view::mask_row_llama(int t, ggml_bf16_t * dst) const {
     const uint16_t ninf = ggml_fp32_to_bf16(-3e38f).bits;  // finite, as the kernels' own masking: no inf - inf
     const char *   row  = (const char *) kqm->data + (kqm->ne[3] == 1 ? t * kqm->nb[1] :
                                                           (t / kqm->ne[1]) * kqm->nb[3] + (t % kqm->ne[1]) * kqm->nb[1]);

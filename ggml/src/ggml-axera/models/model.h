@@ -43,11 +43,18 @@ std::shared_ptr<model> make_model(const manifest & m);
 //   owns_kv_cache  it keeps the KV cache in its own CMM pools, llama.cpp's cache tensors are unused (lazy host memory)
 //   sched_io_only  of a language-model graph it reads the inputs and writes the outputs only; every other tensor the
 //                  scheduler plans is unused and can live in lazy host memory instead of CMM
+//   causal_cells   every sequence it runs fills its cells in order from cell 0 (core/seqstate): a token sees exactly
+//                  the cells up to its own, so llama.cpp need not fill the KQ mask (n_kv x n_ubatch values per batch,
+//                  and that much scheduler memory). GGML_AXERA_KQ_MASK_CHECK=1 keeps the mask and compares every row.
 struct model_caps {
     bool owns_kv_cache = false;
     bool sched_io_only = false;
+    bool causal_cells  = false;
 };
 model_caps model_caps_of(const manifest & m);
+// GGML_AXERA_KQ_MASK_CHECK=1: llama.cpp fills the KQ mask also for a causal_cells adapter, and every row taken from it
+// is compared with the row derived from the token's cell (aborts on a difference)
+bool kq_mask_check();
 // the manifest's vision adapter copies the mmproj weights its kernel reads into its own CMM (one kernel for the whole
 // encoder): mtmd may then keep the mmproj as a file mapping. Adapters that bind weight tensors in place need CMM.
 bool mmproj_host_weights(const manifest & m);

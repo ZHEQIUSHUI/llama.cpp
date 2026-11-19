@@ -481,6 +481,13 @@ static bool ggml_backend_axera_offload_input_layer() {
     return m && m->model == "qwen35_moe_sgl";
 }
 
+// the adapter derives a token's visible cells from its own cell (model_caps.causal_cells): llama.cpp leaves the KQ mask
+// a shape only
+static bool ggml_backend_axera_kq_mask_unused() {
+    const axera::manifest * m = axera::kernels();
+    return m && axera::model_caps_of(*m).causal_cells && !axera::kq_mask_check();
+}
+
 static bool ggml_backend_axera_host_visible_output() {
     // this adapter writes the logits in host-visible CMM: llama.cpp reads them in place instead of copying 1 MiB
     const axera::manifest * m = axera::kernels();
@@ -617,6 +624,9 @@ static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_mmproj_host_weights") == 0) {
         return (void *) ggml_backend_axera_mmproj_host_weights;
+    }
+    if (strcmp(name, "ggml_backend_kq_mask_unused") == 0) {
+        return (void *) ggml_backend_axera_kq_mask_unused;
     }
     if (strcmp(name, "ggml_backend_sched_reserve_outputs") == 0) {
         return (void *) ggml_backend_axera_sched_reserve_outputs;

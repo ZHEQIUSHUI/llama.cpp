@@ -230,6 +230,16 @@ llama_context::llama_context(
         }
     }
 
+    // an adapter that derives the visible cells itself: only the mask goes
+    for (const auto & dev : model.devices) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev.dev);
+        auto fn = (bool (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_kq_mask_unused");
+        if (fn && fn()) {
+            cparams.kq_mask_used = false;
+            break;
+        }
+    }
+
     if (getenv("LLAMA_GRAPH_PROF")) {
         fprintf(stderr, "attn inputs: devices %zu, kq_mask_used %d, v_idxs_used %d\n", model.devices.size(),
                 (int) cparams.kq_mask_used, (int) cparams.v_idxs_used);
