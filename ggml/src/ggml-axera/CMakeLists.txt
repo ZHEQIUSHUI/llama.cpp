@@ -10,6 +10,7 @@ message(STATUS "Axera BSP: ${GGML_AXERA_BSP_DIR}")
 
 ggml_add_backend_library(ggml-axera
                          ggml-axera.cpp
+                         core/affinity.cpp
                          core/runtime.cpp
                          core/manifest.cpp
                          core/quant.cpp

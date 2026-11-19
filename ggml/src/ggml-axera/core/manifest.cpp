@@ -234,6 +234,9 @@ kernel & manifest::load_memory(const std::string & role, std::vector<char> model
     k->model = std::move(model);
     int ret  = k->model.empty() ? -1 : AX_ENGINE_CreateHandle(&k->handle, k->model.data(), k->model.size());
     if (ret == 0) {
+        axera_npu_set_affinity(k->handle, role.c_str(), "<memory>");
+    }
+    if (ret == 0) {
         ret = AX_ENGINE_CreateContext(k->handle);
     }
     if (ret == 0) {
@@ -278,6 +281,9 @@ static std::unique_ptr<kernel> load_kernel(const std::string & dir, const kernel
     k->desc             = &d;
     k->model.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
     int ret = k->model.empty() ? -1 : AX_ENGINE_CreateHandle(&k->handle, k->model.data(), k->model.size());
+    if (ret == 0) {
+        axera_npu_set_affinity(k->handle, d.role.c_str(), d.file.c_str());
+    }
     if (ret == 0) {
         ret = AX_ENGINE_CreateContext(k->handle);
     }

@@ -9,6 +9,8 @@
 
 #include "ggml-impl.h"
 
+#include "affinity.h"
+
 #include <ax_engine_api.h>
 #include <ax_sys_api.h>
 
@@ -35,6 +37,10 @@ bool ggml_backend_buffer_is_axera(struct ggml_backend_buffer * buffer);
 
 // AX_SYS / AX_ENGINE, once per process; false if the NPU is unavailable
 bool axera_runtime_init();
+// GGML_AXERA_NPU_CORES: validate each kernel's compiled core count and bind its handle to those physical cores
+bool axera_npu_cores_enabled();
+void axera_npu_check_cores(const char * role, const char * file);
+void axera_npu_set_affinity(AX_ENGINE_HANDLE handle, const char * role, const char * file);
 // CMM total / free (/proc/ax_proc/mem_cmm_info)
 void axera_cmm_memory(size_t * free, size_t * total);
 // GGML_AXERA_KEEP_PAGES=1: the load keeps the old pinning and page-release timing, for debugging

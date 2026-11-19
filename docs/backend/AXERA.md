@@ -84,11 +84,22 @@ NPU (top-k 1 and 50 kernels); top-p < 1 is not supported.
 | Variable | Effect |
 |---|---|
 | `GGML_AXERA_KERNEL_DIR` | the kernel directory (default `./axera_kernels`); without a `manifest.json` the backend has no device |
+| `GGML_AXERA_NPU_CORES` | physical NPU cores for every kernel in the process, as a comma-separated list: `2`, `0,1`. The number of entries must match each kernel's `_npu<count>` suffix; a mismatch aborts the load. Unset keeps the SDK's affinity |
 | `GGML_AXERA_PROF=1` | time per kernel role and host step, printed at exit |
 | `GGML_AXERA_TRACE=1` | every graph: node count, host gap before it, run time |
 | `GGML_AXERA_TEMP_MAX=<°C>` | the thermal guard: a kernel waits while an NPU sensor reads above it, until 5 °C below (default 100; 0 off). A board without thermal trip points resets itself at about 109 °C, which a long prompt reaches in under a minute |
 
 None of them changes a result.
+
+`GGML_AXERA_NPU_CORES` binds each model handle with `AX_ENGINE_SetAffinity` before its context is created. The SDK's
+affinity value is a VNPU bitmap with two bits per physical AX8860 core, so core 0 is `0x3`, core 1 is `0xc`, core 2 is
+`0x30`, core 3 is `0xc0`, and `0,1` is `0xf`. The backend expands the physical-core list to that bitmap and verifies the
+`GetAffinity` readback. Kernels compiled for a different number of cores are rejected at load time rather than silently
+running on the wrong set. For example, a single-core model on core 2:
+
+```bash
+GGML_AXERA_NPU_CORES=2 GGML_AXERA_KERNEL_DIR=kernels_2b llama-completion -m model.gguf -ngl 99 -c 16384 -p hello
+```
 
 ## Source layout
 

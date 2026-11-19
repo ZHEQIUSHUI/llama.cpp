@@ -112,6 +112,65 @@ bool axera_runtime_init() {
     return ok;
 }
 
+// The selection is process-wide. Kernel handles are created after AX_ENGINE_Init; each one is checked against its
+// compiled core count and then bound before its context is created.
+static const axera::core_selection & axera_npu_cores() {
+    static const axera::core_selection sel = [] {
+        std::string error;
+        auto        s = axera::parse_npu_cores(std::getenv("GGML_AXERA_NPU_CORES"), error);
+        if (!error.empty()) {
+            GGML_ABORT("axera: %s\n", error.c_str());
+        }
+        return s;
+    }();
+    return sel;
+}
+
+bool axera_npu_cores_enabled() {
+    return axera_npu_cores().enabled;
+}
+
+void axera_npu_check_cores(const char * role, const char * file) {
+    const auto & sel = axera_npu_cores();
+    if (!sel.enabled) {
+        return;
+    }
+    const int compiled = axera::kernel_compiled_cores(file);
+    if (compiled < 0) {
+        GGML_LOG_INFO("axera: GGML_AXERA_NPU_CORES: cannot infer the core count of %s (%s); applying the selection\n",
+                      role, file);
+        return;
+    }
+    if (compiled != (int) sel.cores.size()) {
+        std::string list;
+        for (size_t i = 0; i < sel.cores.size(); ++i) {
+            list += (i ? "," : "") + std::to_string(sel.cores[i]);
+        }
+        GGML_ABORT("axera: GGML_AXERA_NPU_CORES=%s selects %zu core(s), but kernel %s (%s) was compiled for %d core(s)\n",
+                   list.c_str(), sel.cores.size(), role, file, compiled);
+    }
+}
+
+void axera_npu_set_affinity(AX_ENGINE_HANDLE handle, const char * role, const char * file) {
+    const auto & sel = axera_npu_cores();
+    if (!sel.enabled) {
+        return;
+    }
+    axera_npu_check_cores(role, file);
+    int ret = AX_ENGINE_SetAffinity(handle, sel.vnpu_mask);
+    if (ret != 0) {
+        GGML_ABORT("axera: AX_ENGINE_SetAffinity(0x%x) failed for kernel %s (%s): 0x%x\n", sel.vnpu_mask, role, file,
+                   ret);
+    }
+    AX_ENGINE_NPU_SET_T got = 0;
+    ret = AX_ENGINE_GetAffinity(handle, &got);
+    if (ret != 0 || got != sel.vnpu_mask) {
+        GGML_ABORT("axera: AX_ENGINE_GetAffinity readback for kernel %s (%s) is 0x%x, expected 0x%x (ret 0x%x)\n", role,
+                   file, got, sel.vnpu_mask, ret);
+    }
+    GGML_LOG_INFO("axera: kernel %s (%s) affinity 0x%x\n", role, file, got);
+}
+
 bool axera_keep_pages() {
     static const bool keep = [] {
         const char * e = std::getenv("GGML_AXERA_KEEP_PAGES");
