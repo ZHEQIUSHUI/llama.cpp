@@ -268,7 +268,7 @@ void hy_mt2::init(const std::map<std::string, ggml_tensor *> & t, const ggml_ten
     // subset with the same g0/g1 names.  A 2-body prefill reuses its g1
     // 12-layer bank for all four host calls, while decode's last bank has 11
     // layers.  Size each bank from the union of both manifests.
-    std::vector<std::map<std::string, uint32_t>> cbytes((size_t) nchunks);
+    std::vector<std::map<std::string, size_t>> cbytes((size_t) nchunks);
     for (const auto & d : dk.desc->in) {
         bank_n[d.name]     = d.bytes;
         bank_dtype[d.name] = d.dtype;
@@ -357,7 +357,7 @@ void hy_mt2::init(const std::map<std::string, ggml_tensor *> & t, const ggml_ten
     const uint32_t hidden_b = std::max<uint32_t>(pk.desc->out[0].bytes, dk.desc->out[0].bytes);
     io["output"]  = axera_cmm_alloc(hidden_b);
     io["hidden2"] = axera_cmm_alloc(hidden_b);
-    uint32_t route_bytes = 0;
+    size_t route_bytes = 0;
     for (const auto * desc : { pk.desc, dk.desc }) {
         for (const io_desc & d : desc->out) {
             if (d.name == "route_ids") {
