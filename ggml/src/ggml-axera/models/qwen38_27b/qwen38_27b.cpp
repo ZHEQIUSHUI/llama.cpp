@@ -113,7 +113,7 @@ class qwen38_27b final : public model, public seq_model {
     size_t    kv_alloc = 0, kvs_alloc = 0;  // the bytes of one layer's pool
     std::vector<call>              dec;
     int                            dec_result = 0;
-    axera_cmm                      A, B, C, D, COS, SIN, CS, PN, MASK;
+    axera_cmm                      A, A2, DIN, B, C, D, COS, SIN, CS, PN, MASK;
     // the current recurrent state of each delta-net layer: its pool part, or a verification snapshot's row (the
     // decode / verify calls' state outputs bound there); the snapshots of the verification groups, two sets
     struct place {
@@ -1165,18 +1165,29 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
     ROT  = 64;
 
     kv_b      = pkv.bytes;  // one call's KV bank (KB blocks)
-    kv_alloc  = kv_b / (size_t) NBLK * (size_t) kv_pages;
+    kv_alloc  = getenv("GGML_AXERA_KV_FULL") ? kv_b : kv_b / (size_t) NBLK * (size_t) kv_pages;
     kvs_b     = 0;
     kvs_alloc = 0;
     KVC.resize(NC);
     for (int c = 0; c < NC; ++c) {
         KVC[c] = axera_cmm_alloc(kv_alloc);
+        // A partially filled page is masked by the decode kernel, but a NaN in
+        // its untouched slots survives the additive mask (NaN + -3e38).  A
+        // fresh CMM pool can hold such patterns, so start it at a finite zero.
+        memset(KVC[c]->vir, 0, KVC[c]->size);
+        KVC[c]->flush();
     }
     KVSC.clear();
     ST = axera_cmm_alloc(st_b * (size_t) NB * 3);
     CQ = axera_cmm_alloc(cq_b * (size_t) NB * 3);
     CK = axera_cmm_alloc(cq_b * (size_t) NB * 3);
     CV = axera_cmm_alloc(cv_b * (size_t) NB * 3);
+    // A fresh CMM pool is not guaranteed to hold zero, and the recurrent state
+    // update reads it before writing.  Start from a finite zero like the KV.
+    for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
+        memset((*p)->vir, 0, (*p)->size);
+        (*p)->flush();
+    }
     state_image_b = ST->size + CQ->size + CK->size + CV->size;
 
     INDPTR  = axera_cmm_alloc(2 * sizeof(int32_t));
@@ -1188,13 +1199,18 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
     const int n_indices = (int) (pk.in_bytes("indices") / sizeof(int32_t));
     // The kernel's table input is sized for the manifest's maximum context;
     // a smaller -c allocates fewer KV pages but leaves this input unchanged.
-    GGML_ASSERT(n_indices >= (int) ((man.context + PG - 1) / PG) && n_indices >= kv_pages);
+    // A multi-block bank keeps every page (fixed block stride) even when the
+    // requested context is shorter, so the table only has to cover the context.
+    GGML_ASSERT(n_indices >= (int) ((man.context + PG - 1) / PG));
+    GGML_ASSERT(KB > 1 || n_indices >= kv_pages);
     for (int i = 0; i < n_indices; ++i) {
         ((int32_t *) INDICES->vir)[i] = i;
     }
     INDICES->flush();
 
-    A = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
+    A   = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
+    A2  = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
+    DIN = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
     B = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
     C = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
     D = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
@@ -1236,7 +1252,9 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
             for (const auto & d : k.desc->in) {
                 const std::string & n = d.name;
                 if (n == "x") {
-                    c.in.push_back(axera_io(decode ? A : (ci == 0 ? pfs[0].X : pfs[0].OUT[(ci - 1) & 1]), d.bytes));
+                    const axera_cmm & xb = decode ? (ci == 0 ? DIN : ((ci - 1) & 1 ? A2 : A)) :
+                                                    (ci == 0 ? pfs[0].X : pfs[0].OUT[(ci - 1) & 1]);
+                    c.in.push_back(axera_io(xb, d.bytes));
                 } else if (n == "position_ids") {
                     c.in.push_back(axera_io(pfs[0].POS, d.bytes));
                 } else if (n == "indptr") {
@@ -1270,7 +1288,7 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
             }
             for (const auto & d : k.desc->out) {
                 GGML_ASSERT(d.name == "output");
-                c.out.push_back(axera_io(decode ? A : pfs[0].OUT[ci & 1], d.bytes));
+                c.out.push_back(axera_io(decode ? (ci & 1 ? A2 : A) : pfs[0].OUT[ci & 1], d.bytes));
             }
         }
     };
@@ -1646,6 +1664,9 @@ seq_caps qwen38_27b::seq_get_caps() const {
     // zero rows from. Rewind to the page's restart point instead (one image load, correctness over the rare case).
     c.verify_min_keep = ver_rows > 0 ? 1 : 0;
     c.decode_at_zero  = true;  // the decode group runs cell 0 (the old path did, after a zeroed state)
+    // The upstream single-row graph has no correct one-core variant for this shape yet; a temporary switch keeps
+    // the model usable through the validated page kernel while that kernel is repaired.
+    c.decode_kernel = getenv("GGML_AXERA_NO_DECODE_KERNEL") == nullptr;
     return c;
 }
 
@@ -1727,38 +1748,73 @@ bool qwen38_27b::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int3
 
 bool qwen38_27b::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p4, int batch_row) {
     GGML_ASSERT(batch_row == 0);
+    if (fused && getenv("GGML_AXERA_DECODE_PREFILL") && atoi(getenv("GGML_AXERA_DECODE_PREFILL")) != 0) {
+        // Debug: run one token through the (validated) prefill kernel, one valid row, and take row 0.
+        prefill_set & P = pfs[0];
+        memset(P.X->vir, 0, (size_t) P.rows * H * sizeof(ggml_bf16_t));
+        memcpy(P.X->vir, x, H * sizeof(ggml_bf16_t));
+        P.X->flush();
+        int32_t * pp = (int32_t *) P.POS->vir;
+        for (int s = 0; s < 3; ++s) {
+            for (int r = 0; r < P.rows; ++r) {
+                pp[s * P.rows + r] = p4 ? p4[s] : (s < 2 ? (int32_t) c : 0);
+            }
+        }
+        P.POS->flush();
+        ((int32_t *) INDPTR->vir)[0]  = 0;
+        ((int32_t *) INDPTR->vir)[1]  = (int32_t) (c / PG);
+        ((int32_t *) LASTLEN->vir)[0] = 1;
+        ((int32_t *) LASTLEN->vir)[1] = 1;
+        ((int32_t *) CLOC->vir)[0]    = (int32_t) (c / PG);
+        ((int32_t *) CLOC->vir)[1]    = (int32_t) (c % PG);
+        *(int32_t *) VALID->vir       = 1;
+        for (const axera_cmm * b : { &INDPTR, &LASTLEN, &CLOC, &VALID }) {
+            (*b)->flush();
+        }
+        for (auto & cc : P.calls) {
+            cc.k->run(cc.in, cc.out, "dense decode via prefill");
+        }
+        state_zero = false;
+        const axera_cmm & po = P.OUT[(P.calls.size() - 1) & 1];
+        po->invalidate(po->vir, H * sizeof(ggml_bf16_t));
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) po->vir, out_h, H);
+        return true;
+    }
     if (fused) {
         // the upstream decode kernel takes the token's three M-RoPE positions, a one-page table and the cell in its
         // page; the recurrent and conv states are updated in place.
-        memcpy(A->vir, x, H * sizeof(ggml_bf16_t));
-        A->flush(A->vir, H * sizeof(ggml_bf16_t));
+        memcpy(DIN->vir, x, H * sizeof(ggml_bf16_t));
+        DIN->flush(DIN->vir, H * sizeof(ggml_bf16_t));
         int32_t * pp = (int32_t *) pfs[0].POS->vir;
         for (int s = 0; s < 3; ++s) {
             pp[s] = p4 ? p4[s] : s < 2 ? (int32_t) c : 0;
         }
         pfs[0].POS->flush(pfs[0].POS->vir, 3 * sizeof(int32_t));
+        // The upstream metadata kernel: history pages are ceil(c/PG) complete
+        // pages and the tail length is the last of them. At c == 0 there is no
+        // history page at all, so the decode kernel never touches the pool's
+        // untouched rows (masking them is not enough when they hold NaNs).
+        const int hp         = (int) ((c + PG - 1) / PG);
+        const int tail       = c == 0 ? 0 : (int) (c - (int64_t) (hp - 1) * PG);
         ((int32_t *) INDPTR->vir)[0] = 0;
-        ((int32_t *) INDPTR->vir)[1] = (int32_t) (c / PG + 1);
-        ((int32_t *) LASTLEN->vir)[0] = (int32_t) (c % PG);
+        ((int32_t *) INDPTR->vir)[1] = hp;
+        ((int32_t *) LASTLEN->vir)[0] = tail;
         ((int32_t *) CLOC->vir)[0]    = (int32_t) (c / PG);
         ((int32_t *) CLOC->vir)[1]    = (int32_t) (c % PG);
         for (const axera_cmm * b : { &INDPTR, &LASTLEN, &CLOC }) {
             (*b)->flush();
         }
-        {
+        auto run_dec = [&]() -> const axera_cmm & {
             axera_timer tl("layers (decode)");
             for (auto & cc : dec) {
                 cc.k->run(cc.in, cc.out, "dense decode");
             }
             state_zero = false;
-        }
-        const axera_cmm & out = dec_result == 0 ? A : dec_result == 1 ? B : dec_result == 2 ? C : D;
-        out->invalidate(out->vir, H * sizeof(ggml_bf16_t));
-        if (dec_result != 0) {
-            memcpy(A->vir, out->vir, H * sizeof(ggml_bf16_t));
-            A->flush(A->vir, H * sizeof(ggml_bf16_t));
-        }
-        ggml_bf16_to_fp32_row((const ggml_bf16_t *) A->vir, out_h, H);
+            return ((dec.size() - 1) & 1) ? A2 : A;
+        };
+        const axera_cmm * res = &run_dec();
+        (*res)->invalidate((*res)->vir, H * sizeof(ggml_bf16_t));
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) (*res)->vir, out_h, H);
         return true;
     }
     (void) p4;  // the row's M-RoPE positions come from the graph's rope view (batch_rope)

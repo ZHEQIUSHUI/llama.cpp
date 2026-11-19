@@ -210,7 +210,7 @@ seq_status seqstate::feed(int64_t c0, int T, const uint16_t * x, const int32_t *
         return fail(SEQ_BAD_BATCH, "a batch that leaves a gap after the state's cell");
     }
     if (state_cell == c0) {
-        if (T == 1 && (c0 > 0 || caps.decode_at_zero)) {
+        if (T == 1 && caps.decode_kernel && (c0 > 0 || caps.decode_at_zero)) {
             return run_decode(c0, x, p4);
         }
         const int vr = caps.verify_rows;
