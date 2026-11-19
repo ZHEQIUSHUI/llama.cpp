@@ -410,7 +410,7 @@ void qwen35_moe::init(ggml_cgraph * g, const std::map<std::string, ggml_tensor *
     GGML_ASSERT(rows <= (size_t) R);
     TOK  = axera_cmm_alloc(std::max(ntok, nsl * (1 + Gs)) * sizeof(int32_t));
     SRW  = axera_cmm_alloc(std::max((size_t) R, rows) * sizeof(float));
-    SOUT = axera_cmm_alloc(std::max(combs.back().k->in_bytes("sout"), (uint32_t) (rows * H * sizeof(ggml_bf16_t))));
+    SOUT = axera_cmm_alloc(std::max(combs.back().k->in_bytes("sout"), (size_t) (rows * H * sizeof(ggml_bf16_t))));
     LOC  = axera_cmm_alloc((size_t) NT * K * sizeof(int32_t));
     SX   = axera_cmm_alloc_nc(std::max(rows * H * sizeof(ggml_bf16_t), (size_t) main.k->in_bytes("h2")));
     GGML_ASSERT(combs.back().k->in_bytes("loc") == LOC->size);
