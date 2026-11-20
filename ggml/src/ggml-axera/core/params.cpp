@@ -186,7 +186,7 @@ AX_ENGINE_IO_BUFFER_T params::get(const std::map<std::string, ggml_tensor *> & t
 
 AX_ENGINE_IO_BUFFER_T params::convert(const std::map<std::string, ggml_tensor *> & t, int il, const std::string & kind,
                                       const std::string & name, const param_desc & p) {
-    const uint32_t size = p.bytes;
+    const size_t size = p.bytes;
     if (p.convert == "mxfp4_planar_codes" || p.convert == "mxfp4_planar_scales") {
         const experts & e = experts_of(t, il);
         const int       g = name == "e_gw" || name == "e_gs" ? 0 : 1;
@@ -338,7 +338,8 @@ const axera_cmm & params::pack(const std::map<std::string, ggml_tensor *> & t, c
             std::call_once(once, [] { GGML_LOG_INFO("axera: no output head in the graph: the group's head members left zero\n"); });
             continue;
         }
-        GGML_ASSERT(src.pVirAddr && src.nSize == mb.bytes && mb.offset + mb.bytes <= b->size);
+        GGML_ASSERT(src.pVirAddr && (mb.bytes > UINT32_MAX ? src.nSize == 0 : src.nSize == mb.bytes) &&
+                   mb.offset + mb.bytes <= b->size);
         char *       dst = (char *) b->vir + mb.offset;
         const char * sp  = (const char *) src.pVirAddr;
         if (mb.strip_w > 0) {  // [rows][cols] -> strip j = columns j * w .. (j + 1) * w of every row, one after another
@@ -399,7 +400,8 @@ std::vector<const axera_cmm *> params::pack_all(const std::map<std::string, ggml
                     std::call_once(once, [] { GGML_LOG_INFO("axera: no output head in the graph: the group's head members left zero\n"); });
                     continue;
                 }
-                GGML_ASSERT(src.pVirAddr && src.nSize == mb.bytes && mb.offset + mb.bytes <= b->size);
+                GGML_ASSERT(src.pVirAddr && (mb.bytes > UINT32_MAX ? src.nSize == 0 : src.nSize == mb.bytes) &&
+                   mb.offset + mb.bytes <= b->size);
                 char *       dst = (char *) b->vir + mb.offset;
                 const char * sp  = (const char *) src.pVirAddr;
                 if (mb.strip_w > 0) {

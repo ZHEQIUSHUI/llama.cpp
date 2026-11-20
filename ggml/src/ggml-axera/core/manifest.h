@@ -22,7 +22,7 @@ namespace axera {
 struct io_desc {
     std::string          name;
     std::string          param, kind;  // a layer parameter input: the parameter and its kind (params), else empty
-    uint32_t             bytes = 0;
+    size_t               bytes = 0;
     int                  dtype = 0;  // AX_ENGINE_DATA_TYPE_T
     std::vector<int64_t> shape;
 };
@@ -43,7 +43,7 @@ struct param_desc {
     std::string          gguf;     // tensor name within blk.<i>.
     std::string          convert;  // tensor, mxfp8, mxfp8_scales, mxfp4, mxfp4_scales, log_neg, bf16_taps_reversed,
                                    // mxfp4_planar_codes, mxfp4_planar_scales
-    uint32_t             bytes = 0;
+    size_t               bytes = 0;
     int                  dtype = 0;
     std::vector<int64_t> shape;
     std::string          vperm;    // after the conversion, value heads from GGUF's tiled order to HF's grouped one:
@@ -69,8 +69,8 @@ struct kernel {
     int  output(const std::string & name) const;  // index, aborts if absent
     int  find_input(const std::string & name) const;  // index, -1 if absent
     int  find_output(const std::string & name) const;  // index, -1 if absent
-    uint32_t in_bytes(const std::string & name) const { return info->pInputs[input(name)].nSize; }
-    uint32_t out_bytes(const std::string & name) const { return info->pOutputs[output(name)].nSize; }
+    size_t in_bytes(const std::string & name) const { return info->pInputs[input(name)].nSize; }
+    size_t out_bytes(const std::string & name) const { return info->pOutputs[output(name)].nSize; }
     // one call; aborts with `what` and the IO on failure
     void run(std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_IO_BUFFER_T> & out, const char * what) const;
 };
