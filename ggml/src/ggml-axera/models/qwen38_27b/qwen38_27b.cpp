@@ -1204,8 +1204,11 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
     // requested context is shorter, so the table only has to cover the context.
     GGML_ASSERT(n_indices >= (int) ((man.context + PG - 1) / PG));
     GGML_ASSERT(KB > 1 || n_indices >= kv_pages);
+    // Entries past the context-sized pool must not point outside it: the
+    // compiled table is always 256k long, while a smaller -c allocates only
+    // the first kv_pages pages.
     for (int i = 0; i < n_indices; ++i) {
-        ((int32_t *) INDICES->vir)[i] = i;
+        ((int32_t *) INDICES->vir)[i] = i < kv_pages ? i : 0;
     }
     INDICES->flush();
 
@@ -1715,6 +1718,13 @@ void qwen38_27b::seq_state_load(const uint8_t * src) {
                 memset(MKV->vir, 0, pages * mtp_page_b);
                 MKV->flush(MKV->vir, pages * mtp_page_b);
             }
+        }
+        // A warm-up or a previous chunk may have left finite garbage in the
+        // paged KV pool; the decode graph reads the current page before it is
+        // fully overwritten. Start every sequence from a deterministic zero.
+        for (const axera_cmm & c : KVC) {
+            memset(c->vir, 0, c->size);
+            c->flush();
         }
         mtp_cell = 0;
     } else {
