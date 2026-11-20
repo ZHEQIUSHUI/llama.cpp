@@ -224,7 +224,7 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
     const bool        cs    = n == "cos" || n == "sin";
     const int         nb    = (int) d.shape[0];
     GGML_ASSERT(d.shape.size() >= 2 && nb > 0 && (nb == L / 4 || cs) && d.bytes % nb == 0);
-    axera_cmm     c  = axera_cmm_alloc(d.bytes);
+    axera_cmm     c  = axera_cmm_alloc_bank(d.bytes);
     const size_t  bb = d.bytes / nb;  // bytes per block
     std::vector<const ggml_tensor *> read;  // the GGUF tensors read: their mapped pages dropped when the bank is done
     auto          T  = [&](int il, const char * g) -> ggml_tensor * {

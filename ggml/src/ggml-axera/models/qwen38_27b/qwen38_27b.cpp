@@ -238,7 +238,7 @@ axera_cmm qwen38_27b::bank(const std::map<std::string, ggml_tensor *> & t, const
     const std::string n     = mt[3];
     const int         nb    = (int) d.shape[0];
     GGML_ASSERT(d.shape.size() >= 2 && nb > 0 && (nb == L / 4 || n == "cos" || n == "sin") && d.bytes % nb == 0);
-    axera_cmm     c  = axera_cmm_alloc(d.bytes);
+    axera_cmm     c  = axera_cmm_alloc_bank(d.bytes);
     const size_t  bb = d.bytes / nb;  // bytes per block
     const bool keep_pages = axera_keep_pages();
     std::vector<const ggml_tensor *> read;  // the GGUF tensors of one block: their mapped pages dropped right after it

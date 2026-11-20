@@ -6,6 +6,9 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <functional>
+#include <deque>
+#include <condition_variable>
 #include <set>
 #include <thread>
 #include <dirent.h>
@@ -259,6 +262,42 @@ void axera_page_in(const ggml_tensor * t) {
     });
 }
 
+// Releasing a converted tensor's pages (madvise on the mapping, fadvise on the file) is work nobody waits for, and
+// on the loading thread it was a fifth of the 27B's bank building. One background thread runs these in order, so a
+// file range's fadvise still comes after the madvise of every mapping range queued before it.
+namespace {
+struct axera_bg_queue {
+    std::mutex                        mu;
+    std::condition_variable           cv;
+    std::deque<std::function<void()>> q;
+    axera_bg_queue() {
+        std::thread([this] {
+            for (;;) {
+                std::function<void()> f;
+                {
+                    std::unique_lock<std::mutex> l(mu);
+                    cv.wait(l, [&] { return !q.empty(); });
+                    f = std::move(q.front());
+                    q.pop_front();
+                }
+                f();
+            }
+        }).detach();
+    }
+    void push(std::function<void()> f) {
+        {
+            std::lock_guard<std::mutex> l(mu);
+            q.push_back(std::move(f));
+        }
+        cv.notify_one();
+    }
+};
+axera_bg_queue & axera_bg() {
+    static axera_bg_queue * q = new axera_bg_queue();  // never destroyed: its thread may be mid-call at exit
+    return *q;
+}
+}  // namespace
+
 void axera_drop_file_pages(const ggml_tensor * t) {
     if (axera_keep_pages() || !t || !t->data || ggml_nbytes(t) == 0) {
         return;
@@ -305,9 +344,9 @@ void axera_flush_file_pages() {
     if (flush_dbg) {
         fprintf(stderr, "file pages flush: %zu ranges, %.3f MB\n", ranges.size(), (double) flush_bytes / 1e6);
     }
-    // fadvise is synchronous (seconds for a 20 GB file) and nothing waits for its result: a thread of its own, so the
-    // first request does not pay for it
-    std::thread([ranges = std::move(ranges)]() mutable {
+    // fadvise is synchronous (seconds for a 20 GB file) and nothing waits for its result: the background thread, so
+    // the first request does not pay for it
+    axera_bg().push([ranges = std::move(ranges)]() mutable {
         std::sort(ranges.begin(), ranges.end(), [](const axera_file_range & a, const axera_file_range & b) {
             return a.fd != b.fd ? a.fd < b.fd : a.off < b.off;
         });
@@ -321,7 +360,7 @@ void axera_flush_file_pages() {
             }
             posix_fadvise(fd, off, end - off, POSIX_FADV_DONTNEED);
         }
-    }).detach();
+    });
 }
 
 void axera_drop_mapped(const ggml_tensor * t, bool force) {
@@ -337,7 +376,7 @@ void axera_drop_mapped(const ggml_tensor * t, bool force) {
     const uintptr_t        a  = ((uintptr_t) t->data + pg - 1) & ~(pg - 1);  // whole pages within the tensor
     const uintptr_t        b  = ((uintptr_t) t->data + ggml_nbytes(t)) & ~(pg - 1);
     if (b > a) {
-        madvise((void *) a, b - a, MADV_DONTNEED);
+        axera_bg().push([a, b] { madvise((void *) a, b - a, MADV_DONTNEED); });
     }
     axera_drop_file_pages(t);
 }
@@ -417,6 +456,19 @@ axera_cmm axera_cmm_alloc_raw(size_t size) {
         GGML_ABORT("%s: failed to allocate %zu bytes of CMM\n", __func__, size);
     }
     axera_mem_trace("alloc", "raw", b->phy, b->size);
+    return b;
+}
+
+// a weight bank: zeroed on the host pool and not flushed, for a caller that fills it and flushes it once. (alloc's
+// memset and cache flush of a 1 GiB bank are a second each on one thread, and the load makes a hundred banks.)
+axera_cmm axera_cmm_alloc_bank(size_t size) {
+    axera_cmm     b   = axera_cmm_alloc_raw(size);
+    const size_t  blk = (size_t) 8 << 20;
+    const int64_t nb  = (int64_t) ((b->size + blk - 1) / blk);
+    axera_host_pool().run(nb, [&](int64_t i) {
+        const size_t o = (size_t) i * blk;
+        memset((char *) b->vir + o, 0, std::min(blk, b->size - o));
+    });
     return b;
 }
 
