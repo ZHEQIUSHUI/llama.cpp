@@ -93,8 +93,10 @@ None of them changes a result.
 
 `GGML_AXERA_NPU_CORES` binds each model handle with `AX_ENGINE_SetAffinity` before its context is created. The SDK's
 affinity value is a VNPU bitmap with two bits per physical AX8860 core, so core 0 is `0x3`, core 1 is `0xc`, core 2 is
-`0x30`, core 3 is `0xc0`, and `0,1` is `0xf`. The backend expands the physical-core list to that bitmap and verifies the
-`GetAffinity` readback. Kernels compiled for a different number of cores are rejected at load time rather than silently
+`0x30`, and core 3 is `0xc0`. A 2-core model always runs on core 0 plus the core named by the bitmap: `0,1` is `0x3`,
+`0,2` is `0x30`, `0,3` is `0xc0`; `0xf` is rejected by the SDK, and pairs without core 0 cannot be expressed. The backend
+expands the physical-core list to the right bitmap for each kernel's compiled core count and verifies the `GetAffinity`
+readback. Kernels compiled for a different number of cores are rejected at load time rather than silently
 running on the wrong set. For example, a single-core model on core 2:
 
 ```bash
