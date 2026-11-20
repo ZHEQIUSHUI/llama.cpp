@@ -1194,7 +1194,9 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
     CLOC  = axera_cmm_alloc(2 * sizeof(int32_t));
     VALID = axera_cmm_alloc(sizeof(int32_t));
     const int n_indices = (int) (pk.in_bytes("indices") / sizeof(int32_t));
-    GGML_ASSERT(n_indices >= (int) ((man.context + PG - 1) / PG) && n_indices <= kv_pages);
+    // The kernel's table input is sized for the manifest's maximum context;
+    // a smaller -c allocates fewer KV pages but leaves this input unchanged.
+    GGML_ASSERT(n_indices >= (int) ((man.context + PG - 1) / PG) && n_indices >= kv_pages);
     for (int i = 0; i < n_indices; ++i) {
         ((int32_t *) INDICES->vir)[i] = i;
     }
