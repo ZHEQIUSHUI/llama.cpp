@@ -1727,13 +1727,9 @@ void qwen38_27b::seq_state_load(const uint8_t * src) {
                 MKV->flush(MKV->vir, pages * mtp_page_b);
             }
         }
-        // A warm-up or a previous chunk may have left finite garbage in the
-        // paged KV pool; the decode graph reads the current page before it is
-        // fully overwritten. Start every sequence from a deterministic zero.
-        for (const axera_cmm & c : KVC) {
-            memset(c->vir, 0, c->size);
-            c->flush();
-        }
+        // (The paged KV pool is not zeroed here: init zeroes it once, so it never holds a NaN, and a row a new
+        // sequence has not written yet holds a finite value of an earlier one behind the kernel's additive mask.
+        // Zeroing every block's whole pool was a second per new sequence on the 4B: 4k prefill 2300 -> 1440 tok/s.)
         mtp_cell = 0;
     } else {
         size_t o = 0;
