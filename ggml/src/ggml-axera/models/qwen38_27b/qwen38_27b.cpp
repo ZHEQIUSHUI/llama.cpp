@@ -1495,12 +1495,12 @@ void qwen38_27b::init_fused_phases(const std::map<std::string, ggml_tensor *> & 
 
     auto state_io = [&](const std::string & n, int b) -> AX_ENGINE_IO_BUFFER_T {
         const int ph = n[1] - '0';
-        const size_t per = n.find("q_conv_state_in") != std::string::npos ? cq_b :
-                           n.find("k_conv_state_in") != std::string::npos ? cq_b :
-                           n.find("v_conv_state_in") != std::string::npos ? cv_b : st_b;
-        const axera_cmm * p = n.find("q_conv_state_in") != std::string::npos ? &CQ :
-                              n.find("k_conv_state_in") != std::string::npos ? &CK :
-                              n.find("v_conv_state_in") != std::string::npos ? &CV : &ST;
+        const size_t per = n.find("q_conv_state") != std::string::npos ? cq_b :
+                           n.find("k_conv_state") != std::string::npos ? cq_b :
+                           n.find("v_conv_state") != std::string::npos ? cv_b : st_b;
+        const axera_cmm * p = n.find("q_conv_state") != std::string::npos ? &CQ :
+                              n.find("k_conv_state") != std::string::npos ? &CK :
+                              n.find("v_conv_state") != std::string::npos ? &CV : &ST;
         GGML_ASSERT(ph >= 0 && ph < 3 && b >= 0 && b < NB);
         const size_t off = ((size_t) ph * NB + (size_t) b) * per;
         return axera_io(p->get(), (char *) (*p)->vir + off, per);
