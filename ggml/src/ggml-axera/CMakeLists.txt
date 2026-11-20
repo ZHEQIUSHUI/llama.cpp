@@ -30,6 +30,7 @@ ggml_add_backend_library(ggml-axera
                          models/qwen35_35b_a3b/qwen35_35b_a3b.cpp
                          models/qwen35_moe_sgl/qwen35_moe_sgl.cpp
                          models/hy_mt2/hy_mt2.cpp
+                         models/q3vl30/q3vl30.cpp
                          models/qwen3/qwen3.cpp
                          models/cpm5/cpm5.cpp
                          models/hymt/hymt.cpp
@@ -40,6 +41,7 @@ ggml_add_backend_library(ggml-axera
                          models/voxcpm2/vox_acoustic.cpp
                          models/qwen35_vit/qwen35_vit.cpp
                          models/qwen35_vit/qwen35_vit_full.cpp
+                         models/q3vl30/q3vl30_vit_full.cpp
                          ggml-axera-buffer.cpp
                         )
 

@@ -124,6 +124,8 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
         llm = make_qwen35_moe_sgl(m);  // the text tower is the published 35B-A3B NVFP4 stack
     } else if (m.model == "hy_mt2") {
         llm = make_hy_mt2(m);
+    } else if (m.model == "q3vl30") {
+        llm = make_q3vl30(m);
     } else if (m.model == "qwen3") {
         llm = make_qwen3(m);
     } else if (m.model == "cpm5") {
@@ -150,6 +152,9 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
     c->vit   = vision1 ? (m.model == "minicpm_ocr" ? make_minicpm_ocr_vit_full(m) :
                           m.model == "minicpmv4_7" ? make_minicpmv4_7_vit_full(m) : make_qwen35_vit_full(m)) :
                vision ? make_qwen35_vit(m) : nullptr;
+    if (vision1 && m.model == "q3vl30") {
+        c->vit = make_q3vl30_vit_full(m);
+    }
     c->audio = audio ? make_qwen3_asr(m) : nullptr;
     c->gen   = gen ? make_qwen3_tts(m) : nullptr;
     return c;
@@ -174,8 +179,9 @@ model_caps model_caps_of(const manifest & m) {
     model_caps c;
     const std::string & n = m.model;
     c.owns_kv_cache = n == "qwen38_27b" || n == "qwen35_whole" || n == "qwen35_moe_sgl" || n == "minicpmv4_7" ||
-                      n == "cpm5" || n == "hymt" || n == "hy_mt2";
-    c.sched_io_only = n == "qwen38_27b" || n == "qwen35_moe_sgl" || n == "minicpmv4_7" || n == "hy_mt2";
+                      n == "cpm5" || n == "hymt" || n == "hy_mt2" || n == "q3vl30";
+    c.sched_io_only = n == "qwen38_27b" || n == "qwen35_moe_sgl" || n == "minicpmv4_7" || n == "hy_mt2" ||
+                      n == "q3vl30";
     c.causal_cells  = n == "qwen38_27b";
     // VoxCPM2's base LM: on the NPU only when the manifest carries its prefill kernel (else llama.cpp runs it on the CPU)
     if (n == "voxcpm2_base" && m.has("prefill")) {
