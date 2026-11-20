@@ -113,6 +113,7 @@ class qwen38_27b final : public model, public seq_model {
     size_t    kv_alloc = 0, kvs_alloc = 0;  // the bytes of one layer's pool
     std::vector<call>              dec;
     int                            dec_result = 0;
+    const axera_cmm *              dec_out = nullptr;
     axera_cmm                      A, A2, DIN, B, C, D, COS, SIN, CS, PN, MASK;
     // the current recurrent state of each delta-net layer: its pool part, or a verification snapshot's row (the
     // decode / verify calls' state outputs bound there); the snapshots of the verification groups, two sets
@@ -1308,6 +1309,7 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
     // are in the last call's buffer, not always OUT[0].
     P.result = (NC - 1) & 1;
     bind(dk, dec, true);
+    dec_out = ((NC - 1) & 1) ? &A2 : &A;
 
     ord.assign(L, 0);
     int ng = 0, na = 0;
@@ -1566,6 +1568,7 @@ void qwen38_27b::init_fused_phases(const std::map<std::string, ggml_tensor *> & 
     };
     bind_phase(false, P.calls, P.result);
     bind_phase(true, dec, dec_result);
+    dec_out = dec_result == 0 ? &A : dec_result == 1 ? &B : dec_result == 2 ? &C : &D;
 
     ord.assign(L, 0);
     int ng = 0, na = 0;
@@ -1775,7 +1778,7 @@ bool qwen38_27b::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p
             cc.k->run(cc.in, cc.out, "dense decode via prefill");
         }
         state_zero = false;
-        const axera_cmm & po = P.OUT[(P.calls.size() - 1) & 1];
+        const axera_cmm & po = P.OUT[P.result];
         po->invalidate(po->vir, H * sizeof(ggml_bf16_t));
         ggml_bf16_to_fp32_row((const ggml_bf16_t *) po->vir, out_h, H);
         return true;
@@ -1810,7 +1813,7 @@ bool qwen38_27b::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p
                 cc.k->run(cc.in, cc.out, "dense decode");
             }
             state_zero = false;
-            return ((dec.size() - 1) & 1) ? A2 : A;
+            return *dec_out;
         };
         const axera_cmm * res = &run_dec();
         (*res)->invalidate((*res)->vir, H * sizeof(ggml_bf16_t));
