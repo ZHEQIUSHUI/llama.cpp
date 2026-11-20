@@ -576,13 +576,13 @@ void hy_mt2::fill_bank(const std::map<std::string, ggml_tensor *> & t, const ggm
     // RoPE tables are model-wide: one global pair instead of 48 copies.
     rope rp(rope_node, inp_pos, 0);
     std::vector<float> cs((size_t) PAGES * PG * (ROT / 2)), sn((size_t) PAGES * PG * (ROT / 2));
-    for (int64_t q = 0; q < (int64_t) PAGES * PG; ++q) {
+    axera_host_pool().run((int64_t) PAGES * PG, [&](int64_t q) {
         for (int i = 0; i < ROT / 2; ++i) {
             const double th = (double) q * rp.freq_scale * rp.inv_freq[i];
             cs[(size_t) q * (ROT / 2) + i] = (float) std::cos(th);
             sn[(size_t) q * (ROT / 2) + i] = (float) std::sin(th);
         }
-    }
+    });
     put_f32(gbank, "cos", 0, cs);
     put_f32(gbank, "sin", 0, sn);
 

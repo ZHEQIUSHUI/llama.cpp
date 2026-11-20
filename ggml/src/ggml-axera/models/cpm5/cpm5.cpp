@@ -201,11 +201,17 @@ axera_cmm cpm5::bank(const std::map<std::string, ggml_tensor *> & t, const io_de
         if (n == "cos" || n == "sin") {
             const int64_t P = d.shape[1], R = d.shape[2];
             GGML_ASSERT(d.dtype == 3 && (size_t) R == rp.inv_freq.size());
-            for (int64_t q = 0; q < P; ++q) {
-                for (int64_t i = 0; i < R; ++i) {
-                    const double th = (double) q * rp.freq_scale * rp.inv_freq[i];
-                    ((float *) dst)[q * R + i] = (float) (n == "cos" ? std::cos(th) : std::sin(th));
-                }
+            if (b > 0) {  // the same table in every block: block 0's, copied
+                memcpy(dst, c->vir, bb);
+            } else {  // (a 262144-position table is 8 M cos or sin: one row per pool item, not one thread for all)
+                const bool co = n == "cos";
+                GGML_ASSERT((size_t) (P * R) * sizeof(float) == bb);
+                axera_host_pool().run(P, [&](int64_t q) {
+                    for (int64_t i = 0; i < R; ++i) {
+                        const double th = (double) q * rp.freq_scale * rp.inv_freq[i];
+                        ((float *) dst)[q * R + i] = (float) (co ? std::cos(th) : std::sin(th));
+                    }
+                });
             }
         } else if (n.rfind("w_scale2_", 0) == 0) {
             fill(1.0f);

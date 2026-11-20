@@ -817,27 +817,7 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
             c->flush();
         }
     }
-    // GGML_AXERA_BANK_SUM=1: one checksum over every bank, to compare two builds or two thread counts of this fill
-    if (std::getenv("GGML_AXERA_BANK_SUM")) {
-        std::vector<const axera_cmm *> bv;
-        for (auto & [n, c] : banks) {
-            bv.push_back(&c);
-        }
-        std::vector<uint64_t> sum(bv.size());
-        axera_host_pool().run((int64_t) bv.size(), [&](int64_t i) {
-            const uint64_t * w = (const uint64_t *) (*bv[i])->vir;
-            uint64_t         h = 1469598103934665603ull;
-            for (size_t k = 0; k < (*bv[i])->size / 8; ++k) {
-                h = (h ^ w[k]) * 1099511628211ull + (h >> 29);
-            }
-            sum[i] = h;
-        });
-        uint64_t all = 0;
-        for (uint64_t h : sum) {
-            all = all * 1099511628211ull + h;
-        }
-        fprintf(stderr, "axera bank sum: %zu banks %016llx\n", bv.size(), (unsigned long long) all);
-    }
+    axera_bank_sum("qwen35_moe_sgl", banks);
 }
 
 void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_) {

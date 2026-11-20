@@ -281,3 +281,7 @@ class axera_pool {
 };
 
 axera_pool & axera_host_pool();
+
+// GGML_AXERA_BANK_SUM=1: print one checksum over these banks (in name order), to compare two builds or two thread
+// counts of a load
+void axera_bank_sum(const char * what, const std::map<std::string, axera_cmm> & banks);

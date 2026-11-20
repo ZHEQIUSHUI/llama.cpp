@@ -329,11 +329,17 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
             } else if (n == "cos" || n == "sin") {  // [16384][ROT / 2] f32
                 const int64_t P = d.shape[1], R = d.shape[2];
                 GGML_ASSERT(R == ROT / 2 && d.dtype == 3);
-                for (int64_t q = 0; q < P; ++q) {
-                    for (int64_t i = 0; i < R; ++i) {
-                        const double th = (double) q * rp.freq_scale * rp.inv_freq[i];
-                        ((float *) dst)[q * R + i] = (float) (n == "cos" ? std::cos(th) : std::sin(th));
-                    }
+                if (b > 0) {  // the same table in every block: block 0's, copied
+                    memcpy(dst, c->vir, bb);
+                } else {  // (a 262144-position table is 8 M cos or sin: one row per pool item, not one thread for all)
+                    const bool co = n == "cos";
+                    GGML_ASSERT((size_t) (P * R) * sizeof(float) == bb);
+                    axera_host_pool().run(P, [&](int64_t q) {
+                        for (int64_t i = 0; i < R; ++i) {
+                            const double th = (double) q * rp.freq_scale * rp.inv_freq[i];
+                            ((float *) dst)[q * R + i] = (float) (co ? std::cos(th) : std::sin(th));
+                        }
+                    });
                 }
             } else if (n.rfind("w_scale2_", 0) == 0) {
                 fill(1.0f);
@@ -588,6 +594,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
                 banks[d.name] = bank(t, dd, rp);
             }
         }
+        axera_bank_sum("qwen35_whole", banks);
     }
     auto bank_io = [&](const kernel & k, const io_desc & d, int gi) -> AX_ENGINE_IO_BUFFER_T {
         auto it = banks.find(d.name.substr(2));

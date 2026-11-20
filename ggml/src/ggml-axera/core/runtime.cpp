@@ -451,6 +451,30 @@ AX_ENGINE_IO_BUFFER_T axera_io(const ggml_backend_axera_buffer_context * ctx, vo
     return b;
 }
 
+void axera_bank_sum(const char * what, const std::map<std::string, axera_cmm> & banks) {
+    if (!std::getenv("GGML_AXERA_BANK_SUM")) {
+        return;
+    }
+    std::vector<const axera_cmm *> bv;
+    for (auto & [n, c] : banks) {
+        bv.push_back(&c);
+    }
+    std::vector<uint64_t> sum(bv.size());
+    axera_host_pool().run((int64_t) bv.size(), [&](int64_t i) {
+        const uint64_t * w = (const uint64_t *) (*bv[i])->vir;
+        uint64_t         h = 1469598103934665603ull;
+        for (size_t k = 0; k < (*bv[i])->size / 8; ++k) {
+            h = (h ^ w[k]) * 1099511628211ull + (h >> 29);
+        }
+        sum[i] = h;
+    });
+    uint64_t all = 0;
+    for (uint64_t h : sum) {
+        all = all * 1099511628211ull + h;
+    }
+    fprintf(stderr, "axera bank sum: %s: %zu banks %016llx\n", what, bv.size(), (unsigned long long) all);
+}
+
 axera_pool & axera_host_pool() {
     static axera_pool pool([] {
         const char * e = std::getenv("AXERA_HOST_POOL_THREADS");
