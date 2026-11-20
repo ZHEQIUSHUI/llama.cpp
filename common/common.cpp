@@ -1242,7 +1242,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (params.fit_params) {
+    // (not with the Axera NPU backend: its memory is the kernels' fixed banks, nothing here is fitted, and the probe
+    // loads the model's metadata a second time, seconds for a large vocabulary)
+    if (params.fit_params && getenv("GGML_AXERA_KERNEL_DIR") == nullptr) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 

@@ -515,17 +515,17 @@ void hy_mt2::fill_bank(const std::map<std::string, ggml_tensor *> & t, const ggm
             const ggml_tensor * wu = W("ffn_up_exps.weight");
             const ggml_tensor * wd = W("ffn_down_exps.weight");
             GGML_ASSERT(wg->ne[1] == wu->ne[1] && wg->ne[2] == E && wu->ne[2] == E && wd->ne[2] == E);
-            for (int e = 0; e < E; ++e) {
+            // one pool job over the experts (each expert's rows then copy in line), not three jobs per expert
+            const std::string qg = pm + "w_gate", sg = pm + "w_scale_gate", zg = pm + "w_scale2_gate";
+            const std::string qd = pm + "w_down", sd = pm + "w_scale_down", zd = pm + "w_scale2_down";
+            axera_host_pool().run(E, [&](int64_t e) {
                 // FusedMoE layout: gate [0,I) and up [I,2I) share one bank
                 // and one [E,2] scale2 slot per expert.
                 const int64_t I = wg->ne[1];
-                put_nv_rows(bm, pm + "w_gate", pm + "w_scale_gate", pm + "w_scale2_gate", wg,
-                            (int64_t) e * I, I, b, (int64_t) e * 2 * I, e * 2, e);
-                put_nv_rows(bm, pm + "w_gate", pm + "w_scale_gate", pm + "w_scale2_gate", wu,
-                            (int64_t) e * I, I, b, (int64_t) e * 2 * I + I, e * 2 + 1, e);
-                put_nv_rows(bm, pm + "w_down", pm + "w_scale_down", pm + "w_scale2_down", wd,
-                            (int64_t) e * wd->ne[1], wd->ne[1], b, (int64_t) e * wd->ne[1], e, e);
-            }
+                put_nv_rows(bm, qg, sg, zg, wg, e * I, I, b, e * 2 * I, e * 2, e);
+                put_nv_rows(bm, qg, sg, zg, wu, e * I, I, b, e * 2 * I + I, e * 2 + 1, e);
+                put_nv_rows(bm, qd, sd, zd, wd, e * wd->ne[1], wd->ne[1], b, e * wd->ne[1], e, e);
+            });
             const char * sn[3] = { "gate", "up", "down" };
             const char * wn[3] = { "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight" };
             // HYV3 has no shared-expert sigmoid.  The kernel uses the upstream
