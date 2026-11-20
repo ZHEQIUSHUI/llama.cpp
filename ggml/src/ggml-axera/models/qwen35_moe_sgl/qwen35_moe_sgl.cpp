@@ -577,6 +577,7 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
                 bv.push_back(&c);
             }
         }
+        axera_timer tz("fill: alloc (zero)");
         axera_host_pool().run((int64_t) bv.size(), [&](int64_t i) { memset((*bv[i])->vir, 0, (*bv[i])->size); });
     }
     auto slot = [&](const std::string & n, int b) -> uint8_t * {
@@ -775,21 +776,22 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
                 const ggml_tensor * d = T(il, "ffn_down_exps.weight");
                 GGML_ASSERT(g->ne[0] == u->ne[0] && g->ne[1] == u->ne[1] && g->ne[2] == u->ne[2]);
                 const int64_t F = g->ne[1], E = g->ne[2];
-                for (int64_t e = 0; e < E; ++e) {
-                    put_nv(pm, "w_gate", g, e * F, F, b, e * 2 * F, e * 2, nullptr, nullptr, pm + "w_scale_gate",
-                           pm + "w_scale2_gate", e);
-                    put_nv(pm, "w_gate", u, e * F, F, b, e * 2 * F + F, e * 2 + 1, nullptr, nullptr,
-                           pm + "w_scale_gate", pm + "w_scale2_gate", e);
-                }
+                // one pool job over the experts (each expert's rows then copy in line): a job per expert would wake
+                // every worker 3 * E times a layer for a few hundred kilobytes each
+                const std::string sg = pm + "w_scale_gate", zg = pm + "w_scale2_gate";
+                axera_host_pool().run(E, [&](int64_t e) {
+                    put_nv(pm, "w_gate", g, e * F, F, b, e * 2 * F, e * 2, nullptr, nullptr, sg, zg, e);
+                    put_nv(pm, "w_gate", u, e * F, F, b, e * 2 * F + F, e * 2 + 1, nullptr, nullptr, sg, zg, e);
+                });
                 if (!keep) {
                     axera_drop_mapped(g);
                     axera_drop_mapped(u);
                 }
                 const int64_t Rd = d->ne[1], Ed = d->ne[2];
-                for (int64_t e = 0; e < Ed; ++e) {
-                    put_nv(pm, "w_down", d, e * Rd, Rd, b, e * Rd, e, nullptr, nullptr, pm + "w_scale_down",
-                           pm + "w_scale2_down", e);
-                }
+                const std::string sd = pm + "w_scale_down", zd = pm + "w_scale2_down";
+                axera_host_pool().run(Ed, [&](int64_t e) {
+                    put_nv(pm, "w_down", d, e * Rd, Rd, b, e * Rd, e, nullptr, nullptr, sd, zd, e);
+                });
                 if (!keep) {
                     axera_drop_mapped(d);
                 }
@@ -814,6 +816,27 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
         for (auto & [n, c] : banks) {
             c->flush();
         }
+    }
+    // GGML_AXERA_BANK_SUM=1: one checksum over every bank, to compare two builds or two thread counts of this fill
+    if (std::getenv("GGML_AXERA_BANK_SUM")) {
+        std::vector<const axera_cmm *> bv;
+        for (auto & [n, c] : banks) {
+            bv.push_back(&c);
+        }
+        std::vector<uint64_t> sum(bv.size());
+        axera_host_pool().run((int64_t) bv.size(), [&](int64_t i) {
+            const uint64_t * w = (const uint64_t *) (*bv[i])->vir;
+            uint64_t         h = 1469598103934665603ull;
+            for (size_t k = 0; k < (*bv[i])->size / 8; ++k) {
+                h = (h ^ w[k]) * 1099511628211ull + (h >> 29);
+            }
+            sum[i] = h;
+        });
+        uint64_t all = 0;
+        for (uint64_t h : sum) {
+            all = all * 1099511628211ull + h;
+        }
+        fprintf(stderr, "axera bank sum: %zu banks %016llx\n", bv.size(), (unsigned long long) all);
     }
 }
 

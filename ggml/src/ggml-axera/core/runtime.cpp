@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <thread>
 #include <dirent.h>
 #include <fcntl.h>
 
@@ -245,19 +246,23 @@ void axera_flush_file_pages() {
     if (flush_dbg) {
         fprintf(stderr, "file pages flush: %zu ranges, %.3f MB\n", ranges.size(), (double) flush_bytes / 1e6);
     }
-    std::sort(ranges.begin(), ranges.end(), [](const axera_file_range & a, const axera_file_range & b) {
-        return a.fd != b.fd ? a.fd < b.fd : a.off < b.off;
-    });
-    size_t i = 0;
-    while (i < ranges.size()) {
-        const int   fd  = ranges[i].fd;
-        off_t       off = ranges[i].off;
-        off_t       end = ranges[i].end;
-        while (++i < ranges.size() && ranges[i].fd == fd && ranges[i].off <= end) {
-            end = std::max(end, ranges[i].end);
+    // fadvise is synchronous (seconds for a 20 GB file) and nothing waits for its result: a thread of its own, so the
+    // first request does not pay for it
+    std::thread([ranges = std::move(ranges)]() mutable {
+        std::sort(ranges.begin(), ranges.end(), [](const axera_file_range & a, const axera_file_range & b) {
+            return a.fd != b.fd ? a.fd < b.fd : a.off < b.off;
+        });
+        size_t i = 0;
+        while (i < ranges.size()) {
+            const int fd  = ranges[i].fd;
+            off_t     off = ranges[i].off;
+            off_t     end = ranges[i].end;
+            while (++i < ranges.size() && ranges[i].fd == fd && ranges[i].off <= end) {
+                end = std::max(end, ranges[i].end);
+            }
+            posix_fadvise(fd, off, end - off, POSIX_FADV_DONTNEED);
         }
-        posix_fadvise(fd, off, end - off, POSIX_FADV_DONTNEED);
-    }
+    }).detach();
 }
 
 void axera_drop_mapped(const ggml_tensor * t, bool force) {

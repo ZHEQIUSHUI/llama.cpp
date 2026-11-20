@@ -374,6 +374,9 @@ static std::unique_ptr<manifest> load_manifest(const std::string & dir) {
     }
     GGML_LOG_INFO("axera: %s: model %s, context %lld, %zu kernels loaded in %.1f s\n", dir.c_str(), m->model.c_str(),
                   (long long) m->context, m->kernels.size(), (ggml_time_us() - t0) / 1e6);
+    if (std::getenv("GGML_AXERA_PROF")) {
+        fprintf(stderr, "axera prof: kernels: %zu loaded in %.2f s\n", m->kernels.size(), (ggml_time_us() - t0) / 1e6);
+    }
     return m;
 }
 

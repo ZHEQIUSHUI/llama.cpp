@@ -183,7 +183,8 @@ struct axera_timer {
 };
 
 // persistent workers for the host loops: run(n, fn) calls fn(0 .. n - 1) on the workers and the caller, returning
-// when all are done
+// when all are done. A run() made from inside a job runs its items in line on that thread: a caller with many small
+// loops (one per MoE expert) wraps them in one outer run() instead of paying a wake-up of every worker per loop.
 class axera_pool {
   public:
     explicit axera_pool(int n) {
@@ -204,7 +205,7 @@ class axera_pool {
     }
 
     void run(int64_t n, const std::function<void(int64_t)> & fn) {
-        if (n <= 1 || workers.empty()) {
+        if (n <= 1 || workers.empty() || in_job) {
             for (int64_t i = 0; i < n; ++i) {
                 fn(i);
             }
@@ -229,10 +230,12 @@ class axera_pool {
   private:
     void work() {
         int64_t k = 0;
+        in_job    = true;
         for (int64_t i; (i = next.fetch_add(1)) < total;) {
             (*job)(i);
             ++k;
         }
+        in_job = false;
         if (k > 0) {
             std::lock_guard<std::mutex> l(mu);
             finished += k;
@@ -262,6 +265,7 @@ class axera_pool {
         }
     }
 
+    static inline thread_local bool      in_job = false;  // this thread is running a job's items
     std::vector<std::thread>             workers;
     std::mutex                           mu;
     std::condition_variable              cv, done, idle;
