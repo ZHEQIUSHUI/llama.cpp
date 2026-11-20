@@ -8,4 +8,6 @@ ${CXX:-g++} -std=c++17 -O2 -Wall -Wextra -pthread "$d/../core/seqstate.cpp" "$d/
 "$o/test-seqstate" "$@"
 ${CXX:-g++} -std=c++17 -O2 -Wall -Wextra -pthread "$d/../core/patch_embed.cpp" "$d/test-patch-embed.cpp" -o "$o/test-patch-embed"
 "$o/test-patch-embed"
+${CXX:-g++} -std=c++17 -O2 -Wall -Wextra "$d/../core/affinity.cpp" "$d/test-affinity.cpp" -o "$o/test-affinity"
+"$o/test-affinity"
 rm -rf "$o"
