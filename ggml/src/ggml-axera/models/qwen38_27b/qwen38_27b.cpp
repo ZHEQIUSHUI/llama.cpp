@@ -187,7 +187,10 @@ class qwen38_27b final : public model, public seq_model {
     bool   fused = false;
     bool   nv4   = false;
     int    NB = 0, KB = 0, NC = 1;
-    int    VH = 0, KHd = 0, KD = 0, VD = 0, REPf = 0;  // delta-net value/key heads and their dimensions
+    // delta-net value/key heads and their dimensions. VH hides the file-level constant of the same name in every
+    // member function, so it starts at that value (KH * REP): the per-group path reads it; the fused paths set it
+    // from the kernel's state shape.
+    int    VH = KH * REP, KHd = 0, KD = 0, VD = 0, REPf = 0;
     size_t kv_blk_b = 0;                              // bytes of one block's KV pool (all pages)
 
     void init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
@@ -273,7 +276,10 @@ axera_cmm qwen38_27b::bank(const std::map<std::string, ggml_tensor *> & t, const
         const int il  = 4 * b + phase;
         uint8_t * dst = (uint8_t *) c->vir + (size_t) b * bb;
         auto put_f32 = [&](const std::vector<float> & v, float scale = 1.0f) {
-            GGML_ASSERT(v.size() * sizeof(float) == bb || v.size() * sizeof(ggml_bf16_t) == bb);
+            if (v.size() * sizeof(float) != bb && v.size() * sizeof(ggml_bf16_t) != bb) {
+                GGML_ABORT("axera qwen38_27b: bank %s: %zu values of dtype %d, the kernel's block takes %zu bytes (%zu / %d)\n",
+                           d.name.c_str(), v.size(), d.dtype, bb, (size_t) d.bytes, nb);
+            }
             for (size_t i = 0; i < v.size(); ++i) {
                 if (d.dtype == 3) {
                     ((float *) dst)[i] = v[i] * scale;
