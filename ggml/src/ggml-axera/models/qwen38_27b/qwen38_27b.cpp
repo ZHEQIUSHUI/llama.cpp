@@ -177,7 +177,18 @@ class qwen38_27b final : public model, public seq_model {
     axera_cmm                      INDPTR, INDICES, LASTLEN, CLOC, VALID;
     output_head                    head;
 
+    // The upstream fused dense path (sgl_kernel_axera.models.qwen38_27b.forward_qwen38_blocks): one prefill kernel and
+    // one decode kernel carry whole 4-layer blocks in banks [KB, ...]. NB = L / 4 blocks in the model, KB = the blocks
+    // one kernel call owns, NC = NB / KB calls per row batch. The 2B/4B manifests have no decode.group; the 27B
+    // manifest keeps it and runs the older per-group path untouched.
+    bool   fused = false;
+    bool   nv4   = false;
+    int    NB = 0, KB = 0, NC = 1;
+    int    VH = 0, KHd = 0, KD = 0, VD = 0, REPf = 0;  // delta-net value/key heads and their dimensions
+    size_t kv_blk_b = 0;                              // bytes of one block's KV pool (all pages)
+
     void init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
+    void init_fused(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
     void init_mtp(const std::map<std::string, ggml_tensor *> & t, int il);
     size_t part(int kind) const { return kind == 0 ? st_b : kind == 3 ? cv_b : cq_b; }
     const axera_cmm & pool(int kind) const { return kind == 0 ? ST : kind == 1 ? CQ : kind == 2 ? CK : CV; }
@@ -187,6 +198,8 @@ class qwen38_27b final : public model, public seq_model {
     ggml_status verify(int64_t c0, int row0, int T, const ggml_bf16_t * xb, const int32_t * pb, float * h);
     ggml_status compute_mtp(ggml_cgraph * g);
     axera_cmm bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d, const rope & rp);
+    axera_cmm bank_fused(const std::map<std::string, ggml_tensor *> & t, const io_desc & d);
+    int       vtiled(int g) const { return (g % REPf) * KHd + g / REPf; }
     void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
                       seq_snap * snap);
 };
@@ -434,6 +447,258 @@ axera_cmm qwen38_27b::bank(const std::map<std::string, ggml_tensor *> & t, const
         for (const ggml_tensor * w : read) {
             axera_drop_mapped(w);
         }
+    }
+    return c;
+}
+
+// Fill one fused upstream bank for all NB blocks: block b's four layers are 4*b + phase. Every source tensor is
+// read straight from the GGUF; the delta-net rows and columns the converter tiled are put back in checkpoint order.
+axera_cmm qwen38_27b::bank_fused(const std::map<std::string, ggml_tensor *> & t, const io_desc & d) {
+    static const std::regex re("b([0-3])_(attn|mlp)_(.+)");
+    std::smatch             mt;
+    if (!std::regex_match(d.name, mt, re)) {
+        GGML_ABORT("axera qwen38_27b: fused: unexpected input %s\n", d.name.c_str());
+    }
+    const int         phase  = std::stoi(mt[1]);
+    const bool        mlp    = mt[2] == "mlp";
+    const std::string n      = mt[3];
+    const bool        shared = d.name == "b3_attn_cos_sin_cache";
+    const size_t      bb     = d.bytes / (shared ? 1 : (size_t) KB);
+    axera_cmm         c      = axera_cmm_alloc(bb * (size_t) (shared ? 1 : NB));
+    const size_t      stride = bb;
+    std::vector<const ggml_tensor *> read;
+    auto T = [&](int il, const char * g) -> ggml_tensor * {
+        const std::string nm = "blk." + std::to_string(il) + "." + g;
+        if (!t.count(nm)) {
+            GGML_ABORT("axera qwen38_27b: fused: %s not in the graph\n", nm.c_str());
+        }
+        read.push_back(t.at(nm));
+        return t.at(nm);
+    };
+    auto scale2_of = [&](const ggml_tensor * w, int64_t row) -> float {
+        std::string nm = w->name;
+        const std::string suf = ".weight";
+        if (nm.size() >= suf.size() && nm.compare(nm.size() - suf.size(), suf.size(), suf) == 0) {
+            nm.resize(nm.size() - suf.size());
+        }
+        nm += ".scale";
+        auto it = t.find(nm);
+        if (it == t.end() || it->second->type != GGML_TYPE_F32) {
+            GGML_ABORT("axera qwen38_27b: fused: NVFP4 tensor %s has no F32 .scale sidecar\n", w->name);
+        }
+        const int64_t ne = ggml_nelements(it->second);
+        GGML_ASSERT(ne == 1 || (row >= 0 && row < ne));
+        return ((const float *) it->second->data)[ne == 1 ? 0 : row];
+    };
+    for (int b = 0; b < (shared ? 1 : NB); ++b) {
+        const int il  = 4 * b + phase;
+        uint8_t * dst = (uint8_t *) c->vir + (size_t) b * stride;
+        auto put = [&](const std::vector<float> & v, float mul = 1.0f) {
+            if (v.size() * (d.dtype == 3 ? sizeof(float) : sizeof(ggml_bf16_t)) != bb) {
+                GGML_ABORT("axera qwen38_27b: fused: bank %s: %zu values of dtype %d, kernel block wants %zu bytes\n",
+                           d.name.c_str(), v.size(), d.dtype, bb);
+            }
+            for (size_t i = 0; i < v.size(); ++i) {
+                if (d.dtype == 3) {
+                    ((float *) dst)[i] = v[i] * mul;
+                } else {
+                    GGML_ASSERT(d.dtype == 9);
+                    ((ggml_bf16_t *) dst)[i] = ggml_fp32_to_bf16(v[i] * mul);
+                }
+            }
+        };
+        auto zero = [&]() { memset(dst, 0, bb); };
+        auto scalar = [&](float v) {
+            for (size_t i = 0; i < bb / (d.dtype == 3 ? 4 : 2); ++i) {
+                if (d.dtype == 3) {
+                    ((float *) dst)[i] = v;
+                } else {
+                    ((ggml_bf16_t *) dst)[i] = ggml_fp32_to_bf16(v);
+                }
+            }
+        };
+        auto nv = [&](const ggml_tensor * w, int64_t s0, int64_t nr, int64_t row0, bool codes, bool scales, int64_t K) {
+            thread_local std::vector<uint8_t> tq, ts;
+            uint8_t * qp = codes ? dst + (size_t) row0 * (K / 2) : nullptr;
+            uint8_t * sp = scales ? dst + (size_t) row0 * (K / 16) : nullptr;
+            if (!codes) {
+                tq.resize((size_t) nr * (K / 2));
+                qp = tq.data();
+            }
+            if (!scales) {
+                ts.resize((size_t) nr * (K / 16));
+                sp = ts.data();
+            }
+            axera_copy_nvfp4_slice(w, s0, nr, qp, K / 2, sp, K / 16);
+        };
+        auto nv_rows = [&](const ggml_tensor * w, int64_t row0, int64_t nr, bool codes, bool scales, int64_t K,
+                           int64_t hr, int64_t vrow) {
+            GGML_ASSERT(hr > 0 && nr % hr == 0);
+            for (int64_t j = 0; j < nr; j += hr) {
+                nv(w, vrow + (int64_t) vtiled((int) (j / hr)) * hr, hr, row0 + j, codes, scales, K);
+            }
+        };
+        auto nv_cols = [&](const ggml_tensor * w, int64_t row0, int64_t nr, bool codes, bool scales, int64_t K) {
+            thread_local std::vector<uint8_t> tq, ts;
+            tq.resize((size_t) K / 2);
+            ts.resize((size_t) K / 16);
+            const size_t cq = (size_t) (K / 2) / VH, cs = (size_t) (K / 16) / VH;
+            GGML_ASSERT((size_t) VH * cq == (size_t) (K / 2) && (size_t) VH * cs == (size_t) (K / 16));
+            for (int64_t r = 0; r < nr; ++r) {
+                axera_copy_nvfp4_slice(w, row0 + r, 1, tq.data(), K / 2, ts.data(), K / 16);
+                for (int g = 0; g < VH; ++g) {
+                    if (codes) {
+                        memcpy(dst + (size_t) (row0 + r) * (K / 2) + (size_t) g * cq, tq.data() + vtiled(g) * cq, cq);
+                    }
+                    if (scales) {
+                        memcpy(dst + (size_t) (row0 + r) * (K / 16) + (size_t) g * cs, ts.data() + vtiled(g) * cs, cs);
+                    }
+                }
+            }
+        };
+        const bool codes  = d.dtype == 15;
+        const bool scales = d.dtype == 11;
+        GGML_ASSERT(codes || scales || d.dtype == 3 || d.dtype == 9 || d.dtype == 6);
+        if (mlp) {
+            if (n == "w_norm") {
+                put(f32_of(T(il, "post_attention_norm.weight")));
+            } else if (n == "input_permutation") {
+                zero();
+            } else if (n == "w1" || n == "w_scale1") {
+                const ggml_tensor * w = T(il, "ffn_gate.weight");
+                nv(w, 0, w->ne[1], 0, codes, scales, w->ne[0]);
+            } else if (n == "w2" || n == "w_scale2") {
+                const ggml_tensor * w = T(il, "ffn_up.weight");
+                nv(w, 0, w->ne[1], 0, codes, scales, w->ne[0]);
+            } else if (n == "w3" || n == "w_scale3") {
+                const ggml_tensor * w = T(il, "ffn_down.weight");
+                nv(w, 0, w->ne[1], 0, codes, scales, w->ne[0]);
+            } else if (n.rfind("w_scale2_", 0) == 0) {
+                const std::string p = n.substr(9);
+                const char *      g = p == "1" ? "ffn_gate.weight" : p == "2" ? "ffn_up.weight" : "ffn_down.weight";
+                scalar(scale2_of(T(il, g), 0));
+            } else if (n.rfind("w_zp_scale", 0) == 0) {
+                zero();
+            } else {
+                GGML_ABORT("axera qwen38_27b: fused: unexpected MLP input %s\n", d.name.c_str());
+            }
+        } else if (phase == 3) {
+            const std::string p = n.size() > 2 ? n.substr(n.rfind('_') + 1) : n;
+            if (n == "w_norm_attn") {
+                put(f32_of(T(il, "attn_norm.weight")));
+            } else if (n == "w_norm_q") {
+                put(f32_of(T(il, "attn_q_norm.weight")), 1.0f / std::sqrt((float) d.shape.back()));
+            } else if (n == "w_norm_k") {
+                put(f32_of(T(il, "attn_k_norm.weight")));
+            } else if (n == "cos_sin_cache") {
+                const int64_t P = d.shape.size() >= 3 ? d.shape[1] : 0;
+                GGML_ASSERT(P > 0 && d.shape.back() == 64 && bb == (size_t) P * 64 * sizeof(ggml_bf16_t));
+                std::vector<float> inv(32);
+                for (int i = 0; i < 32; ++i) {
+                    inv[i] = 1.0f / std::pow(10000000.0f, (float) (2 * i) / 64);
+                }
+                ggml_bf16_t * o = (ggml_bf16_t *) dst;
+                for (int64_t q = 0; q < P; ++q) {
+                    for (int i = 0; i < 32; ++i) {
+                        const float th = (float) q * inv[i];
+                        o[q * 64 + i]      = ggml_fp32_to_bf16(std::cos(th));
+                        o[q * 64 + 32 + i] = ggml_fp32_to_bf16(std::sin(th));
+                    }
+                }
+            } else if (n.size() >= 2 && (n[0] == 'w' && (n[1] == 'q' || n[1] == 'k' || n[1] == 'v' || n[1] == 'o'))) {
+                static const std::map<char, const char *> W = { { 'q', "attn_q.weight" }, { 'k', "attn_k.weight" },
+                                                                { 'v', "attn_v.weight" }, { 'o', "attn_output.weight" } };
+                if (n.size() == 2 && W.count(n[1])) {
+                    const ggml_tensor * w = T(il, W.at(n[1]));
+                    nv(w, 0, w->ne[1], 0, codes, scales, w->ne[0]);
+                } else if (n == "w_scale_q" || n == "w_scale_k" || n == "w_scale_v" || n == "w_scale_o") {
+                    const ggml_tensor * w = T(il, W.at(n[7]));
+                    nv(w, 0, w->ne[1], 0, codes, scales, w->ne[0]);
+                } else if (n.rfind("w_scale2_", 0) == 0 && n.size() == 10) {
+                    const ggml_tensor * w = T(il, W.at(n[9]));
+                    scalar(scale2_of(w, 0));
+                } else if (n.rfind("w_zeropoint_", 0) == 0) {
+                    zero();
+                } else {
+                    GGML_ABORT("axera qwen38_27b: fused: unexpected attention input %s\n", d.name.c_str());
+                }
+            } else {
+                GGML_ABORT("axera qwen38_27b: fused: unexpected attention input %s\n", d.name.c_str());
+            }
+        } else {
+            if (n == "input_norm_w") {
+                put(f32_of(T(il, "attn_norm.weight")));
+            } else if (n == "o_norm_w") {
+                put(f32_of(T(il, "ssm_norm.weight")));
+            } else if (n == "a_log") {
+                const std::vector<float> a = f32_of(T(il, "ssm_a"));
+                std::vector<float>       u(VH);
+                for (int h = 0; h < VH; ++h) {
+                    u[h] = std::log(-a[(size_t) vtiled(h)]);
+                }
+                put(u);
+            } else if (n == "dt_bias") {
+                const std::vector<float> v = f32_of(T(il, "ssm_dt.bias"));
+                std::vector<float>       u(VH);
+                for (int h = 0; h < VH; ++h) {
+                    u[h] = v[(size_t) vtiled(h)];
+                }
+                put(u);
+            } else if (n == "w_q_conv" || n == "w_k_conv" || n == "w_v_conv") {
+                const ggml_tensor *      w = T(il, "ssm_conv1d.weight");
+                const std::vector<float> v = f32_of(w);
+                const int64_t            tp = w->ne[0], C = d.shape[1] * d.shape[2];
+                const int64_t            v0 = w->ne[1] - C;
+                const int64_t            c0 = n[2] == 'q' ? 0 : n[2] == 'k' ? C : v0;
+                GGML_ASSERT(d.shape.size() == 4 && d.shape[2] == 1 && d.shape[3] == tp && C + c0 <= w->ne[1]);
+                std::vector<float> u((size_t) C * tp);
+                for (int64_t r = 0; r < C; ++r) {
+                    const int64_t hr  = C / VH;
+                    const int64_t src = n[2] == 'v' ? v0 + (int64_t) vtiled((int) (r / hr)) * hr + r % hr : c0 + r;
+                    memcpy(&u[(size_t) r * tp], &v[(size_t) src * tp], tp * sizeof(float));
+                }
+                put(u);
+            } else if (n == "w_a_scale2" || n == "w_b_scale2" || n == "w_o_scale2") {
+                const char * g = n[2] == 'a' ? "ssm_alpha.weight" : n[2] == 'b' ? "ssm_beta.weight" : "ssm_out.weight";
+                scalar(scale2_of(T(il, g), 0));
+            } else if (n == "w_q_scale2" || n == "w_k_scale2" || n == "w_v_scale2" || n == "w_z_scale2") {
+                const ggml_tensor * qkv = T(il, "attn_qkv.weight");
+                const int64_t        kh = (int64_t) KHd * KD;
+                const char           p  = n[2];
+                scalar(p == 'z' ? scale2_of(T(il, "attn_gate.weight"), 0)
+                                : scale2_of(qkv, p == 'q' ? 0 : p == 'k' ? kh : 2 * kh));
+            } else if (n == "w_q" || n == "w_q_scale" || n == "w_k" || n == "w_k_scale" || n == "w_v" ||
+                       n == "w_v_scale" || n == "w_z" || n == "w_z_scale") {
+                const ggml_tensor * qkv = T(il, "attn_qkv.weight");
+                const int64_t        K   = qkv->ne[0];
+                const int64_t        kh  = (int64_t) KHd * KD;
+                const int64_t        vh  = qkv->ne[1] - 2 * kh;
+                GGML_ASSERT(kh * 2 + vh == qkv->ne[1] && vh % VH == 0);
+                const bool  sc = n.size() > 6 && n.compare(n.size() - 6, 6, "_scale") == 0;
+                const char  p  = n[2];
+                if (p == 'z') {
+                    const ggml_tensor * z = T(il, "attn_gate.weight");
+                    GGML_ASSERT(z->ne[1] % VH == 0);
+                    nv_rows(z, 0, z->ne[1], codes, scales, K, z->ne[1] / VH, 0);
+                } else if (p == 'v') {
+                    nv_rows(qkv, 2 * kh, vh, codes, scales, K, vh / VH, 2 * kh);
+                } else {
+                    nv(qkv, p == 'q' ? 0 : kh, kh, 0, codes, scales, K);
+                }
+            } else if (n == "w_a" || n == "w_a_scale" || n == "w_b" || n == "w_b_scale") {
+                const ggml_tensor * w = T(il, n[2] == 'a' ? "ssm_alpha.weight" : "ssm_beta.weight");
+                nv(w, 0, w->ne[1], 0, codes, scales, w->ne[0]);
+            } else if (n == "w_o" || n == "w_o_scale") {
+                const ggml_tensor * w = T(il, "ssm_out.weight");
+                nv_cols(w, 0, w->ne[1], codes, scales, w->ne[0]);
+            } else {
+                GGML_ABORT("axera qwen38_27b: fused: unexpected delta-net input %s\n", d.name.c_str());
+            }
+        }
+    }
+    c->flush();
+    for (const ggml_tensor * w : read) {
+        axera_drop_mapped(w);
     }
     return c;
 }
@@ -830,6 +1095,227 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
                   (long long) man.context);
 }
 
+// The upstream fused dense path: one prefill kernel (256 rows) and one decode kernel (1 row), their banks carrying
+// KB whole 4-layer blocks. The 2B/4B manifests use this path; the 27B manifest has decode.group and keeps init().
+void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_) {
+    L    = L_;
+    H    = H_;
+    fused = true;
+    nv4   = true;
+    GGML_ASSERT(L % 4 == 0);
+    NB = L / 4;
+    const kernel & pk = man.get("prefill");
+    const kernel & dk = man.get("decode");
+    auto in_of = [&](const kernel & k, const std::string & n) -> const io_desc & {
+        for (const auto & d : k.desc->in) {
+            if (d.name == n) {
+                return d;
+            }
+        }
+        for (const auto & d : k.desc->out) {
+            if (d.name == n) {
+                return d;
+            }
+        }
+        GGML_ABORT("axera qwen38_27b: %s has no IO %s\n", k.desc->file.c_str(), n.c_str());
+    };
+    // This builder registers the projections separately (w_q, w_k, w_v, w_z, w_a, w_b); the 27B sgl manifests fuse
+    // them into w_k/w_a. The two layouts are filled by different bank mappers, chosen from the compiled IO.
+    if (pk.find_input("b0_attn_w_q") < 0) {
+        GGML_ABORT("axera qwen38_27b: fused prefill needs the per-projection delta-net banks\n");
+    }
+    const io_desc & pst = in_of(pk, "b0_attn_state_in");
+    const io_desc & pcq = in_of(pk, "b0_attn_q_conv_state_in");
+    const io_desc & pcv = in_of(pk, "b0_attn_v_conv_state_in");
+    const io_desc & pkv = in_of(pk, "b3_kv");
+    KB = (int) in_of(pk, "b0_mlp_w_norm").shape[0];
+    GGML_ASSERT(KB > 0 && NB % KB == 0);
+    NC = NB / KB;
+    GGML_ASSERT(pst.shape.size() == 5 && pst.bytes % (size_t) KB == 0);
+    VH  = (int) pst.shape[2];
+    KD  = (int) pst.shape[3];
+    VD  = (int) pst.shape[4];
+    st_b = pst.bytes / (size_t) KB;
+    cq_b = pcq.bytes / (size_t) KB;
+    cv_b = pcv.bytes / (size_t) KB;
+    const io_desc & pq = in_of(pk, "b0_attn_w_q");
+    GGML_ASSERT(pq.shape.size() == 3 && pq.shape[1] % KD == 0);
+    KHd  = (int) (pq.shape[1] / KD);
+    REPf = VH / KHd;
+    GGML_ASSERT(KHd > 0 && REPf > 0 && VH % KHd == 0);
+
+    GGML_ASSERT(pkv.shape.size() >= 5 && pkv.bytes % (size_t) KB == 0);
+    const size_t kd = pkv.shape.size();
+    GGML_ASSERT(kd >= 6 && pkv.shape[kd - 6] == KB && pkv.shape[kd - 4] == 2 && pkv.shape[kd - 3] == PG &&
+                pkv.shape[kd - 1] == 256);
+    kv_blk_b = pkv.bytes / (size_t) KB;
+    // [..][KB][pages][2][PG][KV heads][256]
+    kv_pages = (int) pkv.shape[kd - 5];
+    kv_cells = man.context;
+    GGML_ASSERT((int64_t) kv_pages * PG >= (int64_t) man.context);
+    NBLK = kv_pages;
+    ROT  = 64;
+
+    kv_b      = pkv.bytes;  // one call's KV bank (KB blocks)
+    kv_alloc  = kv_b;
+    kvs_b     = 0;
+    kvs_alloc = 0;
+    KVC.resize(NC);
+    for (int c = 0; c < NC; ++c) {
+        KVC[c] = axera_cmm_alloc(kv_b);
+    }
+    KVSC.clear();
+    ST = axera_cmm_alloc(st_b * (size_t) NB * 3);
+    CQ = axera_cmm_alloc(cq_b * (size_t) NB * 3);
+    CK = axera_cmm_alloc(cq_b * (size_t) NB * 3);
+    CV = axera_cmm_alloc(cv_b * (size_t) NB * 3);
+    state_image_b = ST->size + CQ->size + CK->size + CV->size;
+
+    INDPTR  = axera_cmm_alloc(2 * sizeof(int32_t));
+    INDICES = axera_cmm_alloc(pk.in_bytes("indices"));
+    LASTLEN = axera_cmm_alloc(std::max(pk.in_bytes("last_page_len"), dk.in_bytes("last_page_len")));
+    GGML_ASSERT(LASTLEN->size >= 2 * sizeof(int32_t));
+    CLOC  = axera_cmm_alloc(2 * sizeof(int32_t));
+    VALID = axera_cmm_alloc(sizeof(int32_t));
+    const int n_indices = (int) (pk.in_bytes("indices") / sizeof(int32_t));
+    GGML_ASSERT(n_indices >= (int) ((man.context + PG - 1) / PG) && n_indices <= kv_pages);
+    for (int i = 0; i < n_indices; ++i) {
+        ((int32_t *) INDICES->vir)[i] = i;
+    }
+    INDICES->flush();
+
+    A = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
+    banks.clear();
+    {
+        static const std::set<std::string> runtime = {
+            "x", "position_ids", "indptr", "indices", "last_page_len", "cache_location", "valid_tokens", "b3_kv",
+            "b0_attn_state_in", "b1_attn_state_in", "b2_attn_state_in", "b0_attn_q_conv_state_in",
+            "b1_attn_q_conv_state_in", "b2_attn_q_conv_state_in", "b0_attn_k_conv_state_in",
+            "b1_attn_k_conv_state_in", "b2_attn_k_conv_state_in", "b0_attn_v_conv_state_in",
+            "b1_attn_v_conv_state_in", "b2_attn_v_conv_state_in"
+        };
+        axera_timer tb("init: fused banks");
+        for (const auto & d : pk.desc->in) {
+            if (!runtime.count(d.name)) {
+                banks[d.name] = bank_fused(t, d);
+            }
+        }
+    }
+
+    auto state_io = [&](const std::string & n, int ci) -> AX_ENGINE_IO_BUFFER_T {
+        const int ph = n[1] - '0';
+        const size_t per = n.find("q_conv_state_in") != std::string::npos ? cq_b :
+                           n.find("k_conv_state_in") != std::string::npos ? cq_b :
+                           n.find("v_conv_state_in") != std::string::npos ? cv_b : st_b;
+        const axera_cmm * p = n.find("q_conv_state_in") != std::string::npos ? &CQ :
+                              n.find("k_conv_state_in") != std::string::npos ? &CK :
+                              n.find("v_conv_state_in") != std::string::npos ? &CV : &ST;
+        GGML_ASSERT(ph >= 0 && ph < 3);
+        const size_t off = ((size_t) ph * NB + (size_t) ci * KB) * per;
+        return axera_io(p->get(), (char *) (*p)->vir + off, per * (size_t) KB);
+    };
+    auto bind = [&](const kernel & k, std::vector<call> & calls, bool decode) {
+        calls.assign(NC, {});
+        for (int ci = 0; ci < NC; ++ci) {
+            call & c = calls[ci];
+            c.k      = &k;
+            for (const auto & d : k.desc->in) {
+                const std::string & n = d.name;
+                if (n == "x") {
+                    c.in.push_back(axera_io(decode ? A : (ci == 0 ? pfs[0].X : pfs[0].OUT[(ci - 1) & 1]), d.bytes));
+                } else if (n == "position_ids") {
+                    c.in.push_back(axera_io(pfs[0].POS, d.bytes));
+                } else if (n == "indptr") {
+                    c.in.push_back(axera_io(INDPTR, d.bytes));
+                } else if (n == "indices") {
+                    c.in.push_back(axera_io(INDICES, d.bytes));
+                } else if (n == "last_page_len") {
+                    c.in.push_back(axera_io(LASTLEN, d.bytes));
+                } else if (n == "cache_location") {
+                    c.in.push_back(axera_io(CLOC, d.bytes));
+                } else if (n == "valid_tokens") {
+                    c.in.push_back(axera_io(VALID, d.bytes));
+                } else if (n == "b3_kv") {
+                    GGML_ASSERT(d.bytes == kv_b);
+                    c.in.push_back(axera_io(KVC[ci], kv_b));
+                } else if (n.size() > 2 && n[0] == 'b' && n[1] >= '0' && n[1] <= '2' &&
+                           (n.find("_state_in") != std::string::npos || n.find("_conv_state_in") != std::string::npos)) {
+                    c.in.push_back(state_io(n, ci));
+                } else {
+                    auto it = banks.find(n);
+                    if (it == banks.end()) {
+                        GGML_ABORT("axera qwen38_27b: fused: %s: unexpected input %s\n", k.desc->role.c_str(), n.c_str());
+                    }
+                    const bool shared = n == "b3_attn_cos_sin_cache";
+                    const size_t off  = shared ? 0 : (size_t) ci * d.bytes;
+                    GGML_ASSERT(it->second->size >= off + d.bytes);
+                    c.in.push_back(axera_io(it->second.get(), (char *) it->second->vir + off, d.bytes));
+                }
+            }
+            for (const auto & d : k.desc->out) {
+                GGML_ASSERT(d.name == "output");
+                c.out.push_back(axera_io(decode ? A : pfs[0].OUT[ci & 1], d.bytes));
+            }
+        }
+    };
+    prefill_set & P = pfs[0];
+    P.k             = &pk;
+    P.rows          = PG;
+    P.X             = axera_cmm_alloc(pk.in_bytes("x"));
+    P.POS           = axera_cmm_alloc(pk.in_bytes("position_ids"));
+    P.OUT[0]        = axera_cmm_alloc(pk.out_bytes("output"));
+    P.OUT[1]        = axera_cmm_alloc(pk.out_bytes("output"));
+    GGML_ASSERT(pk.in_bytes("x") == (size_t) PG * H * sizeof(ggml_bf16_t) &&
+                pk.in_bytes("position_ids") == 3 * (size_t) PG * sizeof(int32_t) &&
+                pk.out_bytes("output") == (size_t) PG * H * sizeof(ggml_bf16_t));
+    bind(pk, P.calls, false);
+    bind(dk, dec, true);
+
+    ord.assign(L, 0);
+    int ng = 0, na = 0;
+    for (int il = 0; il < L; ++il) {
+        const bool g = t.count("blk." + std::to_string(il) + ".ssm_a") > 0;
+        if (g != (il % 4 != 3)) {
+            GGML_ABORT("axera qwen38_27b: layer %d is not the 3 delta-net + 1 attention pattern\n", il);
+        }
+        if (g) {
+            const int b = il / 4, ph = il % 4;
+            ord[il] = ph * NB + b;  // the phase-major GDN state pools
+            ++ng;
+        } else {
+            ord[il] = il / 4;  // the fused KV bank's block
+            ++na;
+        }
+    }
+    G = L;
+    for (int k = 0; k < 4; ++k) {
+        where[k].assign(ng, {});
+        for (int g = 0; g < ng; ++g) {
+            where[k][g] = { pool(k).get(), (char *) pool(k)->vir + g * part(k) };
+        }
+    }
+    cur_set       = -1;
+    state_zero    = true;
+    ver_rows      = 0;
+    state_ios.clear();
+    ver.clear();
+
+    seq_config cfg;
+    cfg.kept_max     = 1;
+    cfg.verify_chain = 0;
+    cfg.check        = [] { const char * e = getenv("GGML_AXERA_SEQ_CHECK"); return e && atoi(e) != 0; }();
+    cfg.force_miss   = [] { const char * e = getenv("GGML_AXERA_SEQ_FORCE_MISS"); return e ? std::max(0, atoi(e)) : 0; }();
+    seq              = std::make_unique<seqstate>(*this, cfg);
+    size_t bb = 0;
+    for (const auto & [n, b] : banks) {
+        bb += b->size;
+    }
+    GGML_LOG_INFO("axera qwen38_27b: fused %d layers, %d blocks, %d per call, banks %.2f GiB, state %.2f GiB, %lld cells\n",
+                  L, NB, KB, bb / 1073741824.0,
+                  (double) (KVC.size() * kv_b + ST->size + CQ->size + CK->size + CV->size) / 1073741824.0,
+                  (long long) man.context);
+}
+
 // the calls' state outputs to where the state is
 void qwen38_27b::bind_state() {
     for (const auto & s : state_ios) {
@@ -962,8 +1448,37 @@ bool qwen38_27b::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int3
 }
 
 bool qwen38_27b::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p4, int batch_row) {
-    (void) p4;  // the row's M-RoPE positions come from the graph's rope view (batch_rope)
     GGML_ASSERT(batch_row == 0);
+    if (fused) {
+        // the upstream decode kernel takes the token's three M-RoPE positions, a one-page table and the cell in its
+        // page; the recurrent and conv states are updated in place.
+        memcpy(A->vir, x, H * sizeof(ggml_bf16_t));
+        A->flush(A->vir, H * sizeof(ggml_bf16_t));
+        int32_t * pp = (int32_t *) pfs[0].POS->vir;
+        for (int s = 0; s < 3; ++s) {
+            pp[s] = p4 ? p4[s] : s < 2 ? (int32_t) c : 0;
+        }
+        pfs[0].POS->flush(pfs[0].POS->vir, 3 * sizeof(int32_t));
+        ((int32_t *) INDPTR->vir)[0] = 0;
+        ((int32_t *) INDPTR->vir)[1] = (int32_t) (c / PG + 1);
+        ((int32_t *) LASTLEN->vir)[0] = (int32_t) (c % PG);
+        ((int32_t *) CLOC->vir)[0]    = (int32_t) (c / PG);
+        ((int32_t *) CLOC->vir)[1]    = (int32_t) (c % PG);
+        for (const axera_cmm * b : { &INDPTR, &LASTLEN, &CLOC }) {
+            (*b)->flush();
+        }
+        {
+            axera_timer tl("layers (decode)");
+            for (auto & cc : dec) {
+                cc.k->run(cc.in, cc.out, "dense decode");
+            }
+            state_zero = false;
+        }
+        A->invalidate(A->vir, H * sizeof(ggml_bf16_t));
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) A->vir, out_h, H);
+        return true;
+    }
+    (void) p4;  // the row's M-RoPE positions come from the graph's rope view (batch_rope)
     memcpy(A->vir, x, H * sizeof(ggml_bf16_t));
     A->flush(A->vir, H * sizeof(ggml_bf16_t));
     batch_rope->rows(0, 1, COS.get(), SIN.get());
@@ -1053,8 +1568,12 @@ size_t qwen38_27b::state_size(uint32_t flags) const {
     }
     size_t n = sizeof(state_header_27b) + seq_n;
     if (!partial) {
-        n += (size_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
-        n += (size_t) KVSC.size() * pna * nkv_pages * (kvs_b / NBLK);
+        if (fused) {
+            n += (size_t) KVC.size() * (size_t) KB * nkv_pages * kv_blk_b / (size_t) kv_pages;
+        } else {
+            n += (size_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
+            n += (size_t) KVSC.size() * pna * nkv_pages * (kvs_b / NBLK);
+        }
     }
     n += mtp_pages * mtp_page_b;
     return n;
@@ -1093,10 +1612,11 @@ size_t qwen38_27b::state_write(void * dst, size_t size, uint32_t flags) {
     h.ncall       = (uint32_t) KVC.size();
     h.pna         = (uint32_t) pna;
     h.nkv_pages   = (uint32_t) nkv_pages;
-    h.kv_page_b   = kv_b / NBLK;
+    h.kv_page_b   = fused ? kv_blk_b / (size_t) kv_pages : kv_b / NBLK;
     h.kvs_page_b  = kvs_b / NBLK;
-    h.kv_n        = partial ? 0 : (uint64_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
-    h.kvs_n       = partial ? 0 : (uint64_t) KVSC.size() * pna * nkv_pages * (kvs_b / NBLK);
+    h.kv_n        = partial ? 0 : fused ? (uint64_t) KVC.size() * KB * nkv_pages * h.kv_page_b
+                                      : (uint64_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
+    h.kvs_n       = partial ? 0 : fused ? 0 : (uint64_t) KVSC.size() * pna * nkv_pages * (kvs_b / NBLK);
     h.seq_n       = seq_n;
     h.mtp_page0   = mtp_page0;
     h.mtp_pages   = mtp_pages;
@@ -1108,22 +1628,35 @@ size_t qwen38_27b::state_write(void * dst, size_t size, uint32_t flags) {
     memcpy(p, &h, sizeof(h));
     p += sizeof(h);
     if (!partial) {
-        const size_t page_n = nkv_pages * (kv_b / NBLK);
-        for (const axera_cmm & c : KVC) {
-            for (int j = 0; j < pna; ++j) {
-                char * src = (char *) c->vir + (size_t) j * kv_alloc;
-                c->invalidate(src, page_n);
-                memcpy(p, src, page_n);
-                p += page_n;
+        if (fused) {
+            const size_t page_b = kv_blk_b / (size_t) kv_pages;
+            const size_t page_n = nkv_pages * page_b;
+            for (const axera_cmm & c : KVC) {
+                for (int blk = 0; blk < KB; ++blk) {
+                    char * src = (char *) c->vir + (size_t) blk * kv_blk_b;
+                    c->invalidate(src, page_n);
+                    memcpy(p, src, page_n);
+                    p += page_n;
+                }
             }
-        }
-        const size_t scale_n = nkv_pages * (kvs_b / NBLK);
-        for (const axera_cmm & c : KVSC) {
-            for (int j = 0; j < pna; ++j) {
-                char * src = (char *) c->vir + (size_t) j * kvs_alloc;
-                c->invalidate(src, scale_n);
-                memcpy(p, src, scale_n);
-                p += scale_n;
+        } else {
+            const size_t page_n = nkv_pages * (kv_b / NBLK);
+            for (const axera_cmm & c : KVC) {
+                for (int j = 0; j < pna; ++j) {
+                    char * src = (char *) c->vir + (size_t) j * kv_alloc;
+                    c->invalidate(src, page_n);
+                    memcpy(p, src, page_n);
+                    p += page_n;
+                }
+            }
+            const size_t scale_n = nkv_pages * (kvs_b / NBLK);
+            for (const axera_cmm & c : KVSC) {
+                for (int j = 0; j < pna; ++j) {
+                    char * src = (char *) c->vir + (size_t) j * kvs_alloc;
+                    c->invalidate(src, scale_n);
+                    memcpy(p, src, scale_n);
+                    p += scale_n;
+                }
             }
         }
     }
@@ -1154,12 +1687,16 @@ size_t qwen38_27b::state_read(const void * src, size_t size, uint32_t flags) {
         return 0;
     }
     const int pna = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
-    if (KVC.size() != h.ncall || pna != (int) h.pna || h.kv_page_b != kv_b / NBLK ||
-        h.kvs_page_b != kvs_b / NBLK ||
-        (partial ? h.nkv_pages != 0 || h.kv_n != 0 || h.kvs_n != 0 :
-                   h.nkv_pages > (uint32_t) kv_pages ||
-                       h.kv_n != (uint64_t) h.ncall * h.pna * h.nkv_pages * h.kv_page_b ||
-                       h.kvs_n != (uint64_t) KVSC.size() * h.pna * h.nkv_pages * h.kvs_page_b) ||
+    const bool kv_ok = fused ? h.kv_page_b == kv_blk_b / (size_t) kv_pages && h.kvs_n == 0 &&
+                                  (partial ? h.nkv_pages != 0 || h.kv_n == 0
+                                           : h.nkv_pages <= (uint32_t) kv_pages &&
+                                                 h.kv_n == (uint64_t) h.ncall * KB * h.nkv_pages * h.kv_page_b)
+                            : h.kv_page_b == kv_b / NBLK && h.kvs_page_b == kvs_b / NBLK &&
+                                  (partial ? h.nkv_pages != 0 || h.kv_n == 0 || h.kvs_n == 0
+                                           : h.nkv_pages <= (uint32_t) kv_pages &&
+                                                 h.kv_n == (uint64_t) h.ncall * h.pna * h.nkv_pages * h.kv_page_b &&
+                                                 h.kvs_n == (uint64_t) KVSC.size() * h.pna * h.nkv_pages * h.kvs_page_b);
+    if (KVC.size() != h.ncall || pna != (int) h.pna || !kv_ok ||
         h.state_cell < -1 || h.state_cell > kv_cells) {
         return 0;
     }
@@ -1180,21 +1717,32 @@ size_t qwen38_27b::state_read(const void * src, size_t size, uint32_t flags) {
     const char * p = (const char *) src + sizeof(h);
     if (!partial) {
         const size_t page_n = h.nkv_pages * h.kv_page_b;
-        for (const axera_cmm & c : KVC) {
-            for (int j = 0; j < (int) h.pna; ++j) {
-                char * d = (char *) c->vir + (size_t) j * kv_alloc;
-                memcpy(d, p, page_n);
-                c->flush(d, page_n);
-                p += page_n;
+        if (fused) {
+            for (const axera_cmm & c : KVC) {
+                for (int blk = 0; blk < KB; ++blk) {
+                    char * d = (char *) c->vir + (size_t) blk * kv_blk_b;
+                    memcpy(d, p, page_n);
+                    c->flush(d, page_n);
+                    p += page_n;
+                }
             }
-        }
-        const size_t scale_n = h.nkv_pages * h.kvs_page_b;
-        for (const axera_cmm & c : KVSC) {
-            for (int j = 0; j < (int) h.pna; ++j) {
-                char * d = (char *) c->vir + (size_t) j * kvs_alloc;
-                memcpy(d, p, scale_n);
-                c->flush(d, scale_n);
-                p += scale_n;
+        } else {
+            for (const axera_cmm & c : KVC) {
+                for (int j = 0; j < (int) h.pna; ++j) {
+                    char * d = (char *) c->vir + (size_t) j * kv_alloc;
+                    memcpy(d, p, page_n);
+                    c->flush(d, page_n);
+                    p += page_n;
+                }
+            }
+            const size_t scale_n = h.nkv_pages * h.kvs_page_b;
+            for (const axera_cmm & c : KVSC) {
+                for (int j = 0; j < (int) h.pna; ++j) {
+                    char * d = (char *) c->vir + (size_t) j * kvs_alloc;
+                    memcpy(d, p, scale_n);
+                    c->flush(d, scale_n);
+                    p += scale_n;
+                }
             }
         }
     }
@@ -1240,13 +1788,17 @@ void qwen38_27b::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t
         auto * pp = (int32_t *) P->POS->vir;
         for (int s = 0; s < 3; ++s) {
             for (int r = 0; r < P->rows; ++r) {
-                pp[s * P->rows + r] = r < v ? p4[(size_t) (r0 + r) * 4 + s] : 0;
+                const int rr = fused ? (r < v ? r : std::max(0, v - 1)) : (r < v ? r : 0);
+                pp[s * P->rows + r] = p4[(size_t) (r0 + rr) * 4 + s];
             }
         }
         P->POS->flush();
         ((int32_t *) INDPTR->vir)[0]  = 0;
         ((int32_t *) INDPTR->vir)[1]  = (int32_t) (cell / PG);
         *(int32_t *) LASTLEN->vir     = PG;
+        if (fused) {
+            ((int32_t *) LASTLEN->vir)[1] = PG;
+        }
         ((int32_t *) CLOC->vir)[0]    = (int32_t) (cell / PG);
         ((int32_t *) CLOC->vir)[1]    = 0;
         *(int32_t *) VALID->vir       = v;
@@ -1358,7 +1910,11 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
     GGML_ASSERT(rope_node && "axera qwen38_27b: no ROPE node in the graph");
     const ggml_tensor * w0 = t.at("blk.0.attn_norm.weight");
     if (bound != w0->data || L_ != L) {
-        init(t, rope_node, L_, H_);
+        if (man.has("decode") && !man.has("decode.group")) {
+            init_fused(t, rope_node, L_, H_);
+        } else {
+            init(t, rope_node, L_, H_);
+        }
         bound = w0->data;
     }
     const ggml_tensor * k_idxs = names.find("attn_inp_k_idxs");
@@ -1441,18 +1997,35 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
         }
     }
     axera_timer th("output head");
-    head.bind(man.get("lm_head"), logits->src[0]);
-    if (man.has("lm_head.topk")) {
-        head.bind_topk(man.get("lm_head.topk"));
-    }
-    const bool combined = head.bind_combined(man.get("lm_head"), logits->src[0]) && head.combined_ready(g, names);
-    if (man.has("lm_head.verify")) {
-        head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
-    }
-    if (combined) {
-        head.run_combined(g, names, h, T, nullptr, nullptr);
-    } else {
+    if (fused) {
+        // the upstream rmsnorm_gemm head: an [8, K] bf16 tile, the final-norm weight and the NVFP4 output head.
+        // result_output may be the output.scale MUL over the mm; graph_head walks to the mm and bind_norm_gemm takes
+        // the per-tensor scale from output.scale.
+        ggml_tensor * const hm = graph_head(names);
+        GGML_ASSERT(hm && hm->op == GGML_OP_MUL_MAT && hm->src[0] && hm->src[0]->type == GGML_TYPE_NVFP4);
+        float s2 = 1.0f;
+        auto s2it = t.find("output.scale");
+        if (s2it != t.end() && s2it->second->type == GGML_TYPE_F32 && ggml_nelements(s2it->second) == 1) {
+            s2 = ((const float *) s2it->second->data)[0];
+        }
+        if (!head.bind_norm_gemm(man.get("lm_head"), hm->src[0], s2)) {
+            GGML_ABORT("axera qwen38_27b: the lm_head IO is not the upstream rmsnorm_gemm head\n");
+        }
         head.run(g, names, h, T);
+    } else {
+        head.bind(man.get("lm_head"), logits->src[0]);
+        if (man.has("lm_head.topk")) {
+            head.bind_topk(man.get("lm_head.topk"));
+        }
+        const bool combined = head.bind_combined(man.get("lm_head"), logits->src[0]) && head.combined_ready(g, names);
+        if (man.has("lm_head.verify")) {
+            head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
+        }
+        if (combined) {
+            head.run_combined(g, names, h, T, nullptr, nullptr);
+        } else {
+            head.run(g, names, h, T);
+        }
     }
     if (warmup) {  // the warm-up sequence must not make the first real prompt clear the state
         seq->forget();
