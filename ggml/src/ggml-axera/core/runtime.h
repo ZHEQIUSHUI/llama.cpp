@@ -49,6 +49,8 @@ void axera_keep_mapped(const struct ggml_tensor * t);
 void axera_drop_file_pages(const struct ggml_tensor * t);
 // coalesce and release the queued file-page ranges: the backend calls it after the model's first graph (its init)
 void axera_flush_file_pages();
+// read a mapped tensor's file range into the page cache on the host pool, ahead of a conversion that reads it whole
+void axera_page_in(const struct ggml_tensor * t);
 // drop every tensor read by a bank block when the block ends, including through an early continue
 struct axera_mapped_drop_guard {
     std::vector<const struct ggml_tensor *> & read;

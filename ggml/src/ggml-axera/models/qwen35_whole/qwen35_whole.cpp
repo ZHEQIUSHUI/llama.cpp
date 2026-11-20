@@ -232,6 +232,7 @@ axera_cmm qwen35_whole::bank(const std::map<std::string, ggml_tensor *> & t, con
         if (!t.count(nm)) {
             GGML_ABORT("axera qwen35_whole: %s not in the graph\n", nm.c_str());
         }
+        axera_page_in(t.at(nm));
         read.push_back(t.at(nm));
         return t.at(nm);
     };

@@ -530,6 +530,7 @@ void output_head::bind(const kernel & lm, const ggml_tensor * output_weight) {
         yk = axera_cmm_alloc(R * N * sizeof(float));
         mk = axera_cmm_alloc(sizeof(int32_t));
     }
+    axera_page_in(w);  // (the token embedding is mapped for random access: a page per fault otherwise)
     if (mx4) {
         GGML_ASSERT(vp == N);
         axera_quantize_mxfp4(w, q, s);

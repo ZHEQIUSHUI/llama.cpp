@@ -2,6 +2,9 @@
 
 #include "manifest.h"
 
+#include <atomic>
+#include <thread>
+
 #include <map>
 #include <set>
 
@@ -369,8 +372,37 @@ static std::unique_ptr<manifest> load_manifest(const std::string & dir) {
         m->kernels[role] = std::move(d);
     }
     const int64_t t0 = ggml_time_us();
+    // The handles are created on a few threads: one after another the 35B's 29 kernels take 5.9 s, on 8 threads 1.6 s.
+    // AXERA_KERNEL_LOAD_THREADS=1 goes back to one at a time.
+    const char * lt = std::getenv("AXERA_KERNEL_LOAD_THREADS");
+    const int    nt = lt ? std::max(1, std::atoi(lt)) : 8;
+    std::vector<const kernel_desc *> order;
     for (const auto & [role, d] : m->kernels) {
-        m->loaded[role] = load_kernel(dir, d);
+        order.push_back(&d);
+        m->loaded[role] = nullptr;
+    }
+    std::vector<double>      took(order.size());
+    std::atomic<size_t>      nextk{ 0 };
+    auto                     one = [&] {
+        for (size_t i; (i = nextk.fetch_add(1)) < order.size();) {
+            const int64_t k0 = ggml_time_us();
+            auto          k  = load_kernel(dir, *order[i]);
+            took[i]          = (ggml_time_us() - k0) / 1e3;
+            m->loaded.at(order[i]->role) = std::move(k);
+        }
+    };
+    std::vector<std::thread> th;
+    for (int i = 1; i < nt; ++i) {
+        th.emplace_back(one);
+    }
+    one();
+    for (auto & t : th) {
+        t.join();
+    }
+    if (std::getenv("GGML_AXERA_PROF")) {
+        for (size_t i = 0; i < order.size(); ++i) {
+            fprintf(stderr, "axera prof: kernel load %-24s %8.1f ms  %s\n", order[i]->role.c_str(), took[i], order[i]->file.c_str());
+        }
     }
     GGML_LOG_INFO("axera: %s: model %s, context %lld, %zu kernels loaded in %.1f s\n", dir.c_str(), m->model.c_str(),
                   (long long) m->context, m->kernels.size(), (ggml_time_us() - t0) / 1e6);

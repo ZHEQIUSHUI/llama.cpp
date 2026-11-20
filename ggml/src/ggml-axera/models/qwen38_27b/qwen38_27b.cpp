@@ -247,6 +247,7 @@ axera_cmm qwen38_27b::bank(const std::map<std::string, ggml_tensor *> & t, const
         if (!t.count(nm)) {
             GGML_ABORT("axera qwen38_27b: %s not in the graph\n", nm.c_str());
         }
+        axera_page_in(t.at(nm));
         read.push_back(t.at(nm));
         return t.at(nm);
     };

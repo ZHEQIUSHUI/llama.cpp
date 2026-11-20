@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <set>
 #include <thread>
 #include <dirent.h>
 #include <fcntl.h>
@@ -204,6 +205,60 @@ static int axera_file_fd(const std::string & path) {
     return fd;
 }
 
+// A mapped tensor read through its mapping arrives a page fault at a time: 128 KiB of kernel read-ahead per fault on
+// the plain ranges, a single page on the ranges llama.cpp maps for random access (the token embedding), each fault
+// waiting for its read. page_in reads the tensor's file range with plain reads on the host pool first, whose only
+// purpose is to fill the page cache at the disk's rate; the conversion's faults then find their pages there. Once per
+// tensor until the load's pages are released (axera_flush_file_pages). AXERA_PAGE_IN=0 turns it off.
+static std::set<std::pair<int, off_t>> g_paged_in;
+
+void axera_page_in(const ggml_tensor * t) {
+    static const bool off = [] {
+        const char * e = std::getenv("AXERA_PAGE_IN");
+        return e != nullptr && std::atoi(e) == 0;
+    }();
+    if (off || !t || !t->data) {
+        return;
+    }
+    const ggml_tensor * s = t->view_src ? t->view_src : t;
+    const size_t        n = ggml_nbytes(t);
+    if (n < ((size_t) 1 << 20) || !s->buffer ||
+        strcmp(ggml_backend_buffer_name(s->buffer), GGML_AXERA_NAME "_Mapped") != 0) {
+        return;
+    }
+    int   fd   = -1;
+    off_t off0 = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_file_mappings_mu);
+        const uintptr_t            a = (uintptr_t) t->data;
+        const axera_file_mapping * m = axera_find_file_mapping(a);
+        if (!m || a >= m->end) {
+            return;
+        }
+        off0 = m->off + (off_t) (a - m->start);
+        fd   = axera_file_fd(m->path);
+        if (fd < 0 || !g_paged_in.insert({ fd, off0 }).second) {
+            return;
+        }
+    }
+    axera_timer   tp("page in");
+    const off_t   blk = (off_t) 4 << 20;
+    const int64_t nb  = (int64_t) (((off_t) n + blk - 1) / blk);
+    axera_host_pool().run(nb, [&](int64_t i) {
+        thread_local std::vector<char> buf;
+        buf.resize((size_t) blk);
+        const off_t  o   = off0 + i * blk;
+        const size_t len = (size_t) std::min<off_t>(blk, off0 + (off_t) n - o);
+        for (size_t got = 0; got < len;) {
+            const ssize_t r = pread(fd, buf.data(), len - got, o + (off_t) got);
+            if (r <= 0) {
+                break;
+            }
+            got += (size_t) r;
+        }
+    });
+}
+
 void axera_drop_file_pages(const ggml_tensor * t) {
     if (axera_keep_pages() || !t || !t->data || ggml_nbytes(t) == 0) {
         return;
@@ -234,6 +289,10 @@ void axera_flush_file_pages() {
     {
         std::lock_guard<std::mutex> lock(g_file_pages_mu);
         ranges.swap(g_file_pages_pending);
+    }
+    if (!ranges.empty()) {
+        std::lock_guard<std::mutex> lock(g_file_mappings_mu);
+        g_paged_in.clear();
     }
     if (ranges.empty()) {
         return;
