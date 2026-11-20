@@ -605,14 +605,17 @@ axera_cmm qwen38_27b::bank_fused(const std::map<std::string, ggml_tensor *> & t,
                         o[q * 64 + 32 + i] = ggml_fp32_to_bf16(std::sin(th));
                     }
                 }
-            } else if (n.size() >= 2 && (n[0] == 'w' && (n[1] == 'q' || n[1] == 'k' || n[1] == 'v' || n[1] == 'o'))) {
+            } else if ((n.size() == 3 && n[0] == 'w' && n[1] == '_' &&
+                        (n[2] == 'q' || n[2] == 'k' || n[2] == 'v' || n[2] == 'o')) ||
+                       n.rfind("w_scale_", 0) == 0 || n.rfind("w_scale2_", 0) == 0 ||
+                       n.rfind("w_zeropoint_", 0) == 0) {
                 static const std::map<char, const char *> W = { { 'q', "attn_q.weight" }, { 'k', "attn_k.weight" },
                                                                 { 'v', "attn_v.weight" }, { 'o', "attn_output.weight" } };
-                if (n.size() == 2 && W.count(n[1])) {
-                    const ggml_tensor * w = T(il, W.at(n[1]));
+                if (W.count(n[2])) {
+                    const ggml_tensor * w = T(il, W.at(n[2]));
                     nv(w, 0, w->ne[1], 0, codes, scales, w->ne[0]);
                 } else if (n == "w_scale_q" || n == "w_scale_k" || n == "w_scale_v" || n == "w_scale_o") {
-                    const ggml_tensor * w = T(il, W.at(n[7]));
+                    const ggml_tensor * w = T(il, W.at(n[8]));
                     nv(w, 0, w->ne[1], 0, codes, scales, w->ne[0]);
                 } else if (n.rfind("w_scale2_", 0) == 0 && n.size() == 10) {
                     const ggml_tensor * w = T(il, W.at(n[9]));
@@ -1187,16 +1190,17 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
     A = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
     banks.clear();
     {
-        static const std::set<std::string> runtime = {
-            "x", "position_ids", "indptr", "indices", "last_page_len", "cache_location", "valid_tokens", "b3_kv",
-            "b0_attn_state_in", "b1_attn_state_in", "b2_attn_state_in", "b0_attn_q_conv_state_in",
-            "b1_attn_q_conv_state_in", "b2_attn_q_conv_state_in", "b0_attn_k_conv_state_in",
-            "b1_attn_k_conv_state_in", "b2_attn_k_conv_state_in", "b0_attn_v_conv_state_in",
-            "b1_attn_v_conv_state_in", "b2_attn_v_conv_state_in"
-        };
         axera_timer tb("init: fused banks");
         for (const auto & d : pk.desc->in) {
-            if (!runtime.count(d.name)) {
+            static const std::string rt[] = { "_state_in", "_state_out", "_conv_state_in", "_conv_state_out" };
+            bool runtime = d.name == "x" || d.name == "position_ids" || d.name == "indptr" || d.name == "indices" ||
+                           d.name == "last_page_len" || d.name == "cache_location" || d.name == "valid_tokens" ||
+                           d.name == "b3_kv";
+            for (const auto & suf : rt) {
+                runtime = runtime || (d.name.size() > suf.size() &&
+                                      d.name.compare(d.name.size() - suf.size(), suf.size(), suf) == 0);
+            }
+            if (!runtime) {
                 banks[d.name] = bank_fused(t, d);
             }
         }
@@ -1204,12 +1208,12 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
 
     auto state_io = [&](const std::string & n, int ci) -> AX_ENGINE_IO_BUFFER_T {
         const int ph = n[1] - '0';
-        const size_t per = n.find("q_conv_state_in") != std::string::npos ? cq_b :
-                           n.find("k_conv_state_in") != std::string::npos ? cq_b :
-                           n.find("v_conv_state_in") != std::string::npos ? cv_b : st_b;
-        const axera_cmm * p = n.find("q_conv_state_in") != std::string::npos ? &CQ :
-                              n.find("k_conv_state_in") != std::string::npos ? &CK :
-                              n.find("v_conv_state_in") != std::string::npos ? &CV : &ST;
+        const size_t per = n.find("q_conv_state") != std::string::npos ? cq_b :
+                           n.find("k_conv_state") != std::string::npos ? cq_b :
+                           n.find("v_conv_state") != std::string::npos ? cv_b : st_b;
+        const axera_cmm * p = n.find("q_conv_state") != std::string::npos ? &CQ :
+                              n.find("k_conv_state") != std::string::npos ? &CK :
+                              n.find("v_conv_state") != std::string::npos ? &CV : &ST;
         GGML_ASSERT(ph >= 0 && ph < 3);
         const size_t off = ((size_t) ph * NB + (size_t) ci * KB) * per;
         return axera_io(p->get(), (char *) (*p)->vir + off, per * (size_t) KB);
@@ -1239,7 +1243,9 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
                     GGML_ASSERT(d.bytes == kv_b);
                     c.in.push_back(axera_io(KVC[ci], kv_b));
                 } else if (n.size() > 2 && n[0] == 'b' && n[1] >= '0' && n[1] <= '2' &&
-                           (n.find("_state_in") != std::string::npos || n.find("_conv_state_in") != std::string::npos)) {
+                           (n.find("_state_in") != std::string::npos || n.find("_state_out") != std::string::npos ||
+                            n.find("_conv_state_in") != std::string::npos ||
+                            n.find("_conv_state_out") != std::string::npos)) {
                     c.in.push_back(state_io(n, ci));
                 } else {
                     auto it = banks.find(n);
