@@ -181,11 +181,41 @@ void kernel::run(std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_
                 r0 ? " FAILED" : "", r0);
         exit(r0 ? 1 : 0);
     }
+    // debug: GGML_AXERA_CALL_HASH=<role>: a hash of every IO of at most 2 MiB before and after each call of the role
+    // (the host's cached lines dropped first, so the hash is of what the NPU sees and wrote). Two runs of one command
+    // then show the first call and the buffer where they part.
+    static const char * hash_role = getenv("GGML_AXERA_CALL_HASH");
+    auto io_hash = [&](const char * when) {
+        for (int o = 0; o < 2; ++o) {
+            const auto & bufs = o ? out : in;
+            for (size_t i = 0; i < bufs.size(); ++i) {
+                const AX_ENGINE_IOMETA_T & mt = o ? info->pOutputs[i] : info->pInputs[i];
+                if (mt.nSize > (2u << 20)) {
+                    continue;
+                }
+                AX_SYS_MinvalidateCache(bufs[i].phyAddr, bufs[i].pVirAddr, mt.nSize);
+                const unsigned char * q = (const unsigned char *) bufs[i].pVirAddr;
+                unsigned long long    h = 1469598103934665603ull;
+                for (AX_U32 j = 0; j < mt.nSize; ++j) {
+                    h = (h ^ q[j]) * 1099511628211ull;
+                }
+                fprintf(stderr, "axera hash: %s %llu %s %s %016llx\n", desc->role.c_str(), (unsigned long long) call_no, when,
+                        mt.pName, h);
+            }
+        }
+    };
+    const bool hash_this = hash_role && desc->role == hash_role;
+    if (hash_this) {
+        io_hash("pre");
+    }
     axera_thermal_guard();
     tpre.stop();
     axera_timer trun("kernel: RunSync");
     const int ret  = AX_ENGINE_RunSync(handle, &io);
     trun.stop();
+    if (hash_this && ret == 0) {
+        io_hash("post");
+    }
     if (ret != 0) {  // the IO the kernel got (stderr: the log is asynchronous)
         for (int o = 0; o < 2; ++o) {
             const auto & bufs = o ? out : in;
