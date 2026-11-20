@@ -39,6 +39,7 @@ struct seq_caps {
     int  verify_rows     = 0;
     int  verify_min_keep = 0;
     bool decode_at_zero  = true;  // the decode kernel runs cell 0 (else cell 0 always goes through the pages)
+    bool decode_kernel   = true;  // use the model's single-row kernel (else T == 1 replays through the pages)
 };
 
 // a restart point a page run leaves behind: the state before `cell` (a page's first cell inside the run) into dst;
