@@ -14,6 +14,8 @@
 #include "../../core/patch_embed.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 #include <thread>
 
 namespace axera {
@@ -356,6 +358,26 @@ ggml_status q3vl30_vit_full::compute(ggml_cgraph * g) {
     memcpy(out->data, o->vir, bytes);
     if (ggml_backend_buffer_is_axera(out->buffer)) {
         ((ggml_backend_axera_buffer_context *) out->buffer->context)->flush(out->data, bytes);
+    }
+    if (const char * dir = std::getenv("GGML_AXERA_Q3VL30_VIT_DUMP_DIR"); dir && *dir) {
+        auto dump = [&](const char * name, bool output) {
+            axera_cmm & c = io(name, output);
+            const size_t size = output ? bytes : k.in_bytes(name);
+            std::ofstream f(std::string(dir) + "/" + name + ".bin", std::ios::binary);
+            GGML_ASSERT(f && "axera q3vl30_vit_full: cannot open VIT dump file");
+            f.write((const char *) c->vir, (std::streamsize) size);
+            GGML_ASSERT(f && "axera q3vl30_vit_full: cannot write VIT dump file");
+        };
+        for (const char * name : { "px", "pos", "cos", "sin", "kmask", "nblk" }) {
+            dump(name, false);
+        }
+        dump("out", true);
+        GGML_LOG_INFO("axera q3vl30_vit_full: dumped %d patches, %d x %d pixels, %d x %d merged rows to %s\n",
+                      n, N, CP, n / 4, OUTD, dir);
+        std::fflush(nullptr);
+        if (std::getenv("GGML_AXERA_Q3VL30_VIT_EXIT")) {
+            std::_Exit(0);
+        }
     }
     return GGML_STATUS_SUCCESS;
 }

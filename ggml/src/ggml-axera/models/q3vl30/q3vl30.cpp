@@ -47,7 +47,7 @@ constexpr int TOPK = 8;
 constexpr int VOCAB = 151936;
 constexpr int PAGES = 1040;  // 1024 pages of context plus 16 slots the 4096-row prefill writes past the last cell
 constexpr int KV_HEADROOM = WP_MAX / PG;  // pages a 4096-row prefill call writes from its first page
-constexpr int HEAD_ROWS = 8;
+constexpr int HEAD_ROWS = 256;  // prefill tail rows; PPL asks one logit per 256-row page
 constexpr int LAYERS = 48;
 constexpr int GROUP_LAYERS = 6;
 constexpr int GROUPS = 8;
@@ -95,6 +95,12 @@ static std::vector<float> f32_of(const ggml_tensor * w) {
 class q3vl30 final : public model, public seq_model {
   public:
     explicit q3vl30(const manifest & m) : man(m) {}
+    ~q3vl30() override {
+        if (getenv("GGML_AXERA_Q3VL30_PROF")) {
+            fprintf(stderr, "axera prof: q3vl30 prefill calls %8llu decode calls %8llu\n",
+                    (unsigned long long) prefill_calls, (unsigned long long) decode_calls);
+        }
+    }
 
     ggml_status compute(ggml_cgraph * g) override;
     size_t      state_size(uint32_t flags) const override;
@@ -119,6 +125,10 @@ class q3vl30 final : public model, public seq_model {
     using bmap = std::map<std::string, axera_cmm>;
     bmap                                  gbank;   // head weights
     std::vector<bmap>                     chunks;  // one six-layer bank per group
+    // The 4096-row prefill graph consumes the two attention norm weights in
+    // bf16 (the deepstack post-add makes them bf16) while decode consumes the
+    // same banks in f32.  Keep a bf16 mirror of those two slots per group.
+    std::map<std::string, axera_cmm>      pre_bf16;
     std::vector<axera_cmm>                KVL;     // one BF16 paged cache per layer
     int                                   kv_pages = 0, kv_total_pages = 0;
     size_t                                kv_page_b = 0;
@@ -131,6 +141,8 @@ class q3vl30 final : public model, public seq_model {
     int                                   wp = PG;  // prefill rows: 256 or 4096, from the manifest
 
     std::vector<call> pre, dec;
+    uint64_t         prefill_calls = 0;
+    uint64_t         decode_calls  = 0;
     std::vector<axera_cmm> route_cmm;  // one per call: that call's top-k expert ids
     FILE *                  route_file = nullptr;
 
@@ -425,6 +437,15 @@ void q3vl30::fill_bank(const std::map<std::string, ggml_tensor *> & t, const ggm
         GGML_ASSERT(sl != bank_slot.end());
         memset(slot(bm, n, b), 0, sl->second);
     };
+    auto mirror_bf16 = [&](bmap & bm, const std::string & n, int b, int64_t count) {
+        auto it = pre_bf16.find(n);
+        if (it == pre_bf16.end()) {
+            it = pre_bf16.emplace(n, axera_cmm_alloc_bank((size_t) count * GROUP_LAYERS *
+                                                          sizeof(ggml_bf16_t))).first;
+        }
+        const float * src = (const float *) slot(bm, n, b);
+        ggml_fp32_to_bf16_row(src, (ggml_bf16_t *) it->second->vir + (size_t) b * count, count);
+    };
     auto put_nv_whole = [&](bmap & bm, const std::string & qn, const std::string & sn, const std::string & zn,
                             const ggml_tensor * w, int b, float s2_scale = 1.0f) {
         const int64_t K = w->ne[0], N = ggml_nrows(w);
@@ -476,8 +497,10 @@ void q3vl30::fill_bank(const std::map<std::string, ggml_tensor *> & t, const ggm
         // name is fixed at the b0 label and block_layer selects the layer.
         const std::string pa = g.pre + "b0_attn_";
         put_f32(bm, pa + "w_norm_attn", b, f32_of(W("attn_norm.weight")));
+        mirror_bf16(bm, pa + "w_norm_attn", b, H);
         put_f32(bm, pa + "w_norm_q", b, f32_of(W("attn_q_norm.weight")), 1.0f / std::sqrt((float) HD));
         put_f32(bm, pa + "w_norm_k", b, f32_of(W("attn_k_norm.weight")));
+        mirror_bf16(bm, pa + "w_norm_k", b, HD);
         put_nv_whole(bm, pa + "w_q", pa + "w_scale_q", pa + "w_scale2_q", W("attn_q.weight"), b);
         put_nv_whole(bm, pa + "w_k", pa + "w_scale_k", pa + "w_scale2_k", W("attn_k.weight"), b);
         put_nv_whole(bm, pa + "w_v", pa + "w_scale_v", pa + "w_scale2_v", W("attn_v.weight"), b);
@@ -564,6 +587,14 @@ void q3vl30::fill_bank(const std::map<std::string, ggml_tensor *> & t, const ggm
     for (auto & c : chunks) {
         for (auto & [n, b] : c) b->flush();
     }
+    for (auto & [n, c] : pre_bf16) c->flush();
+    if (std::getenv("GGML_AXERA_BANK_SUM")) {
+        axera_bank_sum("q3vl30_head", gbank);
+        for (size_t gi = 0; gi < chunks.size(); ++gi) {
+            axera_bank_sum(("q3vl30_group" + std::to_string(gi)).c_str(), chunks[gi]);
+        }
+        axera_bank_sum("q3vl30_pre_bf16", pre_bf16);
+    }
 }
 
 seq_caps q3vl30::seq_get_caps() const {
@@ -604,16 +635,24 @@ void q3vl30::bind_calls(std::vector<call> & calls, const kernel & k, const char 
                 }
                 b = &it->second;
             } else if (prefill) {
-                GGML_ASSERT(group_of(d.name) == 0);
-                const int ki = kv_index(d.name);
-                if (ki >= 0) {
-                    GGML_ASSERT(c * GROUP_LAYERS + ki < LAYERS);
-                    cl.in[i] = axera_io(KVL.at((size_t) c * GROUP_LAYERS + ki).get(),
-                                        KVL[(size_t) c * GROUP_LAYERS + ki]->vir, d.bytes);
-                    continue;
+                const int gi0 = group_of(d.name);
+                if (gi0 < 0) {
+                    // The one-bank prefill graph also carries the global output
+                    // head (head_norm/head_w/head_s/head_s2).
+                    b = &at(gbank, d.name);
+                } else {
+                    GGML_ASSERT(gi0 == 0);
+                    const int ki = kv_index(d.name);
+                    if (ki >= 0) {
+                        GGML_ASSERT(c * GROUP_LAYERS + ki < LAYERS);
+                        cl.in[i] = axera_io(KVL.at((size_t) c * GROUP_LAYERS + ki).get(),
+                                            KVL[(size_t) c * GROUP_LAYERS + ki]->vir, d.bytes);
+                        continue;
+                    }
+                    const std::string mapped = "g" + std::to_string(c) + "_" + d.name.substr(3);
+                    auto pb = pre_bf16.find(mapped);
+                    b = pb != pre_bf16.end() ? &pb->second : &at(chunks[(size_t) c], mapped);
                 }
-                const std::string mapped = "g" + std::to_string(c) + "_" + d.name.substr(3);
-                b = &at(chunks[(size_t) c], mapped);
             } else {
                 const int gi = group_of(d.name);
                 if (gi >= 0) {
@@ -894,6 +933,7 @@ static void mrope_cache(float * cs, float * sn, const int32_t * p) {
 
 void q3vl30::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const int32_t * p4, int64_t batch_cell0,
                               bool need_head) {
+    ++prefill_calls;
     GGML_ASSERT(cell % PG == 0 && rows > 0 && rows <= wp);
     auto xi = io.find("x"), oi = io.find("output"), dsi = io.find("deepstack");
     GGML_ASSERT(xi != io.end() && oi != io.end() && dsi != io.end());
@@ -978,6 +1018,14 @@ void q3vl30::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
             GGML_LOG_INFO("axera q3vl30: prefill call %d cell %lld rows %d kernel %.3f ms\n", k, (long long) cell,
                           rows, (ggml_time_us() - t0) / 1e3);
         }
+        // The compiled prefill graph has one six-layer body (g0_) and the host
+        // binds it to all eight groups.  Its layers 1..3 add the deepstack
+        // planes, which is correct only for the first launch (language layers
+        // 1..3); every later launch must see zero planes.
+        if (k == 0 && pre.size() > 1) {
+            memset(dsi->second->vir, 0, dsi->second->size);
+            dsi->second->flush();
+        }
         if (dump) {
             const axera_cmm & b = k % 2 == 0 ? io.at("output") : io.at("hidden2");
             dump_hidden(b, rows, cell, k);
@@ -992,6 +1040,7 @@ void q3vl30::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
 }
 
 void q3vl30::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4) {
+    ++decode_calls;
     auto xi = io.find("x"), oi = io.find("output");
     GGML_ASSERT(xi != io.end() && oi != io.end());
     memcpy(xi->second->vir, x, H * sizeof(uint16_t));
