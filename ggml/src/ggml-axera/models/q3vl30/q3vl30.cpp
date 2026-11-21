@@ -168,6 +168,8 @@ class q3vl30 final : public model, public seq_model {
     void bind_calls(std::vector<call> & calls, const kernel & k, const char * tag, bool prefill);
     void run_prefill_page(int64_t cell, int rows, const uint16_t * x, const int32_t * p4, int64_t batch_cell0,
                           bool need_head);
+    void dump_decode_groups(int64_t cell, const uint16_t * x, const int32_t * p4);
+    void dump_decode_head(int64_t cell, const uint16_t * x, const int32_t * p4);
     void dump_x(const axera_cmm & b, int rows, int64_t cell, int call_index);
     void dump_hidden(const axera_cmm & b, int rows, int64_t cell, int call_index);
     void dump_debug_call(int ci, int64_t cell, int rows, int64_t batch_cell0, int page,
@@ -226,9 +228,9 @@ static bool io_name(const std::string & n) {
     return n == "x" || n == "position_ids" || n == "indptr" || n == "indices" || n == "last_page_len" ||
            n == "cache_location" || n == "head_x" || n == "head_rows" || n == "head_run" ||
            n == "deepstack" || n == "ds_run" || n == "cos" || n == "sin" ||
-           n == "head_logits" || n == "head_ids" ||
+           n == "head_logits" || n == "head_ids" || n.rfind("dbg_", 0) == 0 ||
            n == "head_topk_v" || n == "head_topk_i" || n == "head_vmax" || n == "head_sumexp" ||
-           n == "valid_tokens";
+           n == "valid_tokens" || n.compare(0, 4, "dbg_") == 0;
 }
 
 static bool starts_with(const std::string & n, const std::string & p) {
@@ -330,7 +332,7 @@ void q3vl30::init(const std::map<std::string, ggml_tensor *> & t, const ggml_ten
             }
         }
         for (const auto & d : desc->out) {
-            if (io_name(d.name) && (d.name == "output" || d.name == "head_logits")) {
+            if (io_name(d.name) && (d.name == "output" || d.name == "head_logits" || starts_with(d.name, "dbg_"))) {
                 alloc_io(d);
             }
         }
@@ -426,6 +428,17 @@ void q3vl30::fill_bank(const std::map<std::string, ggml_tensor *> & t, const ggm
         for (size_t i = 0; i < v.size(); ++i) tmp[i] = v[i] * scale;
         ggml_fp32_to_bf16_row(tmp.data(), (ggml_bf16_t *) slot(bm, n, b), (int64_t) v.size());
     };
+    // The compiler may declare a per-layer RMSNorm weight as BF16 in one graph
+    // and FP32 in another; bind exactly what the compiled descriptor asks for.
+    auto put_norm = [&](bmap & bm, const std::string & n, int b, const std::vector<float> & v,
+                        float scale = 1.0f) {
+        auto dt = bank_dtype.find(n);
+        if (dt != bank_dtype.end() && dt->second == 9) {
+            put_bf16(bm, n, b, v, scale);
+        } else {
+            put_f32(bm, n, b, v, scale);
+        }
+    };
     auto fill_f32 = [&](bmap & bm, const std::string & n, int b, float value) {
         auto sl = bank_slot.find(n);
         GGML_ASSERT(sl != bank_slot.end() && sl->second % sizeof(float) == 0);
@@ -496,10 +509,10 @@ void q3vl30::fill_bank(const std::map<std::string, ggml_tensor *> & t, const ggm
         // One bank holds all six layers of the group; the projection's input
         // name is fixed at the b0 label and block_layer selects the layer.
         const std::string pa = g.pre + "b0_attn_";
-        put_f32(bm, pa + "w_norm_attn", b, f32_of(W("attn_norm.weight")));
+        put_norm(bm, pa + "w_norm_attn", b, f32_of(W("attn_norm.weight")));
         mirror_bf16(bm, pa + "w_norm_attn", b, H);
         put_f32(bm, pa + "w_norm_q", b, f32_of(W("attn_q_norm.weight")), 1.0f / std::sqrt((float) HD));
-        put_f32(bm, pa + "w_norm_k", b, f32_of(W("attn_k_norm.weight")));
+        put_norm(bm, pa + "w_norm_k", b, f32_of(W("attn_k_norm.weight")));
         mirror_bf16(bm, pa + "w_norm_k", b, HD);
         put_nv_whole(bm, pa + "w_q", pa + "w_scale_q", pa + "w_scale2_q", W("attn_q.weight"), b);
         put_nv_whole(bm, pa + "w_k", pa + "w_scale_k", pa + "w_scale2_k", W("attn_k.weight"), b);
@@ -1086,11 +1099,98 @@ void q3vl30::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4
         GGML_LOG_INFO("axera q3vl30: decode cell %lld kernel %.3f ms\n", (long long) cell,
                       (ggml_time_us() - t0) / 1e3);
     }
+    dump_decode_groups(cell, x, p4);
+    dump_decode_head(cell, x, p4);
     axera_cmm & hl = io.at("head_logits");
     hl->invalidate(hl->vir, VOCAB * sizeof(float));
     head_first = 0;
     head_n = 1;
     small_head = false;
+}
+
+// Diagnostic decode tap.  A separately compiled decode axmodel may carry eight
+// per-group hidden outputs and a final-norm output; the release axmodels do not.
+// The host only writes this file when GGML_AXERA_Q3VL30_GROUP_CELL names the
+// exact decode cell, so a normal request allocates nothing extra and writes
+// nothing.
+void q3vl30::dump_decode_groups(int64_t cell, const uint16_t * x, const int32_t * p4) {
+    const char * path = getenv("GGML_AXERA_Q3VL30_GROUP_DUMP");
+    const char * cs   = getenv("GGML_AXERA_Q3VL30_GROUP_CELL");
+    if (!path || !*path || !cs || !*cs || strtoll(cs, nullptr, 10) != cell) return;
+    auto it0 = io.find("dbg_g0"), itn = io.find("dbg_norm");
+    if (it0 == io.end() || itn == io.end()) {
+        static bool warned = false;
+        if (!warned) {
+            GGML_LOG_WARN("axera q3vl30: GROUP_DUMP requested, but this decode axmodel has no debug taps\n");
+            warned = true;
+        }
+        return;
+    }
+    FILE * f = fopen(path, "wb");
+    if (!f) {
+        GGML_LOG_WARN("axera q3vl30: cannot open GROUP_DUMP %s\n", path);
+        return;
+    }
+    const uint32_t magic = 0x47443351u;  // "Q3DG"
+    const int32_t header[8] = { (int32_t) cell, 1, H, VOCAB, GROUPS, 0, 0, 0 };
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(header, sizeof(header), 1, f);
+    fwrite(x, sizeof(uint16_t), H, f);
+    fwrite(p4, sizeof(int32_t), 4, f);
+    for (int gi = 0; gi < GROUPS; ++gi) {
+        const std::string name = "dbg_g" + std::to_string(gi);
+        auto it = io.find(name);
+        GGML_ASSERT(it != io.end() && it->second->size >= (size_t) H * sizeof(uint16_t));
+        it->second->invalidate(it->second->vir, (size_t) H * sizeof(uint16_t));
+        fwrite(it->second->vir, sizeof(uint16_t), H, f);
+    }
+    const std::string out_name = "output";
+    auto io_out = io.find(out_name);
+    GGML_ASSERT(io_out != io.end());
+    io_out->second->invalidate(io_out->second->vir, (size_t) H * sizeof(uint16_t));
+    fwrite(io_out->second->vir, sizeof(uint16_t), H, f);
+    itn->second->invalidate(itn->second->vir, (size_t) H * sizeof(float));
+    fwrite(itn->second->vir, sizeof(float), H, f);
+    auto hl = io.find("head_logits"), hi = io.find("head_ids");
+    GGML_ASSERT(hl != io.end() && hi != io.end());
+    hl->second->invalidate(hl->second->vir, (size_t) VOCAB * sizeof(float));
+    hi->second->invalidate(hi->second->vir, sizeof(int32_t));
+    fwrite(hl->second->vir, sizeof(float), VOCAB, f);
+    fwrite(hi->second->vir, sizeof(int32_t), 1, f);
+    fclose(f);
+    GGML_LOG_INFO("axera q3vl30: dumped decode cell %lld group taps to %s\n", (long long) cell, path);
+}
+
+// Production-kernel diagnostic: dump the decode input, the final hidden state
+// and the fused head logits.  Unlike GROUP_DUMP this needs no tap outputs in
+// the compiled graph, so it exercises exactly the released decode axmodel.
+void q3vl30::dump_decode_head(int64_t cell, const uint16_t * x, const int32_t * p4) {
+    const char * path = getenv("GGML_AXERA_Q3VL30_HEAD_DUMP");
+    const char * cs   = getenv("GGML_AXERA_Q3VL30_HEAD_DUMP_CELL");
+    if (!path || !*path || !cs || !*cs || strtoll(cs, nullptr, 10) != cell) return;
+    FILE * f = fopen(path, "wb");
+    if (!f) {
+        GGML_LOG_WARN("axera q3vl30: cannot open HEAD_DUMP %s\n", path);
+        return;
+    }
+    const uint32_t magic = 0x44443351u;  // "Q3DD"
+    const int32_t header[4] = { (int32_t) cell, H, VOCAB, 1 };
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(header, sizeof(header), 1, f);
+    fwrite(x, sizeof(uint16_t), H, f);
+    fwrite(p4, sizeof(int32_t), 4, f);
+    auto out = io.find("output");
+    GGML_ASSERT(out != io.end() && out->second->size >= (size_t) H * sizeof(uint16_t));
+    out->second->invalidate(out->second->vir, (size_t) H * sizeof(uint16_t));
+    fwrite(out->second->vir, sizeof(uint16_t), H, f);
+    auto hl = io.find("head_logits"), hi = io.find("head_ids");
+    GGML_ASSERT(hl != io.end() && hi != io.end());
+    hl->second->invalidate(hl->second->vir, (size_t) VOCAB * sizeof(float));
+    hi->second->invalidate(hi->second->vir, sizeof(int32_t));
+    fwrite(hl->second->vir, sizeof(float), VOCAB, f);
+    fwrite(hi->second->vir, sizeof(int32_t), 1, f);
+    fclose(f);
+    GGML_LOG_INFO("axera q3vl30: dumped decode cell %lld hidden/head to %s\n", (long long) cell, path);
 }
 
 bool q3vl30::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t * p4, int batch0, seq_snap * snap) {
@@ -1152,7 +1252,12 @@ void q3vl30::publish_logits(ggml_cgraph * g, ggml_tensor * logits, int T) {
     if (n_out < T && !out_ids) GGML_ABORT("axera q3vl30: %d of %d output rows without row indices\n", n_out, T);
     const axera_cmm & hl = io.at("head_logits");
     const float *    head_src = small_head ? small_logits.data() : (const float *) hl->vir;
-    auto * dctx = (ggml_backend_axera_buffer_context *) logits->buffer->context;
+    // The scheduler may place result_output in the lazy host buffer (anonymous
+    // mmap) instead of CMM.  Its context is a 16-byte lazy context, not a CMM
+    // buffer context; casting it and calling flush() corrupts the heap.  Host
+    // memory needs no cache maintenance, only a CMM output does.
+    auto * dctx = ggml_backend_buffer_is_axera(logits->buffer)
+                      ? (ggml_backend_axera_buffer_context *) logits->buffer->context : nullptr;
     for (int r = 0; r < n_out; ++r) {
         const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : r;
         if (row < head_first || row >= head_first + head_n) {
@@ -1161,10 +1266,12 @@ void q3vl30::publish_logits(ggml_cgraph * g, ggml_tensor * logits, int T) {
         }
         float * o = (float *) ((char *) logits->data + (size_t) r * logits->nb[1]);
         memcpy(o, head_src + (size_t) (row - head_first) * VOCAB, VOCAB * sizeof(float));
-        dctx->flush(o, VOCAB * sizeof(float));
-        dctx->clean_p = o;
-        dctx->clean_n = VOCAB * sizeof(float);
-        dctx->clean_epoch = axera_graph_epoch;
+        if (dctx) {
+            dctx->flush(o, VOCAB * sizeof(float));
+            dctx->clean_p = o;
+            dctx->clean_n = VOCAB * sizeof(float);
+            dctx->clean_epoch = axera_graph_epoch;
+        }
     }
     output_head::after(g, names);
 }

@@ -86,8 +86,13 @@ def q8_slice(x: np.ndarray) -> np.ndarray:
 
 
 def classify(name: str) -> str:
-    if name in ("token_embd.weight", "output.weight"):
+    if name == "token_embd.weight":
         return "q8"
+    if name == "output.weight":
+        # The AX8860 lm_head is natively NVFP4.  Keeping the head quantized in
+        # the file means CPU and NPU see identical weights (no load-time Q8 to
+        # NVFP4 double quantization) and the CPU reference is the real one.
+        return "nv_whole"
     m = re.fullmatch(r"blk\.(\d+)\.(.+)", name)
     if not m:
         return "f32"

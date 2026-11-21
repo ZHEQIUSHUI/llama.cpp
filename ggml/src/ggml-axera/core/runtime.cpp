@@ -528,10 +528,15 @@ void axera_bank_sum(const char * what, const std::map<std::string, axera_cmm> & 
 }
 
 axera_pool & axera_host_pool() {
-    static axera_pool pool([] {
+    // Never destroyed, like the page-release queue above: exit() can start
+    // while a worker is between jobs, and joining the workers during static
+    // destruction is pointless for a process that is already leaving.  A
+    // Q8_0 lm_head never reproduced the teardown crash; the NVFP4 lm_head
+    // copy path does, so the pool outlives every model and the OS reclaims it.
+    static axera_pool * pool = new axera_pool([] {
         const char * e = std::getenv("AXERA_HOST_POOL_THREADS");
         const int    n = e ? std::atoi(e) : 0;
         return n > 0 ? n : std::min(15, std::max(1, (int) std::thread::hardware_concurrency() - 1));
     }());
-    return pool;
+    return *pool;
 }
