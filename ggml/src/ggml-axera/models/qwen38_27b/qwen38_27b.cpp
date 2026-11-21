@@ -979,9 +979,11 @@ bool qwen38_27b::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p
     PN->flush();
     {
         axera_timer tl("layers (decode)");
+        axera_npu_batch nb;  // the groups' dependent calls, waited for once
         for (auto & c : dec) {
-            c.k->run(c.in, c.out, "decode group");
+            nb.add(*c.k, c.in, c.out, "decode group");
         }
+        nb.wait();
         state_zero = false;
     }
     A->invalidate(A->vir, H * sizeof(ggml_bf16_t));
@@ -1255,9 +1257,11 @@ void qwen38_27b::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t
         }
         {
             axera_timer tl("prefill (page)");
+            axera_npu_batch nb;  // the page's dependent calls, waited for once
             for (auto & c : P->calls) {
-                c.k->run(c.in, c.out, "prefill");
+                nb.add(*c.k, c.in, c.out, "prefill");
             }
+            nb.wait();
             state_zero = false;
         }
         axera_timer       to("prefill out rows");
@@ -1301,13 +1305,15 @@ ggml_status qwen38_27b::verify(int64_t c0, int row0, int T, const ggml_bf16_t * 
     static const char * SN[4] = { "ssnap", "cqsnap", "cksnap", "cvsnap" };
     {
         axera_timer tl("layers (verify)");
+        axera_npu_batch nb;  // the groups' dependent calls, waited for once
         for (size_t gi = 0; gi < ver.size(); ++gi) {
             call & c = ver[gi];
             for (int k = 0; k < 4; ++k) {
                 c.out[c.k->output(SN[k])] = axera_io(snaps[set][gi][k], snaps[set][gi][k]->size);
             }
-            c.k->run(c.in, c.out, "verify group");
+            nb.add(*c.k, c.in, c.out, "verify group");
         }
+        nb.wait();
     }
     VX->invalidate(VX->vir, (size_t) T * H * sizeof(ggml_bf16_t));
     for (int r = 0; r < T; ++r) {

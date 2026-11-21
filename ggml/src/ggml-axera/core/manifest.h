@@ -14,6 +14,7 @@
 #include "runtime.h"
 
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -58,12 +59,23 @@ struct kernel_desc {
     std::vector<pack_member>      members;
 };
 
+// NPU calls go through the runtime's asynchronous Task-ID API (AX_ENGINE_RunAsync / WaitAsync, SDK >= V0.6.0) by
+// default; GGML_AXERA_SYNC=1 (or GGML_AXERA_ASYNC=0) runs every call with AX_ENGINE_RunSync instead, for debugging. A
+// runtime without the API, or a kernel the runtime refuses to run asynchronously, runs synchronously (one warning).
+// Outputs are completed without a cache invalidate, as with RunSync: a caller invalidates what it reads.
+bool axera_npu_async();
+
 // a loaded kernel
 struct kernel {
     const kernel_desc *   desc   = nullptr;
     AX_ENGINE_HANDLE      handle = nullptr;
     AX_ENGINE_IO_INFO_T * info   = nullptr;
     std::vector<char>     model;  // the axmodel's bytes, kept for the handle's lifetime
+    // the async contexts of the handle: a context runs one call at a time, so a batch of n calls in flight on this
+    // kernel takes n of them (made on demand)
+    mutable std::vector<AX_ENGINE_CONTEXT_T> actx;
+    mutable bool                             async_refused = false;  // the runtime refused it: synchronous calls
+    mutable std::mutex                       amu;  // actx, async_refused
     ~kernel();
     int  input(const std::string & name) const;   // index, aborts if absent
     int  output(const std::string & name) const;  // index, aborts if absent
@@ -73,6 +85,25 @@ struct kernel {
     uint32_t out_bytes(const std::string & name) const { return info->pOutputs[output(name)].nSize; }
     // one call; aborts with `what` and the IO on failure
     void run(std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_IO_BUFFER_T> & out, const char * what) const;
+};
+
+// dependent calls submitted together and waited for once (async; each call runs after the one before it, as the
+// runtime runs a process's tasks in submission order); synchronous mode runs each call at add(). The IO descriptors
+// are copied, the buffers must stay as they are until wait(); the host must not touch a call's buffers before then.
+class axera_npu_batch {
+  public:
+    axera_npu_batch();
+    ~axera_npu_batch();  // waits
+    axera_npu_batch(const axera_npu_batch &)             = delete;
+    axera_npu_batch & operator=(const axera_npu_batch &) = delete;
+    void   add(const kernel & k, std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_IO_BUFFER_T> & out,
+               const char * what);
+    void   wait();
+    size_t size() const;
+
+  private:
+    struct impl;
+    impl * p;
 };
 
 struct manifest {
