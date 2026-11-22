@@ -1047,11 +1047,12 @@ void hy_mt2::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const 
 void hy_mt2::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4) {
     auto xi = io.find("x"), oi = io.find("output");
     GGML_ASSERT(xi != io.end() && oi != io.end());
+    // The IO buffers are sized for a prefill page; a decode row writes a few
+    // bytes of each, so clean only those bytes, not the buffers.
     memcpy(xi->second->vir, x, H * sizeof(uint16_t));
-    xi->second->flush();
+    xi->second->flush(xi->second->vir, H * sizeof(uint16_t));
     auto pi = io.find("position_ids");
     *(int32_t *) pi->second->vir = p4[0];
-    pi->second->flush();
     const int page = (int) (cell / PG), off = (int) (cell % PG);
     auto ind = io.find("indptr"), idx = io.find("indices"), last = io.find("last_page_len"), cl = io.find("cache_location");
     // decode_attention computes cached_len = (pages-1)*PG + last_page_len.
@@ -1069,11 +1070,15 @@ void hy_mt2::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4
     *(int32_t *) last->second->vir = hist_last;
     ((int32_t *) cl->second->vir)[0] = page;
     ((int32_t *) cl->second->vir)[1] = off;
-    for (auto * b : { &pi->second, &ind->second, &idx->second, &last->second, &cl->second }) (*b)->flush();
+    pi->second->flush(pi->second->vir, sizeof(int32_t));
+    ind->second->flush(ind->second->vir, 2 * sizeof(int32_t));
+    idx->second->flush(idx->second->vir, (size_t) (page + 1) * sizeof(int32_t));
+    last->second->flush(last->second->vir, sizeof(int32_t));
+    cl->second->flush(cl->second->vir, 2 * sizeof(int32_t));
     auto hx = io.find("head_x"), hri = io.find("head_rows");
     memset(hx->second->vir, 0, hx->second->size);
     *(int32_t *) hri->second->vir = 0;
-    hri->second->flush();
+    hri->second->flush(hri->second->vir, sizeof(int32_t));
     const bool prof = getenv("GGML_AXERA_HY_MT2_PROF") != nullptr;
     auto head_run = io.find("head_run");
     GGML_ASSERT(head_run != io.end());
@@ -1081,12 +1086,12 @@ void hy_mt2::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4
         auto it = io.find(n);
         if (it != io.end()) {
             *(int32_t *) it->second->vir = 1;
-            it->second->flush();
+            it->second->flush(it->second->vir, sizeof(int32_t));
         }
     }
     for (int ci = 0; ci < (int) dec.size(); ++ci) {
         *(int32_t *) head_run->second->vir = ci + 1 == (int) dec.size() ? 1 : 0;
-        head_run->second->flush();
+        head_run->second->flush(head_run->second->vir, sizeof(int32_t));
         const int64_t t0 = prof ? ggml_time_us() : 0;
         dec[ci].k->run(dec[ci].in, dec[ci].out, "decode");
         if (prof) {
