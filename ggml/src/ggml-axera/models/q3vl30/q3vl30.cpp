@@ -1056,16 +1056,15 @@ void q3vl30::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4
     ++decode_calls;
     auto xi = io.find("x"), oi = io.find("output");
     GGML_ASSERT(xi != io.end() && oi != io.end());
+    // The IO buffers are sized for a prefill page (WP_MAX rows); a decode row
+    // writes a few bytes of each, so clean only those bytes, not the buffers.
     memcpy(xi->second->vir, x, H * sizeof(uint16_t));
-    xi->second->flush();
+    xi->second->flush(xi->second->vir, H * sizeof(uint16_t));
     auto pi = io.find("position_ids");
     *(int32_t *) pi->second->vir = 0;
-    pi->second->flush();
     auto ci = io.find("cos"), si = io.find("sin");
     GGML_ASSERT(ci != io.end() && si != io.end());
     mrope_cache((float *) ci->second->vir, (float *) si->second->vir, p4);
-    ci->second->flush();
-    si->second->flush();
 
     const int page = (int) (cell / PG), off = (int) (cell % PG);
     auto ind = io.find("indptr"), idx = io.find("indices"), last = io.find("last_page_len"), cl = io.find("cache_location");
@@ -1079,17 +1078,21 @@ void q3vl30::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4
     *(int32_t *) last->second->vir = hist_last;
     ((int32_t *) cl->second->vir)[0] = page;
     ((int32_t *) cl->second->vir)[1] = off;
-    for (auto * b : { &pi->second, &ind->second, &idx->second, &last->second, &cl->second, &ci->second, &si->second }) {
-        (*b)->flush();
-    }
+    pi->second->flush(pi->second->vir, sizeof(int32_t));
+    ci->second->flush(ci->second->vir, (HD / 2) * sizeof(float));
+    si->second->flush(si->second->vir, (HD / 2) * sizeof(float));
+    ind->second->flush(ind->second->vir, 2 * sizeof(int32_t));
+    idx->second->flush(idx->second->vir, (size_t) (page + 1) * sizeof(int32_t));
+    last->second->flush(last->second->vir, sizeof(int32_t));
+    cl->second->flush(cl->second->vir, 2 * sizeof(int32_t));
     auto hx = io.find("head_x"), hri = io.find("head_rows");
     memset(hx->second->vir, 0, hx->second->size);
     *(int32_t *) hri->second->vir = 0;
-    hri->second->flush();
+    hri->second->flush(hri->second->vir, sizeof(int32_t));
     auto head_run = io.find("head_run");
     GGML_ASSERT(head_run != io.end());
     *(int32_t *) head_run->second->vir = 1;
-    head_run->second->flush();
+    head_run->second->flush(head_run->second->vir, sizeof(int32_t));
 
     GGML_ASSERT(dec.size() == 1);
     const bool prof = getenv("GGML_AXERA_Q3VL30_PROF") != nullptr;
