@@ -491,6 +491,17 @@ ggml_tensor * graph_head(const graph_names & names) {
     return r;
 }
 
+// where the head writes its logits: result_output when it is the mm itself or a same-width wrapper of it (the
+// NVFP4 output.scale MUL), else the mm. A CONCAT result_output (the Qwen3-TTS talker pads its codec logits with -inf
+// up to the text vocabulary) is wider than the mm: the head row goes into the mm, and llama.cpp's CONCAT places it.
+static ggml_tensor * head_dst(const graph_names & names, ggml_tensor * logits) {
+    ggml_tensor * r = names.find("result_output");
+    if (r && logits && r != logits && (r->op == GGML_OP_CONCAT || r->ne[0] != logits->ne[0])) {
+        return logits;
+    }
+    return r ? r : logits;
+}
+
 // the graph's normed rows: result_norm, named result_embd_pooled when the context keeps unpooled embeddings
 static ggml_tensor * normed_rows(const graph_names & names) {
     ggml_tensor * rn = names.find("result_norm");
@@ -1070,7 +1081,7 @@ void output_head::run_combined(ggml_cgraph * g, const graph_names & names, const
     GGML_ASSERT(logits && logits->op == GGML_OP_MUL_MAT && logits->src[0] == w && logits->type == GGML_TYPE_F32 &&
                 ggml_backend_buffer_is_axera(logits->buffer));
     // the graph's own logits tensor: result_output itself, or the scale MUL on top of the mm
-    ggml_tensor * const dst = names.find("result_output") ? names.find("result_output") : logits;
+    ggml_tensor * const dst = head_dst(names, logits);
     const int64_t N = w->ne[1], K = w->ne[0];
     const int     n_out = (int) logits->ne[1];
     if (c4k && n_out == 4 && T == 4 && logits->nb[1] == N * sizeof(float)) {
@@ -1463,7 +1474,7 @@ void output_head::run(ggml_cgraph * g, const graph_names & names, const std::vec
                       const std::vector<char> * normed, const float * last, const std::vector<int> * compact_rows) {
     ggml_tensor * logits = graph_head(names);
     // the graph's own logits tensor: result_output itself, or the output.scale MUL on top of the mm
-    ggml_tensor * const dst = names.find("result_output") ? names.find("result_output") : logits;
+    ggml_tensor * const dst = head_dst(names, logits);
     // dst is llama.cpp's final logits tensor: a device buffer or the host copy the sampler reads
     GGML_ASSERT(logits && logits->op == GGML_OP_MUL_MAT && logits->src[0] == w && logits->type == GGML_TYPE_F32);
     const int64_t N = w->ne[1], K = w->ne[0];
