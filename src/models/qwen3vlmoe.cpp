@@ -152,7 +152,11 @@ llama_model_qwen3vlmoe::graph::graph(const llama_model & model, const llm_graph_
                     LLM_FFN_SILU, true,
                     hparams.expert_weights_scale,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
-                    il);
+                    il,
+                    nullptr, nullptr,
+                    model.layers[il].ffn_up_exps_s,
+                    model.layers[il].ffn_gate_exps_s,
+                    model.layers[il].ffn_down_exps_s);
         cb(moe_out, "ffn_moe_out", il);
         cur = moe_out;
 

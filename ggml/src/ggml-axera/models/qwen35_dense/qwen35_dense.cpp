@@ -534,9 +534,11 @@ ggml_status qwen35_dense::compute(ggml_cgraph * g) {
         }
         {
             axera_timer tl("layers (decode)");
+            axera_npu_batch nb;  // the groups' dependent calls, waited for once
             for (auto & c : dec) {
-                c.k->run(c.in, c.out, "decode group");
+                nb.add(*c.k, c.in, c.out, "decode group");
             }
+            nb.wait();
         }
         if (direct) {
             dec.back().out[dec.back().logits] = axera_io(LOGITS, (uint32_t) LOGITS->size);

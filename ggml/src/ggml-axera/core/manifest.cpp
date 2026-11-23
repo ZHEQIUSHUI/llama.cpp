@@ -11,6 +11,9 @@
 #include <sys/stat.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <dlfcn.h>
 
 #include <nlohmann/json.hpp>
 
@@ -18,6 +21,206 @@
 #include <iterator>
 
 namespace axera {
+
+// ---- the runtime's asynchronous Task-ID API (resolved at run time: the BSP's headers predate it) ----
+namespace {
+
+using async_task_t = uint64_t;
+struct async_options {
+    uint32_t         nSize;
+    uint32_t         nOutputAttrCount;
+    const uint32_t * pOutputAttrs;
+    uint64_t         u64Reserved[4];
+};
+constexpr uint32_t ASYNC_CAP          = 1U << 0;           // AX_ENGINE_CAP_ASYNC
+constexpr uint32_t ASYNC_OUT_UNCACHED = 2;                 // complete outputs without a cache invalidate (as RunSync)
+constexpr int32_t  ASYNC_PARAM_INVALID = (int32_t) 0x80060084U;
+constexpr int32_t  ASYNC_NOT_SUPPORT   = (int32_t) 0x80060088U;
+constexpr int32_t  ASYNC_NOT_SUPPORTED = (int32_t) 0x800600a2U;
+constexpr uint32_t ASYNC_WAIT_MS       = 600000;
+
+using async_cb_fn  = void (*)(AX_ENGINE_HANDLE, AX_ENGINE_CONTEXT_T, async_task_t, int32_t, void *);
+struct async_api {
+    int32_t (*create_context)(AX_ENGINE_HANDLE, AX_ENGINE_CONTEXT_T *) = nullptr;
+    int32_t (*run)(AX_ENGINE_HANDLE, AX_ENGINE_CONTEXT_T, const AX_ENGINE_IO_T *, const async_options *, async_cb_fn, void *,
+                   async_task_t *) = nullptr;
+    int32_t (*run_group)(AX_ENGINE_HANDLE, AX_ENGINE_CONTEXT_T, uint32_t, const AX_ENGINE_IO_T *, const async_options *,
+                         async_cb_fn, void *, async_task_t *) = nullptr;
+    int32_t (*wait)(AX_ENGINE_HANDLE, async_task_t, uint32_t, int32_t *) = nullptr;
+    int32_t (*capability)(uint32_t *) = nullptr;
+};
+
+const async_api & aapi() {
+    static const async_api a = [] {
+        async_api r;
+        r.create_context = (decltype(r.create_context)) dlsym(RTLD_DEFAULT, "AX_ENGINE_CreateAsyncContext");
+        r.run            = (decltype(r.run)) dlsym(RTLD_DEFAULT, "AX_ENGINE_RunAsync");
+        r.run_group      = (decltype(r.run_group)) dlsym(RTLD_DEFAULT, "AX_ENGINE_RunGroupIOAsync");
+        r.wait           = (decltype(r.wait)) dlsym(RTLD_DEFAULT, "AX_ENGINE_WaitAsync");
+        r.capability     = (decltype(r.capability)) dlsym(RTLD_DEFAULT, "AX_ENGINE_GetCapability");
+        return r;
+    }();
+    return a;
+}
+
+// the runtime rejects a NULL callback (V0.6.0) although WaitAsync polls: a no-op one
+void async_noop(AX_ENGINE_HANDLE, AX_ENGINE_CONTEXT_T, async_task_t, int32_t, void *) {}
+
+// one call in flight: the descriptors live here until its wait
+struct async_call {
+    const kernel *                     k = nullptr;
+    const char *                       what = "";
+    std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
+    std::vector<uint32_t>              attrs;
+    AX_ENGINE_IO_T                     io{};
+    async_options                      opt{};
+    async_task_t                       id = 0;
+};
+
+[[noreturn]] void npu_fail(const kernel & k, const std::vector<AX_ENGINE_IO_BUFFER_T> & in,
+                           const std::vector<AX_ENGINE_IO_BUFFER_T> & out, int ret, const char * api, const char * what) {
+    for (int o = 0; o < 2; ++o) {  // the IO the kernel got (stderr: the log is asynchronous)
+        const auto & bufs = o ? out : in;
+        for (size_t i = 0; i < bufs.size(); ++i) {
+            const AX_ENGINE_IOMETA_T & mt = o ? k.info->pOutputs[i] : k.info->pInputs[i];
+            fprintf(stderr, "axera: %s 0x%x: %s %zu %s: %u bytes (bound %u at phy 0x%llx)\n", api, ret, o ? "output" : "input",
+                    i, mt.pName, mt.nSize, bufs[i].nSize, (unsigned long long) bufs[i].phyAddr);
+        }
+    }
+    GGML_ABORT("axera: %s: kernel %s failed (%s 0x%x)\n", what, k.desc->role.c_str(), api, ret);
+}
+
+// submit c on the kernel's context `slot`; false: the runtime refused this kernel (it runs synchronously from now)
+bool async_submit(async_call & c, size_t slot) {
+    const kernel &              k = *c.k;
+    const async_api &           a = aapi();
+    std::lock_guard<std::mutex> lock(k.amu);
+    if (k.async_refused) {
+        return false;
+    }
+    while (k.actx.size() <= slot) {
+        AX_ENGINE_CONTEXT_T ctx = nullptr;
+        const int32_t       rc  = a.create_context(k.handle, &ctx);
+        if (rc != 0 || !ctx) {
+            fprintf(stderr, "axera: kernel %s: AX_ENGINE_CreateAsyncContext 0x%x: synchronous calls\n", k.desc->role.c_str(),
+                          (unsigned) rc);
+            k.async_refused = true;
+            return false;
+        }
+        k.actx.push_back(ctx);
+    }
+    c.attrs.assign(c.out.size(), ASYNC_OUT_UNCACHED);
+    c.io.pInputs        = c.in.data();
+    c.io.nInputSize     = (uint32_t) c.in.size();
+    c.io.pOutputs       = c.out.data();
+    c.io.nOutputSize    = (uint32_t) c.out.size();
+    c.io.u64Reserved[0] = 1;  // AX_ENGINE_IO_FLAG_ALLOW_INPLACE: a state input that is also its output
+    c.opt.nSize            = sizeof(c.opt);
+    c.opt.nOutputAttrCount = (uint32_t) c.attrs.size();
+    c.opt.pOutputAttrs     = c.attrs.data();
+    int32_t rc = a.run(k.handle, k.actx[slot], &c.io, &c.opt, async_noop, nullptr, &c.id);
+    if (rc == ASYNC_NOT_SUPPORT || rc == ASYNC_NOT_SUPPORTED || rc == ASYNC_PARAM_INVALID) {
+        rc = a.run_group(k.handle, k.actx[slot], 0, &c.io, &c.opt, async_noop, nullptr, &c.id);
+    }
+    if (rc == ASYNC_NOT_SUPPORT || rc == ASYNC_NOT_SUPPORTED || rc == ASYNC_PARAM_INVALID) {
+        fprintf(stderr, "axera: kernel %s: the runtime refuses asynchronous calls (0x%x): synchronous calls\n",
+                      k.desc->role.c_str(), (unsigned) rc);
+        k.async_refused = true;
+        return false;
+    }
+    if (rc != 0 || !c.id) {
+        npu_fail(k, c.in, c.out, rc, "RunAsync", c.what);
+    }
+    return true;
+}
+
+void async_wait(async_call & c) {
+    int32_t       result = 0;
+    const int32_t rc     = aapi().wait(c.k->handle, c.id, ASYNC_WAIT_MS, &result);
+    if (rc != 0 || result != 0) {
+        npu_fail(*c.k, c.in, c.out, rc != 0 ? rc : result, rc != 0 ? "WaitAsync" : "async task", c.what);
+    }
+}
+
+}  // namespace
+
+bool axera_npu_async() {
+    static const bool on = [] {
+        // synchronous by default: GGML_AXERA_ASYNC=1 opts in (GGML_AXERA_SYNC=1 still forces synchronous)
+        const char * s = getenv("GGML_AXERA_SYNC");
+        const char * a = getenv("GGML_AXERA_ASYNC");
+        if ((s && atoi(s) != 0) || !(a && atoi(a) != 0)) {
+            return false;
+        }
+        const async_api & api = aapi();
+        if (!api.create_context || !api.run || !api.run_group || !api.wait || !api.capability) {
+            fprintf(stderr, "axera: libax_engine has no asynchronous Task-ID API: NPU calls synchronous\n");
+            return false;
+        }
+        uint32_t      cap = 0;
+        const int32_t rc  = api.capability(&cap);
+        if (rc != 0 || !(cap & ASYNC_CAP)) {
+            fprintf(stderr, "axera: the runtime does not offer asynchronous calls (0x%x, caps 0x%x): NPU calls synchronous\n",
+                          (unsigned) rc, cap);
+            return false;
+        }
+        fprintf(stderr, "axera: NPU calls asynchronous (GGML_AXERA_ASYNC)\n");
+        return true;
+    }();
+    return on;
+}
+
+struct axera_npu_batch::impl {
+    std::vector<async_call *> calls;  // (stable addresses: the runtime holds the descriptors)
+};
+
+axera_npu_batch::axera_npu_batch() : p(new impl) {}
+
+axera_npu_batch::~axera_npu_batch() {
+    wait();
+    delete p;
+}
+
+size_t axera_npu_batch::size() const {
+    return p->calls.size();
+}
+
+void axera_npu_batch::add(const kernel & k, std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_IO_BUFFER_T> & out,
+                          const char * what) {
+    GGML_ASSERT(in.size() == k.info->nInputSize && out.size() == k.info->nOutputSize);
+    if (axera_npu_async() && !k.async_refused) {
+        size_t slot = 0;
+        for (const async_call * c : p->calls) {
+            slot += c->k == &k;
+        }
+        auto * c = new async_call;
+        c->k     = &k;
+        c->what  = what;
+        c->in    = in;
+        c->out   = out;
+        axera_thermal_guard();
+        axera_timer t("kernel: RunAsync (submit)");
+        if (async_submit(*c, slot)) {
+            p->calls.push_back(c);
+            return;
+        }
+        delete c;
+    }
+    wait();  // (a synchronous call after the calls in flight)
+    k.run(in, out, what);
+}
+
+void axera_npu_batch::wait() {
+    if (p->calls.empty()) {
+        return;
+    }
+    axera_timer t("kernel: WaitAsync (batch)");
+    for (async_call * c : p->calls) {
+        async_wait(*c);
+        delete c;
+    }
+    p->calls.clear();
+}
 
 kernel::~kernel() {
     if (handle) {
@@ -213,22 +416,29 @@ void kernel::run(std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_
     }
     axera_thermal_guard();
     tpre.stop();
-    axera_timer trun("kernel: RunSync");
-    const int ret  = AX_ENGINE_RunSync(handle, &io);
-    trun.stop();
-    if (hash_this && ret == 0) {
-        io_hash("post");
-    }
-    if (ret != 0) {  // the IO the kernel got (stderr: the log is asynchronous)
-        for (int o = 0; o < 2; ++o) {
-            const auto & bufs = o ? out : in;
-            for (size_t i = 0; i < bufs.size(); ++i) {
-                const AX_ENGINE_IOMETA_T & mt = o ? info->pOutputs[i] : info->pInputs[i];
-                fprintf(stderr, "axera: RunSync 0x%x: %s %zu %s: %u bytes (bound %u at phy 0x%llx)\n", ret,
-                        o ? "output" : "input", i, mt.pName, mt.nSize, bufs[i].nSize, (unsigned long long) bufs[i].phyAddr);
-            }
+    bool done = false;
+    if (axera_npu_async() && !async_refused) {
+        axera_timer trun("kernel: RunAsync");
+        async_call  c;
+        c.k    = this;
+        c.what = what;
+        c.in   = in;
+        c.out  = out;
+        if (async_submit(c, 0)) {
+            async_wait(c);
+            done = true;
         }
-        GGML_ABORT("axera: %s: kernel %s failed (0x%x)\n", what, desc->role.c_str(), ret);
+    }
+    if (!done) {
+        axera_timer trun("kernel: RunSync");
+        const int   ret = AX_ENGINE_RunSync(handle, &io);
+        trun.stop();
+        if (ret != 0) {
+            npu_fail(*this, in, out, ret, "RunSync", what);
+        }
+    }
+    if (hash_this) {
+        io_hash("post");
     }
     if (dump_all_role && desc->role == dump_all_role && call_no >= dump_first && call_no <= dump_last &&
         getenv("GGML_AXERA_DUMP_OUTPUTS")) {

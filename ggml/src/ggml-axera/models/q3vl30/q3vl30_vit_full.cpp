@@ -1,0 +1,472 @@
+// Axera NPU backend: the Qwen3.5 / Qwen3.8 vision encoder (mtmd clip graph, projector qwen3vl) in one call of the
+// manifest's role vit (ax-dsl-kernels models/<model>/whole/vit, vit_full): patch embedding, every layer, the 2 x 2
+// merge and projector for N patches, an image padded to N. The layer count, width, head width and projector's output
+// width come from the kernel's IO; 27B / 35B-A3B use 27 x 1152 and 2B / 4B use 24 x 1024.
+//
+// The host orders the patches in 2 x 2 merge order (as clip_graph_qwen3vl), resizes the learned position table
+// (bilinear, align corners), makes the 2-D RoPE tables and the key mask: those depend on the image's size only and are
+// kept for the next image of the same size. A video comes as pairs of frames (the tower's temporal merge): what goes
+// into the kernel's patch rows and patch weight for a still or a pair is core/patch_embed's business. The layers' weights from the mmproj GGUF, stacked [layers, ...] bf16 in
+// CMM once.
+//
+// The manifest may carry the same graph for several patch counts: role vit and roles vit_<N> (e.g. vit_1536 for a
+// 640 x 480 camera frame of 1200 patches). Each image runs on the smallest kernel that holds it; the kernels share
+// the weights' CMM (the same inputs at every N) and keep their own tables, scratch and outputs.
+
+#include "../model.h"
+#include "../../ops/ops.h"
+#include "../../core/patch_embed.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <thread>
+
+namespace axera {
+namespace {
+
+class q3vl30_vit_full final : public model {
+  public:
+    explicit q3vl30_vit_full(const manifest & m);
+    ~q3vl30_vit_full() override {
+        if (pairs_bg.joinable()) {
+            pairs_bg.join();
+        }
+    }
+    ggml_status compute(ggml_cgraph * g) override;
+    void        prewarm(ggml_cgraph * g) override;
+
+  private:
+    // one kernel of the vision graph at its patch count
+    struct sized {
+        const kernel *                   k = nullptr;
+        std::string                      role;
+        int                              N = 0, QB = 0, BC = 0;
+        std::map<std::string, axera_cmm> buf;              // its own IO: tables, scratch, outputs
+        int                              gh_ = -1, gw_ = -1;  // the image size of the tables in buf
+        std::vector<int>                 py, px;           // the patches in merge order
+    };
+    const manifest &                  man;
+    std::vector<sized>                ks;           // by patch count, smallest first
+    const kernel &                    k;            // the weights' sizes: ks[0]'s (every kernel's are the same)
+    graph_names                       names;
+    int                               HD = 0;
+    std::map<std::string, axera_cmm>  wbuf;         // the weights' IO by name, shared by the kernels
+    const void *                      bound = nullptr;
+    patch_embed                       pemb;         // the patch projection: the kernel's px rows and w_patch
+    int                               w_frames = 0; // the frames per call w_patch is filled for
+    std::thread                       pairs_bg;     // builds the frame pairs' weight while the model loads
+
+    static bool is_weight(const std::string & n);
+    // a weight's buffer (shared)
+    axera_cmm & io(const char * n) {
+        GGML_ASSERT(is_weight(n));
+        auto & c = wbuf[n];
+        if (!c) {
+            c = axera_cmm_alloc(k.in_bytes(n));
+        }
+        return c;
+    }
+    // any IO of kernel v: a weight's shared buffer or v's own
+    axera_cmm & io(sized & v, const char * n, bool out = false) {
+        if (!out && is_weight(n)) {
+            return io(n);
+        }
+        auto & c = v.buf[n];
+        if (!c) {
+            c = axera_cmm_alloc(out ? v.k->out_bytes(n) : v.k->in_bytes(n));
+        }
+        return c;
+    }
+    void weights(int L, int H);
+    void patch_weight(int frames);
+    void tables(sized & v, int gh, int gw, int n, const ggml_tensor * pe, int H);
+};
+
+// the kernel inputs filled from the mmproj once (weights()) or per frame count (patch_weight())
+bool q3vl30_vit_full::is_weight(const std::string & n) {
+    static const char * w[] = { "ln1_w", "ln1_b", "w_qkv", "b_qkv", "w_o", "b_o", "ln2_w", "ln2_b", "w_up", "b_up",
+                                "w_down", "b_down", "b_patch", "post_w", "post_b", "w0", "b0", "w2", "b2", "ds_post_w",
+                                "ds_post_b", "ds_w0", "ds_b0", "ds_w2", "ds_b2", "w_patch" };
+    for (const char * x : w) {
+        if (n == x) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::vector<std::string> vit_roles(const manifest & m) {
+    std::vector<std::string> r = { "vit" };
+    for (const auto & [role, kd] : m.kernels) {
+        if (role.rfind("vit_", 0) == 0) {
+            r.push_back(role);
+        }
+    }
+    return r;
+}
+
+q3vl30_vit_full::q3vl30_vit_full(const manifest & m) :
+    man(m),
+    ks([&] {
+        std::vector<sized> v;
+        for (const std::string & role : vit_roles(m)) {
+            sized s;
+            s.k    = &m.get(role);
+            s.role = role;
+            const AX_ENGINE_IOMETA_T & km = s.k->info->pInputs[s.k->input("kmask")];  // [N / BC, QB, BC]
+            const AX_ENGINE_IOMETA_T & cm = s.k->info->pInputs[s.k->input("cos")];    // [N, HD / 2]
+            GGML_ASSERT(km.nShapeSize == 3 && cm.nShapeSize == 2);
+            s.N  = (int) cm.pShape[0];
+            s.QB = (int) km.pShape[1];
+            s.BC = (int) km.pShape[2];
+            GGML_ASSERT(km.pShape[0] * s.BC == s.N);
+            v.push_back(std::move(s));
+        }
+        std::sort(v.begin(), v.end(), [](const sized & a, const sized & b) { return a.N < b.N; });
+        return v;
+    }()),
+    k(*ks[0].k) {
+    HD = 2 * (int) ks[0].k->info->pInputs[ks[0].k->input("cos")].pShape[1];
+    for (const sized & v : ks) {
+        GGML_ASSERT(2 * (int) v.k->info->pInputs[v.k->input("cos")].pShape[1] == HD);
+        GGML_ASSERT(v.k->in_bytes("px") / v.N == k.in_bytes("px") / ks[0].N && "axera q3vl30_vit_full: the vit kernels' patch rows differ");
+        for (uint32_t i = 0; i < v.k->info->nInputSize; ++i) {
+            const char * n = v.k->info->pInputs[i].pName;
+            if (is_weight(n) && v.k->in_bytes(n) != k.in_bytes(n)) {
+                GGML_ABORT("axera q3vl30_vit_full: %s: weight %s differs from %s's\n", v.role.c_str(), n, ks[0].role.c_str());
+            }
+        }
+        if (ks.size() > 1) {
+            GGML_LOG_INFO("axera q3vl30_vit_full: role %s: %d patches\n", v.role.c_str(), v.N);
+        }
+    }
+}
+
+// bf16 rows of a weight of any type into dst (ne elements)
+void to_bf16(const ggml_tensor * w, ggml_bf16_t * dst) {
+    const int64_t ne = ggml_nelements(w);
+    if (w->type == GGML_TYPE_BF16) {
+        memcpy(dst, w->data, ne * sizeof(ggml_bf16_t));
+    } else if (w->type == GGML_TYPE_F32) {
+        ggml_fp32_to_bf16_row((const float *) w->data, dst, ne);
+    } else {
+        std::vector<float> f(ne);
+        ggml_get_type_traits(w->type)->to_float(w->data, f.data(), ne);
+        ggml_fp32_to_bf16_row(f.data(), dst, ne);
+    }
+}
+
+void q3vl30_vit_full::weights(int L, int H) {
+    axera_timer tm("vit weights (load)");
+    // stacked per layer: kernel input -> mmproj tensor of v.blk.<l>.
+    static const std::pair<const char *, const char *> per_layer[] = {
+        { "ln1_w", "ln1.weight" }, { "ln1_b", "ln1.bias" }, { "w_qkv", "attn_qkv.weight" }, { "b_qkv", "attn_qkv.bias" },
+        { "w_o", "attn_out.weight" }, { "b_o", "attn_out.bias" }, { "ln2_w", "ln2.weight" }, { "ln2_b", "ln2.bias" },
+        { "w_up", "ffn_up.weight" }, { "b_up", "ffn_up.bias" }, { "w_down", "ffn_down.weight" }, { "b_down", "ffn_down.bias" },
+    };
+    for (const auto & [in, t] : per_layer) {
+        axera_cmm &  c   = io(in);
+        const size_t per = c->size / L;
+        GGML_ASSERT(per * L == k.in_bytes(in) || c->size >= k.in_bytes(in));
+        axera_host_pool().run(L, [&](int64_t l) {
+            const ggml_tensor * w = names.at("v.blk." + std::to_string(l) + "." + t);
+            GGML_ASSERT((size_t) ggml_nelements(w) * sizeof(ggml_bf16_t) == k.in_bytes(in) / L);
+            axera_page_in(w);
+            to_bf16(w, (ggml_bf16_t *) ((char *) c->vir + l * (k.in_bytes(in) / L)));
+            axera_drop_mapped(w);  // (an mmproj mapped by mtmd: the copy above is the only one kept)
+        });
+        c->flush();
+    }
+    static const std::pair<const char *, const char *> whole[] = {
+        { "b_patch", "v.patch_embd.bias" }, { "post_w", "v.post_ln.weight" }, { "post_b", "v.post_ln.bias" },
+        { "w0", "mm.0.weight" }, { "b0", "mm.0.bias" }, { "w2", "mm.2.weight" }, { "b2", "mm.2.bias" },
+    };
+    for (const auto & [in, t] : whole) {
+        const ggml_tensor * w = names.at(t);
+        GGML_ASSERT((size_t) ggml_nelements(w) * sizeof(ggml_bf16_t) == k.in_bytes(in));
+        axera_page_in(w);
+        to_bf16(w, (ggml_bf16_t *) io(in)->vir);
+        io(in)->flush();
+        axera_drop_mapped(w);
+    }
+    // Qwen3-VL adds the merged features of vision layers 8 / 16 / 24 to the
+    // language model's first three layers. The kernel stacks the three
+    // mergers' tensors over that order.
+    static const int ds_layer[3] = { 8, 16, 24 };
+    static const std::pair<const char *, const char *> ds[] = {
+        { "ds_post_w", "norm.weight" }, { "ds_post_b", "norm.bias" },
+        { "ds_w0", "fc1.weight" },      { "ds_b0", "fc1.bias" },
+        { "ds_w2", "fc2.weight" },      { "ds_b2", "fc2.bias" },
+    };
+    for (const auto & [in, t] : ds) {
+        axera_cmm &  c   = io(in);
+        const size_t per = k.in_bytes(in) / 3;
+        GGML_ASSERT(c->size >= 3 * per);
+        axera_host_pool().run(3, [&](int64_t j) {
+            const ggml_tensor * w = names.at("v.deepstack." + std::to_string(ds_layer[j]) + "." + t);
+            GGML_ASSERT((size_t) ggml_nelements(w) * sizeof(ggml_bf16_t) == per);
+            axera_page_in(w);
+            to_bf16(w, (ggml_bf16_t *) ((char *) c->vir + j * per));
+            axera_drop_mapped(w);
+        });
+        c->flush();
+    }
+    axera_flush_file_pages();
+    axera_keep_mapped(names.at("v.position_embd.weight"));  // (tables() reads it per image size)
+    // the patch projection [H][3][PS][PS] x 2 frames: w_patch itself is filled per frame count (patch_weight)
+    const ggml_tensor * w0 = names.at("v.patch_embd.weight"), *w1 = names.at("v.patch_embd.weight.1");
+    const int           CP = (int) (ggml_nelements(w0) / H);
+    const int           PW = (int) (k.in_bytes("px") / sizeof(ggml_bf16_t) / ks[0].N);
+    GGML_ASSERT(w0->type == GGML_TYPE_F32 && w1->type == GGML_TYPE_F32 && ggml_nelements(w0) == ggml_nelements(w1) &&
+                (size_t) H * PW * sizeof(ggml_bf16_t) == k.in_bytes("w_patch"));
+    axera_page_in(w0);
+    axera_page_in(w1);
+    if (pairs_bg.joinable()) {
+        pairs_bg.join();
+    }
+    const bool ok = pemb.init((const float *) w0->data, (const float *) w1->data, H, CP, PW);
+    GGML_ASSERT(ok && "axera q3vl30_vit_full: the kernel's px row is neither one nor two frames wide");
+    w_frames = 0;
+    // a video's first frame pair would otherwise wait seconds for the pairs' weight: build it now, on threads of its
+    // own (the host pool is the loader's and the prompts')
+    pairs_bg = std::thread([this] { pemb.prepare_pairs(patch_embed::threads((int) std::max(1u, std::thread::hardware_concurrency()))); });
+}
+
+void q3vl30_vit_full::patch_weight(int frames) {
+    if (frames == w_frames) {
+        return;
+    }
+    axera_timer                tm(frames == 2 ? "vit patch weight (frame pairs)" : "vit patch weight (stills)");
+    const std::vector<float> & w = frames == 2 ? pemb.weight_pairs([](int64_t n, const std::function<void(int64_t)> & fn) {
+        axera_host_pool().run(n, fn);
+    }) : pemb.weight_still();
+    GGML_ASSERT(w.size() * sizeof(ggml_bf16_t) == k.in_bytes("w_patch"));
+    ggml_fp32_to_bf16_row(w.data(), (ggml_bf16_t *) io("w_patch")->vir, (int64_t) w.size());
+    io("w_patch")->flush();
+    w_frames = frames;
+    if (frames == 2) {
+        GGML_LOG_INFO("axera q3vl30_vit_full: video frame pairs through %d-wide patch rows (basis residual %.1e)\n", pemb.width(),
+                      pemb.pair_residual());
+    }
+}
+
+// the tables of an image of gh x gw patches (n real): merge order, positions, RoPE, key mask
+void q3vl30_vit_full::tables(sized & v, int gh, int gw, int n, const ggml_tensor * pe, int H) {
+    axera_timer tm("vit tables (cpu)");
+    const int N = v.N, QB = v.QB, BC = v.BC;
+    std::vector<int> & py = v.py, & px = v.px;
+    py.assign(N, 0);
+    px.assign(N, 0);
+    for (int y = 0, i = 0; y < gh; y += 2) {
+        for (int x = 0; x < gw; x += 2) {
+            for (int d = 0; d < 4; ++d, ++i) {
+                py[i] = y + d / 2;
+                px[i] = x + d % 2;
+            }
+        }
+    }
+    // learned positions [side x side][H] (x fastest), bilinear with align corners to gh x gw
+    const int     side = (int) std::lround(std::sqrt((double) pe->ne[1]));
+    const float * tab  = (const float *) pe->data;
+    auto *        pos  = (ggml_bf16_t *) io(v, "pos")->vir;
+    GGML_ASSERT(pe->type == GGML_TYPE_F32 && side * side == pe->ne[1]);
+    axera_host_pool().run(N, [&](int64_t i) {
+        ggml_bf16_t * d = pos + i * H;
+        if (i >= n) {
+            std::fill(d, d + H, ggml_fp32_to_bf16(0.0f));
+            return;
+        }
+        const float   sy = gh > 1 ? (float) py[i] * (side - 1) / (gh - 1) : 0.0f;
+        const float   sx = gw > 1 ? (float) px[i] * (side - 1) / (gw - 1) : 0.0f;
+        const int     y0 = (int) sy, x0 = (int) sx, y1 = std::min(y0 + 1, side - 1), x1 = std::min(x0 + 1, side - 1);
+        const float   fy = sy - y0, fx = sx - x0;
+        const float * a = tab + ((int64_t) y0 * side + x0) * H, *b = tab + ((int64_t) y0 * side + x1) * H;
+        const float * c = tab + ((int64_t) y1 * side + x0) * H, *e = tab + ((int64_t) y1 * side + x1) * H;
+        for (int j = 0; j < H; ++j) {
+            d[j] = ggml_fp32_to_bf16((1 - fy) * ((1 - fx) * a[j] + fx * b[j]) + fy * ((1 - fx) * c[j] + fx * e[j]));
+        }
+    });
+    io(v, "pos")->flush();
+    // RoPE: frequency j of HD / 4 for the row, then HD / 4 for the column, 10000^(-4 j / HD)
+    std::vector<float> inv(HD / 4);
+    for (int q = 0; q < HD / 4; ++q) {
+        inv[q] = (float) std::pow(10000.0, -4.0 * q / HD);
+    }
+    auto * cs = (ggml_bf16_t *) io(v, "cos")->vir, *sn = (ggml_bf16_t *) io(v, "sin")->vir;
+    axera_host_pool().run(N, [&](int64_t i) {
+        for (int j = 0; j < HD / 2; ++j) {
+            const float a = (float) (j < HD / 4 ? py[i] : px[i]) * inv[j % (HD / 4)];
+            cs[i * (HD / 2) + j] = ggml_fp32_to_bf16(std::cos(a));
+            sn[i * (HD / 2) + j] = ggml_fp32_to_bf16(std::sin(a));
+        }
+    });
+    io(v, "cos")->flush();
+    io(v, "sin")->flush();
+    // keys: the n patches in nblk blocks, the padding of the last hidden ([N / BC][QB][BC], the key row repeated)
+    *(int32_t *) io(v, "nblk")->vir = (n + BC - 1) / BC;
+    io(v, "nblk")->flush();
+    auto * km = (ggml_bf16_t *) io(v, "kmask")->vir;
+    axera_host_pool().run(N / BC, [&](int64_t b) {
+        std::vector<ggml_bf16_t> row(BC);
+        for (int c = 0; c < BC; ++c) {
+            row[c] = ggml_fp32_to_bf16(b * BC + c < n ? 0.0f : -3e38f);
+        }
+        for (int r = 0; r < QB; ++r) {
+            memcpy(km + ((size_t) b * QB + r) * BC, row.data(), BC * sizeof(ggml_bf16_t));
+        }
+    });
+    io(v, "kmask")->flush();
+}
+
+// mtmd opened the model: load the weights now (seconds of file reads and conversion), not inside the first image
+void q3vl30_vit_full::prewarm(ggml_cgraph * g) {
+    names.of(g);
+    if (!names.find("v.position_embd.weight") || !names.find("v.patch_embd.weight") || !names.find("v.blk.0.ln1.weight")) {
+        return;
+    }
+    const int H = (int) names.at("v.position_embd.weight")->ne[0], PS = (int) names.at("v.patch_embd.weight")->ne[0];
+    int       L = 0;
+    while (names.find("v.blk." + std::to_string(L) + ".ln1.weight")) {
+        ++L;
+    }
+    const ggml_tensor * w0 = names.at("v.blk.0.ln1.weight");
+    if (!w0->data || bound == w0->data) {
+        return;
+    }
+    GGML_ASSERT(k.in_bytes("px") == (size_t) ks[0].N * 3 * PS * PS * sizeof(ggml_bf16_t) ||
+                k.in_bytes("px") == (size_t) ks[0].N * 2 * 3 * PS * PS * sizeof(ggml_bf16_t));
+    weights(L, H);
+    bound = w0->data;
+    for (sized & s : ks) {
+        s.gh_ = s.gw_ = -1;
+    }
+}
+
+ggml_status q3vl30_vit_full::compute(ggml_cgraph * g) {
+    names.of(g);
+    ggml_tensor * raw = names.at("inp_raw");  // [W, H, 3, frames] f32, normalized
+    ggml_tensor * pe  = names.at("v.position_embd.weight");
+    ggml_tensor * out = g->nodes[g->n_nodes - 1];
+    const int     H = (int) pe->ne[0], PS = (int) names.at("v.patch_embd.weight")->ne[0], CP = 3 * PS * PS;
+    const int     gw = (int) raw->ne[0] / PS, gh = (int) raw->ne[1] / PS, n = gw * gh;
+    int           L  = 0;
+    while (names.find("v.blk." + std::to_string(L) + ".ln1.weight")) {
+        ++L;
+    }
+    const int frames = (int) raw->ne[3];  // 1: a still image, 2: a pair of video frames
+    const int NMAX   = ks.back().N;
+    if (frames < 1 || frames > 2 || gw % 2 || gh % 2 || n > NMAX) {
+        GGML_LOG_ERROR("axera q3vl30_vit_full: %d frame(s) of %d x %d patches: one image or a pair of video frames, even patch "
+                       "counts, at most %d patches (mtmd --image-max-tokens)\n", frames, gw, gh, NMAX);
+        return GGML_STATUS_FAILED;
+    }
+    sized & v = *std::find_if(ks.begin(), ks.end(), [&](const sized & s) { return n <= s.N; });
+    const kernel & kv = *v.k;
+    const int      N  = v.N;
+    const std::vector<int> & py = v.py, & px = v.px;
+    const ggml_tensor * w0 = names.at("v.blk.0.ln1.weight");
+    if (bound != w0->data) {
+        weights(L, H);
+        bound = w0->data;
+        for (sized & s : ks) {
+            s.gh_ = s.gw_ = -1;
+        }
+    }
+    if (gh != v.gh_ || gw != v.gw_) {
+        tables(v, gh, gw, n, pe, H);
+        v.gh_ = gh;
+        v.gw_ = gw;
+    }
+    patch_weight(frames);
+    {
+        axera_timer   tm(frames == 2 ? "vit patches (cpu, frame pairs)" : "vit patches (cpu)");
+        const float * img = (const float *) raw->data;
+        const int64_t W = raw->ne[0], HI = raw->ne[1];
+        const int     PW = pemb.width();
+        const bool    plain = frames == 1 && PW == CP;  // the pixels are the row
+        auto *        pxb = (ggml_bf16_t *) io(v, "px")->vir;
+        axera_host_pool().run(N, [&](int64_t i) {
+            ggml_bf16_t * d = pxb + i * PW;
+            if (i >= n) {
+                std::fill(d, d + PW, ggml_fp32_to_bf16(0.0f));
+                return;
+            }
+            if (plain) {
+                for (int c = 0; c < 3; ++c) {
+                    for (int ky = 0; ky < PS; ++ky) {
+                        const float * row = img + c * W * HI + (int64_t) (py[i] * PS + ky) * W + px[i] * PS;
+                        ggml_fp32_to_bf16_row(row, d + (c * PS + ky) * PS, PS);
+                    }
+                }
+                return;
+            }
+            std::vector<float> p((size_t) 2 * CP + PW);  // the patch in both frames, its row
+            for (int f = 0; f < frames; ++f) {
+                for (int c = 0; c < 3; ++c) {
+                    for (int ky = 0; ky < PS; ++ky) {
+                        const float * row = img + (f * 3 + c) * W * HI + (int64_t) (py[i] * PS + ky) * W + px[i] * PS;
+                        memcpy(p.data() + (size_t) f * CP + (c * PS + ky) * PS, row, PS * sizeof(float));
+                    }
+                }
+            }
+            pemb.row(p.data(), frames == 2 ? p.data() + CP : nullptr, p.data() + 2 * CP);
+            ggml_fp32_to_bf16_row(p.data() + 2 * CP, d, PW);
+        });
+        io(v, "px")->flush();
+    }
+    std::vector<AX_ENGINE_IO_BUFFER_T> in(kv.info->nInputSize), outs(kv.info->nOutputSize);
+    for (uint32_t i = 0; i < kv.info->nInputSize; ++i) {
+        const AX_ENGINE_IOMETA_T & m = kv.info->pInputs[i];
+        in[i]                        = axera_io(io(v, m.pName), m.nSize);
+    }
+    for (uint32_t i = 0; i < kv.info->nOutputSize; ++i) {
+        const AX_ENGINE_IOMETA_T & m = kv.info->pOutputs[i];
+        outs[i]                      = axera_io(io(v, m.pName, true), m.nSize);
+    }
+    {
+        axera_timer tm("vit (one call)");
+        kv.run(in, outs, v.role.c_str());
+    }
+    axera_cmm &  o     = io(v, "out", true);
+    const int    OUTD  = (int) (kv.out_bytes("out") / sizeof(float) / (N / 4));
+    const int    OUTM  = (int) names.at("mm.2.weight")->ne[1];
+    GGML_ASSERT(OUTD == 4 * OUTM && "q3vl30 ViT kernel must carry the main plane and three deepstack planes");
+    const size_t bytes = (size_t) (n / 4) * OUTD * sizeof(float);
+    GGML_ASSERT(out->type == GGML_TYPE_F32 && out->ne[0] == OUTD && out->ne[1] == n / 4);
+    o->invalidate(o->vir, bytes);
+    memcpy(out->data, o->vir, bytes);
+    if (ggml_backend_buffer_is_axera(out->buffer)) {
+        ((ggml_backend_axera_buffer_context *) out->buffer->context)->flush(out->data, bytes);
+    }
+    if (const char * dir = std::getenv("GGML_AXERA_Q3VL30_VIT_DUMP_DIR"); dir && *dir) {
+        auto dump = [&](const char * name, bool output) {
+            axera_cmm & c = io(v, name, output);
+            const size_t size = output ? bytes : kv.in_bytes(name);
+            std::ofstream f(std::string(dir) + "/" + name + ".bin", std::ios::binary);
+            GGML_ASSERT(f && "axera q3vl30_vit_full: cannot open VIT dump file");
+            f.write((const char *) c->vir, (std::streamsize) size);
+            GGML_ASSERT(f && "axera q3vl30_vit_full: cannot write VIT dump file");
+        };
+        for (const char * name : { "px", "pos", "cos", "sin", "kmask", "nblk" }) {
+            dump(name, false);
+        }
+        dump("out", true);
+        GGML_LOG_INFO("axera q3vl30_vit_full: dumped %d patches, %d x %d pixels, %d x %d merged rows to %s\n",
+                      n, N, CP, n / 4, OUTD, dir);
+        std::fflush(nullptr);
+        if (std::getenv("GGML_AXERA_Q3VL30_VIT_EXIT")) {
+            std::_Exit(0);
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+std::shared_ptr<model> make_q3vl30_vit_full(const manifest & m) {
+    return std::make_shared<q3vl30_vit_full>(m);
+}
+
+}  // namespace axera

@@ -8,6 +8,7 @@
 |---|---|
 | `LD_LIBRARY_PATH` | 必须包含 `/opt/lib`（板子的 SDK 库）；动态构建还要包含程序所在目录 |
 | `GGML_AXERA_KERNEL_DIR` | 必填，kernel 目录（`*.axmodel` + `manifest.json`）；不设、目录不对或 NPU 初始化失败都直接报错退出，不会回退 CPU |
+| `GGML_AXERA_ASYNC=1` | NPU 调用走 SDK 异步接口（RunAsync/WaitAsync）；默认同步，`GGML_AXERA_SYNC=1` 强制同步 |
 | `GGML_AXERA_PROF=1` | 进程退出时打印各阶段耗时（prefill、decode、lm_head、权重转换等） |
 | `GGML_AXERA_TRACE=1` | 每个计算图打印节点数、两图之间的 host 间隔、NPU 运行时间 |
 | `GGML_AXERA_CODEC_DUMP=<目录>` | 仅调试用：把 TTS 声码器转换后的权重写成文件 |
