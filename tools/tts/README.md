@@ -104,3 +104,31 @@ The [upstream repository](https://huggingface.co/kyutai/pocket-tts) holds one co
 python convert_hf_to_gguf.py path/to/pocket-tts/languages/english --outfile pocket-tts.gguf
 python convert_hf_to_gguf.py path/to/pocket-tts/languages/english --mmproj --outfile mmproj-pocket-tts.gguf
 ```
+
+## CosyVoice3
+
+CosyVoice3 keeps its own Qwen2 backbone GGUF, auxiliary speech-token GGUF,
+ONNX frontend and flow/HiFT runner.  `llama-tts` forwards any invocation that
+contains `--aux` to the in-process CosyVoice3 runtime:
+
+```sh
+llama-tts -m cosyvoice3-llm-bf16.gguf --aux cosyvoice3-aux-llm-f32.gguf \
+    --tables tables --campplus campplus.onnx \
+    --tokenizer speech_tokenizer_v3.onnx --flow-encoder flow_encoder.onnx \
+    --flow-npu flow_npu4.axmodel --hift-npu hift_npu4.axmodel \
+    -p "你好，欢迎使用语音合成。" \
+    --prompt-text "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。" \
+    --prompt-wav zero_shot_prompt.wav -o out.wav
+```
+
+For the OpenAI-compatible server, set `COSYVOICE3_HOME` to the model package
+directory.  `llama-server` creates the kernel sessions and runs the reference
+warm-up in its own process before `/health` becomes ready.  `POST
+/v1/audio/speech` then accepts `input`, `voice`, `response_format`, base64
+`ref_audio` and `ref_text`; no separate TTS worker process is started.  The
+existing Qwen3-TTS path is unchanged.
+
+```sh
+COSYVOICE3_HOME="$PWD" \
+    llama-server -m cosyvoice3-llm-bf16.gguf -np 1 --host 0.0.0.0 --port 18260
+```

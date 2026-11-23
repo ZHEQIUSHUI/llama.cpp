@@ -24,10 +24,13 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "cosy-tts-runtime.h"
 #include "gguf.h"
 #include "forced-aligner.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <climits>
 #include <cmath>
 #include <cstddef>
@@ -35,10 +38,21 @@
 #include <cstdlib>
 #include <exception>
 #include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <thread>
 #include <filesystem>
 #include <random>
 #include <utility>
 #include <fstream>
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -80,6 +94,40 @@ static llama_token server_tts_sample(void * user_data) {
     const llama_token sampled = common_sampler_sample(ctx->smpl, ctx->lctx, -1);
     common_sampler_accept(ctx->smpl, sampled, true);
     return sampled;
+}
+
+static bool server_cosy_tts_enabled() {
+    return cosyvoice3_service_available();
+}
+
+static bool server_cosy_tts_start(std::string & error) {
+    const char * home_env = std::getenv("COSYVOICE3_HOME");
+    if (home_env == nullptr || home_env[0] == '\0') {
+        return true;
+    }
+    const std::filesystem::path home(home_env);
+    const auto path = [&](const char * rel) { return (home / rel).string(); };
+    std::vector<std::string> args = {
+        "cosyvoice3",
+        "-m", path("gguf/cosyvoice3-llm-bf16.gguf"),
+        "--aux", path("gguf/cosyvoice3-aux-llm-f32.gguf"),
+        "--front", path("gguf/cosyvoice3-front2-bf16.gguf"),
+        "--tok-gguf", path("gguf/cosyvoice3-tokenizer-bank-bf16.gguf"),
+        "--front-npu", path("kernels/cosyvoice3_front_npu4.axmodel"),
+        "--bank", path("gguf/cosyvoice3-bank-bf16.gguf"),
+        "--flow-loop-npu", path("kernels/cosyvoice3_flow_bank_n256_s5_npu4.axmodel"),
+        "--hift-npu", path("kernels/cosyvoice3_hift_dec_bank_c256_npu4.axmodel"),
+        "--feat-cache", path("cache"),
+        "-p", "x", "--prompt-text", "x", "--prompt-wav", "/dev/null",
+        "-o", "/tmp/cosy_service.wav", "-ngl", "99", "-t", "8", "--seed", "123",
+        "--warm-prompt-wav", path("examples/zero_shot_prompt.wav"),
+        "--warm-prompt-text",
+        "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。",
+        "--warm-prompt-wav2", path("examples/asr_en_5s.wav"),
+        "--warm-prompt-text2",
+        "You are a helpful assistant.<|endofprompt|>Mm-hmm. Oh, yeah, yeah. He wasn't even that big when I started listening.",
+    };
+    return cosyvoice3_service_start(args, error);
 }
 
 // A forced aligner emits one classifier row per timestamp token.  The server's normal output
@@ -1527,6 +1575,7 @@ public:
     }
 
     ~server_context_impl() {
+        cosyvoice3_service_stop();
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -2316,6 +2365,14 @@ private:
         // propagate new defaults back to caller
         params = params_base;
 
+        if (std::getenv("COSYVOICE3_HOME") != nullptr) {
+            std::string cosy_error;
+            if (!server_cosy_tts_start(cosy_error)) {
+                SRV_ERR("failed to initialize CosyVoice3 runtime: %s\n", cosy_error.c_str());
+                return false;
+            }
+            SRV_INF("%s", "CosyVoice3 runtime ready\n");
+        }
         if (voxcpm2_enabled) {
             const std::string & base_path = !params.voxcpm2_base_lm.empty()
                     ? params.voxcpm2_base_lm : params.model.path;
@@ -6162,6 +6219,34 @@ struct vox_stream_state {
     std::string             error;
 };
 
+struct cosy_stream_state {
+    std::mutex              mutex;
+    std::condition_variable cond;
+    std::deque<std::string> queue;
+    bool                    done   = false;
+    bool                    cancel = false;
+    bool                    header = false;
+    std::thread             worker;
+    std::string             error;
+};
+
+struct cosy_stream_response : server_res_generator {
+    std::shared_ptr<cosy_stream_state> state;
+    cosy_stream_response(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds)
+            : server_res_generator(queue_tasks, queue_results, sleep_idle_seconds) {}
+    void on_complete() override {
+        if (state) {
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->cancel = true;
+                state->cond.notify_all();
+            }
+            if (state->worker.joinable()) state->worker.join();
+        }
+        server_res_generator::on_complete();
+    }
+};
+
 struct vox_stream_response : server_res_generator {
     std::shared_ptr<vox_stream_state> state;
     vox_stream_response(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds)
@@ -6180,7 +6265,18 @@ struct vox_stream_response : server_res_generator {
         server_res_generator::on_complete();
     }
 };
+static std::string cosy_wav_header(uint32_t data_bytes, uint32_t sample_rate) {
+    std::string h(44, '\0');
+    auto * p = reinterpret_cast<uint8_t *>(h.data());
+    auto w32 = [&](uint32_t v) { memcpy(p, &v, 4); p += 4; };
+    auto w16 = [&](uint16_t v) { memcpy(p, &v, 2); p += 2; };
+    memcpy(p, "RIFF", 4); p += 4; w32(36 + data_bytes); memcpy(p, "WAVE", 4); p += 4;
+    memcpy(p, "fmt ", 4); p += 4; w32(16); w16(1); w16(1); w32(sample_rate);
+    w32(sample_rate * 2); w16(2); w16(16); memcpy(p, "data", 4); p += 4; w32(data_bytes);
+    return h;
+}
 }  // namespace
+
 
 bool server_context::voxcpm2_available() const {
     return impl->voxcpm2_available();
@@ -7194,6 +7290,7 @@ void server_routes::init_routes() {
 
     this->post_audio_speech = [this](const server_http_req & req) {
         auto res = create_response();
+        const bool cosyvoice3 = !meta->has_mtmd && server_cosy_tts_enabled();
 
         if (ctx_server.voxcpm2_available()) {
             try {
@@ -7332,17 +7429,17 @@ void server_routes::init_routes() {
             }
         }
 
-        if (!meta->has_mtmd) {
+        if (!meta->has_mtmd && !cosyvoice3) {
             res->error(format_error_response(
                 "Audio generation requires an mmproj loaded with --mmproj.", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
-        if (meta->tts_gen_audio_type == MTMD_GEN_AUDIO_TYPE_NONE) {
+        if (!cosyvoice3 && meta->tts_gen_audio_type == MTMD_GEN_AUDIO_TYPE_NONE) {
             res->error(format_error_response(
                 "The loaded mmproj does not support audio generation.", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
-        if (meta->tts_gen_audio_type != MTMD_GEN_AUDIO_TYPE_QWEN3TTS) {
+        if (!cosyvoice3 && meta->tts_gen_audio_type != MTMD_GEN_AUDIO_TYPE_QWEN3TTS) {
             res->error(format_error_response(
                 "This audio generation model is not supported by /v1/audio/speech.", ERROR_TYPE_NOT_SUPPORTED));
             return res;
@@ -7353,7 +7450,10 @@ void server_routes::init_routes() {
             return res;
         }
 
+        const auto t_tts_route0 = std::chrono::steady_clock::now();
         const json body = json::parse(req.body);
+        const double t_tts_json = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_tts_route0).count();
         if (!body.is_object()) {
             throw std::invalid_argument("request body must be a JSON object");
         }
@@ -7369,6 +7469,7 @@ void server_routes::init_routes() {
         };
 
         server_task task(SERVER_TASK_TYPE_TTS);
+        task.tts.cosyvoice3 = cosyvoice3;
         task.tts.prompt = opt_string("input");
         if (task.tts.prompt.empty()) {
             throw std::invalid_argument("missing required field \"input\"");
@@ -7395,16 +7496,156 @@ void server_routes::init_routes() {
             if (data_uri != std::string::npos) {
                 encoded = encoded.substr(data_uri + 8);
             }
-            try {
-                const std::string decoded = base64::decode(encoded);
-                task.tts.ref_audio.assign(decoded.begin(), decoded.end());
-            } catch (const std::exception & e) {
-                throw std::invalid_argument(std::string("invalid ref_audio base64: ") + e.what());
+            // /v1/audio/speech sends the same reference WAV on every request.
+            // Decoding its base64 is tens of ms on the board, so keep a tiny
+            // LRU of decoded buffers keyed by a 64-bit hash of the payload.
+            uint64_t ref_hash = 1469598103934665603ull;
+            for (unsigned char ch : encoded) { ref_hash ^= ch; ref_hash *= 1099511628211ull; }
+            static std::mutex ref_cache_mu;
+            static std::deque<std::pair<uint64_t, std::vector<uint8_t>>> ref_cache;
+            bool ref_hit = false;
+            {
+                std::lock_guard<std::mutex> lock(ref_cache_mu);
+                for (const auto & e : ref_cache) {
+                    if (e.first == ref_hash) {
+                        task.tts.ref_audio = e.second;
+                        ref_hit = true;
+                        break;
+                    }
+                }
             }
+            const auto t_b64_0 = std::chrono::steady_clock::now();
+            if (!ref_hit) {
+                try {
+                    const std::string decoded = base64::decode(encoded);
+                    task.tts.ref_audio.assign(decoded.begin(), decoded.end());
+                } catch (const std::exception & e) {
+                    throw std::invalid_argument(std::string("invalid ref_audio base64: ") + e.what());
+                }
+                std::lock_guard<std::mutex> lock(ref_cache_mu);
+                ref_cache.emplace_back(ref_hash, task.tts.ref_audio);
+                while (ref_cache.size() > 4) ref_cache.pop_front();
+            }
+            const double t_tts_b64 = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_b64_0).count();
+            fprintf(stderr, "[http-tts] json=%.4f ref_b64=%.4f ref_cache=%d enc=%zu dec=%zu\n",
+                    t_tts_json, t_tts_b64, ref_hit ? 1 : 0, encoded.size(), task.tts.ref_audio.size());
             if (task.tts.ref_audio.empty()) {
                 throw std::invalid_argument("\"ref_audio\" decoded to an empty buffer");
             }
             task.tts.has_ref_audio = true;
+        }
+
+        if (cosyvoice3) {
+            if (!task.tts.instructions.empty()) {
+                throw std::invalid_argument("instructions are not supported by CosyVoice3");
+            }
+            if (!task.tts.language.empty()) {
+                throw std::invalid_argument("language is not supported by CosyVoice3");
+            }
+            if (body.contains("speed") && !body.at("speed").is_null()) {
+                throw std::invalid_argument("speed is not supported by CosyVoice3");
+            }
+            if (!task.tts.voice.empty() && task.tts.voice != "default") {
+                throw std::invalid_argument("voice must be \"default\" for CosyVoice3");
+            }
+            if (!task.tts.has_ref_audio) {
+                throw std::invalid_argument("ref_audio is required for CosyVoice3 zero-shot cloning");
+            }
+            if (task.tts.ref_text.empty()) {
+                throw std::invalid_argument("ref_text is required for CosyVoice3 zero-shot cloning");
+            }
+            uint32_t cosy_seed = 123;
+            if (body.contains("seed") && !body.at("seed").is_null()) {
+                if (!body.at("seed").is_number_integer()) {
+                    throw std::invalid_argument("\"seed\" must be an integer");
+                }
+                const int64_t v = body.at("seed").get<int64_t>();
+                if (v < 0 || v > (int64_t) UINT32_MAX) {
+                    throw std::invalid_argument("\"seed\" must be in the uint32 range");
+                }
+                cosy_seed = (uint32_t) v;
+            }
+            const bool stream = body.value("stream", false);
+            const int sr = 24000;
+            if (stream) {
+                auto st = std::make_shared<cosy_stream_state>();
+                auto * snew = new cosy_stream_response(queue_tasks, queue_results, params.sleep_idle_seconds);
+                snew->state        = st;
+                snew->content_type = task.tts.response_format == "pcm" ? "audio/pcm" : "audio/wav";
+                snew->headers["X-TTS-Backend"] = "cosyvoice3";
+                snew->headers["X-TTS-Sample-Rate"] = std::to_string(sr);
+                std::unique_ptr<server_res_generator> sres(snew);
+                const std::string text = task.tts.prompt;
+                const std::string ref_text = task.tts.ref_text;
+                const std::vector<uint8_t> ref_wav = task.tts.ref_audio;
+                const std::string format = task.tts.response_format;
+                sres->next = [st, text, ref_text, ref_wav, cosy_seed, sr, format](std::string & out) -> bool {
+                    if (!st->worker.joinable()) {
+                        st->worker = std::thread([st, text, ref_text, ref_wav, cosy_seed]() {
+                            auto cb = [st](const std::vector<uint8_t> & chunk, bool) -> bool {
+                                if (chunk.empty()) return true;
+                                std::string buf((const char *) chunk.data(), chunk.size());
+                                std::lock_guard<std::mutex> lock(st->mutex);
+                                if (st->cancel) return false;
+                                st->queue.push_back(std::move(buf));
+                                st->cond.notify_one();
+                                return true;
+                            };
+                            std::string err;
+                            if (!cosyvoice3_service_request(text, ref_text, ref_wav, cosy_seed, true, cb, err)) {
+                                std::lock_guard<std::mutex> lock(st->mutex);
+                                st->error = std::move(err);
+                            }
+                            std::lock_guard<std::mutex> lock(st->mutex);
+                            st->done = true;
+                            st->cond.notify_all();
+                        });
+                    }
+                    std::unique_lock<std::mutex> lock(st->mutex);
+                    st->cond.wait(lock, [&] { return !st->queue.empty() || st->done; });
+                    if (!st->queue.empty()) {
+                        std::string chunk = std::move(st->queue.front());
+                        st->queue.pop_front();
+                        if (format == "wav" && !st->header) {
+                            st->header = true;
+                            out = cosy_wav_header(0x7FFFFFFFu, (uint32_t) sr) + chunk;
+                        } else {
+                            out = std::move(chunk);
+                        }
+                        return true;
+                    }
+                    lock.unlock();
+                    if (st->worker.joinable()) st->worker.join();
+                    return false;
+                };
+                return sres;
+            }
+
+            std::string pcm;
+            auto cb = [&pcm](const std::vector<uint8_t> & chunk, bool) -> bool {
+                pcm.append((const char *) chunk.data(), chunk.size());
+                return true;
+            };
+            std::string cosy_error;
+            if (!cosyvoice3_service_request(task.tts.prompt, task.tts.ref_text, task.tts.ref_audio,
+                                            cosy_seed, false, cb, cosy_error, &pcm)) {
+                res->error(format_error_response(cosy_error, ERROR_TYPE_SERVER));
+                return res;
+            }
+            if (task.tts.response_format == "wav") {
+                const std::string header = cosy_wav_header((uint32_t) pcm.size(), (uint32_t) sr);
+                res->content_type = "audio/wav";
+                res->data = header + pcm;
+            } else {
+                res->content_type = "audio/pcm";
+                res->data = std::move(pcm);
+            }
+            res->status = 200;
+            res->headers["X-TTS-Backend"] = "cosyvoice3";
+            res->headers["X-TTS-Sample-Rate"] = std::to_string(sr);
+            res->headers["X-TTS-Audio-Seconds"] = string_format("%.3f", pcm.size() / 2.0 / sr);
+            return res;
         }
 
         if (body.contains("top_k") && !body.at("top_k").is_null()) {

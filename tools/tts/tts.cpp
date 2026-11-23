@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "cosy-tts-runtime.h"
 #include "voxcpm2_runtime.h"
 #include "voxcpm2_wav.h"
 
@@ -14,6 +15,10 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 /**
  * Please note that this is NOT a production-ready binary.
@@ -107,6 +112,15 @@ static void print_usage(int, char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+    // CosyVoice3 uses its own frontend/flow/HiFT runner instead of the mtmd
+    // audio-generation interface.  Keep the public CLI unchanged and forward
+    // invocations that carry the auxiliary GGUF option to the sibling binary.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--aux") == 0) {
+            return cosyvoice3_cli_main(argc, argv);
+        }
+    }
+
     common_params params;
 
     common_init();

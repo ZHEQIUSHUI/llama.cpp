@@ -177,6 +177,10 @@ bool server_http_context::init_listener(const common_params & params) {
     srv.reset(new httplib::Server());
 #endif
 
+    // Streaming TTS responses write a small HTTP header followed by small PCM
+    // chunks.  With Nagle on, the body waits for the delayed ACK of the
+    // header (~40 ms); disable it so the first audio chunk leaves immediately.
+    srv->set_tcp_nodelay(true);
     srv->set_default_headers({{"Server", "llama.cpp"}});
     // srv->set_logger(log_server_request); // TODO @ngxson : this is too spamy, no very useful; improve it in the future
     srv->set_exception_handler([](const httplib::Request &, httplib::Response & res, const std::exception_ptr & ep) {
