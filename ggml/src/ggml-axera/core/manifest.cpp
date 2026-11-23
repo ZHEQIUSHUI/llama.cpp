@@ -459,7 +459,9 @@ const manifest * kernels() {
             return;
         }
         const char * e = std::getenv("GGML_AXERA_KERNEL_DIR");
-        m              = load_manifest(e ? e : "./axera_kernels");
+        if (e && e[0]) {
+            m = load_manifest(e);
+        }
     });
     return m.get();
 }

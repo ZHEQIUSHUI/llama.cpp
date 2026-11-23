@@ -1,6 +1,5 @@
 // Axera NPU backend: backend, device and registry (the design: ggml-axera-impl.h)
 
-#include <cstdlib>
 #include "ggml-axera-impl.h"
 #include "core/manifest.h"
 #include "core/npu_sampling.h"
@@ -8,6 +7,9 @@
 #include "core/argmax_state.h"
 
 #include <atomic>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <unordered_map>
@@ -283,27 +285,33 @@ static const char * ggml_backend_axera_reg_get_name(ggml_backend_reg_t reg) {
     GGML_UNUSED(reg);
 }
 
+// a setup error the user fixes (no kernel directory, wrong path, NPU runtime down): one line and exit status 1, no
+// abort backtrace
+[[noreturn]] static void axera_config_error(const char * fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
+    std::exit(1);
+}
+
 static size_t ggml_backend_axera_reg_get_device_count(ggml_backend_reg_t reg) {
-    // the manifest's kernels loaded before the model's tensors; no manifest, no device
-    //
-    // A kernel directory given explicitly asks for the NPU: without it the model would run on the CPU, far too slow
-    // to be what anyone meant, so a directory that cannot be used is an error, not a silent fallback. (A kernel file
+    // This build exists to run models on the AX8860 NPU: a CPU run is never what was meant, so a missing or unusable
+    // kernel directory, or an NPU runtime that fails to start, is an error, never a silent CPU fallback. (A kernel file
     // the manifest names but the directory lacks already aborts in the loader.)
-    const char * dir      = std::getenv("GGML_AXERA_KERNEL_DIR");
-    const bool   explicit_dir = dir && dir[0];
+    const char * dir = std::getenv("GGML_AXERA_KERNEL_DIR");
+    if (!dir || !dir[0]) {
+        axera_config_error("axera: GGML_AXERA_KERNEL_DIR is not set; set it to the package's kernels directory "
+                           "(*.axmodel + manifest.json). This build does not run models on the CPU\n");
+    }
     if (!axera_runtime_init()) {
-        if (explicit_dir) {
-            GGML_ABORT("axera: GGML_AXERA_KERNEL_DIR=%s is set but the NPU runtime failed to initialize; "
-                       "refusing to run on the CPU (unset GGML_AXERA_KERNEL_DIR to allow it)\n", dir);
-        }
-        return 0;
+        axera_config_error("axera: the NPU runtime failed to initialize (GGML_AXERA_KERNEL_DIR=%s, LD_LIBRARY_PATH must "
+                           "include /opt/lib). This build does not run models on the CPU\n", dir);
     }
     if (!axera::kernels()) {
-        if (explicit_dir) {
-            GGML_ABORT("axera: GGML_AXERA_KERNEL_DIR=%s has no manifest.json (wrong path or incomplete package); "
-                       "refusing to run on the CPU (unset GGML_AXERA_KERNEL_DIR to allow it)\n", dir);
-        }
-        return 0;
+        axera_config_error("axera: GGML_AXERA_KERNEL_DIR=%s has no manifest.json (wrong path or incomplete package). "
+                           "This build does not run models on the CPU\n", dir);
     }
     return 1;
     GGML_UNUSED(reg);

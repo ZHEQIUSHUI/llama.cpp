@@ -83,7 +83,7 @@ NPU (top-k 1 and 50 kernels); top-p < 1 is not supported.
 
 | Variable | Effect |
 |---|---|
-| `GGML_AXERA_KERNEL_DIR` | the kernel directory (default `./axera_kernels`); without a `manifest.json` the backend has no device |
+| `GGML_AXERA_KERNEL_DIR` | required: the kernel directory (`*.axmodel` + `manifest.json`); unset, missing or unusable aborts the process, there is no CPU fallback |
 | `GGML_AXERA_NPU_CORES` | physical NPU cores for every kernel in the process, as a comma-separated list: `2`, `0,1`. The number of entries must match each kernel's `_npu<count>` suffix; a mismatch aborts the load. Unset keeps the SDK's affinity |
 | `GGML_AXERA_PROF=1` | time per kernel role and host step, printed at exit |
 | `GGML_AXERA_TRACE=1` | every graph: node count, host gap before it, run time |

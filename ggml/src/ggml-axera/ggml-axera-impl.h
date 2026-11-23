@@ -3,9 +3,9 @@
 
 // Axera NPU backend.
 //
-// - The kernel directory (GGML_AXERA_KERNEL_DIR, default ./axera_kernels) holds one model's 4-core kernels and its
+// - The kernel directory (GGML_AXERA_KERNEL_DIR, required) holds one model's 4-core kernels and its
 //   manifest.json (core/manifest.h): the model adapter it names (models/) runs every graph of the process with those
-//   kernels. Without a manifest the backend has no device.
+//   kernels. Without one the process aborts: this build never falls back to the CPU.
 // - Device memory is CMM allocated cached (AX_SYS_MemAllocCached). It is host-visible, so the CPU backend works on it
 //   directly for the graph nodes an adapter leaves to it; the NPU addresses it physically. Cache maintenance: the CPU
 //   side flushes after writing, the NPU side flushes its output range before a run (no dirty line may be evicted over

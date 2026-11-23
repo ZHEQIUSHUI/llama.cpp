@@ -96,7 +96,7 @@ struct manifest {
     mutable std::vector<std::unique_ptr<kernel_desc>>     extra_desc;
 };
 
-// the manifest of GGML_AXERA_KERNEL_DIR (default ./axera_kernels), its kernels loaded; nullptr if the directory has no
+// the manifest of GGML_AXERA_KERNEL_DIR, its kernels loaded; nullptr if the variable is unset or the directory has no
 // manifest.json
 const manifest * kernels();
 

@@ -2266,7 +2266,7 @@ private:
             cache_identity.has_draft = ctx_dft != nullptr;
 
             const char * kernel_dir = std::getenv("GGML_AXERA_KERNEL_DIR");
-            const std::string manifest_path = std::string(kernel_dir ? kernel_dir : "axera_kernels") + "/manifest.json";
+            const std::string manifest_path = std::string(kernel_dir ? kernel_dir : "") + "/manifest.json";
             cache_identity.kernel_manifest_md5 = server_file_md5(manifest_path);
 
             std::string cache_path;
