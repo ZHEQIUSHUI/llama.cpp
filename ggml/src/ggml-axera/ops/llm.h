@@ -52,6 +52,10 @@ int llm_kv_pages(int max_pages, int pg, bool sizable = true);
 void llm_paging(const axera_cmm & indptr, const axera_cmm & last_len, const axera_cmm & cloc, int64_t hist,
                 int64_t write_cell, int pg);
 
+// The batch rows llama.cpp wants the logits of (its n_out logits rows of a T-row batch): the graph's out_ids, or rows
+// 0 .. n_out - 1 when it wants every row.
+void llm_out_rows(const ggml_cgraph * g, const graph_names & names, int n_out, int T, std::vector<int32_t> & rows);
+
 // a [rows] or [rows][cols] f32 copy of any small GGUF tensor
 std::vector<float> f32_of(const ggml_tensor * w);
 

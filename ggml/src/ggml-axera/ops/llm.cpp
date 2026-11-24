@@ -117,6 +117,28 @@ void llm_paging(const axera_cmm & indptr, const axera_cmm & last_len, const axer
     }
 }
 
+void llm_out_rows(const ggml_cgraph * g, const graph_names & names, int n_out, int T, std::vector<int32_t> & rows) {
+    const ggml_tensor * out_ids = nullptr;
+    if (n_out < T) {
+        out_ids = names.find("out_ids");
+        if (!out_ids || out_ids->type != GGML_TYPE_I32 || out_ids->ne[0] != n_out) {
+            out_ids = nullptr;
+            for (int i = 0; i < g->n_nodes && !out_ids; i++) {
+                const ggml_tensor * node = g->nodes[i];
+                if (node->op == GGML_OP_GET_ROWS && node->src[1] && node->src[1]->type == GGML_TYPE_I32 &&
+                    node->src[1]->ne[0] == n_out && node->src[0]->ne[1] == T) {
+                    out_ids = node->src[1];
+                }
+            }
+        }
+        GGML_ASSERT(out_ids);
+    }
+    rows.clear();
+    for (int r = 0; r < n_out; ++r) {
+        rows.push_back(out_ids ? ((const int32_t *) out_ids->data)[r] : r);
+    }
+}
+
 std::vector<float> f32_of(const ggml_tensor * w) {
     std::vector<float> v((size_t) ggml_nelements(w));
     if (w->type == GGML_TYPE_F32) {

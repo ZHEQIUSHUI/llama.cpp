@@ -548,24 +548,7 @@ ggml_status llama_dense::compute(ggml_cgraph * g) {
             if (n_out > 4) {
                 GGML_ABORT("axera %s: a prompt asking for %d logits rows; the merged prefill head covers 4\n", fam.tag, n_out);
             }
-            ggml_tensor * out_ids = nullptr;
-            if (n_out < T) {
-                out_ids = names.find("out_ids");
-                if (!out_ids || out_ids->type != GGML_TYPE_I32 || out_ids->ne[0] != n_out) {
-                    out_ids = nullptr;
-                    for (int i = 0; i < g->n_nodes && !out_ids; i++) {
-                        ggml_tensor * node = g->nodes[i];
-                        if (node->op == GGML_OP_GET_ROWS && node->src[1] && node->src[1]->type == GGML_TYPE_I32 &&
-                            node->src[1]->ne[0] == n_out && node->src[0]->ne[1] == T) {
-                            out_ids = node->src[1];
-                        }
-                    }
-                }
-                GGML_ASSERT(out_ids);
-            }
-            for (int r = 0; r < n_out; ++r) {
-                pre_rows.push_back(out_ids ? ((const int32_t *) out_ids->data)[r] : r);
-            }
+            llm_out_rows(g, names, n_out, T, pre_rows);
         } else {
             head.prepare_merged_topk();
         }

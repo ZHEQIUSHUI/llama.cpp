@@ -111,7 +111,7 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
     } else if (m.model == "qwen35_whole") {
         llm = make_qwen35_whole(m);
     } else if (m.model == "minicpm_ocr") {
-        llm = make_minicpm_ocr_text(m);
+        llm = make_qwen35_whole(m);  // the Qwen3.5-0.8B design with the head merged into its kernels
     } else if (m.model == "qwen35_moe_sgl") {
         llm = make_qwen35_moe_sgl(m);
     } else if (m.model == "minicpmv4_7") {

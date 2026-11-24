@@ -62,7 +62,7 @@ bool mmproj_host_weights(const manifest & m);
 bool scheduler_llm_graph(const ggml_cgraph * g);
 
 std::shared_ptr<model> make_qwen38_27b(const manifest & m);  // Qwen3.8-27B: the whole-model prefill kernel
-std::shared_ptr<model> make_qwen35_whole(const manifest & m);  // Qwen3.5 dense: the whole-model prefill kernel
+std::shared_ptr<model> make_qwen35_whole(const manifest & m);  // Qwen3.5 dense (and MiniCPM-OCR's text decoder)
 std::shared_ptr<model> make_qwen35_moe_sgl(const manifest & m);  // Qwen3.5/3.6-35B-A3B with the sgl NVFP4 kernels
 std::shared_ptr<model> make_hy_mt2(const manifest & m);  // Hy-MT2-30B-A3B: one prefill page and one decode row
 std::shared_ptr<model> make_q3vl30(const manifest & m);  // Qwen3-VL-30B-A3B: eight 6-layer groups, one prefill page and one decode row
@@ -75,7 +75,6 @@ std::shared_ptr<model> make_qwen35_vit_full(const manifest & m);  // the same in
 std::shared_ptr<model> make_q3vl30_vit_full(const manifest & m);  // Qwen3-VL vision encoder with three deepstack mergers (role vit)
 std::shared_ptr<model> make_minicpm_ocr_vit_full(const manifest & m);  // MiniCPM-OCR SigLIP tower (role vit)
 std::shared_ptr<model> make_minicpmv4_7_vit_full(const manifest & m);  // MiniCPM-V 4.7 SigLIP + window merger (role vit)
-std::shared_ptr<model> make_minicpm_ocr_text(const manifest & m);  // MiniCPM-OCR text decoder (core/seqstate)
 bool minicpm_ocr_vit_graph(const ggml_cgraph * g);
 std::shared_ptr<model> make_qwen3_asr(const manifest & m);  // the Qwen3-ASR audio encoder (roles audio.*)
 // the Qwen3-TTS generation graphs: code predictor frames, codec decoder, speaker encoder (roles cp.*, gen.*)
