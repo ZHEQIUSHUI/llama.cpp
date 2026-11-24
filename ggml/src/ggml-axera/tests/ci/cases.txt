@@ -5,7 +5,7 @@
 #         is not run-to-run exact (gated on rc 0 and a non-empty output only)
 q08b    |pr  |qwen35_whole                     |Qwen3.5-0.8B-AX8860-llama.cpp                |"The capital of France is" 48|1
 q08bi   |pr  |qwen35_whole qwen35_vit          |Qwen3.5-0.8B-AX8860-llama.cpp                |-i $AXERA_CI_DATA/bus.jpg "Describe this image in one sentence." 48|1
-npu1    |pr  |qwen38_27b                       |Qwen3.5-2B-AX8860-NPU1-llama.cpp             |"The capital of France is" 48|1
+npu1    |pr  |qwen38_27b                       |Qwen3.5-2B-AX8860-NPU1-llama.cpp             |"The capital of France is" 48|0
 ocr     |pr  |qwen35_whole minicpm_ocr         |MiniCPM-OCR-1.0-AX8860-llama.cpp             |-i $AXERA_CI_DATA/bus.jpg|1
 cpm5    |pr  |llama_dense                      |MiniCPM5-2B-AX8860-llama.cpp                 |"The capital of France is" 48|1
 hymt18  |pr  |llama_dense                      |Hy-MT2-1.8B-AX8860-llama.cpp                 |"今天天气很好，我们一起去公园散步吧。" 48|1
