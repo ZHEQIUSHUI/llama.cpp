@@ -22,6 +22,7 @@
 #include "../../core/argmax_state.h"
 #include "../../core/seqstate.h"
 #include "../../ops/ops.h"
+#include "../../ops/llm.h"
 #include "vocab_embedding_1_axmodel.h"
 #include "vocab_embedding_axmodel.h"
 #include "fused_head_axmodel.h"
@@ -212,13 +213,9 @@ inline int tiled(int g) {
     return (g % REP) * KH + g / REP;
 }
 
-std::vector<float> f32_of(const ggml_tensor * w) {
-    std::vector<float> v((size_t) ggml_nelements(w));
-    if (w->type == GGML_TYPE_F32) {
-        memcpy(v.data(), w->data, v.size() * sizeof(float));
-    } else {
-        axera_for_rows_f32(w, [&](int64_t r, const float * row) { memcpy(&v[(size_t) r * w->ne[0]], row, w->ne[0] * sizeof(float)); });
-    }
+// f32_of, then the tensor's mapped pages are dropped (each small tensor is read once)
+std::vector<float> f32_once(const ggml_tensor * w) {
+    std::vector<float> v = f32_of(w);
     axera_drop_mapped(w);
     return v;
 }
@@ -704,7 +701,7 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
             const std::string pm = "b" + std::to_string(phase) + "_moe_";
             read.clear();
             if (phase < 3) {  // gated delta net
-                put(pa + "input_norm_w", b, f32_of(T(il, "attn_norm.weight")));
+                put(pa + "input_norm_w", b, f32_once(T(il, "attn_norm.weight")));
                 const ggml_tensor * qkv = T(il, "attn_qkv.weight");
                 GGML_ASSERT(qkv->ne[0] % 16 == 0 && qkv->ne[1] == 2048 + 2048 + 4096);
                 const std::vector<int64_t> vr = head_rows(4096);
@@ -730,16 +727,16 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
                     const std::vector<int64_t> m = head_blocks(w->ne[0]);
                     put_nv(pa, "w_o", w, 0, ggml_nrows(w), b, 0, 0, nullptr, &m);
                 }
-                const std::vector<float> a = f32_of(T(il, "ssm_a"));
+                const std::vector<float> a = f32_once(T(il, "ssm_a"));
                 std::vector<float>       al(VH);
                 for (int h = 0; h < VH; ++h) {
                     al[h] = logf(-a[tiled(h)]);  // GGUF ssm_a = -exp(A_log)
                 }
                 put(pa + "a_log", b, al);
-                put(pa + "dt_bias", b, head_perm(f32_of(T(il, "ssm_dt.bias"))));
-                put(pa + "o_norm_w", b, f32_of(T(il, "ssm_norm.weight")));
+                put(pa + "dt_bias", b, head_perm(f32_once(T(il, "ssm_dt.bias"))));
+                put(pa + "o_norm_w", b, f32_once(T(il, "ssm_norm.weight")));
                 const ggml_tensor *      w  = T(il, "ssm_conv1d.weight");
-                const std::vector<float> cv = f32_of(w);
+                const std::vector<float> cv = f32_once(w);
                 const int64_t            tp = w->ne[0];
                 for (char c : { 'q', 'k', 'v' }) {
                     const int64_t C  = (int64_t) bank_n.at(pa + std::string("w_") + c + "_conv") / NB / (tp * 2);
@@ -754,9 +751,9 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
                     put(pa + std::string("w_") + c + "_conv", b, u);
                 }
             } else {  // gated attention
-                put(pa + "w_norm_attn", b, f32_of(T(il, "attn_norm.weight")));
-                put(pa + "w_norm_q", b, f32_of(T(il, "attn_q_norm.weight")), 1.0f / std::sqrt(256.0f));
-                put(pa + "w_norm_k", b, f32_of(T(il, "attn_k_norm.weight")));
+                put(pa + "w_norm_attn", b, f32_once(T(il, "attn_norm.weight")));
+                put(pa + "w_norm_q", b, f32_once(T(il, "attn_q_norm.weight")), 1.0f / std::sqrt(256.0f));
+                put(pa + "w_norm_k", b, f32_once(T(il, "attn_k_norm.weight")));
                 for (const char * n : { "q", "k", "v", "o" }) {
                     const std::string g = std::string("attn_") + (n[0] == 'o' ? "output" : n) + ".weight";
                     const ggml_tensor * w = T(il, g);
@@ -765,9 +762,9 @@ void qwen35_moe_sgl::fill(const std::map<std::string, ggml_tensor *> & t, const 
                 }
             }
             // MoE of this layer
-            put(pm + "input_norm_w", b, f32_of(T(il, "post_attention_norm.weight")));
-            put(pm + "shared_expert_gate", b, f32_of(T(il, "ffn_gate_inp_shexp.weight")));
-            put(pm + "w_route", b, f32_of(T(il, "ffn_gate_inp.weight")));
+            put(pm + "input_norm_w", b, f32_once(T(il, "post_attention_norm.weight")));
+            put(pm + "shared_expert_gate", b, f32_once(T(il, "ffn_gate_inp_shexp.weight")));
+            put(pm + "w_route", b, f32_once(T(il, "ffn_gate_inp.weight")));
             put(pm + "w_scale_route", b, std::vector<float>(256, 1.0f));
             ((float *) slot(pm + "w_scale2_route", b))[0] = 1.0f;
             {
@@ -1395,20 +1392,7 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
         state_set[k][1] = (k == 0 ? ST2 : k == 1 ? CQ2 : k == 2 ? CK2 : CV2).get();
     }
     ver_rows = ver.k ? (int) (ver.k->in_bytes("positions") / sizeof(int32_t)) : 0;
-    seq_config cfg;
-    cfg.kept_max = 1;
-    cfg.verify_chain = [] {
-        const char * e = getenv("GGML_AXERA_VERIFY_CHAIN");
-        return e ? atoi(e) : 32;
-    }();
-    cfg.check = [] {
-        const char * e = getenv("GGML_AXERA_SEQ_CHECK");
-        return e && atoi(e) != 0;
-    }();
-    cfg.force_miss = [] {
-        const char * e = getenv("GGML_AXERA_SEQ_FORCE_MISS");
-        return e ? std::max(0, atoi(e)) : 0;
-    }();
+    seq_config cfg = seq_config_env(1, env_int("GGML_AXERA_VERIFY_CHAIN", 32));
     seq = std::make_unique<seqstate>(*this, cfg);
     size_t bb = 0;
     for (const auto & [n, b] : banks) {
@@ -2969,17 +2953,10 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     const ggml_tensor * kqm    = names.find("attn_inp_kq_mask");
     GGML_ASSERT(k_idxs && k_idxs->type == GGML_TYPE_I64 && k_idxs->ne[0] == T && kqm);
     const kv_view kv(k_idxs, kqm, man.context, PG);
-    if (axera_n_seq_max() != 1) {
-        GGML_LOG_ERROR("axera qwen35_35b_a3b: one sequence only (-np 1)\n");
-        return GGML_STATUS_FAILED;
-    }
     {
         axera_timer tchk("prompt: cell checks");
-        for (int i = 1; i < T; ++i) {
-            if (kv.stream_of(i) != 0 || kv.cell_of(i) != kv.cell_of(0) + i) {
-                GGML_LOG_ERROR("axera qwen35_35b_a3b: a batch of non-consecutive cells\n");
-                return GGML_STATUS_FAILED;
-            }
+        if (!llm_one_sequence(kv, T, "qwen35_moe_sgl")) {
+            return GGML_STATUS_FAILED;
         }
     }
     tkv.stop();
@@ -3112,14 +3089,7 @@ ggml_status qwen35_moe_sgl::compute(ggml_cgraph * g) {
     last_seq_status = 0;
     const seq_status sst = seq->feed(c0, T, feed_x, pb.data());
     if (sst != SEQ_OK) {
-        last_seq_status = (int) sst;
-        if (sst == SEQ_MISS) {
-            GGML_LOG_WARN("axera qwen35_moe_sgl: batch from cell %lld has no restart point (%s); the slot must replay\n",
-                          (long long) c0, seq->why());
-        } else {
-            GGML_LOG_ERROR("axera qwen35_moe_sgl: sequence state rejected a batch from cell %lld: %s\n",
-                           (long long) c0, seq->why());
-        }
+        last_seq_status = (int) llm_seq_log(sst, c0, *seq, "qwen35_moe_sgl");
         return GGML_STATUS_FAILED;
     }
     if (need_hn) {
@@ -3285,20 +3255,20 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
     };
 
     // RMSNorm weights (the GGUF converter folded the +1 already) and the attention q norm's scale
-    put_bf16("w_enorm", f32_of(T("nextn.enorm.weight")));
-    put_bf16("w_hnorm", f32_of(T("nextn.hnorm.weight")));
-    put_bf16("w_attn_norm", f32_of(T("attn_norm.weight")));
-    put_bf16("w_moe_input_norm_w", f32_of(T("post_attention_norm.weight")));
-    put_bf16("w_shared_head_norm", f32_of(T("nextn.shared_head_norm.weight")));
+    put_bf16("w_enorm", f32_once(T("nextn.enorm.weight")));
+    put_bf16("w_hnorm", f32_once(T("nextn.hnorm.weight")));
+    put_bf16("w_attn_norm", f32_once(T("attn_norm.weight")));
+    put_bf16("w_moe_input_norm_w", f32_once(T("post_attention_norm.weight")));
+    put_bf16("w_shared_head_norm", f32_once(T("nextn.shared_head_norm.weight")));
     put_f32("w_attn_q_norm", [&] {
-        std::vector<float> v = f32_of(T("attn_q_norm.weight"));
+        std::vector<float> v = f32_once(T("attn_q_norm.weight"));
         const float        s = 1.0f / std::sqrt(256.0f);
         for (float & x : v) {
             x *= s;
         }
         return v;
     }());
-    put_bf16("w_attn_k_norm", f32_of(T("attn_k_norm.weight")));
+    put_bf16("w_attn_k_norm", f32_once(T("attn_k_norm.weight")));
 
     // the rotary table: [max positions][cos | sin of ROT / 2] f32, theta and freq scale of the graph's ROPE node
     {
@@ -3320,10 +3290,10 @@ void qwen35_moe_sgl::init_mtp(const std::map<std::string, ggml_tensor *> & t, in
     put_nv("k", T("attn_k.weight"));
     put_nv("v", T("attn_v.weight"));
     put_nv("o", T("attn_output.weight"));
-    put_bf16("w_route", f32_of(T("ffn_gate_inp.weight")));
+    put_bf16("w_route", f32_once(T("ffn_gate_inp.weight")));
     put_f32("w_scale_route", std::vector<float>(256, 1.0f));
     put_f32("w_scale2_route", std::vector<float>(1, 1.0f));
-    put_bf16("w_shared_expert_gate", f32_of(T("ffn_gate_inp_shexp.weight")));
+    put_bf16("w_shared_expert_gate", f32_once(T("ffn_gate_inp_shexp.weight")));
     for (const char * n : { "gate", "up", "down" }) {
         const std::string base = std::string("shared_expert_mlp_") + n;
         put_nv(base.c_str(), T((std::string("ffn_") + n + "_shexp.weight").c_str()));
@@ -3562,10 +3532,7 @@ ggml_status qwen35_moe_sgl::compute_mtp(ggml_cgraph * g) {
     GGML_ASSERT(hin->type == GGML_TYPE_F32 && hin->ne[0] == H && embd->type == GGML_TYPE_F32 && embd->ne[0] == H &&
                 embd->ne[1] == T && hn->ne[1] == T);
     const ggml_tensor * w0 = names.at("blk." + std::to_string(il) + ".nextn.eh_proj.weight");
-    const ggml_tensor * rope_node = nullptr;
-    for (int i = 0; i < g->n_nodes && !rope_node; i++) {
-        rope_node = g->nodes[i]->op == GGML_OP_ROPE ? g->nodes[i] : nullptr;
-    }
+    const ggml_tensor * rope_node = llm_rope_node(g);
     if (!rope_node) {
         GGML_LOG_ERROR("axera qwen35_moe_sgl: MTP graph without a ROPE node\n");
         return GGML_STATUS_FAILED;

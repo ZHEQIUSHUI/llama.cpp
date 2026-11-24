@@ -20,6 +20,7 @@
 #include "../../core/seqstate.h"
 #include "../../core/params.h"
 #include "../../ops/ops.h"
+#include "../../ops/llm.h"
 
 #include <algorithm>
 #include <array>
@@ -235,17 +236,6 @@ struct mx4 {
         axera_mxfp4_rows(src, 1, K, scales ? other.data() : dst, scales ? dst : other.data());
     }
 };
-
-// a [rows] or [rows][cols] f32 view of any small GGUF tensor
-std::vector<float> f32_of(const ggml_tensor * w) {
-    std::vector<float> v((size_t) ggml_nelements(w));
-    if (w->type == GGML_TYPE_F32) {
-        memcpy(v.data(), w->data, v.size() * sizeof(float));
-    } else {
-        axera_for_rows_f32(w, [&](int64_t r, const float * row) { memcpy(&v[(size_t) r * w->ne[0]], row, w->ne[0] * sizeof(float)); });
-    }
-    return v;
-}
 
 axera_cmm qwen38_27b::bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d, const rope & rp) {
     static const std::regex re("b([0-3])_(attn|mlp)_(.+)");
@@ -1080,24 +1070,11 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
     ver_rows = man.has("decode.verify")
                    ? (int) (man.get("decode.verify").in_bytes("x") / (H * sizeof(ggml_bf16_t)))
                    : 0;
-    seq_config cfg;
-    cfg.kept_max = 1;
     // The 27B verify kernel materializes one 4-row snapshot per call; chaining several calls for a 5..32-row tail
     // changes the numerics (and the kernel count) of a path that used to be one prefill page, which flips greedy
     // continuations in long degraded chats. Keep the pre-migration path selection by default; the environment
     // variable still opts into a longer chain.
-    cfg.verify_chain = [vr = ver_rows] {
-        const char * e = getenv("GGML_AXERA_VERIFY_CHAIN");
-        return e ? atoi(e) : vr;
-    }();
-    cfg.check = [] {
-        const char * e = getenv("GGML_AXERA_SEQ_CHECK");
-        return e && atoi(e) != 0;
-    }();
-    cfg.force_miss = [] {
-        const char * e = getenv("GGML_AXERA_SEQ_FORCE_MISS");
-        return e ? std::max(0, atoi(e)) : 0;
-    }();
+    seq_config cfg = seq_config_env(1, env_int("GGML_AXERA_VERIFY_CHAIN", ver_rows));
     seq = std::make_unique<seqstate>(*this, cfg);
     size_t bb = 0;
     for (const auto & [n, b] : banks) {
@@ -1357,12 +1334,7 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
     state_ios.clear();
     ver.clear();
 
-    seq_config cfg;
-    cfg.kept_max     = 1;
-    cfg.verify_chain = 0;
-    cfg.check        = [] { const char * e = getenv("GGML_AXERA_SEQ_CHECK"); return e && atoi(e) != 0; }();
-    cfg.force_miss   = [] { const char * e = getenv("GGML_AXERA_SEQ_FORCE_MISS"); return e ? std::max(0, atoi(e)) : 0; }();
-    seq              = std::make_unique<seqstate>(*this, cfg);
+    seq = std::make_unique<seqstate>(*this, seq_config_env(1));
     size_t bb = 0;
     for (const auto & [n, b] : banks) {
         bb += b->size;
@@ -1615,12 +1587,7 @@ void qwen38_27b::init_fused_phases(const std::map<std::string, ggml_tensor *> & 
     state_ios.clear();
     ver.clear();
 
-    seq_config cfg;
-    cfg.kept_max     = 1;
-    cfg.verify_chain = 0;
-    cfg.check        = [] { const char * e = getenv("GGML_AXERA_SEQ_CHECK"); return e && atoi(e) != 0; }();
-    cfg.force_miss   = [] { const char * e = getenv("GGML_AXERA_SEQ_FORCE_MISS"); return e ? std::max(0, atoi(e)) : 0; }();
-    seq              = std::make_unique<seqstate>(*this, cfg);
+    seq = std::make_unique<seqstate>(*this, seq_config_env(1));
     size_t bb = 0;
     for (const auto & [n, b] : banks) {
         bb += b->size;
@@ -2255,29 +2222,10 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
         GGML_LOG_ERROR("axera qwen38_27b: a graph of %d nodes that is not the whole model (-ngl 99)\n", g->n_nodes);
         return GGML_STATUS_FAILED;
     }
-    ggml_tensor * x0 = norm0;
-    while (x0 && x0->op != GGML_OP_RMS_NORM) {
-        x0 = x0->src[0];
-    }
-    GGML_ASSERT(x0 && x0->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(x0->src[0]));
-    if (x0->src[0]->op != GGML_OP_NONE) {
-        int n0 = 0;
-        while (n0 < g->n_nodes && g->nodes[n0] != x0) {
-            ++n0;
-        }
-        axera_timer tc("input (cpu graph)");
-        cpu_compute(g, g->nodes, n0, "input (cpu)");
-    }
-    x0           = x0->src[0];
+    ggml_tensor * x0 = llm_input(g, norm0);
     const int H_ = (int) x0->ne[0], T = (int) x0->ne[1];
-    int       L_ = 0;
-    while (t.count("blk." + std::to_string(L_) + ".attn_norm.weight")) {
-        ++L_;
-    }
-    const ggml_tensor * rope_node = nullptr;
-    for (int i = 0; i < g->n_nodes && !rope_node; i++) {
-        rope_node = g->nodes[i]->op == GGML_OP_ROPE ? g->nodes[i] : nullptr;
-    }
+    int       L_ = llm_layers(t);
+    const ggml_tensor * rope_node = llm_rope_node(g);
     GGML_ASSERT(rope_node && "axera qwen38_27b: no ROPE node in the graph");
     const ggml_tensor * w0 = t.at("blk.0.attn_norm.weight");
     if (bound != w0->data || L_ != L) {
@@ -2296,24 +2244,11 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
     axera_timer   tkv("kv view");
     const kv_view kv(k_idxs, kqm, man.context, PG);
     tkv.stop();
-    if (axera_n_seq_max() != 1) {
-        GGML_LOG_ERROR("axera qwen38_27b: one sequence only (-np 1)\n");
+    if (!llm_one_sequence(kv, T, "qwen38_27b")) {
         return GGML_STATUS_FAILED;
     }
-    for (int i = 1; i < T; ++i) {
-        if (kv.stream_of(i) != 0 || kv.cell_of(i) != kv.cell_of(0) + i) {
-            GGML_LOG_ERROR("axera qwen38_27b: a batch of non-consecutive cells\n");
-            return GGML_STATUS_FAILED;
-        }
-    }
-    const int32_t *    pos  = (const int32_t *) inp_pos->data;
-    const bool         mr   = inp_pos->ne[0] == 4 * (int64_t) T;  // M-RoPE: [4][T], else [T]
-    std::vector<int32_t> pb((size_t) T * 4);
-    for (int r = 0; r < T; ++r) {
-        for (int s = 0; s < 4; ++s) {
-            pb[(size_t) r * 4 + s] = mr ? pos[(size_t) s * T + r] : pos[r];
-        }
-    }
+    std::vector<int32_t> pb;
+    llm_positions(inp_pos, T, pb);
     const rope         rp(rope_node, inp_pos, T);
     GGML_ASSERT(rp.ROT == ROT);
     h_buf.resize((size_t) T * H);
@@ -2337,14 +2272,7 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
     last_seq_status = 0;
     const seq_status sst = seq->feed(c0, T, (const uint16_t *) xb.data(), pb.data());
     if (sst != SEQ_OK) {
-        last_seq_status = (int) sst;
-        if (sst == SEQ_MISS) {
-            GGML_LOG_WARN("axera qwen38_27b: batch from cell %lld has no restart point (%s); the slot must replay\n",
-                          (long long) c0, seq->why());
-        } else {
-            GGML_LOG_ERROR("axera qwen38_27b: sequence state rejected a batch from cell %lld: %s\n",
-                           (long long) c0, seq->why());
-        }
+        last_seq_status = (int) llm_seq_log(sst, c0, *seq, "qwen38_27b");
         return GGML_STATUS_FAILED;
     }
     ggml_tensor * hn = names.find("h_nextn");  // the MTP block's input: every row's final norm
@@ -2529,10 +2457,7 @@ ggml_status qwen38_27b::compute_mtp(ggml_cgraph * g) {
         init_mtp(t, il);
         mtp_bound = w0->data;
     }
-    const ggml_tensor * rope_node = nullptr;
-    for (int i = 0; i < g->n_nodes && !rope_node; i++) {
-        rope_node = g->nodes[i]->op == GGML_OP_ROPE ? g->nodes[i] : nullptr;
-    }
+    const ggml_tensor * rope_node = llm_rope_node(g);
     const rope    rp(rope_node, pos, T);
     const kv_view kv(kidx, kqm, man.context, PG);
     mtp_cell = 0;

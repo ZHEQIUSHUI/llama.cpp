@@ -14,6 +14,7 @@
 #include "../../core/quant.h"
 #include "../../core/seqstate.h"
 #include "../../ops/ops.h"
+#include "../../ops/llm.h"
 
 #include <algorithm>
 #include <cmath>
@@ -104,18 +105,6 @@ void dump_meta(const char * prefix, const char * tag, int valid, int cell, int p
         fprintf(f, "valid %d\ncell %d\npos %d\nhidden 2048\n", valid, cell, pos);
         fclose(f);
     }
-}
-
-std::vector<float> f32_of(const ggml_tensor * w) {
-    std::vector<float> v((size_t) ggml_nelements(w));
-    if (w->type == GGML_TYPE_F32) {
-        memcpy(v.data(), w->data, v.size() * sizeof(float));
-    } else {
-        axera_for_rows_f32(w, [&](int64_t r, const float * row) {
-            memcpy(&v[(size_t) r * w->ne[0]], row, w->ne[0] * sizeof(float));
-        });
-    }
-    return v;
 }
 
 // row r of MiniCPM's half-split RoPE order -> the GGUF's adjacent-pair order (conversion/minicpm.py's inverse)
@@ -428,16 +417,7 @@ void voxcpm2_base::init(const std::map<std::string, ggml_tensor *> & t, const gg
         pre16.out.push_back(axera_io(POUT16, sk.desc->out[0].bytes));
     }
 
-    seq_config cfg;
-    cfg.kept_max = 1;
-    cfg.check = [] {
-        const char * e = getenv("GGML_AXERA_SEQ_CHECK");
-        return e && atoi(e) != 0;
-    }();
-    cfg.force_miss = [] {
-        const char * e = getenv("GGML_AXERA_SEQ_FORCE_MISS");
-        return e ? std::max(0, atoi(e)) : 0;
-    }();
+    seq_config cfg = seq_config_env(1);
     seq = std::make_unique<seqstate>(*this, cfg);
 
     size_t bb = 0;
@@ -583,28 +563,10 @@ ggml_status voxcpm2_base::compute(ggml_cgraph * g) {
         GGML_LOG_ERROR("axera voxcpm2_base: a graph of %d nodes that is not the whole model (-ngl 99)\n", g->n_nodes);
         return GGML_STATUS_FAILED;
     }
-    ggml_tensor * x0 = norm0;
-    while (x0 && x0->op != GGML_OP_RMS_NORM) {
-        x0 = x0->src[0];
-    }
-    GGML_ASSERT(x0 && x0->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(x0->src[0]));
-    if (x0->src[0]->op != GGML_OP_NONE) {
-        int n0 = 0;
-        while (n0 < g->n_nodes && g->nodes[n0] != x0) {
-            ++n0;
-        }
-        cpu_compute(g, g->nodes, n0, "input (cpu)");
-    }
-    x0 = x0->src[0];
+    ggml_tensor * x0 = llm_input(g, norm0);
     const int H_ = (int) x0->ne[0], T = (int) x0->ne[1];
-    int       L_ = 0;
-    while (t.count("blk." + std::to_string(L_) + ".attn_norm.weight")) {
-        ++L_;
-    }
-    const ggml_tensor * rope_node = nullptr;
-    for (int i = 0; i < g->n_nodes && !rope_node; ++i) {
-        rope_node = g->nodes[i]->op == GGML_OP_ROPE ? g->nodes[i] : nullptr;
-    }
+    int       L_ = llm_layers(t);
+    const ggml_tensor * rope_node = llm_rope_node(g);
     GGML_ASSERT(rope_node && "axera voxcpm2_base: no ROPE node in the graph");
     const ggml_tensor * w0 = t.at("blk.0.attn_norm.weight");
     if (bound != w0->data || L_ != L || H_ != H) {
@@ -616,22 +578,10 @@ ggml_status voxcpm2_base::compute(ggml_cgraph * g) {
     const ggml_tensor * kqm    = names.find("attn_inp_kq_mask");
     GGML_ASSERT(k_idxs && k_idxs->type == GGML_TYPE_I64 && k_idxs->ne[0] == T && kqm);
     const kv_view   kv(k_idxs, kqm, man.context, PG);
-    const int32_t * pos = (const int32_t *) inp_pos->data;
-    std::vector<int32_t> pb((size_t) T * 4);
-    for (int r = 0; r < T; ++r) {
-        for (int s = 0; s < 4; ++s) {
-            pb[(size_t) r * 4 + s] = pos[r];
-        }
-    }
-    if (axera_n_seq_max() != 1) {
-        GGML_LOG_ERROR("axera voxcpm2_base: one sequence only (-np 1)\n");
+    std::vector<int32_t> pb;
+    llm_positions(inp_pos, T, pb);
+    if (!llm_one_sequence(kv, T, "voxcpm2_base")) {
         return GGML_STATUS_FAILED;
-    }
-    for (int i = 1; i < T; ++i) {
-        if (kv.stream_of(i) != 0 || kv.cell_of(i) != kv.cell_of(0) + i) {
-            GGML_LOG_ERROR("axera voxcpm2_base: a batch of non-consecutive cells\n");
-            return GGML_STATUS_FAILED;
-        }
     }
 
     std::vector<ggml_bf16_t> xb((size_t) T * H);
@@ -649,14 +599,7 @@ ggml_status voxcpm2_base::compute(ggml_cgraph * g) {
     axera_timer tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
     const seq_status sst = seq->feed(kv.cell_of(0), T, (const uint16_t *) xb.data(), pb.data());
     if (sst != SEQ_OK) {
-        last_seq_status = (int) sst;
-        if (sst == SEQ_MISS) {
-            GGML_LOG_WARN("axera voxcpm2_base: batch from cell %lld has no restart point (%s); the slot must replay\n",
-                          (long long) kv.cell_of(0), seq->why());
-        } else {
-            GGML_LOG_ERROR("axera voxcpm2_base: sequence state rejected a batch from cell %lld: %s\n",
-                           (long long) kv.cell_of(0), seq->why());
-        }
+        last_seq_status = (int) llm_seq_log(sst, kv.cell_of(0), *seq, "voxcpm2_base");
         return GGML_STATUS_FAILED;
     }
 

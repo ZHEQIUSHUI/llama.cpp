@@ -22,6 +22,7 @@
 #include "../../core/mx.h"
 #include "../../core/quant.h"
 #include "../../ops/ops.h"
+#include "../../ops/llm.h"
 #include "../../core/seqstate.h"
 
 #include <cmath>
@@ -72,17 +73,6 @@ class qwen3 final : public model {
                       std::vector<float> * cls, int token0);
     void      decode(int64_t c, int t, const ggml_bf16_t * x, const int32_t * p4, const rope & rp, float * h);
 };
-
-// a [rows] or [rows][cols] f32 view of any small GGUF tensor
-std::vector<float> f32_of(const ggml_tensor * w) {
-    std::vector<float> v((size_t) ggml_nelements(w));
-    if (w->type == GGML_TYPE_F32) {
-        memcpy(v.data(), w->data, v.size() * sizeof(float));
-    } else {
-        axera_for_rows_f32(w, [&](int64_t r, const float * row) { memcpy(&v[(size_t) r * w->ne[0]], row, w->ne[0] * sizeof(float)); });
-    }
-    return v;
-}
 
 axera_cmm qwen3::bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d, const rope & rp) {
     static const std::regex re("b([0-3])_(attn|mlp)_(.+)");
@@ -514,28 +504,10 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
         GGML_LOG_ERROR("axera qwen3: a graph of %d nodes that is not the whole model (-ngl 99)\n", g->n_nodes);
         return GGML_STATUS_FAILED;
     }
-    ggml_tensor * x0 = norm0;
-    while (x0 && x0->op != GGML_OP_RMS_NORM) {
-        x0 = x0->src[0];
-    }
-    GGML_ASSERT(x0 && x0->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(x0->src[0]));
-    if (x0->src[0]->op != GGML_OP_NONE) {  // a layer-0 input computed in this graph (the TTS talker's): on the CPU
-        int n0 = 0;
-        while (n0 < g->n_nodes && g->nodes[n0] != x0) {
-            ++n0;
-        }
-        cpu_compute(g, g->nodes, n0, "input (cpu)");
-    }
-    x0           = x0->src[0];
+    ggml_tensor * x0 = llm_input(g, norm0);
     const int H_ = (int) x0->ne[0], T = (int) x0->ne[1];
-    int       L_ = 0;
-    while (t.count("blk." + std::to_string(L_) + ".attn_norm.weight")) {
-        ++L_;
-    }
-    const ggml_tensor * rope_node = nullptr;
-    for (int i = 0; i < g->n_nodes && !rope_node; i++) {
-        rope_node = g->nodes[i]->op == GGML_OP_ROPE ? g->nodes[i] : nullptr;
-    }
+    int       L_ = llm_layers(t);
+    const ggml_tensor * rope_node = llm_rope_node(g);
     GGML_ASSERT(rope_node && "axera qwen3: no ROPE node in the graph");
     const ggml_tensor * w0 = t.at("blk.0.attn_norm.weight");
     if (bound != w0->data || L_ != L) {
@@ -546,14 +518,8 @@ ggml_status qwen3::compute(ggml_cgraph * g) {
     const ggml_tensor * kqm    = names.find("attn_inp_kq_mask");
     GGML_ASSERT(k_idxs && k_idxs->type == GGML_TYPE_I64 && k_idxs->ne[0] == T && kqm);
     const kv_view   kv(k_idxs, kqm, man.context, PG);
-    const int32_t * pos = (const int32_t *) inp_pos->data;
-    const bool      mr  = inp_pos->ne[0] == 4 * (int64_t) T;  // M-RoPE: [4][T], else [T]
-    std::vector<int32_t> pb((size_t) T * 4);
-    for (int r = 0; r < T; ++r) {
-        for (int s = 0; s < 4; ++s) {
-            pb[(size_t) r * 4 + s] = mr ? pos[(size_t) s * T + r] : pos[r];
-        }
-    }
+    std::vector<int32_t> pb;
+    llm_positions(inp_pos, T, pb);
     std::vector<ggml_bf16_t> xb((size_t) T * H);
     axera_host_pool().run(T, [&](int64_t r) {
         ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]), xb.data() + (size_t) r * H, H);

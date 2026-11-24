@@ -20,6 +20,7 @@ ggml_add_backend_library(ggml-axera
                          core/seqstate.cpp
                          core/patch_embed.cpp
                          ops/ops.cpp
+                         ops/llm.cpp
                          models/model.cpp
                          models/qwen38_27b/qwen38_27b.cpp
                          models/qwen35_whole/qwen35_whole.cpp

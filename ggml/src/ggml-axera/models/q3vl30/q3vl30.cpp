@@ -20,6 +20,7 @@
 #include "../../core/seqstate.h"
 #include "../../core/quant.h"
 #include "../../ops/ops.h"
+#include "../../ops/llm.h"
 
 #include <algorithm>
 #include <cctype>
@@ -79,18 +80,6 @@ struct state_header {
 };
 
 constexpr size_t state_magic_n = 8;
-
-static std::vector<float> f32_of(const ggml_tensor * w) {
-    std::vector<float> v((size_t) ggml_nelements(w));
-    if (w->type == GGML_TYPE_F32) {
-        memcpy(v.data(), w->data, v.size() * sizeof(float));
-    } else {
-        axera_for_rows_f32(w, [&](int64_t r, const float * row) {
-            memcpy(v.data() + (size_t) r * w->ne[0], row, (size_t) w->ne[0] * sizeof(float));
-        });
-    }
-    return v;
-}
 
 class q3vl30 final : public model, public seq_model {
   public:
@@ -388,16 +377,7 @@ void q3vl30::init(const std::map<std::string, ggml_tensor *> & t, const ggml_ten
     bind_calls(pre, pk, "prefill", true);
     bind_calls(dec, dk, "decode", false);
 
-    seq_config cfg;
-    cfg.kept_max = 1;
-    cfg.check = [] {
-        const char * e = getenv("GGML_AXERA_SEQ_CHECK");
-        return e && atoi(e) != 0;
-    }();
-    cfg.force_miss = [] {
-        const char * e = getenv("GGML_AXERA_SEQ_FORCE_MISS");
-        return e ? std::max(0, atoi(e)) : 0;
-    }();
+    seq_config cfg = seq_config_env(1);
     seq = std::make_unique<seqstate>(*this, cfg);
     size_t bytes = 0;
     for (const auto & [n, b] : gbank) bytes += b->size;
@@ -1288,22 +1268,13 @@ ggml_status q3vl30::compute(ggml_cgraph * g) {
         GGML_LOG_ERROR("axera q3vl30: a graph of %d nodes that is not the whole model (-ngl 99)\n", g->n_nodes);
         return GGML_STATUS_FAILED;
     }
-    ggml_tensor * x0 = norm0;
-    while (x0 && x0->op != GGML_OP_RMS_NORM) x0 = x0->src[0];
-    GGML_ASSERT(x0 && x0->src[0] && x0->src[0]->type == GGML_TYPE_F32);
-    if (x0->src[0]->op != GGML_OP_NONE) {
-        int n0 = 0;
-        while (n0 < g->n_nodes && g->nodes[n0] != x0) ++n0;
-        cpu_compute(g, g->nodes, n0, "input (cpu)");
-    }
-    x0 = x0->src[0];
+    ggml_tensor * x0 = llm_input(g, norm0, false);
     // Qwen3-VL's token input is a [H, T] view of the [H + 3 * H, T] embedding
     // tensor: the three deepstack planes follow the token row and llama.cpp
     // zeroes them for text tokens. Read all IN floats of each row.
     const int Hh = (int) x0->ne[0], T = (int) x0->ne[1];
     GGML_ASSERT(Hh == H && x0->nb[1] >= (size_t) IN * sizeof(float));
-    int Ll = 0;
-    while (t.count("blk." + std::to_string(Ll) + ".attn_norm.weight")) ++Ll;
+    int Ll = llm_layers(t);
     const ggml_tensor * w0 = t.at("blk.0.attn_norm.weight");
     if (bound != w0->data || Ll != L || Hh != H_) {
         L = Ll; H_ = Hh;
@@ -1315,22 +1286,10 @@ ggml_status q3vl30::compute(ggml_cgraph * g) {
     const ggml_tensor * kqm = names.find("attn_inp_kq_mask");
     GGML_ASSERT(k_idxs && k_idxs->type == GGML_TYPE_I64 && k_idxs->ne[0] == T && kqm);
     const kv_view kv(k_idxs, kqm, cells, PG);
-    if (axera_n_seq_max() != 1) {
-        GGML_LOG_ERROR("axera q3vl30: one sequence only (-np 1)\n");
+    if (!llm_one_sequence(kv, T, "q3vl30")) {
         return GGML_STATUS_FAILED;
     }
-    for (int i = 1; i < T; ++i) {
-        if (kv.stream_of(i) != 0 || kv.cell_of(i) != kv.cell_of(0) + i) {
-            GGML_LOG_ERROR("axera q3vl30: a batch of non-consecutive cells\n");
-            return GGML_STATUS_FAILED;
-        }
-    }
-    const int32_t * pos = (const int32_t *) inp_pos->data;
-    const bool mr = inp_pos->ne[0] == 4 * (int64_t) T;
-    pbuf.resize((size_t) T * 4);
-    for (int r = 0; r < T; ++r) {
-        for (int s = 0; s < 4; ++s) pbuf[(size_t) r * 4 + s] = mr ? pos[(size_t) s * T + r] : pos[r];
-    }
+    llm_positions(inp_pos, T, pbuf);
     std::vector<ggml_bf16_t> xb((size_t) T * IN);
     axera_host_pool().run(T, [&](int64_t r) {
         ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]),
@@ -1356,14 +1315,7 @@ ggml_status q3vl30::compute(ggml_cgraph * g) {
     const int64_t c0 = kv.cell_of(0);
     const seq_status sst = seq->feed(c0, T, (const uint16_t *) xb.data(), pbuf.data());
     if (sst != SEQ_OK) {
-        last_seq_status = (int) sst;
-        if (sst == SEQ_MISS) {
-            GGML_LOG_WARN("axera q3vl30: batch from cell %lld has no restart point (%s); the slot must replay\n",
-                          (long long) c0, seq->why());
-        } else {
-            GGML_LOG_ERROR("axera q3vl30: sequence state rejected a batch from cell %lld: %s\n",
-                           (long long) c0, seq->why());
-        }
+        last_seq_status = (int) llm_seq_log(sst, c0, *seq, "q3vl30");
         return GGML_STATUS_FAILED;
     }
     publish_logits(g, logits, T);
