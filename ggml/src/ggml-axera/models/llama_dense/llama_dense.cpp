@@ -49,10 +49,7 @@ struct dense_family {
 constexpr dense_family CPM5 = { "cpm5", "CPM5S1", 42, 2, 1e-6f, true };
 constexpr dense_family HYMT = { "hymt", "HYMTS1", 32, 4, 1e-5f, false };
 
-struct call {
-    const kernel *                     k = nullptr;
-    std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
-};
+using call = npu_call;
 
 
 class llama_dense final : public model, public seq_model {

@@ -16,6 +16,12 @@
 
 namespace axera {
 
+// one kernel call: the kernel and its bound IO
+struct npu_call {
+    const kernel *                     k = nullptr;
+    std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
+};
+
 // Layer 0's input rows ([H][T] f32): from attn_norm-0 back to its RMS_NORM, that node's source. A layer-0 input the
 // graph computes itself (the TTS talker's sum of embeddings) runs on the CPU first. contiguous: the rows must be
 // contiguous (false for a view of wider rows, Qwen3-VL's token row in front of its deepstack planes).

@@ -54,10 +54,7 @@ constexpr int GROUP_LAYERS = 6;
 constexpr int GROUPS = 8;
 constexpr int IN = 4 * H;  // x plus the three deepstack planes
 
-struct call {
-    const kernel *                     k = nullptr;
-    std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
-};
+using call = npu_call;
 
 struct group_info {
     int         first = 0;

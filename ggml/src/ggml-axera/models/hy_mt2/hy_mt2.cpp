@@ -50,10 +50,7 @@ constexpr int PAGES = 513;  // 131328 cells, enough for -c 131072
 constexpr int HEAD_ROWS = 8;
 constexpr int SMALL_BATCH = 64;  // rows below this replay the decode kernel
 
-struct call {
-    const kernel *                     k = nullptr;
-    std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
-};
+using call = npu_call;
 
 struct group_info {
     int         first = 0;

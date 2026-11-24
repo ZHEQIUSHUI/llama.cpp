@@ -22,6 +22,7 @@
 #include "../../ops/ops.h"
 #include "../../ops/llm.h"
 #include "../../ops/gdn_bank.h"
+#include "../../ops/gdn_mtp.h"
 
 #include <algorithm>
 #include <array>
@@ -38,10 +39,7 @@ constexpr int PG = 256;           // cells per page = prefill rows per call = th
 constexpr int KH = 16, VH = 48;   // key / value heads of a delta-net layer
 constexpr int REP = VH / KH;
 
-struct call {
-    const kernel *                     k = nullptr;
-    std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
-};
+using call = npu_call;
 
 // the adapter blob in llama.cpp's sequence state (context checkpoints / prompt cache). The recurrent state itself is
 // core/seqstate's blob; this header only describes the KV pages and the MTP cache around it. AXW27S1 (version 2) is
@@ -73,7 +71,6 @@ struct state_header_27b {
 class qwen38_27b final : public model, public seq_model {
   public:
     explicit qwen38_27b(const manifest & m) : man(m), prm(m) {}
-    ~qwen38_27b() override { mtp_wait(); }
     ggml_status compute(ggml_cgraph * g) override;
     size_t       state_size(uint32_t flags) const override;
     size_t       state_write(void * dst, size_t size, uint32_t flags) override;
@@ -128,7 +125,6 @@ class qwen38_27b final : public model, public seq_model {
     std::vector<call>                     ver;  // per group (role decode.verify)
     std::vector<std::array<axera_cmm, 4>> snaps[2];
     std::vector<float>                    h_buf;      // the target graph's hidden rows
-    std::vector<float>                    mtp_h_buf;  // the MTP graph's hidden rows
     axera_cmm                             VX, VCS, VPN, VMASK, VNT;
     int     cur_set = -1;              // the snapshot set holding the current state, -1: the pools
     bool    state_zero = true;         // the pools hold the zero state (CMM starts zero; a load sets it)
@@ -143,26 +139,7 @@ class qwen38_27b final : public model, public seq_model {
     const rope *        batch_rope = nullptr;
     float *             out_h = nullptr;
     std::vector<ggml_bf16_t> src_rows;
-    // the MTP block (draft context graphs): its kernels' IO, its KV cache
-    call      mtp1, mtpp, mtppkv, mtp8;  // mtp8: role mtp.m8 (optional), up to 8 consecutive rows per call
-    axera_cmm ME, MH, MCS, MPN, MMASK, MOUT, MRAW, PE, PH, PCS, PPN, PMASK, PNBLK, POUT2, PRAW, MKV;
-    axera_cmm PKE, PKH, PKCS;  // the compact prompt kernels use their own row width (not mtp.prompt's 256)
-    axera_cmm PK, PV;  // the K/V-only prompt pass' plain row outputs (copied into the paged MKV)
-    size_t    mtp_kv_row = 0;
-    bool      mtp_h_f32 = false;  // the K/V prompt kernel takes FP32 h rows (the EF32 build)
-    bool      mtp_e_f32 = false;  // the K/V prompt kernel takes FP32 token-embedding rows
-    axera_cmm M8E, M8H, M8CS, M8PN, M8MASK, M8NT, M8OUT, M8RAW;
-    const void * mtp_bound = nullptr;
-    size_t       mtp_page_b = 0;  // bytes of one MTP KV page
-    int64_t      mtp_cell  = 0;   // the next MTP KV cell
-    // a verification's MTP catch-up (nothing on the host reads its result: it only extends the MTP block's KV) runs
-    // on its own thread while the host goes on (sampling, the next draft's setup); any next graph waits for it
-    mutable std::thread mtp_bg;
-    void                mtp_wait() const {
-        if (mtp_bg.joinable()) {
-            mtp_bg.join();
-        }
-    }
+    gdn_mtp mtp;  // the MTP block (draft context graphs)
     // the prefill kernel variants: 256 rows, and the 128 / 64-row tails that hold the last page of a prompt
     struct prefill_set {
         const kernel *    k = nullptr;
@@ -193,14 +170,13 @@ class qwen38_27b final : public model, public seq_model {
     void init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
     void init_fused(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
     void init_fused_phases(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
-    void init_mtp(const std::map<std::string, ggml_tensor *> & t, int il);
+    gdn_mtp_env mtp_env();
     size_t part(int kind) const { return kind == 0 ? st_b : kind == 3 ? cv_b : cq_b; }
     const axera_cmm & pool(int kind) const { return kind == 0 ? ST : kind == 1 ? CQ : kind == 2 ? CK : CV; }
     void bind_state();
     void state_home();
     void state_at(int set, int row);
     ggml_status verify(int64_t c0, int row0, int T, const ggml_bf16_t * xb, const int32_t * pb, float * h);
-    ggml_status compute_mtp(ggml_cgraph * g);
     axera_cmm bank_fused(const std::map<std::string, ggml_tensor *> & t, const io_desc & d);
     int       vtiled(int g) const { return (g % REPf) * KHd + g / REPf; }
     void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
@@ -1437,17 +1413,7 @@ void qwen38_27b::seq_state_load(const uint8_t * src) {
             }
         }
         state_zero = true;
-        if (MKV && mtp_page_b && mtp_cell > 0) {
-            const size_t pages = std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG));
-            if (pages) {
-                memset(MKV->vir, 0, pages * mtp_page_b);
-                MKV->flush(MKV->vir, pages * mtp_page_b);
-            }
-        }
-        // (The paged KV pool is not zeroed here: init zeroes it once, so it never holds a NaN, and a row a new
-        // sequence has not written yet holds a finite value of an earlier one behind the kernel's additive mask.
-        // Zeroing every block's whole pool was a second per new sequence on the 4B: 4k prefill 2300 -> 1440 tok/s.)
-        mtp_cell = 0;
+        mtp.clear();
     } else {
         size_t o = 0;
         for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
@@ -1625,7 +1591,7 @@ void qwen38_27b::seq_verify_peek(int k, uint8_t * dst) {
 // llama.cpp cache tensors, so the checkpoint carries the KV pages before the current cell, the recurrent state and the
 // current page's restart point. The int8 KV caches' per-row scales travel with them (KVSC).
 size_t qwen38_27b::state_size(uint32_t flags) const {
-    mtp_wait();  // the MTP catch-up extends MKV and mtp_cell; size and bytes must be consistent
+    mtp.wait();  // the MTP catch-up extends MKV and mtp_cell; size and bytes must be consistent
     if (KVC.empty() || !ST || !seq) {
         return 0;
     }
@@ -1637,10 +1603,7 @@ size_t qwen38_27b::state_size(uint32_t flags) const {
     const int     pna       = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
     const int64_t state_cell = std::max<int64_t>(0, seq->cell());
     const size_t  nkv_pages  = std::min<size_t>((size_t) kv_pages, (size_t) ((state_cell + PG - 1) / PG));
-    size_t        mtp_pages  = 0;
-    if (MKV && mtp_page_b && mtp_cell > 0) {
-        mtp_pages = partial ? 1 : std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG));
-    }
+    const size_t mtp_pages = mtp.blob_span(partial).pages;
     size_t n = sizeof(state_header_27b) + seq_n;
     if (!partial) {
         if (fused) {
@@ -1650,13 +1613,13 @@ size_t qwen38_27b::state_size(uint32_t flags) const {
             n += (size_t) KVSC.size() * pna * nkv_pages * (kvs_b / NBLK);
         }
     }
-    n += mtp_pages * mtp_page_b;
+    n += mtp_pages * mtp.page_bytes();
     return n;
 }
 
 size_t qwen38_27b::state_write(void * dst, size_t size, uint32_t flags) {
     axera_timer tw("state write");
-    mtp_wait();  // an async MTP catch-up writes MKV; serialize after it finishes
+    mtp.wait();  // an async MTP catch-up writes MKV; serialize after it finishes
     const size_t total = state_size(flags);
     if (!total || size < total) {
         return 0;
@@ -1665,15 +1628,7 @@ size_t qwen38_27b::state_write(void * dst, size_t size, uint32_t flags) {
     const int    pna     = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
     const size_t seq_n   = seq->size(partial);
     const size_t nkv_pages = partial ? 0 : std::min<size_t>((size_t) kv_pages, (size_t) ((std::max<int64_t>(0, seq->cell()) + PG - 1) / PG));
-    size_t mtp_pages = 0, mtp_page0 = 0;
-    if (MKV && mtp_page_b && mtp_cell > 0) {
-        if (partial) {
-            mtp_pages = 1;
-            mtp_page0 = (size_t) ((mtp_cell - 1) / PG);
-        } else {
-            mtp_pages = std::min<size_t>(MKV->size / mtp_page_b, (size_t) ((mtp_cell + PG - 1) / PG));
-        }
-    }
+    const gdn_mtp::span ms = mtp.blob_span(partial);
 
     state_header_27b h;
     memset(&h, 0, sizeof(h));
@@ -1681,9 +1636,9 @@ size_t qwen38_27b::state_write(void * dst, size_t size, uint32_t flags) {
     h.version     = 3;
     h.kind        = 2;
     h.has_target  = 1;
-    h.has_mtp     = mtp_pages > 0;
+    h.has_mtp     = ms.pages > 0;
     h.state_cell  = seq->cell();
-    h.mtp_cell    = mtp_cell;
+    h.mtp_cell    = mtp.next_cell();
     h.ncall       = (uint32_t) KVC.size();
     h.pna         = (uint32_t) pna;
     h.nkv_pages   = (uint32_t) nkv_pages;
@@ -1693,10 +1648,10 @@ size_t qwen38_27b::state_write(void * dst, size_t size, uint32_t flags) {
                                       : (uint64_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
     h.kvs_n       = partial ? 0 : fused ? 0 : (uint64_t) KVSC.size() * pna * nkv_pages * (kvs_b / NBLK);
     h.seq_n       = seq_n;
-    h.mtp_page0   = mtp_page0;
-    h.mtp_pages   = mtp_pages;
-    h.mtp_page_b  = mtp_page_b;
-    h.mtp_n       = mtp_pages * mtp_page_b;
+    h.mtp_page0   = ms.page0;
+    h.mtp_pages   = ms.pages;
+    h.mtp_page_b  = mtp.page_bytes();
+    h.mtp_n       = ms.bytes(mtp.page_bytes());
     h.partial     = partial;
 
     char * p = (char *) dst;
@@ -1739,18 +1694,14 @@ size_t qwen38_27b::state_write(void * dst, size_t size, uint32_t flags) {
         return 0;
     }
     p += seq_n;
-    if (h.mtp_n) {
-        char * src = (char *) MKV->vir + mtp_page0 * mtp_page_b;
-        MKV->invalidate(src, h.mtp_n);
-        memcpy(p, src, h.mtp_n);
-        p += h.mtp_n;
-    }
+    mtp.save(ms, p);
+    p += h.mtp_n;
     return (size_t) (p - (char *) dst);
 }
 
 size_t qwen38_27b::state_read(const void * src, size_t size, uint32_t flags) {
     axera_timer tr("state read");
-    mtp_wait();
+    mtp.wait();
     if (size < sizeof(state_header_27b)) {
         return 0;
     }
@@ -1776,11 +1727,8 @@ size_t qwen38_27b::state_read(const void * src, size_t size, uint32_t flags) {
         return 0;
     }
     const bool mtp_valid = h.mtp_n == 0 ? h.mtp_pages == 0 && !h.has_mtp :
-                           h.has_mtp && MKV && mtp_page_b && h.mtp_page_b == mtp_page_b &&
-                               h.mtp_pages > 0 && h.mtp_pages <= MKV->size / mtp_page_b &&
-                               h.mtp_page0 <= MKV->size / mtp_page_b - h.mtp_pages &&
-                               h.mtp_pages * mtp_page_b == h.mtp_n && (!partial || h.mtp_pages == 1) &&
-                               h.mtp_cell >= 0 && h.mtp_cell <= kv_cells;
+                           h.has_mtp && mtp.fits(h.mtp_page0, h.mtp_pages, h.mtp_page_b, h.mtp_n, h.mtp_cell,
+                                                 partial, kv_cells);
     if (!mtp_valid) {
         return 0;
     }
@@ -1825,13 +1773,8 @@ size_t qwen38_27b::state_read(const void * src, size_t size, uint32_t flags) {
         return 0;
     }
     p += h.seq_n;
-    if (h.mtp_n) {
-        char * dst = (char *) MKV->vir + (size_t) h.mtp_page0 * mtp_page_b;
-        memcpy(dst, p, h.mtp_n);
-        MKV->flush(dst, h.mtp_n);
-        p += h.mtp_n;
-    }
-    mtp_cell = h.mtp_cell;
+    mtp.load(h.mtp_page0, h.mtp_n, p, h.mtp_cell);
+    p += h.mtp_n;
     state_zero = false;
     return (size_t) (p - (const char *) src);
 }
@@ -1954,10 +1897,10 @@ ggml_status qwen38_27b::verify(int64_t c0, int row0, int T, const ggml_bf16_t * 
 }
 
 ggml_status qwen38_27b::compute(ggml_cgraph * g) {
-    mtp_wait();
+    mtp.wait();
     const auto &  t       = names.of(g);
     if (names.find("mtp_h_input")) {  // a speculative draft context's MTP block
-        return compute_mtp(g);
+        return mtp.compute(mtp_env(), g);
     }
     ggml_tensor * norm0   = names.find("attn_norm-0");
     ggml_tensor * logits  = names.find("result_output");
@@ -2080,377 +2023,36 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
 }
 
 // the MTP block's kernels: its packs from blk.<il>.* (both kernels the same layout), its paged KV cache, the IO
-void qwen38_27b::init_mtp(const std::map<std::string, ggml_tensor *> & t, int il) {
-    axera_timer    tb("init: mtp");
-    const kernel & k1 = man.get("mtp.t1");
-    const kernel & kp = man.get("mtp.prompt");
-    GGML_ASSERT(k1.desc->packs == kp.desc->packs && k1.out_bytes("kv") == kp.out_bytes("kv"));
-    MKV = axera_cmm_alloc(k1.out_bytes("kv") / NBLK * kv_pages);  // (paged like the layers' caches)
-    mtp_page_b = k1.out_bytes("kv") / NBLK;
-    mtp_kv_row = (size_t) k1.out_bytes("kv") / NBLK / (2 * PG);   // one K (or V) row: HKV * D bf16
-    auto bind = [&](call & c, const kernel & k, std::initializer_list<std::pair<const char *, axera_cmm *>> io) {
-        c   = {};
-        c.k = &k;
-        auto of = [&](const std::string & n) -> axera_cmm * {
-            for (const auto & [name, b] : io) {
-                if (n == name) {
-                    return b;
-                }
-            }
-            return nullptr;
-        };
-        for (const auto & d : k.desc->in) {
-            if (k.desc->packs.count(d.name)) {
-                c.in.push_back(axera_io(prm.pack(t, *k.desc, d.name, il), d.bytes));
-                continue;
-            }
-            axera_cmm * b = of(d.name);
-            if (!b) {
-                GGML_ABORT("axera qwen38_27b: %s: unexpected input %s\n", k.desc->role.c_str(), d.name.c_str());
-            }
-            if (!*b) {
-                *b = axera_cmm_alloc(d.bytes);
-            }
-            c.in.push_back(axera_io(*b, d.bytes));
-        }
-        for (const auto & d : k.desc->out) {
-            axera_cmm * b = d.name == std::string("kv") ? &MKV : of(d.name);
-            if (!b) {
-                GGML_ABORT("axera qwen38_27b: %s: unexpected output %s\n", k.desc->role.c_str(), d.name.c_str());
-            }
-            if (!*b) {
-                *b = axera_cmm_alloc(d.bytes);
-            }
-            c.out.push_back(d.name == std::string("kv") ? axera_io(b->get(), (*b)->vir, (uint32_t) d.bytes) : axera_io(*b, d.bytes));
-        }
-    };
-    bind(mtp1, k1, { { "e", &ME }, { "h", &MH }, { "cs", &MCS }, { "pn", &MPN }, { "mask", &MMASK }, { "hnext", &MOUT },
-                     { "hraw", &MRAW } });
-    bind(mtpp, kp, { { "e", &PE }, { "h", &PH }, { "cs", &PCS }, { "pn", &PPN }, { "mask", &PMASK }, { "nblk", &PNBLK },
-                     { "hnext", &POUT2 }, { "hraw", &PRAW } });
-    GGML_ASSERT(MCS->size == (size_t) ROT * sizeof(ggml_bf16_t) && MMASK->size == (size_t) man.context * sizeof(ggml_bf16_t) &&
-                PE->size % ((size_t) H * sizeof(ggml_bf16_t)) == 0);
-    std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> live = { &mtp1.in, &mtpp.in };
-    if (man.has("mtp.promptkv")) {  // the K/V-only prompt pass (the last row uses mtp1's full block)
-        const kernel & kpk = man.get("mtp.promptkv");
-        // its compact pack has only the eh_proj / K / V weights; its K/V rows are copied into MKV by the host
-        bind(mtppkv, kpk, { { "e", &PKE }, { "h", &PKH }, { "cs", &PKCS }, { "kout", &PK }, { "vout", &PV } });
-        const io_desc * ed = nullptr;
-        for (const auto & d : kpk.desc->in) {
-            if (d.name == "e") {
-                ed = &d;
-            }
-        }
-        GGML_ASSERT(ed && ed->shape.size() >= 2);
-        const size_t P = (size_t) ed->shape[1];
-        mtp_h_f32 = PKH->size == P * H * sizeof(float);
-        mtp_e_f32 = PKE->size == P * H * sizeof(float);
-        live.push_back(&mtppkv.in);
-    }
-    if (man.has("mtp.m8")) {
-        const kernel & k8 = man.get("mtp.m8");
-        GGML_ASSERT(k8.desc->packs == k1.desc->packs && k8.out_bytes("kv") == k1.out_bytes("kv"));
-        bind(mtp8, k8, { { "e", &M8E }, { "h", &M8H }, { "cs", &M8CS }, { "pn", &M8PN }, { "mask", &M8MASK }, { "ntok", &M8NT },
-                         { "hnext", &M8OUT }, { "hraw", &M8RAW } });
-        GGML_ASSERT(M8MASK->size == M8E->size / ((size_t) H * sizeof(ggml_bf16_t)) * MMASK->size);
-        live.push_back(&mtp8.in);
-    }
-    for (auto & c : dec) {
-        live.push_back(&c.in);
-    }
-    prm.release(live);
-}
-
 // a draft context's MTP graph: token x_p (its embedding row) with the target's final-norm hidden of p - 1 through the
 // MTP block at the draft context's cells; h_nextn (the block's shared head norm) and the logits of the output rows
-ggml_status qwen38_27b::compute_mtp(ggml_cgraph * g) {
-    const auto &  t     = names.cur.t;
-    ggml_tensor * hin   = names.find("mtp_h_input");
-    ggml_tensor * hn    = names.find("h_nextn");
-    ggml_tensor * pos   = names.find("inp_pos");
-    ggml_tensor * kidx  = names.find("attn_inp_k_idxs");
-    ggml_tensor * kqm   = names.find("attn_inp_kq_mask");
-    const ggml_tensor * embd = nullptr;
-    int           il    = -1;
-    for (int i = 0; i < g->n_nodes && !embd; i++) {  // the token rows: the input of the embedding norm mtp_enorm-<il>
-        const char * n = g->nodes[i]->name;
-        if (strncmp(n, "mtp_enorm-", 10) == 0) {
-            il                    = atoi(n + 10);
-            const ggml_tensor * m = g->nodes[i];
-            const ggml_tensor * r = m->src[0]->op == GGML_OP_RMS_NORM ? m->src[0] : m->src[1];
-            embd                  = r->op == GGML_OP_RMS_NORM ? r->src[0] : nullptr;
-            if (embd && embd->op != GGML_OP_NONE) {  // (computed in this graph: the nodes before the norm on the CPU)
-                int n0 = 0;
-                while (n0 < g->n_nodes && g->nodes[n0] != r) {
-                    ++n0;
-                }
-                cpu_compute(g, g->nodes, n0, "mtp input (cpu)");
-            }
-        }
-    }
-    if (!embd || !hn || !pos || !kidx || !kqm || il < 0 || !bound) {
-        GGML_LOG_ERROR("axera qwen38_27b: an MTP graph before the target model's or of an unexpected shape (embd %d h_nextn %d "
-                       "inp_pos %d k_idxs %d kq_mask %d layer %d target %d)\n", !!embd, !!hn, !!pos, !!kidx, !!kqm, il, !!bound);
-        return GGML_STATUS_FAILED;
-    }
-    const int T = (int) hin->ne[1];
-    GGML_ASSERT(hin->type == GGML_TYPE_F32 && hin->ne[0] == H && embd->type == GGML_TYPE_F32 && embd->ne[0] == H &&
-                embd->ne[1] == T && hn->ne[1] == T);
-    const ggml_tensor * w0 = t.at("blk." + std::to_string(il) + ".nextn.eh_proj.weight");
-    if (mtp_bound != w0->data) {
-        init_mtp(t, il);
-        mtp_bound = w0->data;
-    }
-    const ggml_tensor * rope_node = llm_rope_node(g);
-    const rope    rp(rope_node, pos, T);
-    const kv_view kv(kidx, kqm, man.context, PG);
-    mtp_cell = 0;
-    for (int r = 0; r < T; ++r) {
-        mtp_cell = std::max(mtp_cell, kv.cell_of(r) + 1);
-    }
-    auto row_bf16 = [&](const ggml_tensor * x, int r, ggml_bf16_t * d) {
-        ggml_fp32_to_bf16_row((const float *) ((const char *) x->data + (size_t) r * x->nb[1]), d, H);
-    };
-    mtp_h_buf.resize((size_t) T * H);
-    std::vector<float> & h = mtp_h_buf;
-    std::vector<float> hr((size_t) T * H);  // the pre-head-norm rows, for the combined head
-    const size_t       half = (ROT / 2) * sizeof(ggml_bf16_t);
-    axera_timer        tm(T == 1 ? "mtp (draft)" : T <= 8 ? "mtp (catch-up rows)" : "mtp (prompt)");
-    const int R8 = mtp8.k ? (int) (M8E->size / (H * sizeof(ggml_bf16_t))) : 0;
-    if (T >= 2 && T <= R8) {  // a verification's accepted rows in one call (each row sees the rows before it)
-        const size_t mrow = MMASK->size;
-        auto *       pn   = (int32_t *) M8PN->vir;
-        for (int r = 0; r < R8; ++r) {
-            const int rr = std::min(r, T - 1);  // rows from T on: the last row's (the kernel leaves their KV alone)
-            if (r < T) {
-                row_bf16(embd, r, (ggml_bf16_t *) M8E->vir + (size_t) r * H);
-                row_bf16(hin, r, (ggml_bf16_t *) M8H->vir + (size_t) r * H);
-            }
-            rp.rows(rr, 1, COS.get(), SIN.get());
-            memcpy((char *) M8CS->vir + r * 2 * half, COS->vir, half);
-            memcpy((char *) M8CS->vir + r * 2 * half + half, SIN->vir, half);
-            auto * mk = (ggml_bf16_t *) ((char *) M8MASK->vir + r * mrow);
-            std::fill(mk, mk + man.context, ggml_fp32_to_bf16(-3e38f));
-            const int64_t c    = kv.cell_of(rr);
-            const int     nblk = kv.mask_row(rr, mk);
-            pn[3 * r]          = (int32_t) c;
-            pn[3 * r + 1]      = std::max(nblk, (int) (c / PG + 1));
-            pn[3 * r + 2]      = (int32_t) ((c / PG) * 2 * PG + c % PG);
-        }
-        for (int r = 0; r < 3 * R8; ++r) {  // (an index out of the kernel's range hangs the NPU: stop here instead)
-            GGML_ASSERT(pn[r] >= 0 && pn[r] < 2 * man.context);
-        }
-        *(int32_t *) M8NT->vir = T;
-        for (const axera_cmm * b : { &M8E, &M8H, &M8CS, &M8PN, &M8MASK, &M8NT }) {
-            (*b)->flush();
-        }
-        // (GGML_AXERA_MTP_SYNC=1: in line) asynchronous when this graph has no output rows: neither its logits nor
-        // its h_nextn rows are read
-        static const bool  sync = getenv("GGML_AXERA_MTP_SYNC") && atoi(getenv("GGML_AXERA_MTP_SYNC")) != 0;
-        const ggml_tensor * lg   = names.find("result_output");
-        if (!sync && !(lg && lg->ne[1] > 0 && (lg->flags & GGML_TENSOR_FLAG_COMPUTE))) {
-            tm.stop();
-            mtp_bg = std::thread([this] {
-                axera_timer tb("mtp (catch-up rows, async)");
-                mtp8.k->run(mtp8.in, mtp8.out, "mtp m8");
-            });
-            return GGML_STATUS_SUCCESS;
-        }
-        mtp8.k->run(mtp8.in, mtp8.out, "mtp m8");
-        M8OUT->invalidate();
-        M8RAW->invalidate();
-        for (int r = 0; r < T; ++r) {
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) M8OUT->vir + (size_t) r * H, h.data() + (size_t) r * H, H);
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) M8RAW->vir + (size_t) r * H, hr.data() + (size_t) r * H, H);
-        }
-    } else if (T <= 8) {  // a draft step, or a verification's accepted rows: row by row
-        for (int r = 0; r < T; ++r) {
-            row_bf16(embd, r, (ggml_bf16_t *) ME->vir);
-            row_bf16(hin, r, (ggml_bf16_t *) MH->vir);
-            rp.rows(r, 1, COS.get(), SIN.get());
-            memcpy(MCS->vir, COS->vir, half);
-            memcpy((char *) MCS->vir + half, SIN->vir, half);
-            const int64_t c    = kv.cell_of(r);
-            const int     nblk = kv.mask_row(r, (ggml_bf16_t *) MMASK->vir);
-            auto *        pn   = (int32_t *) MPN->vir;
-            pn[0]              = (int32_t) c;
-            pn[1]              = std::max(nblk, (int) (c / PG + 1));
-            pn[2]              = (int32_t) ((c / PG) * 2 * PG + c % PG);
-            for (const axera_cmm * b : { &ME, &MH, &MCS, &MPN, &MMASK }) {
-                (*b)->flush();
-            }
-            mtp1.k->run(mtp1.in, mtp1.out, "mtp t1");
-            MOUT->invalidate();
-            MRAW->invalidate();
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) MOUT->vir, h.data() + (size_t) r * H, H);
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) MRAW->vir, hr.data() + (size_t) r * H, H);
-        }
-    } else {
-        const bool kvonly = mtppkv.k != nullptr;  // all but the last row need only their K/V
-        axera_cmm & pv_e  = kvonly ? PKE : PE;
-        axera_cmm & pv_h  = kvonly ? PKH : PH;
-        axera_cmm & pv_cs = kvonly ? PKCS : PCS;
-        const size_t e_row = mtp_e_f32 ? sizeof(float) : sizeof(ggml_bf16_t);
-        const int  P      = (int) (pv_e->size / (H * e_row));  // rows per call
-        const int  n_rows = kvonly ? T - 1 : T;
-        auto run_t1 = [&](int r) {
-            row_bf16(embd, r, (ggml_bf16_t *) ME->vir);
-            row_bf16(hin, r, (ggml_bf16_t *) MH->vir);
-            rp.rows(r, 1, COS.get(), SIN.get());
-            memcpy(MCS->vir, COS->vir, half);
-            memcpy((char *) MCS->vir + half, SIN->vir, half);
-            const int64_t c    = kv.cell_of(r);
-            const int     nblk = kv.mask_row(r, (ggml_bf16_t *) MMASK->vir);
-            auto *        pn   = (int32_t *) MPN->vir;
-            pn[0]              = (int32_t) c;
-            pn[1]              = std::max(nblk, (int) (c / PG + 1));
-            pn[2]              = (int32_t) ((c / PG) * 2 * PG + c % PG);
-            for (const axera_cmm * b : { &ME, &MH, &MCS, &MPN, &MMASK }) {
-                (*b)->flush();
-            }
-            mtp1.k->run(mtp1.in, mtp1.out, "mtp t1");
-            MOUT->invalidate();
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) MOUT->vir, h.data() + (size_t) r * H, H);
-        };
-        for (int it = 0; it < n_rows; it += P) {
-            const int n = std::min(P, n_rows - it);
-            if (n < P) {  // (a full chunk overwrites every row)
-                memset((char *) pv_e->vir + (size_t) n * H * e_row, 0, (size_t) (P - n) * H * e_row);
-                memset((char *) pv_h->vir + (size_t) n * H * (mtp_h_f32 ? sizeof(float) : sizeof(ggml_bf16_t)), 0,
-                       (size_t) (P - n) * H * (mtp_h_f32 ? sizeof(float) : sizeof(ggml_bf16_t)));
-            }
-            // mtp.promptkv has no pn input. Keep its cells in host memory instead of writing three
-            // uncached CMM words per row and reading them back again for the K/V scatter.
-            std::vector<int32_t> pn_host;
-            if (kvonly) {
-                pn_host.resize((size_t) 3 * P);
-            }
-            auto * pn = kvonly ? pn_host.data() : (int32_t *) PPN->vir;
-            const int nmax = kvonly ? 0 : kv.chunk_mask((const int32_t *) pos->data, it, P, n, (ggml_bf16_t *) PMASK->vir);
-            axera_host_pool().run((int64_t) 2 * n, [&](int64_t j) {
-                const int rr = (int) (j % n);
-                if (j < n) {
-                    if (mtp_e_f32) {
-                        memcpy((char *) pv_e->vir + (size_t) rr * H * sizeof(float),
-                               (const char *) embd->data + (size_t) (it + rr) * embd->nb[1], H * sizeof(float));
-                    } else {
-                        row_bf16(embd, it + rr, (ggml_bf16_t *) pv_e->vir + (size_t) rr * H);
-                    }
-                } else {
-                    if (mtp_h_f32) {
-                        memcpy((char *) pv_h->vir + (size_t) rr * H * sizeof(float),
-                               (const char *) hin->data + (size_t) (it + rr) * hin->nb[1], H * sizeof(float));
-                    } else {
-                        row_bf16(hin, it + rr, (ggml_bf16_t *) pv_h->vir + (size_t) rr * H);
-                    }
-                }
-            });
-            for (int r = 0; r < P; ++r) {
-                const int     rr = std::min(r, n - 1);  // padded rows: the last row's positions and mask, later cells
-                const int64_t c  = kv.cell_of(it + rr) + (r - rr);
-                GGML_ASSERT(c < kv_cells);
-                rp.rows(it + rr, 1, COS.get(), SIN.get());
-                memcpy((char *) pv_cs->vir + r * 2 * half, COS->vir, half);
-                memcpy((char *) pv_cs->vir + r * 2 * half + half, SIN->vir, half);
-                pn[3 * r]     = (int32_t) c;
-                pn[3 * r + 1] = (int32_t) (c / PG + 1);
-                pn[3 * r + 2] = (int32_t) ((c / PG) * 2 * PG + c % PG);
-            }
-            pv_e->flush(pv_e->vir, (size_t) n * H * e_row);
-            pv_h->flush(pv_h->vir, (size_t) n * H * (mtp_h_f32 ? sizeof(float) : sizeof(ggml_bf16_t)));
-            pv_cs->flush(pv_cs->vir, (size_t) n * 2 * half);
-            if (!kvonly) {
-                PPN->flush();
-            }
-            if (kvonly) {
-                mtppkv.k->run(mtppkv.in, mtppkv.out, "mtp prompt kv");
-                PK->invalidate();
-                PV->invalidate();
-                int64_t pg0 = -1, pg1 = -1;
-                for (int r = 0; r < n; ++r) {  // each row's K/V into its paged cell (K page then V page)
-                    const int64_t cell = pn[3 * r];
-                    const int64_t page = cell / PG, cl = cell % PG;
-                    memcpy((char *) MKV->vir + (size_t) ((page * 2 + 0) * PG + cl) * mtp_kv_row,
-                           (char *) PK->vir + (size_t) r * mtp_kv_row, mtp_kv_row);
-                    memcpy((char *) MKV->vir + (size_t) ((page * 2 + 1) * PG + cl) * mtp_kv_row,
-                           (char *) PV->vir + (size_t) r * mtp_kv_row, mtp_kv_row);
-                    pg0 = pg0 < 0 ? page : std::min(pg0, page);
-                    pg1 = std::max(pg1, page);
-                }
-                if (pg1 >= 0) {
-                    MKV->flush((char *) MKV->vir + (size_t) (pg0 * 2) * PG * mtp_kv_row,
-                               (size_t) ((pg1 - pg0 + 1) * 2) * PG * mtp_kv_row);
-                }
-            } else {
-                *(int32_t *) PNBLK->vir = nmax;
-                PNBLK->flush();
-                PMASK->flush(PMASK->vir, (size_t) nmax * P * PG * sizeof(ggml_bf16_t));
-                mtpp.k->run(mtpp.in, mtpp.out, "mtp prompt");
-                POUT2->invalidate();
-                for (int r = 0; r < n; ++r) {
-                    ggml_bf16_to_fp32_row((const ggml_bf16_t *) POUT2->vir + (size_t) r * H,
-                                          h.data() + (size_t) (it + r) * H, H);
-                }
-            }
-        }
-        if (kvonly) {
-            // the last prompt row's full block: its h_nextn seeds the first draft step, and mtp1 writes its KV cell too
-            run_t1(T - 1);
-        }
-    }
-    if (hn->flags & GGML_TENSOR_FLAG_COMPUTE) {
-        for (int r = 0; r < T; ++r) {
-            memcpy((char *) hn->data + r * hn->nb[1], h.data() + (size_t) r * H, H * sizeof(float));
-        }
-        if (ggml_backend_buffer_is_axera(hn->buffer)) {
-            ((ggml_backend_axera_buffer_context *) hn->buffer->context)->flush(hn->data, ggml_nbytes(hn));
-        }
-    }
-    ggml_tensor * logits = names.find("result_output");
-    if (logits && logits->ne[1] > 0 && (logits->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-        head.bind(man.get("lm_head"), logits->src[0]);
-        if (man.has("lm_head.topk")) {
-            head.bind_topk(man.get("lm_head.topk"));
-        }
-        if (T == 1 && man.has("lm_head.draft")) {  // a draft step: the draft vocabulary's head (draft_vocab.i32)
-            if (!head.dk) {
-                const std::string f  = man.dir + "/draft_vocab.i32";
-                FILE *            fp = fopen(f.c_str(), "rb");
-                GGML_ASSERT(fp);
-                // the vocabulary is the file's, not the kernel's output shape: an argmax draft head has no full row
-                fseek(fp, 0, SEEK_END);
-                const long fsz = ftell(fp);
-                fseek(fp, 0, SEEK_SET);
-                GGML_ASSERT(fsz > 0 && fsz % (long) sizeof(int32_t) == 0);
-                std::vector<int32_t> ids((size_t) fsz / sizeof(int32_t));
-                GGML_ASSERT(fread(ids.data(), sizeof(int32_t), ids.size(), fp) == ids.size());
-                fclose(fp);
-                axera_timer tb("init: draft head");
-                head.bind_draft(man.get("lm_head.draft"), ids);
-            }
-            head.draft = true;
-            const std::vector<char> normed(T, 1);  // (the draft kernel projects the MTP shared-head norm)
-            head.run(g, names, h, T, &normed);
-        } else {
-            if (!head.bind_combined(man.get("lm_head"), logits->src[0])) {
-                GGML_LOG_ERROR("axera qwen38_27b: the MTP head is not a combined lm_head\n");
-                return GGML_STATUS_FAILED;
-            }
-            if (man.has("lm_head.verify")) {
-                head.bind_combined4(man.get("lm_head.verify"), logits->src[0]);
-            }
-            // the draft context's catch-up rows are not host-sampled; publishing them can replace the target verify
-            // rows when both graphs reuse the same host-visible logits buffer
-            head.run_combined(g, names, hr, T, nullptr, nullptr, false);
-        }
-    }
-    return GGML_STATUS_SUCCESS;
-}
-
 }  // namespace
 
 std::shared_ptr<model> make_qwen38_27b(const manifest & m) {
     return std::make_shared<qwen38_27b>(m);
+}
+
+
+gdn_mtp_env qwen38_27b::mtp_env() {
+    gdn_mtp_env e;
+    e.who          = "qwen38_27b";
+    e.man          = &man;
+    e.prm          = &prm;
+    e.names        = &names;
+    e.head         = &head;
+    e.COS          = &COS;
+    e.SIN          = &SIN;
+    e.H            = H;
+    e.ROT          = ROT;
+    e.NBLK         = NBLK;
+    e.kv_pages     = kv_pages;
+    e.kv_cells     = kv_cells;
+    e.target_bound = bound != nullptr;
+    e.paged        = true;
+    e.async        = true;
+    for (auto & c : dec) {
+        e.live.push_back(&c.in);
+    }
+    return e;
 }
 
 }  // namespace axera

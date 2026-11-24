@@ -34,10 +34,7 @@ namespace {
 constexpr int PG = 256;  // cells per page = prefill rows per call
 constexpr int AX_DTYPE_BF16 = 9;  // AX_ENGINE_DATA_TYPE_T, not ggml_type
 
-struct call {
-    const kernel *                     k = nullptr;
-    std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
-};
+using call = npu_call;
 
 class qwen3 final : public model {
   public:

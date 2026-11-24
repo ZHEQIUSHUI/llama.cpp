@@ -27,10 +27,7 @@ namespace {
 
 constexpr int PG = 256;
 
-struct call {
-    const kernel *                     k = nullptr;
-    std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
-};
+using call = npu_call;
 
 class voxcpm2_base final : public model, public seq_model {
   public:
