@@ -1,0 +1,23 @@
+# Board smoke cases: one or two per adapter, the smallest published package that runs it.
+# tag | tier | adapters it covers (models/<dir>, space separated) | package (HF repo name) | run.sh arguments | det
+#   tier  pr: every change that touches what it covers; full: also on the nightly / release run only
+#   det   1: greedy output is the same on every run (gated on its golden md5); 0: the board's NVFP4 MoE / sampling
+#         is not run-to-run exact (gated on rc 0 and a non-empty output only)
+q08b    |pr  |qwen35_whole                     |Qwen3.5-0.8B-AX8860-llama.cpp                |"The capital of France is" 48|1
+q08bi   |pr  |qwen35_whole qwen35_vit          |Qwen3.5-0.8B-AX8860-llama.cpp                |-i $AXERA_CI_DATA/bus.jpg "Describe this image in one sentence." 48|1
+npu1    |pr  |qwen38_27b                       |Qwen3.5-2B-AX8860-NPU1-llama.cpp             |"The capital of France is" 48|1
+ocr     |pr  |qwen35_whole minicpm_ocr         |MiniCPM-OCR-1.0-AX8860-llama.cpp             |-i $AXERA_CI_DATA/bus.jpg|1
+cpm5    |pr  |llama_dense                      |MiniCPM5-2B-AX8860-llama.cpp                 |"The capital of France is" 48|1
+hymt18  |pr  |llama_dense                      |Hy-MT2-1.8B-AX8860-llama.cpp                 |"今天天气很好，我们一起去公园散步吧。" 48|1
+emb06   |pr  |qwen3                            |Qwen3-Embedding-0.6B-AX8860-llama.cpp        |"hello world"|1
+asr06   |pr  |qwen3 qwen3_asr                  |Qwen3-ASR-0.6B-AX8860-llama.cpp              |$AXERA_CI_DATA/smoke_en.wav|1
+tts06   |pr  |qwen3 qwen3_tts                  |Qwen3-TTS-0.6B-AX8860-llama.cpp              |"今天天气很好，我们一起去公园散步吧。" $AXERA_CI_DATA/smoke_zh.wav "$OUT" zh|0
+vox     |pr  |voxcpm2                          |VoxCPM2-AX8860-llama.cpp                     |"今天天气很好，我们一起去公园散步吧。" "$OUT"|0
+cosy    |pr  |cosyvoice3                       |Fun-CosyVoice3-0.5B-2512-AX8860-llama.cpp    |"今天天气很好，我们一起去公园散步吧。" "" "" "$OUT"|0
+q9b     |full|qwen35_whole                     |Qwen3.5-9B-AX8860-llama.cpp                  |"The capital of France is" 48|1
+q27     |full|qwen38_27b                       |Qwen3.8-27B-AX8860-llama.cpp                 |"The capital of France is" 48|1
+q27i    |full|qwen38_27b qwen35_vit            |Qwen3.8-27B-AX8860-llama.cpp                 |-i $AXERA_CI_DATA/bus.jpg "Describe this image in one sentence." 48|0
+cpmv47i |full|qwen35_moe_sgl minicpmv4_7       |MiniCPM-V-4.7-35B-A3B-AX8860-llama.cpp       |-i $AXERA_CI_DATA/bus.jpg "Describe this image in one sentence." 48|0
+q36     |full|qwen35_moe_sgl                   |Qwen3.6-35B-A3B-AX8860-llama.cpp             |"The capital of France is" 48|0
+hymt30  |full|hy_mt2                           |Hy-MT2-30B-A3B-AX8860-llama.cpp              |"The capital of France is" 48|0
+vl30i   |full|q3vl30                           |Qwen3-VL-30B-A3B-AX8860-llama.cpp            |-i $AXERA_CI_DATA/bus.jpg "Describe this image in one sentence." 48|0
