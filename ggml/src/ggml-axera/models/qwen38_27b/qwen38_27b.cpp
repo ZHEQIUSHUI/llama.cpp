@@ -23,6 +23,7 @@
 #include "../../ops/llm.h"
 #include "../../ops/gdn_bank.h"
 #include "../../ops/gdn_mtp.h"
+#include "../../ops/gdn_state.h"
 
 #include <algorithm>
 #include <array>
@@ -68,7 +69,7 @@ struct state_header_27b {
     uint32_t reserved;
 };
 
-class qwen38_27b final : public model, public seq_model {
+class qwen38_27b final : public model, public seq_model, gdn_state {
   public:
     explicit qwen38_27b(const manifest & m) : man(m), prm(m) {}
     ggml_status compute(ggml_cgraph * g) override;
@@ -78,28 +79,32 @@ class qwen38_27b final : public model, public seq_model {
     int          last_state_status() const override { return last_seq_status; }
 
     seq_caps seq_get_caps() const override;
-    void     seq_state_save(uint8_t * dst) override;
-    void     seq_state_load(const uint8_t * src) override;
+    void     seq_state_save(uint8_t * dst) override { state_save(dst); }
+    void     seq_state_load(const uint8_t * src) override {
+        if (state_load(src)) {
+            mtp.clear();
+        }
+    }
     bool     seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t * p4, int batch0, seq_snap * snap) override;
     bool     seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p4, int batch_row) override;
     void     seq_rows(int batch_row0, int n, uint16_t * dst) override;
     bool     seq_run_verify(int64_t c, int n, const uint16_t * x, const int32_t * p4, int batch_row0) override;
-    void     seq_verify_keep(int k) override;
-    void     seq_verify_peek(int k, uint8_t * dst) override;
+    void     seq_verify_keep(int k) override { verify_keep(k); }
+    void     seq_verify_peek(int k, uint8_t * dst) override { verify_peek(k, dst); }
 
   private:
     const manifest & man;
     params           prm;
     graph_names      names;
     const void *     bound = nullptr;
-    int              L = 0, H = 0, G = 0, ROT = 0, NBLK = 0;
+    int              L = 0, H = 0, ROT = 0, NBLK = 0;
     std::vector<int> ord;  // layer -> its index among the delta-net layers / the attention layers
 
     // the state pools; their sizes per layer
-    axera_cmm              KV, ST, CQ, CK, CV;
+    axera_cmm              KV;
     std::vector<axera_cmm> KVC;  // the KV cache: one buffer per prefill call's attention layers (a CMM allocation is < 4 GB)
     std::vector<axera_cmm> KVSC;  // its scales (an int8 cache: a bf16 scale per row and head), the same split
-    size_t    kv_b = 0, kvs_b = 0, st_b = 0, cq_b = 0, cv_b = 0;
+    size_t    kv_b = 0, kvs_b = 0;
     // the pages of the cache the pools hold (GGML_AXERA_KV_PAGES; default: the kernels' context): the kernels keep their
     // declared IO size but touch only the pages up to the runtime page count, so a smaller context needs only its pages
     int       kv_pages = 0;
@@ -109,30 +114,11 @@ class qwen38_27b final : public model, public seq_model {
     int                            dec_result = 0;
     const axera_cmm *              dec_out = nullptr;
     axera_cmm                      A, A2, DIN, B, C, D, COS, SIN, CS, PN, MASK;
-    // the current recurrent state of each delta-net layer: its pool part, or a verification snapshot's row (the
-    // decode / verify calls' state outputs bound there); the snapshots of the verification groups, two sets
-    struct place {
-        const ggml_backend_axera_buffer_context * b = nullptr;
-        char *                                    p = nullptr;
-    };
-    struct state_io {
-        call * c;
-        size_t i;
-        int    kind, g;  // kind: 0 st, 1 cq, 2 ck, 3 cv; g: the delta-net layer
-    };
-    std::vector<place>                    where[4];
-    std::vector<state_io>                 state_ios;
     std::vector<call>                     ver;  // per group (role decode.verify)
-    std::vector<std::array<axera_cmm, 4>> snaps[2];
     std::vector<float>                    h_buf;      // the target graph's hidden rows
     axera_cmm                             VX, VCS, VPN, VMASK, VNT;
-    int     cur_set = -1;              // the snapshot set holding the current state, -1: the pools
-    bool    state_zero = true;         // the pools hold the zero state (CMM starts zero; a load sets it)
-    int     ver_set = -1;              // the snapshot set of the pending verification
     std::unique_ptr<seqstate> seq;
     int                       last_seq_status = 0;
-    size_t                    state_image_b = 0;
-    int                       ver_rows = 0;
     // the current batch, for x == nullptr runs; the rows the kernel callbacks write the hidden states into
     const ggml_bf16_t * batch_rows = nullptr;
     const kv_view *     batch_kv = nullptr;
@@ -171,11 +157,6 @@ class qwen38_27b final : public model, public seq_model {
     void init_fused(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
     void init_fused_phases(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
     gdn_mtp_env mtp_env();
-    size_t part(int kind) const { return kind == 0 ? st_b : kind == 3 ? cv_b : cq_b; }
-    const axera_cmm & pool(int kind) const { return kind == 0 ? ST : kind == 1 ? CQ : kind == 2 ? CK : CV; }
-    void bind_state();
-    void state_home();
-    void state_at(int set, int row);
     ggml_status verify(int64_t c0, int row0, int T, const ggml_bf16_t * xb, const int32_t * pb, float * h);
     axera_cmm bank_fused(const std::map<std::string, ggml_tensor *> & t, const io_desc & d);
     int       vtiled(int g) const { return (g % REPf) * KHd + g / REPf; }
@@ -1320,46 +1301,8 @@ void qwen38_27b::init_fused_phases(const std::map<std::string, ggml_tensor *> & 
 }
 
 // the calls' state outputs to where the state is
-void qwen38_27b::bind_state() {
-    for (const auto & s : state_ios) {
-        const place & w = where[s.kind][s.g];
-        s.c->out[s.i]   = axera_io(w.b, w.p, (uint32_t) part(s.kind));
-    }
-}
-
 // the current state into the pools (the prefill kernel's, the decode calls' default)
-void qwen38_27b::state_home() {
-    if (cur_set < 0) {
-        return;
-    }
-    axera_timer tl("state home");
-    for (int k = 0; k < 4; ++k) {
-        for (size_t g = 0; g < where[k].size(); ++g) {
-            char * dst = (char *) pool(k)->vir + g * part(k);
-            where[k][g].b->invalidate(where[k][g].p, part(k));
-            memcpy(dst, where[k][g].p, part(k));
-            where[k][g] = { pool(k).get(), dst };
-        }
-        pool(k)->flush();
-    }
-    cur_set = -1;
-    state_zero = false;
-    bind_state();
-}
-
 // the current state: the snapshot after row `row` of the last verification (set `set`)
-void qwen38_27b::state_at(int set, int row) {
-    const int per = G / 4 * 3;  // delta-net layers per group
-    for (int k = 0; k < 4; ++k) {
-        for (size_t g = 0; g < where[k].size(); ++g) {
-            const axera_cmm & sn = snaps[set][g / per][k];
-            where[k][g]          = { sn.get(), (char *) sn->vir + ((size_t) row * per + g % per) * part(k) };
-        }
-    }
-    cur_set = set;
-    bind_state();
-}
-
 seq_caps qwen38_27b::seq_get_caps() const {
     seq_caps c;
     c.page            = PG;
@@ -1377,62 +1320,7 @@ seq_caps qwen38_27b::seq_get_caps() const {
     return c;
 }
 
-void qwen38_27b::seq_state_save(uint8_t * dst) {
-    axera_timer tl("state save");
-    size_t o = 0;
-    if (cur_set < 0) {  // the pools: one contiguous copy per kind
-        for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
-            (*p)->invalidate((*p)->vir, (*p)->size);
-            memcpy(dst + o, (*p)->vir, (*p)->size);
-            o += (*p)->size;
-        }
-    } else {  // a verification snapshot: its rows are not contiguous in the pools' order
-        for (int k = 0; k < 4; ++k) {
-            for (const place & w : where[k]) {
-                w.b->invalidate(w.p, part(k));
-                memcpy(dst + o, w.p, part(k));
-                o += part(k);
-            }
-        }
-    }
-    GGML_ASSERT(o == state_image_b);
-    state_zero = false;
-}
-
 // src == nullptr: the zero state of a new sequence (and of the dummy warm-up batch's cleanup).
-void qwen38_27b::seq_state_load(const uint8_t * src) {
-    axera_timer tl("state load");
-    const bool had_snapshot = cur_set >= 0;
-    ver_set = -1;
-    if (!src) {
-        if (!state_zero || had_snapshot) {
-            axera_timer tz("state zero");
-            for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
-                memset((*p)->vir, 0, (*p)->size);
-                (*p)->flush();
-            }
-        }
-        state_zero = true;
-        mtp.clear();
-    } else {
-        size_t o = 0;
-        for (const axera_cmm * p : { &ST, &CQ, &CK, &CV }) {
-            memcpy((*p)->vir, src + o, (*p)->size);
-            (*p)->flush();
-            o += (*p)->size;
-        }
-        GGML_ASSERT(o == state_image_b);
-        state_zero = false;
-    }
-    for (int k = 0; k < 4; ++k) {
-        for (size_t g = 0; g < where[k].size(); ++g) {
-            where[k][g] = { pool(k).get(), (char *) pool(k)->vir + g * part(k) };
-        }
-    }
-    cur_set = -1;
-    bind_state();
-}
-
 bool qwen38_27b::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t * p4, int batch0, seq_snap * snap) {
     state_home();  // the prefill kernels read the pools
     const ggml_bf16_t * xb = (const ggml_bf16_t *) x;
@@ -1564,27 +1452,6 @@ bool qwen38_27b::seq_run_verify(int64_t c, int n, const uint16_t * x, const int3
         xr = (const uint16_t *) src_rows.data();
     }
     return verify(c, batch_row0, n, (const ggml_bf16_t *) xr, p4, out_h) == GGML_STATUS_SUCCESS;
-}
-
-void qwen38_27b::seq_verify_keep(int k) {
-    GGML_ASSERT(ver_set >= 0 && k > 0 && k <= ver_rows);
-    state_at(ver_set, k - 1);
-}
-
-void qwen38_27b::seq_verify_peek(int k, uint8_t * dst) {
-    GGML_ASSERT(ver_set >= 0 && k > 0 && k <= ver_rows);
-    const int    per = G / 4 * 3;  // delta-net layers per group
-    size_t       o   = 0;
-    for (int kind = 0; kind < 4; ++kind) {
-        for (size_t g = 0; g < where[kind].size(); ++g) {
-            const axera_cmm & sn = snaps[ver_set][g / per][kind];
-            char *            p  = (char *) sn->vir + ((size_t) (k - 1) * per + g % per) * part(kind);
-            sn->invalidate(p, part(kind));
-            memcpy(dst + o, p, part(kind));
-            o += part(kind);
-        }
-    }
-    GGML_ASSERT(o == state_image_b);
 }
 
 // llama.cpp's sequence state (prompt cache / context checkpoint): see qwen35_whole. The private CMM pools are not the

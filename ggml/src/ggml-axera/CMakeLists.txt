@@ -24,6 +24,7 @@ ggml_add_backend_library(ggml-axera
                          ops/llm.cpp
                          ops/gdn_bank.cpp
                          ops/gdn_mtp.cpp
+                         ops/gdn_state.cpp
                          models/model.cpp
                          models/qwen38_27b/qwen38_27b.cpp
                          models/qwen35_whole/qwen35_whole.cpp
