@@ -529,14 +529,15 @@ ggml_status llama_dense::compute(ggml_cgraph * g) {
         const float * gw  = final_norm(hn, H, &eps);
         GGML_ASSERT(gw && eps == fam.norm_eps);
         head.set_merged_norm(gw, H);
-        if (T > 1) {
-            pre_logits = logits;
-            const int n_out = (int) logits->ne[1];
-            if (n_out > 4) {
-                GGML_ABORT("axera %s: a prompt asking for %d logits rows; the merged prefill head covers 4\n", fam.tag, n_out);
-            }
-            llm_out_rows(g, names, n_out, T, pre_rows);
-        } else {
+        // the prefill head's rows for every graph: a one-row batch the sequence state rewinds runs through a page
+        // replay (the prefill kernel), not the decode kernel
+        pre_logits = logits;
+        const int n_out = (int) logits->ne[1];
+        if (n_out > 4) {
+            GGML_ABORT("axera %s: a prompt asking for %d logits rows; the merged prefill head covers 4\n", fam.tag, n_out);
+        }
+        llm_out_rows(g, names, n_out, T, pre_rows);
+        if (T == 1) {
             head.prepare_merged_topk();
         }
     } else {
@@ -574,8 +575,10 @@ ggml_status llama_dense::compute(ggml_cgraph * g) {
     }
 
     if (dec_head) {
-        if (T == 1) {
+        if (T == 1 && strcmp(seq->path(), "decode") == 0) {  // the decode kernel's head wrote this row
             head.finish_merged_decode(g, names, h, T, logits);
+        } else if (T == 1) {  // a page replay: the prefill head wrote the row's logits
+            output_head::after(g, names);
         }
     } else {
         axera_timer th("output head");
