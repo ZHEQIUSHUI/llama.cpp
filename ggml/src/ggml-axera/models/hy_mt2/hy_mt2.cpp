@@ -62,20 +62,6 @@ struct group_info {
     std::string pre;
 };
 
-struct state_header {
-    char     magic[8];
-    uint32_t version;
-    uint32_t partial;
-    uint32_t ngroups;
-    uint32_t pad;
-    int64_t  state_cell;
-    uint32_t nkv_pages;
-    uint32_t kv_page_b;
-    uint64_t kv_n;
-    uint64_t seq_n;
-};
-
-constexpr size_t state_magic_n = 8;
 
 class hy_mt2 final : public model, public seq_model {
   public:
@@ -85,6 +71,8 @@ class hy_mt2 final : public model, public seq_model {
     size_t      state_size(uint32_t flags) const override;
     size_t      state_write(void * dst, size_t size, uint32_t flags) override;
     size_t      state_read(const void * src, size_t size, uint32_t flags) override;
+    kv_state_format state_format() const;
+    cmm_kv_pools    state_pools() const;
     int         last_state_status() const override { return last_seq_status; }
 
     seq_caps seq_get_caps() const override;
@@ -1259,107 +1247,47 @@ ggml_status hy_mt2::compute(ggml_cgraph * g) {
     return GGML_STATUS_SUCCESS;
 }
 
-size_t hy_mt2::state_size(uint32_t flags) const {
-    if (!inited || !seq) return 0;
-    const bool partial = flags & state_flags_partial_only;
-    const size_t seq_n = seq->size(partial);
-    if (!seq_n) return 0;
-    size_t page_b = 0;
-    if (!partial) {
-        page_b = bank_n.at(groups[0].pre + "kv") / PAGES;  // one layer in the dense body
-        for (size_t gi = 1; gi < groups.size(); ++gi) {
-            GGML_ASSERT(bank_n.at(groups[gi].pre + "kv") / groups[gi].layers / PAGES == page_b);
+// the sequence state: every layer's KV pages before the current cell (at the layer's slot in its group's bank) and
+// core/seqstate's blob (core/kv_state)
+kv_state_format hy_mt2::state_format() const {
+    kv_state_format f;
+    f.magic   = "HYMT2S1";
+    f.version = 4;
+    f.page_b  = bank_n.at(groups[0].pre + "kv") / PAGES;  // one layer in the dense body
+    f.pages   = PAGES;
+    f.pg      = PG;
+    f.cells   = cells;
+    return f;
+}
+
+cmm_kv_pools hy_mt2::state_pools() const {
+    cmm_kv_pools p;
+    for (size_t gi = 0; gi < groups.size(); ++gi) {
+        const bmap &        bank = gi == 0 ? dense : chunks[gi - 1];
+        const std::string   kn   = groups[gi].pre + "kv";
+        GGML_ASSERT(gi == 0 || bank_n.at(kn) / groups[gi].layers / PAGES == bank_n.at(groups[0].pre + "kv") / PAGES);
+        for (int b = 0; b < groups[gi].layers; ++b) {
+            p.p.push_back({ &bank.at(kn), (size_t) b * bank_slot.at(kn) });
         }
     }
-    const int64_t cell = std::max<int64_t>(0, seq->cell());
-    const int nkv = partial ? 0 : (int) std::min<int64_t>(PAGES, (cell + PG - 1) / PG);
-    return sizeof(state_header) + (uint64_t) L * nkv * page_b + seq_n;
+    GGML_ASSERT((int) p.p.size() == L);
+    return p;
+}
+
+size_t hy_mt2::state_size(uint32_t flags) const {
+    return !inited || !seq ? 0 : kv_state_size(state_format(), state_pools(), *seq, flags & state_flags_partial_only);
 }
 
 size_t hy_mt2::state_write(void * dst, size_t size, uint32_t flags) {
-    axera_timer tw("state write");
-    const size_t total = state_size(flags);
-    if (!total || size < total) return 0;
-    const bool partial = flags & state_flags_partial_only;
-    const size_t seq_n = seq->size(partial);
-    const size_t page_b = bank_n.at(groups[0].pre + "kv") / PAGES;
-    const int64_t cell = std::max<int64_t>(0, seq->cell());
-    const int nkv = partial ? 0 : (int) std::min<int64_t>(PAGES, (cell + PG - 1) / PG);
-
-    state_header h{};
-    memcpy(h.magic, "HYMT2S1", state_magic_n - 1);
-    h.version = 3;
-    h.partial = partial;
-    h.ngroups = (uint32_t) groups.size();
-    h.state_cell = seq->cell();
-    h.nkv_pages = (uint32_t) nkv;
-    h.kv_page_b = (uint32_t) page_b;
-    h.kv_n = (uint64_t) L * nkv * page_b;
-    h.seq_n = seq_n;
-    char * p = (char *) dst;
-    memcpy(p, &h, sizeof(h));
-    p += sizeof(h);
-    if (!partial) {
-        const size_t n = (size_t) nkv * page_b;
-        auto copy_out = [&](bmap & bm, const std::string & name, int layer) {
-            axera_cmm & c = bm.at(name);
-            char * src = (char *) c->vir + (size_t) layer * bank_slot.at(name);
-            c->invalidate(src, n);
-            memcpy(p, src, n);
-            p += n;
-        };
-        int done = 0;
-        for (size_t gi = 0; gi < groups.size(); ++gi) {
-            bmap & bank = gi == 0 ? dense : chunks[gi - 1];
-            const std::string kn = groups[gi].pre + "kv";
-            for (int b = 0; b < groups[gi].layers; ++b, ++done) {
-                copy_out(bank, kn, b);
-            }
-        }
-        GGML_ASSERT(done == L);
-    }
-    if (seq->write((uint8_t *) p, seq_n, partial) != seq_n) return 0;
-    p += seq_n;
-    return (size_t) (p - (char *) dst);
+    axera_timer  tw("state write");
+    cmm_kv_pools p = state_pools();
+    return !inited || !seq ? 0 : kv_state_write(state_format(), p, *seq, dst, size, flags & state_flags_partial_only);
 }
 
 size_t hy_mt2::state_read(const void * src, size_t size, uint32_t flags) {
-    axera_timer tr("state read");
-    if (size < sizeof(state_header)) return 0;
-    const bool partial = flags & state_flags_partial_only;
-    state_header h{};
-    memcpy(&h, src, sizeof(h));
-    const size_t page_b = bank_n.at(groups[0].pre + "kv") / PAGES;
-    if (memcmp(h.magic, "HYMT2S1", state_magic_n - 1) != 0 || h.version != 3 || h.partial != partial ||
-        h.ngroups != (uint32_t) groups.size() || !h.seq_n || h.state_cell < -1 || h.state_cell > cells ||
-        h.nkv_pages > (uint32_t) PAGES) {
-        return 0;
-    }
-    const uint64_t kv_n = partial ? 0 : (uint64_t) L * h.nkv_pages * page_b;
-    if (h.kv_page_b != page_b || h.kv_n != kv_n || size < sizeof(h) + kv_n + h.seq_n) return 0;
-    const char * p = (const char *) src + sizeof(h);
-    if (!partial) {
-        const size_t n = (size_t) h.nkv_pages * page_b;
-        auto copy_in = [&](bmap & bm, const std::string & name, int layer) {
-            axera_cmm & c = bm.at(name);
-            char * d = (char *) c->vir + (size_t) layer * bank_slot.at(name);
-            memcpy(d, p, n);
-            c->flush(d, n);
-            p += n;
-        };
-        int done = 0;
-        for (size_t gi = 0; gi < groups.size(); ++gi) {
-            bmap & bank = gi == 0 ? dense : chunks[gi - 1];
-            const std::string kn = groups[gi].pre + "kv";
-            for (int b = 0; b < groups[gi].layers; ++b, ++done) {
-                copy_in(bank, kn, b);
-            }
-        }
-        GGML_ASSERT(done == L);
-    }
-    if (seq->read((const uint8_t *) p, h.seq_n) != h.seq_n) return 0;
-    p += h.seq_n;
-    return (size_t) (p - (const char *) src);
+    axera_timer  tr("state read");
+    cmm_kv_pools p = state_pools();
+    return !inited || !seq ? 0 : kv_state_read(state_format(), p, *seq, src, size, flags & state_flags_partial_only);
 }
 
 }  // namespace

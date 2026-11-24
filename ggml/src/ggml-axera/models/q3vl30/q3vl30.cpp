@@ -66,20 +66,6 @@ struct group_info {
     std::string pre;
 };
 
-struct state_header {
-    char     magic[8];
-    uint32_t version;
-    uint32_t partial;
-    uint32_t ngroups;
-    uint32_t pad;
-    int64_t  state_cell;
-    uint32_t nkv_pages;
-    uint32_t kv_page_b;
-    uint64_t kv_n;
-    uint64_t seq_n;
-};
-
-constexpr size_t state_magic_n = 8;
 
 class q3vl30 final : public model, public seq_model {
   public:
@@ -95,6 +81,8 @@ class q3vl30 final : public model, public seq_model {
     size_t      state_size(uint32_t flags) const override;
     size_t      state_write(void * dst, size_t size, uint32_t flags) override;
     size_t      state_read(const void * src, size_t size, uint32_t flags) override;
+    kv_state_format state_format() const;
+    cmm_kv_pools    state_pools() const;
     int         last_state_status() const override { return last_seq_status; }
 
     seq_caps seq_get_caps() const override;
@@ -1322,78 +1310,40 @@ ggml_status q3vl30::compute(ggml_cgraph * g) {
     return GGML_STATUS_SUCCESS;
 }
 
+// the sequence state: every layer pool's pages before the current cell and core/seqstate's blob (core/kv_state)
+kv_state_format q3vl30::state_format() const {
+    kv_state_format f;
+    f.magic   = "Q3VL30S";
+    f.version = 2;
+    f.page_b  = kv_page_b;
+    f.pages   = kv_pages;
+    f.pg      = PG;
+    f.cells   = cells;
+    return f;
+}
+
+cmm_kv_pools q3vl30::state_pools() const {
+    cmm_kv_pools p;
+    for (const axera_cmm & c : KVL) {
+        p.p.push_back({ &c, 0 });
+    }
+    return p;
+}
+
 size_t q3vl30::state_size(uint32_t flags) const {
-    if (!inited || !seq) return 0;
-    const bool partial = flags & state_flags_partial_only;
-    const size_t seq_n = seq->size(partial);
-    if (!seq_n) return 0;
-    const int64_t cell = std::max<int64_t>(0, seq->cell());
-    const int nkv = partial ? 0 : (int) std::min<int64_t>(kv_pages, (cell + PG - 1) / PG);
-    return sizeof(state_header) + (uint64_t) LAYERS * nkv * kv_page_b + seq_n;
+    return !inited || !seq ? 0 : kv_state_size(state_format(), state_pools(), *seq, flags & state_flags_partial_only);
 }
 
 size_t q3vl30::state_write(void * dst, size_t size, uint32_t flags) {
-    axera_timer tw("state write");
-    const size_t total = state_size(flags);
-    if (!total || size < total) return 0;
-    const bool partial = flags & state_flags_partial_only;
-    const size_t seq_n = seq->size(partial);
-    const int64_t cell = std::max<int64_t>(0, seq->cell());
-    const int nkv = partial ? 0 : (int) std::min<int64_t>(kv_pages, (cell + PG - 1) / PG);
-
-    state_header h{};
-    memcpy(h.magic, "Q3VL30S1", state_magic_n - 1);
-    h.version = 1;
-    h.partial = partial;
-    h.ngroups = (uint32_t) GROUPS;
-    h.state_cell = seq->cell();
-    h.nkv_pages = (uint32_t) nkv;
-    h.kv_page_b = (uint32_t) kv_page_b;
-    h.kv_n = (uint64_t) LAYERS * nkv * kv_page_b;
-    h.seq_n = seq_n;
-    char * p = (char *) dst;
-    memcpy(p, &h, sizeof(h));
-    p += sizeof(h);
-    if (!partial) {
-        const size_t n = (size_t) nkv * kv_page_b;
-        for (int j = 0; j < LAYERS; ++j) {
-            axera_cmm & c = KVL[(size_t) j];
-            c->invalidate(c->vir, n);
-            memcpy(p, c->vir, n);
-            p += n;
-        }
-    }
-    if (seq->write((uint8_t *) p, seq_n, partial) != seq_n) return 0;
-    p += seq_n;
-    return (size_t) (p - (char *) dst);
+    axera_timer  tw("state write");
+    cmm_kv_pools p = state_pools();
+    return !inited || !seq ? 0 : kv_state_write(state_format(), p, *seq, dst, size, flags & state_flags_partial_only);
 }
 
 size_t q3vl30::state_read(const void * src, size_t size, uint32_t flags) {
-    axera_timer tr("state read");
-    if (size < sizeof(state_header)) return 0;
-    const bool partial = flags & state_flags_partial_only;
-    state_header h{};
-    memcpy(&h, src, sizeof(h));
-    if (memcmp(h.magic, "Q3VL30S1", state_magic_n - 1) != 0 || h.version != 1 || h.partial != partial ||
-        h.ngroups != (uint32_t) GROUPS || !h.seq_n || h.state_cell < -1 || h.state_cell > cells ||
-        h.nkv_pages > (uint32_t) kv_pages) {
-        return 0;
-    }
-    const uint64_t kv_n = partial ? 0 : (uint64_t) LAYERS * h.nkv_pages * kv_page_b;
-    if (h.kv_page_b != kv_page_b || h.kv_n != kv_n || size < sizeof(h) + kv_n + h.seq_n) return 0;
-    const char * p = (const char *) src + sizeof(h);
-    if (!partial) {
-        const size_t n = (size_t) h.nkv_pages * kv_page_b;
-        for (int j = 0; j < LAYERS; ++j) {
-            axera_cmm & c = KVL[(size_t) j];
-            memcpy(c->vir, p, n);
-            c->flush(c->vir, n);
-            p += n;
-        }
-    }
-    if (seq->read((const uint8_t *) p, h.seq_n) != h.seq_n) return 0;
-    p += h.seq_n;
-    return (size_t) (p - (const char *) src);
+    axera_timer  tr("state read");
+    cmm_kv_pools p = state_pools();
+    return !inited || !seq ? 0 : kv_state_read(state_format(), p, *seq, src, size, flags & state_flags_partial_only);
 }
 
 }  // namespace

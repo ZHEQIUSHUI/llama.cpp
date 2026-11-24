@@ -54,21 +54,6 @@ struct call {
     std::vector<AX_ENGINE_IO_BUFFER_T> in, out;
 };
 
-// the adapter blob in llama.cpp's sequence state (context checkpoints / prompt cache):
-// the KV pages before the current cell and core/seqstate's own restart-point blob.
-struct dense_state_header {
-    char     magic[8];
-    uint32_t version;
-    uint32_t kind;
-    uint32_t partial;
-    int64_t  state_cell;
-    uint32_t nkv_pages;
-    uint32_t nkv;
-    uint64_t kv_page_b;
-    uint64_t kv_n;
-    uint64_t seq_n;
-    uint32_t reserved;
-};
 
 class llama_dense final : public model, public seq_model {
   public:
@@ -126,6 +111,8 @@ class llama_dense final : public model, public seq_model {
     void      prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
                       ggml_tensor * logits, const std::vector<int32_t> & rows);
     void      decode(int64_t c, int t, const ggml_bf16_t * x, float * h);
+    kv_state_format state_format() const;
+    cmm_kv_pools    state_pools() const;
 };
 
 axera_cmm llama_dense::bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d, const rope & rp) {
@@ -653,95 +640,40 @@ void llama_dense::seq_rows(int batch_row0, int n, uint16_t * dst) {
     }
 }
 
+// the sequence state: every layer pool's pages before the current cell and core/seqstate's blob (core/kv_state)
+kv_state_format llama_dense::state_format() const {
+    kv_state_format f;
+    f.magic   = fam.magic;
+    f.version = 2;
+    f.page_b  = kv_b / NBLK;
+    f.pages   = kv_pages;
+    f.pg      = PG;
+    f.cells   = kv_cells;
+    return f;
+}
+
+cmm_kv_pools llama_dense::state_pools() const {
+    cmm_kv_pools p;
+    for (const axera_cmm & c : KVC) {
+        p.p.push_back({ &c, 0 });
+    }
+    return p;
+}
+
 size_t llama_dense::state_size(uint32_t flags) const {
-    if (KVC.empty() || !seq) {
-        return 0;
-    }
-    const bool   partial = flags & state_flags_partial_only;
-    const size_t seq_n   = seq->size(partial);
-    if (!seq_n) {
-        return 0;
-    }
-    const int64_t state_cell = std::max<int64_t>(0, seq->cell());
-    const size_t  nkv_pages  = partial ? 0 :
-        std::min<size_t>((size_t) kv_pages, (size_t) ((state_cell + PG - 1) / PG));
-    return sizeof(dense_state_header) + seq_n + (size_t) KVC.size() * nkv_pages * (kv_b / NBLK);
+    return KVC.empty() || !seq ? 0 : kv_state_size(state_format(), state_pools(), *seq, flags & state_flags_partial_only);
 }
 
 size_t llama_dense::state_write(void * dst, size_t size, uint32_t flags) {
-    axera_timer tw("state write");
-    const size_t total = state_size(flags);
-    if (!total || size < total) {
-        return 0;
-    }
-    const bool   partial   = flags & state_flags_partial_only;
-    const size_t seq_n     = seq->size(partial);
-    const size_t nkv_pages = partial ? 0 :
-        std::min<size_t>((size_t) kv_pages, (size_t) ((std::max<int64_t>(0, seq->cell()) + PG - 1) / PG));
-    dense_state_header h;
-    memset(&h, 0, sizeof(h));
-    memcpy(h.magic, fam.magic, sizeof(h.magic) - 1);
-    h.version    = 1;
-    h.kind       = 1;
-    h.partial    = partial;
-    h.state_cell = seq->cell();
-    h.nkv_pages  = partial ? 0 : (uint32_t) nkv_pages;
-    h.nkv        = (uint32_t) KVC.size();
-    h.kv_page_b  = kv_b / NBLK;
-    h.kv_n       = partial ? 0 : (uint64_t) KVC.size() * nkv_pages * (kv_b / NBLK);
-    h.seq_n      = seq_n;
-    char * p     = (char *) dst;
-    memcpy(p, &h, sizeof(h));
-    p += sizeof(h);
-    if (!partial) {
-        const size_t page_n = nkv_pages * (kv_b / NBLK);
-        for (const axera_cmm & c : KVC) {
-            c->invalidate(c->vir, page_n);
-            memcpy(p, c->vir, page_n);
-            p += page_n;
-        }
-    }
-    if (seq->write((uint8_t *) p, seq_n, partial) != seq_n) {
-        return 0;
-    }
-    p += seq_n;
-    return (size_t) (p - (char *) dst);
+    axera_timer  tw("state write");
+    cmm_kv_pools p = state_pools();
+    return KVC.empty() || !seq ? 0 : kv_state_write(state_format(), p, *seq, dst, size, flags & state_flags_partial_only);
 }
 
 size_t llama_dense::state_read(const void * src, size_t size, uint32_t flags) {
-    axera_timer tr("state read");
-    if (size < sizeof(dense_state_header)) {
-        return 0;
-    }
-    const bool partial = flags & state_flags_partial_only;
-    dense_state_header h;
-    memcpy(&h, src, sizeof(h));
-    if (memcmp(h.magic, fam.magic, sizeof(h.magic) - 1) != 0 || h.version != 1 || h.kind != 1 ||
-        h.partial != partial || !h.seq_n || h.nkv != KVC.size() || h.kv_page_b != kv_b / NBLK ||
-        (partial ? h.nkv_pages != 0 || h.kv_n != 0 :
-                   h.nkv_pages > (uint32_t) kv_pages ||
-                       h.kv_n != (uint64_t) KVC.size() * h.nkv_pages * (kv_b / NBLK)) ||
-        h.state_cell < -1 || h.state_cell > kv_cells) {
-        return 0;
-    }
-    const size_t need = sizeof(h) + h.kv_n + h.seq_n;
-    if (size < need) {
-        return 0;
-    }
-    const char * p = (const char *) src + sizeof(h);
-    if (!partial) {
-        const size_t page_n = h.nkv_pages * (kv_b / NBLK);
-        for (const axera_cmm & c : KVC) {
-            memcpy(c->vir, p, page_n);
-            c->flush(c->vir, page_n);
-            p += page_n;
-        }
-    }
-    if (seq->read((const uint8_t *) p, h.seq_n) != h.seq_n) {
-        return 0;
-    }
-    p += h.seq_n;
-    return (size_t) (p - (const char *) src);
+    axera_timer  tr("state read");
+    cmm_kv_pools p = state_pools();
+    return KVC.empty() || !seq ? 0 : kv_state_read(state_format(), p, *seq, src, size, flags & state_flags_partial_only);
 }
 
 }  // namespace

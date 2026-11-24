@@ -5,6 +5,7 @@
 
 #include "ops.h"
 #include "../core/seqstate.h"
+#include "../core/kv_state.h"
 
 #include "ggml-backend.h"
 
@@ -55,6 +56,15 @@ void llm_paging(const axera_cmm & indptr, const axera_cmm & last_len, const axer
 // The batch rows llama.cpp wants the logits of (its n_out logits rows of a T-row batch): the graph's out_ids, or rows
 // 0 .. n_out - 1 when it wants every row.
 void llm_out_rows(const ggml_cgraph * g, const graph_names & names, int n_out, int T, std::vector<int32_t> & rows);
+
+// core/kv_state's pools over CMM buffers: pool i's pages from p[i].first's memory + p[i].second
+struct cmm_kv_pools final : kv_pools {
+    std::vector<std::pair<const axera_cmm *, size_t>> p;
+    size_t    count() const override { return p.size(); }
+    uint8_t * pages(size_t i) override { return (uint8_t *) (*p[i].first)->vir + p[i].second; }
+    void      to_host(size_t i, size_t n) override { (*p[i].first)->invalidate(pages(i), n); }
+    void      to_npu(size_t i, size_t n) override { (*p[i].first)->flush(pages(i), n); }
+};
 
 // a [rows] or [rows][cols] f32 copy of any small GGUF tensor
 std::vector<float> f32_of(const ggml_tensor * w);

@@ -18,6 +18,7 @@ ggml_add_backend_library(ggml-axera
                          core/npu_sampling.cpp
                          core/argmax_state.cpp
                          core/seqstate.cpp
+                         core/kv_state.cpp
                          core/patch_embed.cpp
                          ops/ops.cpp
                          ops/llm.cpp
