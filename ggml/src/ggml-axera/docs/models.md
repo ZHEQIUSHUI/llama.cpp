@@ -20,26 +20,6 @@
 | MTP | 用模型自带的单层 MTP 头连续出 3 个 draft（草稿词表头出 logits），再一次验证 4 行。验证 kernel 把每一行之后的递归状态和 conv 状态写成快照，下一轮从被接受的那一行的快照继续；验证后被接受的几行用 `mtp.m8` 一次补进 MTP 头的 KV（在另一个线程上，和采样重叠）。`GGML_AXERA_MTP_SYNC=1` 改为同步 |
 | 加载 | 约 60 s，大部分时间是 GGUF 转 NPU 格式；转完的 GGUF 页随即释放，系统内存峰值约 3 GB |
 
-## Qwen3.5-35B-A3B（`qwen35_moe`）
-
-| 项 | 内容 |
-|---|---|
-| GGUF | `qwen3.5-35b-a3b-mxfp4_moe.gguf`：路由专家 MXFP4，其余 Q8_0（`llama-quantize ... MXFP4_MOE`） |
-| kernel | `decode.group`：每次若干个完整 MoE 层（含 router、top-K 和专家）<br>`prefill256.*` 等：分块 prefill，每层先跑层 kernel，再跑路由专家<br>`moe.slots*` / `moe.combine_t*`：把同一专家的 token 收进槽位一起计算，再加回各 token<br>`lm_head`：输出头 |
-| 上下文 | 8192（发布版 kernel） |
-| 状态 | KV cache 和递归状态放在 llama.cpp 的 memory 里（CMM） |
-
-整模型 kernel 版（`qwen35_35b_a3b`，每层 kernel 内含注意力 / GDN、路由和共享专家，专家按层集中计算）还在开发中，manifest 里有对应角色时才会启用。
-
-## Qwen3.5-9B（`qwen35_dense`）
-
-| 项 | 内容 |
-|---|---|
-| kernel | `decode.group`（整模型一组，带输出头），`prefill128.*` / 64 / 16 / 4 分块 prefill |
-| 状态 | 和 35B 一样放在 llama.cpp 的 memory 里 |
-
-暂未发布。
-
 ## Qwen3.5-9B / 4B / 2B / 0.8B 整模型（`qwen35_whole`）
 
 | 项 | 内容 |

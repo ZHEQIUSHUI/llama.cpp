@@ -8,9 +8,8 @@ parts of the TTS codec decoder) run on the CPU backend on the same memory.
 
 | Model | Adapter (`models/`) | Graphs on the NPU | Context |
 |---|---|---|---|
-| Qwen3.5-35B-A3B (MoE, MXFP4 experts) | `qwen35_moe` + `qwen35_vit` | language model, 4-core ViT | 16k |
-| Qwen3.8-27B (MXFP4) | `qwen35_dense` + `qwen35_vit` | language model, 4-core ViT | 16k |
-| Qwen3.5-9B (MXFP4) | `qwen35_dense` | language model | 16k |
+| Qwen3.5 / 3.6-35B-A3B (MoE, NVFP4 experts) | `qwen35_moe_sgl` + `qwen35_vit` | whole-model language path, one-call ViT | 256k |
+| Qwen3.8-27B | `qwen38_27b` + `qwen35_vit` | whole-model language path, one-call ViT | 256k |
 | Qwen3.5-9B / 4B / 2B (MXFP4), 0.8B (MXFP8) | `qwen35_whole` + `qwen35_vit` | whole-model language path, one-call ViT | 16k |
 | Qwen3-Embedding-0.6B | `qwen3` | model up to the final norm (pooling on the CPU) | 16k |
 | Qwen3-ASR-0.6B / 1.7B | `qwen3` + `qwen3_asr` | text model, audio encoder | 4k |
@@ -112,8 +111,8 @@ GGML_AXERA_NPU_CORES=2 GGML_AXERA_KERNEL_DIR=kernels_2b llama-completion -m mode
 | `core/` | runtime, CMM, profiling; manifest and kernels; weight conversions; parameters and packs |
 | `ops/` | graph tensors by name, KV cache view and masks, RoPE, output head, CPU slices |
 | `models/model.cpp` | the adapter by manifest model name; a composite per graph kind (vision, audio, TTS generation) |
-| `models/qwen35_moe/` | Qwen3.5-35B-A3B: 8-layer decode groups, 256-row prefill groups with routed-expert slots |
-| `models/qwen35_dense/` | Qwen3.5 dense (9B, 27B): decode groups (9B: whole model with the head), padded prefill chunks |
+| `models/qwen35_moe_sgl/` | Qwen3.5 / 3.6-35B-A3B whole-model NVFP4 kernels |
+| `models/qwen38_27b/` | Qwen3.8-27B whole-model kernels, MTP |
 | `models/qwen35_whole/` | Qwen3.5 dense whole-model kernels (4B, 9B, 2B): banked prefill, bank-reading decode groups |
 | `models/qwen3/` | Qwen3 text decoders: Embedding, the ASR text model, the TTS talker |
 | `models/qwen35_vit/` | the Qwen3.5 vision encoder (4-core ViT) |

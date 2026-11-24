@@ -11,8 +11,8 @@ ggml-axera 是 llama.cpp 的一个 ggml 后端，在爱芯 AX8860 的 NPU（4 �
 | 模型 | 适配器 | 功能 | HF 发布仓库 |
 |---|---|---|---|
 | Qwen3.8-27B | `qwen38_27b`（ViT：`qwen35_vit`） | 文本、图像输入；MTP 投机解码；NPU 内存里只放一份权重 | [AXERA-TECH/Qwen3.8-27B-AX8860-llama.cpp](https://huggingface.co/AXERA-TECH/Qwen3.8-27B-AX8860-llama.cpp) |
-| Qwen3.5-35B-A3B | `qwen35_moe`（整模型版 `qwen35_35b_a3b` 开发中） | 文本 | 待发布 |
-| Qwen3.5-9B | `qwen35_dense` / `qwen35_whole` | 文本、图像输入（`qwen35_whole` 整模型路径） | 待发布 |
+| Qwen3.5-35B-A3B / Qwen3.6-35B-A3B | `qwen35_moe_sgl`（ViT：`qwen35_vit`） | 文本、图像输入 | 见 HF |
+| Qwen3.5-9B | `qwen35_whole` | 文本、图像输入 | 待发布 |
 | Qwen3.5-4B | `qwen35_whole` | 文本、图像输入 | 待发布 |
 | Qwen3.5-2B | `qwen35_whole` | 文本、图像输入 | 待发布 |
 | Qwen3.5-0.8B | `qwen35_whole` | 文本、图像输入 | 待发布 |

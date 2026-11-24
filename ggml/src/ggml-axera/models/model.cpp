@@ -106,18 +106,12 @@ struct composite final : model {
 
 static std::shared_ptr<model> make_model_of(const manifest & m) {
     std::shared_ptr<model> llm;
-    if (m.model == "qwen35_moe") {
-        llm = make_qwen35_moe(m);
-    } else if (m.model == "qwen35_dense") {
-        llm = make_qwen35_dense(m);
-    } else if (m.model == "qwen38_27b") {
+    if (m.model == "qwen38_27b") {
         llm = make_qwen38_27b(m);
     } else if (m.model == "qwen35_whole") {
         llm = make_qwen35_whole(m);
     } else if (m.model == "minicpm_ocr") {
         llm = make_minicpm_ocr_text(m);
-    } else if (m.model == "qwen35_35b_a3b") {
-        llm = make_qwen35_35b_a3b(m);
     } else if (m.model == "qwen35_moe_sgl") {
         llm = make_qwen35_moe_sgl(m);
     } else if (m.model == "minicpmv4_7") {

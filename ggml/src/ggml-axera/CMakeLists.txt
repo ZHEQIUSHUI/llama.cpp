@@ -21,14 +21,11 @@ ggml_add_backend_library(ggml-axera
                          core/patch_embed.cpp
                          ops/ops.cpp
                          models/model.cpp
-                         models/qwen35_moe/qwen35_moe.cpp
-                         models/qwen35_dense/qwen35_dense.cpp
                          models/qwen38_27b/qwen38_27b.cpp
                          models/qwen35_whole/qwen35_whole.cpp
                          models/minicpm_ocr/minicpm_ocr_text.cpp
                          models/minicpm_ocr/minicpm_ocr_vit_full.cpp
                          models/minicpmv4_7/minicpmv4_7_vit.cpp
-                         models/qwen35_35b_a3b/qwen35_35b_a3b.cpp
                          models/qwen35_moe_sgl/qwen35_moe_sgl.cpp
                          models/hy_mt2/hy_mt2.cpp
                          models/q3vl30/q3vl30.cpp
