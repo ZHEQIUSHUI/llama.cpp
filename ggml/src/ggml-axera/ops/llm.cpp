@@ -93,6 +93,30 @@ seq_status llm_seq_log(seq_status s, int64_t c0, const seqstate & seq, const cha
     return s;
 }
 
+int llm_kv_pages(int max_pages, int pg, bool sizable) {
+    int p = max_pages;
+    if (const int64_t cells = axera_kv_cells(); cells > 0 && sizable) {
+        p = (int) std::max<int64_t>(1, std::min<int64_t>(max_pages, (cells + pg - 1) / pg));
+    }
+    if (const char * e = getenv("GGML_AXERA_KV_PAGES")) {
+        p = std::max(1, std::min(max_pages, atoi(e)));
+    }
+    return p;
+}
+
+void llm_paging(const axera_cmm & indptr, const axera_cmm & last_len, const axera_cmm & cloc, int64_t hist,
+                int64_t write_cell, int pg) {
+    const int64_t pages           = (hist + pg - 1) / pg;
+    ((int32_t *) indptr->vir)[0]  = 0;
+    ((int32_t *) indptr->vir)[1]  = (int32_t) pages;
+    *(int32_t *) last_len->vir    = (int32_t) (pages ? hist - (pages - 1) * pg : 0);
+    ((int32_t *) cloc->vir)[0]    = (int32_t) (write_cell / pg);
+    ((int32_t *) cloc->vir)[1]    = (int32_t) (write_cell % pg);
+    for (const axera_cmm * b : { &indptr, &last_len, &cloc }) {
+        (*b)->flush();
+    }
+}
+
 std::vector<float> f32_of(const ggml_tensor * w) {
     std::vector<float> v((size_t) ggml_nelements(w));
     if (w->type == GGML_TYPE_F32) {

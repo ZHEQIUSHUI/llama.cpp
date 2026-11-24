@@ -42,6 +42,16 @@ int env_int(const char * name, int def);
 // 0), anything else an error. Returns s.
 seq_status llm_seq_log(seq_status s, int64_t c0, const seqstate & seq, const char * who);
 
+// The pages of the KV cache an adapter's pools hold: by default (and at most) the kernels' max_pages; llama.cpp's -c
+// (its own cache's cells) when the kernels can run on fewer pages (sizable: a pool with a fixed page stride);
+// GGML_AXERA_KV_PAGES overrides both.
+int llm_kv_pages(int max_pages, int pg, bool sizable = true);
+
+// The paged attention kernels' page table for the token(s) written from cell write_cell after hist cells of history:
+// indptr {0, pages}, last_page_len (the cells of the last history page), cache_location {page, offset}; flushed.
+void llm_paging(const axera_cmm & indptr, const axera_cmm & last_len, const axera_cmm & cloc, int64_t hist,
+                int64_t write_cell, int pg);
+
 // a [rows] or [rows][cols] f32 copy of any small GGUF tensor
 std::vector<float> f32_of(const ggml_tensor * w);
 

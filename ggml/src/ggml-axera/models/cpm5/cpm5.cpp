@@ -265,13 +265,7 @@ void cpm5::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tenso
     NBLK = (int) kv0.shape[0];  // [pages][K,V][256][2 heads][128]
     GGML_ASSERT((int64_t) NBLK * PG == man.context);
     kv_b     = kv0.bytes;
-    kv_pages = NBLK;
-    if (const int64_t cells = axera_kv_cells(); cells > 0) {
-        kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(NBLK, (cells + PG - 1) / PG));
-    }
-    if (const char * e = getenv("GGML_AXERA_KV_PAGES")) {
-        kv_pages = std::max(1, std::min(NBLK, atoi(e)));
-    }
+    kv_pages = llm_kv_pages(NBLK, PG);
     kv_cells = (int64_t) kv_pages * PG;
     kv_alloc = kv_b / NBLK * kv_pages;
     if (kv_pages < NBLK) {
@@ -400,15 +394,7 @@ void cpm5::bind_calls(ggml_tensor * logits) {
 }
 
 void cpm5::paging(int64_t hist, int64_t write_cell) {
-    const int64_t pages          = (hist + PG - 1) / PG;
-    ((int32_t *) INDPTR->vir)[0] = 0;
-    ((int32_t *) INDPTR->vir)[1] = (int32_t) pages;
-    *(int32_t *) LASTLEN->vir    = (int32_t) (pages ? hist - (pages - 1) * PG : 0);
-    ((int32_t *) CLOC->vir)[0]   = (int32_t) (write_cell / PG);
-    ((int32_t *) CLOC->vir)[1]   = (int32_t) (write_cell % PG);
-    for (const axera_cmm * b : { &INDPTR, &LASTLEN, &CLOC }) {
-        (*b)->flush();
-    }
+    llm_paging(INDPTR, LASTLEN, CLOC, hist, write_cell, PG);
 }
 
 void cpm5::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,

@@ -400,15 +400,7 @@ void qwen3::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tens
 
 // the history before the token(s) written from cell write_cell: hist cells in whole pages and a last one
 void qwen3::paging(int64_t hist, int64_t write_cell) {
-    const int64_t pages           = (hist + PG - 1) / PG;
-    ((int32_t *) INDPTR->vir)[0]  = 0;
-    ((int32_t *) INDPTR->vir)[1]  = (int32_t) pages;
-    *(int32_t *) LASTLEN->vir     = (int32_t) (pages ? hist - (pages - 1) * PG : 0);
-    ((int32_t *) CLOC->vir)[0]    = (int32_t) (write_cell / PG);
-    ((int32_t *) CLOC->vir)[1]    = (int32_t) (write_cell % PG);
-    for (const axera_cmm * b : { &INDPTR, &LASTLEN, &CLOC }) {
-        (*b)->flush();
-    }
+    llm_paging(INDPTR, LASTLEN, CLOC, hist, write_cell, PG);
 }
 
 // prefill pages from cell c0 (a page's first): n rows x [n][H] bf16, their positions p4 [n][4]; the hidden states of

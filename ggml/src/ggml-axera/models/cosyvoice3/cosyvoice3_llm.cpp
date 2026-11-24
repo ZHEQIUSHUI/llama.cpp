@@ -461,15 +461,7 @@ void cosyvoice3_llm::init(const std::map<std::string, ggml_tensor *> & t, int L_
 }
 
 void cosyvoice3_llm::paging(int64_t hist, int64_t write_cell) {
-    const int64_t pages          = (hist + PG - 1) / PG;
-    ((int32_t *) INDPTR->vir)[0] = 0;
-    ((int32_t *) INDPTR->vir)[1] = (int32_t) pages;
-    *(int32_t *) LASTLEN->vir    = (int32_t) (pages ? hist - (pages - 1) * PG : 0);
-    ((int32_t *) CLOC->vir)[0]   = (int32_t) (write_cell / PG);
-    ((int32_t *) CLOC->vir)[1]   = (int32_t) (write_cell % PG);
-    INDPTR->flush();
-    LASTLEN->flush();
-    CLOC->flush();
+    llm_paging(INDPTR, LASTLEN, CLOC, hist, write_cell, PG);
 }
 
 void cosyvoice3_llm::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, int batch0, seq_snap * snap) {

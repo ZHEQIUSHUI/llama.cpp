@@ -883,12 +883,7 @@ void qwen35_moe_sgl::init(const std::map<std::string, ggml_tensor *> & t, const 
     kv_split             = split;
     KVL.clear();
     if (split) {
-        if (const int64_t cells = axera_kv_cells(); cells > 0) {  // llama.cpp's -c
-            kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(NP, (cells + PG - 1) / PG));
-        }
-        if (const char * e = getenv("GGML_AXERA_KV_PAGES")) {
-            kv_pages = std::max(1, std::min(NP, atoi(e)));
-        }
+        kv_pages = llm_kv_pages(NP, PG);
         for (int j = 0; j < NB; ++j) {
             GGML_ASSERT(logical("b3_kv" + std::to_string(j)) == (size_t) NP * page_kv);
             KVL.push_back(axera_cmm_alloc((size_t) kv_pages * page_kv));

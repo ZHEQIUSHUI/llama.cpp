@@ -782,13 +782,8 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
                 in_of(dk, "ck0").bytes == cq_b && in_of(dk, "cv0").bytes == cv_b);
     NBLK = (int) pkv.shape[split_kv ? 0 : 1];
     GGML_ASSERT(pkv.shape[split_kv ? 2 : 3] == PG && (int64_t) NBLK * PG == man.context);
-    kv_pages = NBLK;
-    if (const int64_t cells = axera_kv_cells(); cells > 0 && (split_kv || pna == 1)) {  // llama.cpp's -c (its own cache's cells); a
-        kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(NBLK, (cells + PG - 1) / PG));  // multi-layer prefill
-    }                                                                                            // call needs every page
-    if (const char * e = getenv("GGML_AXERA_KV_PAGES")) {
-        kv_pages = std::max(1, std::min(NBLK, atoi(e)));
-    }
+    // llama.cpp's -c sizes the pools unless a multi-layer prefill call needs every page
+    kv_pages = llm_kv_pages(NBLK, PG, split_kv || pna == 1);
     GGML_ASSERT(kv_pages == NBLK || pna == 1 || split_kv);  // (a multi-layer bank needs fixed layer strides in its IO)
     kv_cells  = (int64_t) kv_pages * PG;
     kv_alloc  = kv_b / NBLK * kv_pages;
@@ -1140,18 +1135,12 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
                 pkv.shape[kd - 1] == 256);
     kv_blk_b = pkv.bytes / (size_t) KB;
     // [..][KB][pages][2][PG][KV heads][256]
-    kv_pages = (int) pkv.shape[kd - 5];
-    NBLK = kv_pages;
+    NBLK = (int) pkv.shape[kd - 5];
     GGML_ASSERT((int64_t) NBLK * PG >= (int64_t) man.context);
     // A one-block bank has a fixed page stride and can hold only the pages the
     // requested context needs, like the released 27B prefill.  A multi-block
     // bank needs every page to keep the block stride in the compiled IO.
-    if (const int64_t cells = axera_kv_cells(); cells > 0 && KB == 1) {
-        kv_pages = (int) std::max<int64_t>(1, std::min<int64_t>(NBLK, (cells + PG - 1) / PG));
-    }
-    if (const char * e = getenv("GGML_AXERA_KV_PAGES")) {
-        kv_pages = std::max(1, std::min(NBLK, atoi(e)));
-    }
+    kv_pages = llm_kv_pages(NBLK, PG, KB == 1);
     GGML_ASSERT(kv_pages == NBLK || KB == 1);
     kv_cells = (int64_t) kv_pages * PG;
     ROT  = 64;
