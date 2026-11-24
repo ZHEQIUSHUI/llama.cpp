@@ -6,9 +6,13 @@
 #pragma once
 
 #include "llm.h"
+#include "../core/params.h"
 
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <map>
+#include <string>
 #include <vector>
 
 namespace axera {
@@ -39,6 +43,12 @@ struct gdn_state {
     // a delta-net layer -> its verification group / its row in the group's snapshot (empty: consecutive groups of
     // G / 4 * 3 layers)
     std::vector<int> state_group, state_local;
+    // the decode groups (role decode.group, G layers each) and their verification calls (decode.verify, optional);
+    // their x / out, cos | sin, cell | blocks | K row, mask inputs; the verification's 4-row ones
+    std::vector<npu_call>            dec, ver;
+    axera_cmm                        A, COS, SIN, CS, PN, MASK;
+    axera_cmm                        VX, VCS, VPN, VMASK, VNT;
+    std::map<std::string, axera_cmm> banks;  // the prefill kernel's weight banks (inputs k_<bank> of dec / ver)
     int              cur_set  = -1;  // the snapshot set holding the current state, -1: the pools
     int              ver_set  = -1;  // the snapshot set of the pending verification
     int              ver_rows = 0;
@@ -58,6 +68,16 @@ struct gdn_state {
     // a verification's k accepted rows: the state after row k; a copy of it
     void verify_keep(int k);
     void verify_peek(int k, uint8_t * dst) const;
+
+    // dec / ver bound (A, CS, PN, MASK allocated, banks filled, the pools and ord set): the groups' packs and banks,
+    // their KV / state IO (pool_io(name, layer)), where[] at the pools, the snapshots and the state outputs
+    using gdn_pool_io = std::function<AX_ENGINE_IO_BUFFER_T(const std::string & name, int il)>;
+    void bind_decode(const char * who, const manifest & man, params & prm, const std::map<std::string, ggml_tensor *> & t,
+                     int L, int H, int ng, const std::vector<int> & ord, const gdn_pool_io & pool_io);
+    // a verification batch of T <= 4 rows xb from cell c0 (rows row0 .. of the graph's batch): the hidden rows into h,
+    // the state after each row in the other snapshot set, the current state the last row's
+    ggml_status verify(int64_t c0, int row0, int T, const ggml_bf16_t * xb, float * h, int H, int ROT, int64_t context,
+                       const kv_view * batch_kv, const rope * batch_rope);
 
   private:
     int  group_of(size_t g) const { return state_group.empty() ? (int) g / (G / 4 * 3) : state_group[g]; }

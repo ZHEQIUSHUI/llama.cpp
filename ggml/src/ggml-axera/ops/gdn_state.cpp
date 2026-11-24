@@ -1,6 +1,13 @@
 #include "gdn_state.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
+
+namespace {
+constexpr int PG = 256;  // cells per page
+}  // namespace
 
 namespace axera {
 
@@ -120,6 +127,191 @@ void gdn_state::verify_peek(int k, uint8_t * dst) const {
         }
     }
     GGML_ASSERT(o == state_image_b);
+}
+
+void gdn_state::bind_decode(const char * who, const manifest & man, params & prm,
+                            const std::map<std::string, ggml_tensor *> & t, int L, int H, int ng,
+                            const std::vector<int> & ord, const gdn_pool_io & pool_io) {
+    const kernel & dk  = man.get("decode.group");
+    const uint32_t csb = dk.in_bytes("cs");
+    auto bank_io = [&](const kernel & k, const io_desc & d, int gi) -> AX_ENGINE_IO_BUFFER_T {
+        auto it = banks.find(d.name.substr(2));
+        if (d.name.rfind("k_", 0) != 0 || it == banks.end()) {
+            GGML_ABORT("axera %s: %s: unexpected input %s\n", who, k.desc->role.c_str(), d.name.c_str());
+        }
+        const size_t bb = it->second->size / (L / 4);  // a block's bytes
+        GGML_ASSERT(d.bytes == (size_t) (G / 4) * bb);
+        return axera_io(it->second.get(), (char *) it->second->vir + (size_t) gi * d.bytes, d.bytes);
+    };
+    dec.assign(L / G, {});
+    for (int gi = 0; gi < L / G; ++gi) {
+        npu_call & c = dec[gi];
+        c.k      = &dk;
+        for (const auto & d : dk.desc->in) {
+            if (d.name.rfind("k_", 0) == 0) {
+                c.in.push_back(bank_io(dk, d, gi));
+                continue;
+            }
+            if (dk.desc->packs.count(d.name)) {
+                c.in.push_back(axera_io(prm.pack(t, *dk.desc, d.name, gi * G), d.bytes));
+                continue;
+            }
+            if (d.name == "head" || d.name == "topk_on" || d.name == "norm_w" || d.name == "w_lm" ||
+                d.name == "s_lm" || d.name == "bias" || d.name == "mul_pos" || d.name == "mul_neg" ||
+                d.name == "temp") {  // a merged head's: bind_head_calls
+                c.in.push_back(AX_ENGINE_IO_BUFFER_T{});
+                continue;
+            }
+            const axera_cmm * b = d.name == "x" ? &A : d.name == "cs" ? &CS : d.name == "pn" ? &PN : d.name == "mask" ? &MASK : nullptr;
+            if (!b) {
+                GGML_ABORT("axera %s: decode.group: unexpected input %s\n", who, d.name.c_str());
+            }
+            c.in.push_back(axera_io(*b, d.bytes));
+        }
+        for (const auto & d : dk.desc->out) {
+            if (d.name == "logits" || d.name == "ids" || d.name == "top_logits" || d.name == "values" ||
+                d.name == "kids" || d.name == "vmax" || d.name == "sumexp") {  // a merged head's: bind_head_calls
+                c.out.push_back(AX_ENGINE_IO_BUFFER_T{});
+                continue;
+            }
+            c.out.push_back(d.name == "out" ? axera_io(A, d.bytes) : pool_io(d.name, gi * G + atoi(d.name.c_str() + strspn(d.name.c_str(), "abcdefghijklmnopqrstuvwxyz"))));
+        }
+        // this group's converted parameters, read only through its packs now: freed before the next group's
+        // (the load's peak: the packs so far and one group's conversions, not every layer's)
+        std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> live;
+        for (int gj = 0; gj <= gi; ++gj) {
+            live.push_back(&dec[gj].in);
+        }
+        prm.release(live);
+    }
+    for (int k = 0; k < 4; ++k) {  // the current state: the pools
+        where[k].assign(ng, {});
+        for (int g = 0; g < ng; ++g) {
+            where[k][g] = { pool(k).get(), (char *) pool(k)->vir + g * part(k) };
+        }
+    }
+    cur_set = -1;
+    ver_set = -1;
+    // a call's state outputs st<j> / cq<j> / ck<j> / cv<j> (layer j of the group from layer l0): bound to where[]
+    auto state_outs = [&](npu_call & c, int l0) {
+        for (size_t i = 0; i < c.k->desc->out.size(); ++i) {
+            const std::string & n = c.k->desc->out[i].name;
+            const int kind = n.rfind("st", 0) == 0 ? 0 : n.rfind("cq", 0) == 0 ? 1 : n.rfind("ck", 0) == 0 ? 2 :
+                             n.rfind("cv", 0) == 0 ? 3 : -1;
+            if (kind >= 0 && isdigit((unsigned char) n[2])) {
+                state_ios.push_back({ &c, i, kind, ord[l0 + atoi(n.c_str() + 2)] });
+            }
+        }
+    };
+    state_ios.clear();
+    for (int gi = 0; gi < L / G; ++gi) {
+        state_outs(dec[gi], gi * G);
+    }
+    // verification: the decode groups' packs, x / out in place, 4 rows' cs / pn / mask, the snapshots
+    ver.clear();
+    if (man.has("decode.verify")) {
+        const kernel & vk = man.get("decode.verify");
+        GGML_ASSERT(vk.in_bytes("x") == 4 * H * sizeof(ggml_bf16_t) && vk.in_bytes("cs") == 4 * csb &&
+                    vk.in_bytes("pn") == 4 * 3 * sizeof(int32_t) && vk.in_bytes("mask") == 4 * dk.in_bytes("mask"));
+        VX    = axera_cmm_alloc(vk.in_bytes("x"));
+        VCS   = axera_cmm_alloc(vk.in_bytes("cs"));
+        VPN   = axera_cmm_alloc(vk.in_bytes("pn"));
+        VMASK = axera_cmm_alloc(vk.in_bytes("mask"));
+        VNT   = axera_cmm_alloc(sizeof(int32_t));
+        static const char * SN[4] = { "ssnap", "cqsnap", "cksnap", "cvsnap" };
+        for (auto & set : snaps) {
+            set.clear();
+            set.resize(L / G);
+            for (auto & a : set) {
+                for (int k = 0; k < 4; ++k) {
+                    a[k] = axera_cmm_alloc(vk.out_bytes(SN[k]));
+                    GGML_ASSERT(a[k]->size == 4 * (size_t) (G / 4 * 3) * part(k));
+                }
+            }
+        }
+        ver.assign(L / G, {});
+        for (int gi = 0; gi < L / G; ++gi) {
+            npu_call & c = ver[gi];
+            c.k      = &vk;
+            for (const auto & d : vk.desc->in) {
+                if (vk.desc->packs.count(d.name)) {  // the decode group's (the same layout)
+                    GGML_ASSERT(dk.desc->packs.count(d.name) && dk.desc->packs.at(d.name) == vk.desc->packs.at(d.name));
+                    size_t j = 0;
+                    while (dk.desc->in[j].name != d.name) {
+                        ++j;
+                    }
+                    c.in.push_back(dec[gi].in[j]);
+                    continue;
+                }
+                if (d.name.rfind("k_", 0) == 0) {
+                    c.in.push_back(bank_io(vk, d, gi));
+                    continue;
+                }
+                const axera_cmm * b = d.name == "x" ? &VX : d.name == "cs" ? &VCS : d.name == "pn" ? &VPN :
+                                      d.name == "mask" ? &VMASK : d.name == "ntok" ? &VNT : nullptr;
+                if (!b) {
+                    GGML_ABORT("axera %s: decode.verify: unexpected input %s\n", who, d.name.c_str());
+                }
+                c.in.push_back(axera_io(*b, d.bytes));
+            }
+            for (const auto & d : vk.desc->out) {
+                int k = -1;
+                for (int j = 0; j < 4; ++j) {
+                    k = d.name == SN[j] ? j : k;
+                }
+                c.out.push_back(d.name == "out" ? axera_io(VX, d.bytes) : k >= 0 ? axera_io(snaps[0][gi][k], d.bytes) :
+                                                   pool_io(d.name, gi * G + atoi(d.name.c_str() + strspn(d.name.c_str(), "abcdefghijklmnopqrstuvwxyz"))));
+            }
+            state_outs(c, gi * G);
+        }
+    }
+}
+
+ggml_status gdn_state::verify(int64_t c0, int row0, int T, const ggml_bf16_t * xb, float * h, int H, int ROT,
+                              int64_t context, const kv_view * batch_kv, const rope * batch_rope) {
+    GGML_ASSERT(batch_kv && batch_rope && T >= 1 && T <= ver_rows);
+    memset(VX->vir, 0, VX->size);
+    memcpy(VX->vir, xb, (size_t) T * H * sizeof(ggml_bf16_t));
+    VX->flush();
+    const size_t half = (ROT / 2) * sizeof(ggml_bf16_t);
+    auto *       cs   = (char *) VCS->vir;
+    auto *       pn   = (int32_t *) VPN->vir;
+    for (int r = 0; r < 4; ++r) {
+        const int     rr = std::min(r, T - 1);
+        const int64_t c  = c0 + r;
+        batch_rope->rows(row0 + rr, 1, COS.get(), SIN.get());
+        memcpy(cs + r * 2 * half, COS->vir, half);
+        memcpy(cs + r * 2 * half + half, SIN->vir, half);
+        const int nblk = batch_kv->mask_row(row0 + rr, (ggml_bf16_t *) VMASK->vir + (size_t) r * context);
+        pn[3 * r]      = (int32_t) c;
+        pn[3 * r + 1]  = std::max(nblk, (int) (c / PG + 1));
+        pn[3 * r + 2]  = (int32_t) ((c / PG) * 2 * PG + c % PG);
+    }
+    *(int32_t *) VNT->vir = T;
+    for (const axera_cmm * b : { &VCS, &VPN, &VMASK, &VNT }) {
+        (*b)->flush();
+    }
+    const int set = cur_set == 0 ? 1 : 0;
+    static const char * SN[4] = { "ssnap", "cqsnap", "cksnap", "cvsnap" };
+    {
+        axera_timer tl("layers (verify)");
+        axera_npu_batch nb;  // the groups' dependent calls, waited for once
+        for (size_t gi = 0; gi < ver.size(); ++gi) {
+            npu_call & c = ver[gi];
+            for (int k = 0; k < 4; ++k) {
+                c.out[c.k->output(SN[k])] = axera_io(snaps[set][gi][k], snaps[set][gi][k]->size);
+            }
+            nb.add(*c.k, c.in, c.out, "verify group");
+        }
+        nb.wait();
+    }
+    VX->invalidate(VX->vir, (size_t) T * H * sizeof(ggml_bf16_t));
+    for (int r = 0; r < T; ++r) {
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) VX->vir + (size_t) r * H, h + (size_t) (row0 + r) * H, H);
+    }
+    state_at(set, T - 1);
+    ver_set = set;
+    return GGML_STATUS_SUCCESS;
 }
 
 }  // namespace axera
