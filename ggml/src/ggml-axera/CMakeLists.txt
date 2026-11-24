@@ -31,8 +31,7 @@ ggml_add_backend_library(ggml-axera
                          models/hy_mt2/hy_mt2.cpp
                          models/q3vl30/q3vl30.cpp
                          models/qwen3/qwen3.cpp
-                         models/cpm5/cpm5.cpp
-                         models/hymt/hymt.cpp
+                         models/llama_dense/llama_dense.cpp
                          models/qwen3_asr/qwen3_asr.cpp
                          models/qwen3_tts/qwen3_tts.cpp
                          models/qwen3_tts/codec.cpp

@@ -1,16 +1,18 @@
-// Axera NPU backend: Hy-MT2-1.8B, a plain 32-layer HunYuan dense text decoder (GQA 16 / 4,
-// head_dim 128, SwiGLU 6144, per-head Q/K RMSNorm after RoPE, no vision, no MTP).
+// Axera NPU backend: the plain dense Llama-family text decoders whose whole backbone is one prefill and one decode
+// kernel (GQA, head_dim 128, SwiGLU, no vision, no MTP). One adapter, the per-model facts in dense_family:
+//   cpm5  MiniCPM5-2B: 42 layers, GQA 16 / 2, no Q/K RMSNorm; llama.cpp's GGUF has q/k in the interleaved RoPE
+//         layout (convert_hf_to_gguf's permute()), mapped back to the kernels' half-split rows
+//   hymt  Hy-MT2-1.8B (HunYuan dense): 32 layers, GQA 16 / 4, per-head Q/K RMSNorm after RoPE; its converter keeps
+//         the half-split layout, rows map one-to-one
 //
 // One path, the manifest's kernels:
-//   prefill  role prefill: the whole 32-layer backbone in one call per page of 256
-//            cells.  The layers are unrolled at trace time (the 27B split-KV method)
-//            and every layer owns one compact KV input b0_kv<j>; the weights are
-//            32-row runtime banks.  The last page of a batch is padded and
-//            valid_tokens masks its output rows.
-//   decode   role decode: one token through the same 32 layers and banks.
+//   prefill  role prefill: the whole backbone in one call per page of 256 cells. The layers are unrolled at trace
+//            time (the 27B split-KV method) and every layer owns one compact KV input b0_kv<j>; the weights are
+//            per-layer runtime banks. The last page of a batch is padded and valid_tokens masks its output rows.
+//   decode   role decode: one token through the same layers and banks.
 //   lm_head  role lm_head: fused final RMSNorm + projection + greedy argmax.
 //   lm_head.topk: fused projection + host penalty state + exact top-1024.
-// The KV cache is this adapter's: 32 paged pools [pages][K, V][256][4][128] bf16.
+// The KV cache is this adapter's: one paged pool per layer [pages][K, V][256][KV heads][128] bf16.
 // There is no recurrent state and no MTP; core/seqstate owns the restart points.
 
 #include "../model.h"
@@ -33,6 +35,19 @@ namespace axera {
 namespace {
 
 constexpr int PG = 256;  // cells per page = prefill rows per call
+constexpr int HD = 128;  // head_dim
+
+// what the kernels of one model were compiled for
+struct dense_family {
+    const char * tag;               // the manifest's model name (logs)
+    const char * magic;             // the sequence-state blob's magic (saved slots stay readable)
+    int          layers;
+    int          kv_heads;
+    float        norm_eps;          // the final norm's eps the merged head was built with
+    bool         qk_rope_permuted;  // GGUF q/k rows in llama.cpp's interleaved RoPE layout
+};
+constexpr dense_family CPM5 = { "cpm5", "CPM5S1", 42, 2, 1e-6f, true };
+constexpr dense_family HYMT = { "hymt", "HYMTS1", 32, 4, 1e-5f, false };
 
 struct call {
     const kernel *                     k = nullptr;
@@ -41,7 +56,7 @@ struct call {
 
 // the adapter blob in llama.cpp's sequence state (context checkpoints / prompt cache):
 // the KV pages before the current cell and core/seqstate's own restart-point blob.
-struct hymt_state_header {
+struct dense_state_header {
     char     magic[8];
     uint32_t version;
     uint32_t kind;
@@ -55,9 +70,9 @@ struct hymt_state_header {
     uint32_t reserved;
 };
 
-class hymt final : public model, public seq_model {
+class llama_dense final : public model, public seq_model {
   public:
-    explicit hymt(const manifest & m) : man(m), prm(m) {}
+    llama_dense(const manifest & m, const dense_family & f) : fam(f), man(m), prm(m) {}
     ggml_status compute(ggml_cgraph * g) override;
     size_t       state_size(uint32_t flags) const override;
     size_t       state_write(void * dst, size_t size, uint32_t flags) override;
@@ -72,6 +87,7 @@ class hymt final : public model, public seq_model {
     void     seq_rows(int batch_row0, int n, uint16_t * dst) override;
 
   private:
+    const dense_family & fam;
     const manifest & man;
     params           prm;
     graph_names      names;
@@ -81,7 +97,7 @@ class hymt final : public model, public seq_model {
     int64_t          kv_cells = 0;
     size_t           kv_b = 0, kv_alloc = 0;
 
-    std::vector<axera_cmm>           KVC;  // one pool per layer (32 compact IOs)
+    std::vector<axera_cmm>           KVC;  // one pool per layer (compact IOs)
     std::map<std::string, axera_cmm> banks;
     call                             pre, dec;
     axera_cmm                        PX, POUT, POS, VALID, INDPTR, INDICES, LASTLEN, CLOC;
@@ -112,15 +128,15 @@ class hymt final : public model, public seq_model {
     void      decode(int64_t c, int t, const ggml_bf16_t * x, float * h);
 };
 
-axera_cmm hymt::bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d, const rope & rp) {
+axera_cmm llama_dense::bank(const std::map<std::string, ggml_tensor *> & t, const io_desc & d, const rope & rp) {
     static const std::regex re("b0_(attn|mlp)_(.+)");
     std::smatch             mt;
     if (!std::regex_match(d.name, mt, re)) {
-        GGML_ABORT("axera hymt: prefill: unexpected input %s\n", d.name.c_str());
+        GGML_ABORT("axera %s: prefill: unexpected input %s\n", fam.tag, d.name.c_str());
     }
     const bool        mlp = mt[1] == "mlp";
     const std::string n   = mt[2];
-    const int         nb  = (int) d.shape[0];  // 32 blocks; cos / sin are one shared table
+    const int         nb  = (int) d.shape[0];  // one block per layer; cos / sin are one shared table
     GGML_ASSERT(nb > 0 && d.bytes % nb == 0);
     axera_cmm         c  = axera_cmm_alloc(d.bytes);
     const size_t      bb = d.bytes / nb;
@@ -129,7 +145,7 @@ axera_cmm hymt::bank(const std::map<std::string, ggml_tensor *> & t, const io_de
     auto T = [&](int il, const char * g) -> ggml_tensor * {
         const std::string nm = "blk." + std::to_string(il) + "." + g;
         if (!t.count(nm)) {
-            GGML_ABORT("axera hymt: %s not in the graph\n", nm.c_str());
+            GGML_ABORT("axera %s: %s not in the graph\n", fam.tag, nm.c_str());
         }
         read.push_back(t.at(nm));
         return t.at(nm);
@@ -155,18 +171,33 @@ axera_cmm hymt::bank(const std::map<std::string, ggml_tensor *> & t, const io_de
             const ggml_tensor * w = T(il, g);
             const int64_t       K = w->ne[0];
             GGML_ASSERT((size_t) ggml_nrows(w) * (scales ? K / AXERA_MX_GROUP : K) == bb);
-            // HunYuan's converter keeps q/k in the HF half-split RoPE layout
-            // (no convert_hf_to_gguf permute), which is exactly what the kernels
-            // rotate.  Rows therefore map one-to-one; v/o are the same in both.
+            // A permuted GGUF (convert_hf_to_gguf's permute()) stores q/k in the interleaved RoPE layout; the
+            // kernels rotate the HF half-split layout, so map every GGUF row back to its HF output channel.
+            // v/o are never permuted.
+            int64_t n_head = 0;
+            if (fam.qk_rope_permuted && strcmp(g, "attn_q.weight") == 0) {
+                n_head = H / HD;
+            } else if (fam.qk_rope_permuted && strcmp(g, "attn_k.weight") == 0) {
+                n_head = fam.kv_heads;
+            }
+            const int64_t m = n_head ? w->ne[1] / n_head / 2 : 0;  // head_dim / 2
+            auto          row_hf = [&](int64_t r) -> int64_t {
+                if (!n_head) {
+                    return r;
+                }
+                const int64_t h = r / (2 * m), rem = r % (2 * m);
+                return (h * 2 + rem % 2) * m + rem / 2;
+            };
             axera_for_rows_f32(w, [&](int64_t r, const float * row) {
                 thread_local std::vector<uint8_t> q, s;
                 q.resize(K);
                 s.resize(K / AXERA_MX_GROUP);
                 axera_quantize_row_mxfp8_f32(row, q.data(), s.data(), K);
+                const int64_t rh = row_hf(r);
                 if (scales) {
-                    memcpy(dst + r * (K / AXERA_MX_GROUP), s.data(), s.size());
+                    memcpy(dst + rh * (K / AXERA_MX_GROUP), s.data(), s.size());
                 } else {
-                    memcpy(dst + r * K, q.data(), q.size());
+                    memcpy(dst + rh * K, q.data(), q.size());
                 }
             });
         };
@@ -200,7 +231,7 @@ axera_cmm hymt::bank(const std::map<std::string, ggml_tensor *> & t, const io_de
             } else if (n.rfind("w_scale", 0) == 0 && W.count(n.substr(7))) {
                 mx8(W.at(n.substr(7)), true);
             } else {
-                GGML_ABORT("axera hymt: prefill: unexpected MLP input %s\n", d.name.c_str());
+                GGML_ABORT("axera %s: prefill: unexpected MLP input %s\n", fam.tag, d.name.c_str());
             }
         } else {
             static const std::map<std::string, const char *> W = {
@@ -217,7 +248,7 @@ axera_cmm hymt::bank(const std::map<std::string, ggml_tensor *> & t, const io_de
             } else if (W.count(p) && (n == "w_" + p || n == "w_scale_" + p)) {
                 mx8(W.at(p), n != "w_" + p);
             } else {
-                GGML_ABORT("axera hymt: prefill: unexpected attention input %s\n", d.name.c_str());
+                GGML_ABORT("axera %s: prefill: unexpected attention input %s\n", fam.tag, d.name.c_str());
             }
         }
     }
@@ -230,11 +261,11 @@ axera_cmm hymt::bank(const std::map<std::string, ggml_tensor *> & t, const io_de
     return c;
 }
 
-void hymt::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_) {
+void llama_dense::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_) {
     L = L_;
     H = H_;
     L_ = 0;
-    GGML_ASSERT(H_ == 2048 && L == 32);
+    GGML_ASSERT(H_ == 2048 && L == fam.layers);
     const kernel & pk = man.get("prefill");
     const kernel & dk = man.get("decode");
 
@@ -249,15 +280,15 @@ void hymt::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tenso
     });
     GGML_ASSERT((int) kvd.size() == L);
     const io_desc & kv0 = *kvd[0];
-    GGML_ASSERT(kv0.shape.size() == 5 && kv0.shape[2] == PG && kv0.shape[3] == 4 && kv0.shape[4] == 128);
-    NBLK = (int) kv0.shape[0];  // [pages][K,V][256][4 heads][128]
+    GGML_ASSERT(kv0.shape.size() == 5 && kv0.shape[2] == PG && kv0.shape[3] == fam.kv_heads && kv0.shape[4] == HD);
+    NBLK = (int) kv0.shape[0];  // [pages][K,V][256][KV heads][128]
     GGML_ASSERT((int64_t) NBLK * PG == man.context);
     kv_b     = kv0.bytes;
     kv_pages = llm_kv_pages(NBLK, PG);
     kv_cells = (int64_t) kv_pages * PG;
     kv_alloc = kv_b / NBLK * kv_pages;
     if (kv_pages < NBLK) {
-        GGML_LOG_INFO("axera hymt: the KV pools hold %d of the kernels' %d pages (%lld cells)\n",
+        GGML_LOG_INFO("axera %s: the KV pools hold %d of the kernels' %d pages (%lld cells)\n", fam.tag,
                       kv_pages, NBLK, (long long) kv_cells);
     }
     KVC.resize(L);
@@ -308,11 +339,11 @@ void hymt::init(const std::map<std::string, ggml_tensor *> & t, const ggml_tenso
     for (const auto & [n, b] : banks) {
         bsum += b->size;
     }
-    GGML_LOG_INFO("axera hymt: %d layers, banks %.2f GiB, KV %.2f GiB (%d of %d pages, %lld cells)\n",
+    GGML_LOG_INFO("axera %s: %d layers, banks %.2f GiB, KV %.2f GiB (%d of %d pages, %lld cells)\n", fam.tag,
                   L, bsum / 1073741824.0, (double) kv_alloc * L / 1073741824.0, kv_pages, NBLK, (long long) kv_cells);
 }
 
-void hymt::bind_calls(ggml_tensor * logits) {
+void llama_dense::bind_calls(ggml_tensor * logits) {
     const kernel & pk = man.get("prefill");
     const kernel & dk = man.get("decode");
     auto kv_index = [&](const std::string & n) { return atoi(n.c_str() + 5); };
@@ -381,11 +412,11 @@ void hymt::bind_calls(ggml_tensor * logits) {
     bind_common(dk, dec, false);
 }
 
-void hymt::paging(int64_t hist, int64_t write_cell) {
+void llama_dense::paging(int64_t hist, int64_t write_cell) {
     llm_paging(INDPTR, LASTLEN, CLOC, hist, write_cell, PG);
 }
 
-void hymt::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
+void llama_dense::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
                    ggml_tensor * logits, const std::vector<int32_t> & rows) {
     GGML_ASSERT(c0 % PG == 0 && c0 >= 0 && n >= 0 && c0 + n <= kv_cells);
     for (int r0 = 0; r0 < n; r0 += PG) {
@@ -446,9 +477,9 @@ void hymt::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4,
     }
 }
 
-void hymt::decode(int64_t c, int t, const ggml_bf16_t * x, float * h) {
+void llama_dense::decode(int64_t c, int t, const ggml_bf16_t * x, float * h) {
     (void) t;
-    memcpy(DX->vir, x, H * sizeof(ggml_bf16_t));
+        memcpy(DX->vir, x, H * sizeof(ggml_bf16_t));
     DX->flush(DX->vir, H * sizeof(ggml_bf16_t));
     *(int32_t *) DPOS->vir = (int32_t) c;
     DPOS->flush();
@@ -467,21 +498,21 @@ void hymt::decode(int64_t c, int t, const ggml_bf16_t * x, float * h) {
     ggml_bf16_to_fp32_row((const ggml_bf16_t *) DOUT->vir, h, H);
 }
 
-ggml_status hymt::compute(ggml_cgraph * g) {
+ggml_status llama_dense::compute(ggml_cgraph * g) {
     last_seq_status = 0;
     const auto &  t       = names.of(g);
     ggml_tensor * norm0   = names.find("attn_norm-0");
     ggml_tensor * logits  = names.find("result_output");
     ggml_tensor * inp_pos = names.find("inp_pos");
     if (!norm0 || !logits || !inp_pos) {
-        GGML_LOG_ERROR("axera hymt: a graph of %d nodes that is not the whole model (-ngl 99)\n", g->n_nodes);
+        GGML_LOG_ERROR("axera %s: a graph of %d nodes that is not the whole model (-ngl 99)\n", fam.tag, g->n_nodes);
         return GGML_STATUS_FAILED;
     }
     ggml_tensor * x0 = llm_input(g, norm0);
     const int H_ = (int) x0->ne[0], T = (int) x0->ne[1];
     int       L_ = llm_layers(t);
     const ggml_tensor * rope_node = llm_rope_node(g);
-    GGML_ASSERT(rope_node && "axera hymt: no ROPE node in the graph");
+    GGML_ASSERT(rope_node && "axera llama_dense: no ROPE node in the graph");
     const ggml_tensor * w0 = t.at("blk.0.attn_norm.weight");
     if (bound != w0->data || L_ != L) {
         init(t, rope_node, L_, H_);
@@ -509,13 +540,13 @@ ggml_status hymt::compute(ggml_cgraph * g) {
         }
         float         eps = 0.0f;
         const float * gw  = final_norm(hn, H, &eps);
-        GGML_ASSERT(gw && eps == 1e-5f);
+        GGML_ASSERT(gw && eps == fam.norm_eps);
         head.set_merged_norm(gw, H);
         if (T > 1) {
             pre_logits = logits;
             const int n_out = (int) logits->ne[1];
             if (n_out > 4) {
-                GGML_ABORT("axera hymt: a prompt asking for %d logits rows; the merged prefill head covers 4\n", n_out);
+                GGML_ABORT("axera %s: a prompt asking for %d logits rows; the merged prefill head covers 4\n", fam.tag, n_out);
             }
             ggml_tensor * out_ids = nullptr;
             if (n_out < T) {
@@ -545,7 +576,7 @@ ggml_status hymt::compute(ggml_cgraph * g) {
     const ggml_tensor * kqm    = names.find("attn_inp_kq_mask");
     GGML_ASSERT(k_idxs && k_idxs->type == GGML_TYPE_I64 && k_idxs->ne[0] == T && kqm);
     const kv_view kv(k_idxs, kqm, man.context, PG);
-    if (!llm_one_sequence(kv, T, "hymt")) {
+    if (!llm_one_sequence(kv, T, fam.tag)) {
         return GGML_STATUS_FAILED;
     }
     std::vector<int32_t> pb;
@@ -568,7 +599,7 @@ ggml_status hymt::compute(ggml_cgraph * g) {
     last_seq_status = 0;
     const seq_status sst = seq->feed(kv.cell_of(0), T, (const uint16_t *) xb.data(), pb.data());
     if (sst != SEQ_OK) {
-        last_seq_status = (int) llm_seq_log(sst, kv.cell_of(0), *seq, "hymt");
+        last_seq_status = (int) llm_seq_log(sst, kv.cell_of(0), *seq, fam.tag);
         return GGML_STATUS_FAILED;
     }
 
@@ -592,7 +623,7 @@ ggml_status hymt::compute(ggml_cgraph * g) {
     return GGML_STATUS_SUCCESS;
 }
 
-seq_caps hymt::seq_get_caps() const {
+seq_caps llama_dense::seq_get_caps() const {
     seq_caps c;
     c.page           = PG;
     c.width          = H;
@@ -603,7 +634,7 @@ seq_caps hymt::seq_get_caps() const {
     return c;
 }
 
-bool hymt::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t * p4, int batch0, seq_snap * snap) {
+bool llama_dense::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t * p4, int batch0, seq_snap * snap) {
     (void) snap;  // KV needs no rewind: seqstate replays from the page's first cell
     const ggml_bf16_t * xb = (const ggml_bf16_t *) x;
     if (!xb) {
@@ -616,7 +647,7 @@ bool hymt::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t * 
     return true;
 }
 
-bool hymt::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p4, int batch_row) {
+bool llama_dense::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p4, int batch_row) {
     (void) p4;
     const uint16_t * xr = x;
     if (!xr) {
@@ -628,7 +659,7 @@ bool hymt::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p4, int
     return true;
 }
 
-void hymt::seq_rows(int batch_row0, int n, uint16_t * dst) {
+void llama_dense::seq_rows(int batch_row0, int n, uint16_t * dst) {
     if (n <= 0) {
         return;
     }
@@ -639,7 +670,7 @@ void hymt::seq_rows(int batch_row0, int n, uint16_t * dst) {
     }
 }
 
-size_t hymt::state_size(uint32_t flags) const {
+size_t llama_dense::state_size(uint32_t flags) const {
     if (KVC.empty() || !seq) {
         return 0;
     }
@@ -651,10 +682,10 @@ size_t hymt::state_size(uint32_t flags) const {
     const int64_t state_cell = std::max<int64_t>(0, seq->cell());
     const size_t  nkv_pages  = partial ? 0 :
         std::min<size_t>((size_t) kv_pages, (size_t) ((state_cell + PG - 1) / PG));
-    return sizeof(hymt_state_header) + seq_n + (size_t) KVC.size() * nkv_pages * (kv_b / NBLK);
+    return sizeof(dense_state_header) + seq_n + (size_t) KVC.size() * nkv_pages * (kv_b / NBLK);
 }
 
-size_t hymt::state_write(void * dst, size_t size, uint32_t flags) {
+size_t llama_dense::state_write(void * dst, size_t size, uint32_t flags) {
     axera_timer tw("state write");
     const size_t total = state_size(flags);
     if (!total || size < total) {
@@ -664,9 +695,9 @@ size_t hymt::state_write(void * dst, size_t size, uint32_t flags) {
     const size_t seq_n     = seq->size(partial);
     const size_t nkv_pages = partial ? 0 :
         std::min<size_t>((size_t) kv_pages, (size_t) ((std::max<int64_t>(0, seq->cell()) + PG - 1) / PG));
-    hymt_state_header h;
+    dense_state_header h;
     memset(&h, 0, sizeof(h));
-    memcpy(h.magic, "HYMTS1", sizeof(h.magic) - 1);
+    memcpy(h.magic, fam.magic, sizeof(h.magic) - 1);
     h.version    = 1;
     h.kind       = 1;
     h.partial    = partial;
@@ -694,15 +725,15 @@ size_t hymt::state_write(void * dst, size_t size, uint32_t flags) {
     return (size_t) (p - (char *) dst);
 }
 
-size_t hymt::state_read(const void * src, size_t size, uint32_t flags) {
+size_t llama_dense::state_read(const void * src, size_t size, uint32_t flags) {
     axera_timer tr("state read");
-    if (size < sizeof(hymt_state_header)) {
+    if (size < sizeof(dense_state_header)) {
         return 0;
     }
     const bool partial = flags & state_flags_partial_only;
-    hymt_state_header h;
+    dense_state_header h;
     memcpy(&h, src, sizeof(h));
-    if (memcmp(h.magic, "HYMTS1", sizeof(h.magic) - 1) != 0 || h.version != 1 || h.kind != 1 ||
+    if (memcmp(h.magic, fam.magic, sizeof(h.magic) - 1) != 0 || h.version != 1 || h.kind != 1 ||
         h.partial != partial || !h.seq_n || h.nkv != KVC.size() || h.kv_page_b != kv_b / NBLK ||
         (partial ? h.nkv_pages != 0 || h.kv_n != 0 :
                    h.nkv_pages > (uint32_t) kv_pages ||
@@ -732,8 +763,12 @@ size_t hymt::state_read(const void * src, size_t size, uint32_t flags) {
 
 }  // namespace
 
+std::shared_ptr<model> make_cpm5(const manifest & m) {
+    return std::make_shared<llama_dense>(m, CPM5);
+}
+
 std::shared_ptr<model> make_hymt(const manifest & m) {
-    return std::make_shared<hymt>(m);
+    return std::make_shared<llama_dense>(m, HYMT);
 }
 
 }  // namespace axera
