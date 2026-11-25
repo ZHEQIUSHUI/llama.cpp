@@ -80,9 +80,8 @@ class qwen38_27b final : public model, public seq_model, gdn_state {
     axera_cmm              KV;
     // the pages of the cache the pools hold (GGML_AXERA_KV_PAGES; default: the kernels' context): the kernels keep their
     // declared IO size but touch only the pages up to the runtime page count, so a smaller context needs only its pages
-    int                            dec_result = 0;
     const axera_cmm *              dec_out = nullptr;
-    axera_cmm                      A2, DIN, B, C, D;
+    axera_cmm                      A2, DIN;
     gdn_mtp mtp;  // the MTP block (draft context graphs)
     // the prefill kernel variants: 256 rows, and the 128 / 64-row tails that hold the last page of a prompt
     output_head                    head;
@@ -102,7 +101,6 @@ class qwen38_27b final : public model, public seq_model, gdn_state {
 
     void init(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
     void init_fused(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
-    void init_fused_phases(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_);
     gdn_mtp_env mtp_env();
     axera_cmm bank_fused(const std::map<std::string, ggml_tensor *> & t, const io_desc & d);
     int       vtiled(int g) const { return (g % REPf) * KHd + g / REPf; }
@@ -666,9 +664,6 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
     A   = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
     A2  = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
     DIN = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
-    B = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
-    C = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
-    D = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
     banks.clear();
     {
         axera_timer tb("init: fused banks");
@@ -805,259 +800,6 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
                   (long long) man.context);
 }
 
-
-// The 2-core build of the upstream fused graph is numerically wrong once a GQA phase follows a delta-net phase in
-// the same axmodel (CRUN: cos 0.78 for the full graph, 0.89 for [GDN, GQA]; the board reproduces it). The fix that
-// keeps the upstream kernels untouched is to compile each 4-layer block twice: one axmodel with the three delta-net
-// stages, one with the attention stage. This adapter runs them in layer order, block by block, on the same weight
-// banks / state pools / KV pools. The manifests name the four roles prefill.gdn, prefill.attn, decode.gdn,
-// decode.attn.
-void qwen38_27b::init_fused_phases(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node,
-                                   int L_, int H_) {
-    (void) rope_node;
-    L    = L_;
-    H    = H_;
-    fused = true;
-    nv4   = true;
-    GGML_ASSERT(L % 4 == 0);
-    NB = L / 4;
-    const kernel & kg = man.get("prefill.gdn");
-    const kernel & ka = man.get("prefill.attn");
-    const kernel & km = man.get("prefill.mlp");
-    const kernel & dg = man.get("decode.gdn");
-    const kernel & da = man.get("decode.attn");
-    const kernel & dm = man.get("decode.mlp");
-    // The 2-core fallback splits the phase-3 attention and MLP into separate
-    // graphs; the attention stage is the one that diverged when fused with MLP.
-    // Require all six roles so a half-updated package fails at load, not silently.
-    auto in_of = [&](const kernel & k, const std::string & n) -> const io_desc & {
-        for (const auto & d : k.desc->in) {
-            if (d.name == n) return d;
-        }
-        for (const auto & d : k.desc->out) {
-            if (d.name == n) return d;
-        }
-        GGML_ABORT("axera qwen38_27b: %s has no IO %s\n", k.desc->file.c_str(), n.c_str());
-    };
-    if (kg.find_input("b0_attn_w_q") < 0) {
-        GGML_ABORT("axera qwen38_27b: phase prefill needs the per-projection delta-net banks\n");
-    }
-    KB = (int) in_of(kg, "b0_mlp_w_norm").shape[0];
-    GGML_ASSERT(KB == 1);
-    NC = NB;
-    const io_desc & pst = in_of(kg, "b0_attn_state_in");
-    const io_desc & pcq = in_of(kg, "b0_attn_q_conv_state_in");
-    const io_desc & pcv = in_of(kg, "b0_attn_v_conv_state_in");
-    GGML_ASSERT(pst.shape.size() == 5);
-    VH  = (int) pst.shape[2];
-    KD  = (int) pst.shape[3];
-    VD  = (int) pst.shape[4];
-    st_b = pst.bytes / (size_t) KB;
-    cq_b = pcq.bytes / (size_t) KB;
-    cv_b = pcv.bytes / (size_t) KB;
-    const io_desc & pq = in_of(kg, "b0_attn_w_q");
-    GGML_ASSERT(pq.shape.size() == 3 && pq.shape[1] % KD == 0);
-    KHd  = (int) (pq.shape[1] / KD);
-    REPf = VH / KHd;
-    GGML_ASSERT(KHd > 0 && REPf > 0 && VH % KHd == 0);
-
-    const io_desc & pkv = in_of(ka, "b3_kv");
-    GGML_ASSERT(pkv.shape.size() >= 5 && pkv.bytes % (size_t) KB == 0);
-    const size_t kd = pkv.shape.size();
-    GGML_ASSERT(kd >= 6 && pkv.shape[kd - 6] == KB && pkv.shape[kd - 4] == 2 && pkv.shape[kd - 3] == PG &&
-                pkv.shape[kd - 1] == 256);
-    kv_blk_b = pkv.bytes;
-    kv_b     = pkv.bytes;
-    kv_alloc = kv_b;
-    kv_pages = (int) pkv.shape[kd - 5];
-    kv_cells = man.context;
-    GGML_ASSERT((int64_t) kv_pages * PG >= (int64_t) man.context);
-    NBLK = kv_pages;
-    ROT  = 64;
-    kvs_b = 0;
-    KVSC.clear();
-    KVC.resize(NB);
-    for (int b = 0; b < NB; ++b) {
-        KVC[b] = axera_cmm_alloc(kv_b);
-    }
-    ST = axera_cmm_alloc(st_b * (size_t) NB * 3);
-    CQ = axera_cmm_alloc(cq_b * (size_t) NB * 3);
-    CK = axera_cmm_alloc(cq_b * (size_t) NB * 3);
-    CV = axera_cmm_alloc(cv_b * (size_t) NB * 3);
-    state_image_b = ST->size + CQ->size + CK->size + CV->size;
-
-    INDPTR  = axera_cmm_alloc(2 * sizeof(int32_t));
-    INDICES = axera_cmm_alloc(kg.in_bytes("indices"));
-    LASTLEN = axera_cmm_alloc(std::max(kg.in_bytes("last_page_len"),
-                                       std::max(dg.in_bytes("last_page_len"), da.in_bytes("last_page_len"))));
-    CLOC  = axera_cmm_alloc(2 * sizeof(int32_t));
-    VALID = axera_cmm_alloc(sizeof(int32_t));
-    const int n_indices = (int) (kg.in_bytes("indices") / sizeof(int32_t));
-    GGML_ASSERT(n_indices >= (int) ((man.context + PG - 1) / PG) && n_indices <= kv_pages);
-    for (int i = 0; i < n_indices; ++i) {
-        ((int32_t *) INDICES->vir)[i] = i;
-    }
-    INDICES->flush();
-
-    A = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
-    B = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
-    C = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
-    D = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
-    banks.clear();
-    auto skip = [](const std::string & n) {
-        static const std::set<std::string> rt = { "x", "position_ids", "indptr", "indices", "last_page_len",
-                                                  "cache_location", "valid_tokens", "b3_kv", "residual" };
-        if (rt.count(n)) return true;
-        return n.size() > 2 && n[0] == 'b' && n[1] >= '0' && n[1] <= '2' &&
-               (n.find("_state_in") != std::string::npos || n.find("_conv_state_in") != std::string::npos);
-    };
-    for (const kernel * k : { &kg, &ka, &km, &dg, &da, &dm }) {
-        for (const auto & d : k->desc->in) {
-            if (!skip(d.name) && !banks.count(d.name)) {
-                banks[d.name] = bank_fused(t, d);
-            }
-        }
-    }
-
-    gdn_page_set & P = pfs[0];
-    P.k             = &kg;
-    P.rows          = PG;
-    P.X             = axera_cmm_alloc(kg.in_bytes("x"));
-    P.POS           = axera_cmm_alloc(kg.in_bytes("position_ids"));
-    for (int i = 0; i < 4; ++i) {
-        P.OUT[i] = axera_cmm_alloc(kg.out_bytes("output"));
-    }
-    GGML_ASSERT(kg.in_bytes("x") == (size_t) PG * H * sizeof(ggml_bf16_t) &&
-                kg.in_bytes("position_ids") == 3 * (size_t) PG * sizeof(int32_t) &&
-                kg.out_bytes("output") == (size_t) PG * H * sizeof(ggml_bf16_t) &&
-                ka.in_bytes("x") == kg.in_bytes("x") && ka.out_bytes("output") == kg.out_bytes("output") &&
-                km.out_bytes("output") == kg.out_bytes("output") &&
-                dm.out_bytes("output") == (size_t) H * sizeof(ggml_bf16_t));
-
-    auto state_io = [&](const std::string & n, int b) -> AX_ENGINE_IO_BUFFER_T {
-        const int ph = n[1] - '0';
-        const size_t per = n.find("q_conv_state") != std::string::npos ? cq_b :
-                           n.find("k_conv_state") != std::string::npos ? cq_b :
-                           n.find("v_conv_state") != std::string::npos ? cv_b : st_b;
-        const axera_cmm * p = n.find("q_conv_state") != std::string::npos ? &CQ :
-                              n.find("k_conv_state") != std::string::npos ? &CK :
-                              n.find("v_conv_state") != std::string::npos ? &CV : &ST;
-        GGML_ASSERT(ph >= 0 && ph < 3 && b >= 0 && b < NB);
-        const size_t off = ((size_t) ph * NB + (size_t) b) * per;
-        return axera_io(p->get(), (char *) (*p)->vir + off, per);
-    };
-    auto bind_phase = [&](bool decode, std::vector<call> & calls, int & result) {
-        calls.clear();
-        // Three kernels per block (delta-net phases 0-2, attention, MLP) with a
-        // four-buffer rotation: block input, GDN out, attention out, MLP out.
-        // After NB=8 blocks the rotation returns to buffer 0, the page result.
-        const kernel * ks[3] = { decode ? &dg : &kg, decode ? &da : &ka, decode ? &dm : &km };
-        auto buf = [&](int i) -> axera_cmm & {
-            if (decode) {
-                return i == 0 ? A : i == 1 ? B : i == 2 ? C : D;
-            }
-            return P.OUT[i];
-        };
-        int cur = 0;
-        for (int b = 0; b < NB; ++b) {
-            for (int j = 0; j < 3; ++j) {
-                const kernel * k = ks[j];
-                const int ini  = (cur + j) & 3;
-                const int outi = (cur + j + 1) & 3;
-                call c;
-                c.k = k;
-                for (const auto & d : k->desc->in) {
-                    const std::string & n = d.name;
-                    if (n == "x") {
-                        c.in.push_back(axera_io(buf(ini), d.bytes));
-                    } else if (n == "residual") {
-                        // MLP keeps the block input as its residual while
-                        // attention has already replaced the activation.
-                        c.in.push_back(axera_io(buf(cur), d.bytes));
-                    } else if (n == "position_ids") {
-                        c.in.push_back(axera_io(P.POS, d.bytes));
-                    } else if (n == "indptr") {
-                        c.in.push_back(axera_io(INDPTR, d.bytes));
-                    } else if (n == "indices") {
-                        c.in.push_back(axera_io(INDICES, d.bytes));
-                    } else if (n == "last_page_len") {
-                        c.in.push_back(axera_io(LASTLEN, d.bytes));
-                    } else if (n == "cache_location") {
-                        c.in.push_back(axera_io(CLOC, d.bytes));
-                    } else if (n == "valid_tokens") {
-                        c.in.push_back(axera_io(VALID, d.bytes));
-                    } else if (n == "b3_kv") {
-                        GGML_ASSERT(d.bytes == kv_b);
-                        c.in.push_back(axera_io(KVC[b], d.bytes));
-                    } else if (n.size() > 2 && n[0] == 'b' && n[1] >= '0' && n[1] <= '2' &&
-                               (n.find("_state_in") != std::string::npos || n.find("_conv_state_in") != std::string::npos)) {
-                        c.in.push_back(state_io(n, b));
-                    } else {
-                        auto it = banks.find(n);
-                        if (it == banks.end()) {
-                            GGML_ABORT("axera qwen38_27b: fused phases: %s: unexpected input %s\n",
-                                       k->desc->role.c_str(), n.c_str());
-                        }
-                        const bool shared = n == "b3_attn_cos_sin_cache";
-                        const size_t off  = shared ? 0 : (size_t) b * d.bytes;
-                        GGML_ASSERT(it->second->size >= off + d.bytes);
-                        c.in.push_back(axera_io(it->second.get(), (char *) it->second->vir + off, d.bytes));
-                    }
-                }
-                for (const auto & d : k->desc->out) {
-                    GGML_ASSERT(d.name == "output" &&
-                                d.bytes == (decode ? (size_t) H * sizeof(ggml_bf16_t) : P.OUT[0]->size));
-                    c.out.push_back(axera_io(buf(outi), d.bytes));
-                }
-                calls.push_back(std::move(c));
-            }
-            cur = (cur + 3) & 3;
-        }
-        result = cur;
-    };
-    bind_phase(false, P.calls, P.result);
-    bind_phase(true, dec, dec_result);
-    dec_out = dec_result == 0 ? &A : dec_result == 1 ? &B : dec_result == 2 ? &C : &D;
-
-    ord.assign(L, 0);
-    int ng = 0, na = 0;
-    for (int il = 0; il < L; ++il) {
-        const bool g = t.count("blk." + std::to_string(il) + ".ssm_a") > 0;
-        if (g != (il % 4 != 3)) {
-            GGML_ABORT("axera qwen38_27b: layer %d is not the 3 delta-net + 1 attention pattern\n", il);
-        }
-        if (g) {
-            ord[il] = (il % 4) * NB + il / 4;
-            ++ng;
-        } else {
-            ord[il] = il / 4;
-            ++na;
-        }
-    }
-    G = L;
-    for (int k = 0; k < 4; ++k) {
-        where[k].assign(ng, {});
-        for (int g = 0; g < ng; ++g) {
-            where[k][g] = { pool(k).get(), (char *) pool(k)->vir + g * part(k) };
-        }
-    }
-    cur_set    = -1;
-    state_zero = true;
-    ver_rows   = 0;
-    state_ios.clear();
-    ver.clear();
-
-    seq = std::make_unique<seqstate>(*this, seq_config_env(1));
-    size_t bb = 0;
-    for (const auto & [n, b] : banks) {
-        bb += b->size;
-    }
-    GGML_LOG_INFO("axera qwen38_27b: fused phases %d layers, %d blocks, GDN+attn kernels, banks %.2f GiB, "
-                  "state %.2f GiB, %lld cells\n",
-                  L, NB, bb / 1073741824.0,
-                  (double) (KVC.size() * kv_b + ST->size + CQ->size + CK->size + CV->size) / 1073741824.0,
-                  (long long) man.context);
-}
 
 // the calls' state outputs to where the state is
 // the current state into the pools (the prefill kernel's, the decode calls' default)
@@ -1268,9 +1010,7 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
     GGML_ASSERT(rope_node && "axera qwen38_27b: no ROPE node in the graph");
     const ggml_tensor * w0 = t.at("blk.0.attn_norm.weight");
     if (bound != w0->data || L_ != L) {
-        if (man.has("prefill.gdn")) {
-            init_fused_phases(t, rope_node, L_, H_);
-        } else if (man.has("decode") && !man.has("decode.group")) {
+        if (man.has("decode") && !man.has("decode.group")) {
             init_fused(t, rope_node, L_, H_);
         } else {
             init(t, rope_node, L_, H_);
