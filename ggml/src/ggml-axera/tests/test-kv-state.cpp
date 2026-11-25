@@ -1,7 +1,8 @@
 // Host test of core/kv_state: a KV-only fake model (pools of per-cell hashes, no recurrent state) under core/seqstate.
 // A blob written after a prompt restores the pools and the sequence: the continuation after the restore must equal the
 // one without it. Blobs of another format (magic, version, pool count, page size, context) and short buffers are
-// refused, and a refused read leaves nothing half-done that a later valid read cannot repair.
+// refused, and a refused read leaves nothing half-done that a later valid read cannot repair. A tail (an adapter's own
+// cache after seqstate's blob) round-trips, and a tail its reader refuses refuses the blob before any pool is written.
 //
 // Build and run (no SDK needed): ggml/src/ggml-axera/tests/run-host-tests.sh
 
@@ -139,6 +140,49 @@ bool same_pools(const fake & a, const fake & b, int64_t cells) {
     return true;
 }
 
+// a tail of n bytes, the first its length
+struct tail final : kv_tail {
+    std::vector<uint8_t> b;
+    bool                 refuse = false;
+    size_t tail_size(bool) const override { return b.size(); }
+    void   tail_write(uint8_t * dst, bool) const override { memcpy(dst, b.data(), b.size()); }
+    bool   tail_check(const uint8_t * src, size_t n, bool, int64_t) const override {
+        return !refuse && (n == 0 || src[0] == (uint8_t) n);
+    }
+    void tail_read(const uint8_t * src, size_t n) override { b.assign(src, src + n); }
+};
+
+void test_tail(const kv_state_format & f) {
+    run a;
+    a.feed(0, PG + 3, 11);
+    tail ta;
+    ta.b = { 5, 1, 2, 3, 4 };
+    const size_t n = kv_state_size(f, a.m, a.s, false, &ta);
+    REQUIRE(n == kv_state_size(f, a.m, a.s, false) + 5, "the tail's bytes");
+    std::vector<uint8_t> blob(n);
+    REQUIRE(kv_state_write(f, a.m, a.s, blob.data(), n, false, &ta) == n, "write with a tail");
+
+    run b;
+    b.feed(0, 3, 99);
+    const auto before = b.m.pool;
+    tail tb;
+    REQUIRE(kv_state_read(f, b.m, b.s, blob.data(), n, false) == 0, "a blob with a tail needs a reader with one");
+    tb.refuse = true;
+    REQUIRE(kv_state_read(f, b.m, b.s, blob.data(), n, false, &tb) == 0, "a refused tail refuses the blob");
+    REQUIRE(b.m.pool == before && b.m.synced_npu == 0, "a refused tail: no pool written");
+    tb.refuse = false;
+    REQUIRE(kv_state_read(f, b.m, b.s, blob.data(), n, false, &tb) == n, "read with a tail");
+    REQUIRE(tb.b == ta.b, "the tail round-trips");
+    REQUIRE(same_pools(a.m, b.m, PG + 3), "the pools with a tail");
+
+    // a blob without a tail into a reader with one: the tail's read sees 0 bytes
+    const size_t m = kv_state_size(f, a.m, a.s, false);
+    std::vector<uint8_t> plain(m);
+    REQUIRE(kv_state_write(f, a.m, a.s, plain.data(), m, false) == m, "write without a tail");
+    REQUIRE(kv_state_read(f, b.m, b.s, plain.data(), m, false, &tb) == m && tb.b.empty(), "an empty tail");
+    printf("tail: OK\n");
+}
+
 }  // namespace
 
 int main() {
@@ -207,6 +251,7 @@ int main() {
         REQUIRE(kv_state_read(f, a.m, a.s, pb.data(), pn, true) == pn, "partial read");
         printf("prompt %3d: blob %6zu bytes (partial %zu): restore + continue OK\n", prompt, n, pn);
     }
+    test_tail(f);
     printf("test-kv-state: PASS\n");
     return 0;
 }

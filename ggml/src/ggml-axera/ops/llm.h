@@ -63,13 +63,27 @@ void llm_paging(const axera_cmm & indptr, const axera_cmm & last_len, const axer
 // 0 .. n_out - 1 when it wants every row.
 void llm_out_rows(const ggml_cgraph * g, const graph_names & names, int n_out, int T, std::vector<int32_t> & rows);
 
-// core/kv_state's pools over CMM buffers: pool i's pages from p[i].first's memory + p[i].second
+// core/kv_state's pools over CMM buffers: pool i's pages from p[i].c's memory + p[i].off
 struct cmm_kv_pools final : kv_pools {
-    std::vector<std::pair<const axera_cmm *, size_t>> p;
+    struct pool {
+        const axera_cmm * c;
+        size_t            off;         // page 0's offset in the block
+        size_t            page_b = 0;  // 0: the format's page
+    };
+    std::vector<pool> p;
+    // n pools of each block, stride bytes apart
+    void add(const std::vector<axera_cmm> & cs, int n, size_t stride, size_t page_b) {
+        for (const axera_cmm & c : cs) {
+            for (int j = 0; j < n; ++j) {
+                p.push_back({ &c, (size_t) j * stride, page_b });
+            }
+        }
+    }
     size_t    count() const override { return p.size(); }
-    uint8_t * pages(size_t i) override { return (uint8_t *) (*p[i].first)->vir + p[i].second; }
-    void      to_host(size_t i, size_t n) override { (*p[i].first)->invalidate(pages(i), n); }
-    void      to_npu(size_t i, size_t n) override { (*p[i].first)->flush(pages(i), n); }
+    uint8_t * pages(size_t i) override { return (uint8_t *) (*p[i].c)->vir + p[i].off; }
+    size_t    page_b(size_t i) const override { return p[i].page_b; }
+    void      to_host(size_t i, size_t n) override { (*p[i].c)->invalidate(pages(i), n); }
+    void      to_npu(size_t i, size_t n) override { (*p[i].c)->flush(pages(i), n); }
 };
 
 // a [rows] or [rows][cols] f32 copy of any small GGUF tensor

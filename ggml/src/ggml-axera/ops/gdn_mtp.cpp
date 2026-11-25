@@ -399,43 +399,62 @@ void gdn_mtp::clear() {
     cell = 0;
 }
 
-gdn_mtp::span gdn_mtp::blob_span(bool partial) const {
+gdn_mtp::tail_header gdn_mtp::blob_span(bool partial) const {
     wait();  // the MTP catch-up extends MKV and cell; size and bytes must be consistent
-    span sp;
+    tail_header th{ 0, 0, page_b, cell };
     if (MKV && page_b && cell > 0) {
         if (partial) {
-            sp.pages = 1;
-            sp.page0 = (size_t) ((cell - 1) / PG);
+            th.pages = 1;
+            th.page0 = (uint64_t) ((cell - 1) / PG);
         } else {
-            sp.pages = std::min<size_t>(MKV->size / page_b, (size_t) ((cell + PG - 1) / PG));
+            th.pages = std::min<uint64_t>(MKV->size / page_b, (uint64_t) ((cell + PG - 1) / PG));
         }
     }
-    return sp;
+    return th;
 }
 
-void gdn_mtp::save(const span & sp, char * p) const {
-    wait();
-    if (sp.pages) {
-        char * src = (char *) MKV->vir + sp.page0 * page_b;
-        MKV->invalidate(src, sp.pages * page_b);
-        memcpy(p, src, sp.pages * page_b);
+size_t gdn_mtp::tail_size(bool partial) const {
+    return MKV && page_b ? sizeof(tail_header) + blob_span(partial).pages * page_b : 0;
+}
+
+void gdn_mtp::tail_write(uint8_t * dst, bool partial) const {
+    const tail_header th = blob_span(partial);
+    memcpy(dst, &th, sizeof(th));
+    if (th.pages) {
+        char * src = (char *) MKV->vir + th.page0 * page_b;
+        MKV->invalidate(src, th.pages * page_b);
+        memcpy(dst + sizeof(th), src, th.pages * page_b);
     }
 }
 
-bool gdn_mtp::fits(size_t page0, size_t pages, size_t pb, size_t n, int64_t c, bool partial, int64_t kv_cells) const {
-    return MKV && page_b && pb == page_b && pages > 0 && pages <= MKV->size / page_b &&
-           page0 <= MKV->size / page_b - pages && pages * page_b == n && (!partial || pages == 1) && c >= 0 &&
-           c <= kv_cells;
+bool gdn_mtp::tail_check(const uint8_t * src, size_t n, bool partial, int64_t cells) const {
+    if (!n) {
+        return true;  // a blob of a model without the cache: the cache starts empty
+    }
+    if (!MKV || !page_b || n < sizeof(tail_header)) {
+        return false;
+    }
+    tail_header th;
+    memcpy(&th, src, sizeof(th));
+    const uint64_t np = MKV->size / page_b;
+    return th.page_b == page_b && n == sizeof(th) + th.pages * page_b && th.cell >= 0 && th.cell <= cells &&
+           (th.pages == 0 ? th.cell == 0 : th.pages <= np && th.page0 <= np - th.pages && (!partial || th.pages == 1));
 }
 
-void gdn_mtp::load(size_t page0, size_t n, const char * p, int64_t c) {
+void gdn_mtp::tail_read(const uint8_t * src, size_t n) {
     wait();
-    if (n) {
-        char * dst = (char *) MKV->vir + page0 * page_b;
-        memcpy(dst, p, n);
-        MKV->flush(dst, n);
+    if (!n) {
+        cell = 0;
+        return;
     }
-    cell = c;
+    tail_header th;
+    memcpy(&th, src, sizeof(th));
+    if (th.pages) {
+        char * dst = (char *) MKV->vir + th.page0 * page_b;
+        memcpy(dst, src + sizeof(th), th.pages * page_b);
+        MKV->flush(dst, th.pages * page_b);
+    }
+    cell = th.cell;
 }
 
 }  // namespace axera

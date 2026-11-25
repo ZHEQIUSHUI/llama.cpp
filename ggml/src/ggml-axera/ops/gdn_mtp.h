@@ -5,6 +5,7 @@
 
 #include "ops.h"
 #include "llm.h"
+#include "../core/kv_state.h"
 #include "../core/params.h"
 
 #include <map>
@@ -33,7 +34,7 @@ struct gdn_mtp_env {
     std::vector<const std::vector<AX_ENGINE_IO_BUFFER_T> *> live;
 };
 
-class gdn_mtp {
+class gdn_mtp final : public kv_tail {
   public:
     ~gdn_mtp() { wait(); }
     // a draft context's MTP graph
@@ -46,20 +47,19 @@ class gdn_mtp {
     }
     // the sequence is cleared: the cache's used pages zeroed
     void clear();
-    // the cache's pages in a state blob (partial: the page of the last cell only)
-    struct span {
-        size_t page0 = 0, pages = 0;
-        size_t bytes(size_t pb) const { return pages * pb; }
-    };
-    span   blob_span(bool partial) const;
-    size_t page_bytes() const { return page_b; }
-    int64_t next_cell() const { return cell; }
-    // the blob's pages: written to / checked and read from p
-    void save(const span & sp, char * p) const;
-    bool fits(size_t page0, size_t pages, size_t pb, size_t n, int64_t c, bool partial, int64_t kv_cells) const;
-    void load(size_t page0, size_t n, const char * p, int64_t c);
+    // the sequence-state blob's tail (core/kv_state): the next cell and the cache's pages (partial: the page of the
+    // last cell only)
+    size_t tail_size(bool partial) const override;
+    void   tail_write(uint8_t * dst, bool partial) const override;
+    bool   tail_check(const uint8_t * src, size_t n, bool partial, int64_t cells) const override;
+    void   tail_read(const uint8_t * src, size_t n) override;
 
   private:
+    struct tail_header {
+        uint64_t page0, pages, page_b;
+        int64_t  cell;
+    };
+    tail_header blob_span(bool partial) const;
     void init(const gdn_mtp_env & e, const std::map<std::string, ggml_tensor *> & t, int il);
 
     npu_call  mtp1, mtpp, mtppkv, mtp8;  // mtp8: role mtp.m8 (optional), up to 8 consecutive rows per call

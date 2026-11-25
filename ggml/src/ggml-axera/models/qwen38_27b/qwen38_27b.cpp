@@ -45,30 +45,6 @@ using call = npu_call;
 // the adapter blob in llama.cpp's sequence state (context checkpoints / prompt cache). The recurrent state itself is
 // core/seqstate's blob; this header only describes the KV pages and the MTP cache around it. AXW27S1 (version 2) is
 // refused: its state layout is the old adapter-owned one.
-struct state_header_27b {
-    char     magic[8];
-    uint32_t version;
-    uint32_t kind;
-    uint32_t has_target;
-    uint32_t has_mtp;
-    int64_t  state_cell;
-    int64_t  mtp_cell;
-    uint32_t ncall;
-    uint32_t pna;
-    uint32_t nkv_pages;
-    uint64_t kv_page_b;
-    uint64_t kvs_page_b;
-    uint64_t kv_n;
-    uint64_t kvs_n;
-    uint64_t seq_n;
-    uint64_t mtp_page0;
-    uint64_t mtp_pages;
-    uint64_t mtp_page_b;
-    uint64_t mtp_n;
-    uint32_t partial;
-    uint32_t reserved;
-};
-
 class qwen38_27b final : public model, public seq_model, gdn_state {
   public:
     explicit qwen38_27b(const manifest & m) : man(m), prm(m) {}
@@ -76,6 +52,8 @@ class qwen38_27b final : public model, public seq_model, gdn_state {
     size_t       state_size(uint32_t flags) const override;
     size_t       state_write(void * dst, size_t size, uint32_t flags) override;
     size_t       state_read(const void * src, size_t size, uint32_t flags) override;
+    kv_state_format state_format() const;
+    cmm_kv_pools    state_pools() const;
     int          last_state_status() const override { return last_seq_status; }
 
     seq_caps seq_get_caps() const override;
@@ -1332,196 +1310,59 @@ bool qwen38_27b::seq_run_verify(int64_t c, int n, const uint16_t * x, const int3
            GGML_STATUS_SUCCESS;
 }
 
-// llama.cpp's sequence state (prompt cache / context checkpoint): see qwen35_whole. The private CMM pools are not the
-// llama.cpp cache tensors, so the checkpoint carries the KV pages before the current cell, the recurrent state and the
-// current page's restart point. The int8 KV caches' per-row scales travel with them (KVSC).
+// llama.cpp's sequence state (prompt cache / context checkpoint): core/kv_state's blob of the KV pages before the
+// current cell, core/seqstate's restart points (the recurrent state) and, its tail, the MTP cache (gdn_mtp)
+kv_state_format qwen38_27b::state_format() const {
+    kv_state_format f;
+    f.magic   = "AXW27S2";
+    f.version = 4;
+    f.pages   = kv_pages;
+    f.pg      = PG;
+    f.cells   = kv_cells;
+    return f;
+}
+
+cmm_kv_pools qwen38_27b::state_pools() const {
+    cmm_kv_pools p;
+    if (fused) {
+        p.add(KVC, KB, kv_blk_b, kv_blk_b / (size_t) kv_pages);
+    } else {
+        const int pna = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
+        p.add(KVC, pna, kv_alloc, kv_b / NBLK);
+        p.add(KVSC, pna, kvs_alloc, kvs_b / NBLK);  // the int8 caches' scales
+    }
+    return p;
+}
+
 size_t qwen38_27b::state_size(uint32_t flags) const {
-    mtp.wait();  // the MTP catch-up extends MKV and mtp_cell; size and bytes must be consistent
     if (KVC.empty() || !ST || !seq) {
         return 0;
     }
-    const bool   partial = flags & state_flags_partial_only;
-    const size_t seq_n   = seq->size(partial);
-    if (!seq_n) {
-        return 0;
-    }
-    const int     pna       = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
-    const int64_t state_cell = std::max<int64_t>(0, seq->cell());
-    const size_t  nkv_pages  = std::min<size_t>((size_t) kv_pages, (size_t) ((state_cell + PG - 1) / PG));
-    const size_t mtp_pages = mtp.blob_span(partial).pages;
-    size_t n = sizeof(state_header_27b) + seq_n;
-    if (!partial) {
-        if (fused) {
-            n += (size_t) KVC.size() * (size_t) KB * nkv_pages * kv_blk_b / (size_t) kv_pages;
-        } else {
-            n += (size_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
-            n += (size_t) KVSC.size() * pna * nkv_pages * (kvs_b / NBLK);
-        }
-    }
-    n += mtp_pages * mtp.page_bytes();
-    return n;
+    return kv_state_size(state_format(), state_pools(), *seq, flags & state_flags_partial_only, &mtp);
 }
 
 size_t qwen38_27b::state_write(void * dst, size_t size, uint32_t flags) {
     axera_timer tw("state write");
-    mtp.wait();  // an async MTP catch-up writes MKV; serialize after it finishes
-    const size_t total = state_size(flags);
-    if (!total || size < total) {
+    mtp.wait();  // an asynchronous MTP catch-up extends the MTP cache
+    if (KVC.empty() || !ST || !seq) {
         return 0;
     }
-    const bool   partial = flags & state_flags_partial_only;
-    const int    pna     = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
-    const size_t seq_n   = seq->size(partial);
-    const size_t nkv_pages = partial ? 0 : std::min<size_t>((size_t) kv_pages, (size_t) ((std::max<int64_t>(0, seq->cell()) + PG - 1) / PG));
-    const gdn_mtp::span ms = mtp.blob_span(partial);
-
-    state_header_27b h;
-    memset(&h, 0, sizeof(h));
-    memcpy(h.magic, "AXW27S2", sizeof(h.magic) - 1);
-    h.version     = 3;
-    h.kind        = 2;
-    h.has_target  = 1;
-    h.has_mtp     = ms.pages > 0;
-    h.state_cell  = seq->cell();
-    h.mtp_cell    = mtp.next_cell();
-    h.ncall       = (uint32_t) KVC.size();
-    h.pna         = (uint32_t) pna;
-    h.nkv_pages   = (uint32_t) nkv_pages;
-    h.kv_page_b   = fused ? kv_blk_b / (size_t) kv_pages : kv_b / NBLK;
-    h.kvs_page_b  = kvs_b / NBLK;
-    h.kv_n        = partial ? 0 : fused ? (uint64_t) KVC.size() * KB * nkv_pages * h.kv_page_b
-                                      : (uint64_t) KVC.size() * pna * nkv_pages * (kv_b / NBLK);
-    h.kvs_n       = partial ? 0 : fused ? 0 : (uint64_t) KVSC.size() * pna * nkv_pages * (kvs_b / NBLK);
-    h.seq_n       = seq_n;
-    h.mtp_page0   = ms.page0;
-    h.mtp_pages   = ms.pages;
-    h.mtp_page_b  = mtp.page_bytes();
-    h.mtp_n       = ms.bytes(mtp.page_bytes());
-    h.partial     = partial;
-
-    char * p = (char *) dst;
-    memcpy(p, &h, sizeof(h));
-    p += sizeof(h);
-    if (!partial) {
-        if (fused) {
-            const size_t page_b = kv_blk_b / (size_t) kv_pages;
-            const size_t page_n = nkv_pages * page_b;
-            for (const axera_cmm & c : KVC) {
-                for (int blk = 0; blk < KB; ++blk) {
-                    char * src = (char *) c->vir + (size_t) blk * kv_blk_b;
-                    c->invalidate(src, page_n);
-                    memcpy(p, src, page_n);
-                    p += page_n;
-                }
-            }
-        } else {
-            const size_t page_n = nkv_pages * (kv_b / NBLK);
-            for (const axera_cmm & c : KVC) {
-                for (int j = 0; j < pna; ++j) {
-                    char * src = (char *) c->vir + (size_t) j * kv_alloc;
-                    c->invalidate(src, page_n);
-                    memcpy(p, src, page_n);
-                    p += page_n;
-                }
-            }
-            const size_t scale_n = nkv_pages * (kvs_b / NBLK);
-            for (const axera_cmm & c : KVSC) {
-                for (int j = 0; j < pna; ++j) {
-                    char * src = (char *) c->vir + (size_t) j * kvs_alloc;
-                    c->invalidate(src, scale_n);
-                    memcpy(p, src, scale_n);
-                    p += scale_n;
-                }
-            }
-        }
-    }
-    if (seq->write((uint8_t *) p, seq_n, partial) != seq_n) {
-        return 0;
-    }
-    p += seq_n;
-    mtp.save(ms, p);
-    p += h.mtp_n;
-    return (size_t) (p - (char *) dst);
+    cmm_kv_pools p = state_pools();
+    return kv_state_write(state_format(), p, *seq, dst, size, flags & state_flags_partial_only, &mtp);
 }
 
 size_t qwen38_27b::state_read(const void * src, size_t size, uint32_t flags) {
     axera_timer tr("state read");
     mtp.wait();
-    if (size < sizeof(state_header_27b)) {
+    if (KVC.empty() || !ST || !seq) {
         return 0;
     }
-    const bool partial = flags & state_flags_partial_only;
-    state_header_27b h;
-    memcpy(&h, src, sizeof(h));
-    if (memcmp(h.magic, "AXW27S2", sizeof(h.magic) - 1) != 0 || h.version != 3 || h.kind != 2 || !h.has_target ||
-        h.partial != partial || !h.seq_n) {
-        return 0;
+    cmm_kv_pools p = state_pools();
+    const size_t n = kv_state_read(state_format(), p, *seq, src, size, flags & state_flags_partial_only, &mtp);
+    if (n) {
+        state_zero = false;
     }
-    const int pna = kv_alloc ? (int) (KVC[0]->size / kv_alloc) : 0;
-    const bool kv_ok = fused ? h.kv_page_b == kv_blk_b / (size_t) kv_pages && h.kvs_n == 0 &&
-                                  (partial ? h.nkv_pages != 0 || h.kv_n == 0
-                                           : h.nkv_pages <= (uint32_t) kv_pages &&
-                                                 h.kv_n == (uint64_t) h.ncall * KB * h.nkv_pages * h.kv_page_b)
-                            : h.kv_page_b == kv_b / NBLK && h.kvs_page_b == kvs_b / NBLK &&
-                                  (partial ? h.nkv_pages != 0 || h.kv_n == 0 || h.kvs_n == 0
-                                           : h.nkv_pages <= (uint32_t) kv_pages &&
-                                                 h.kv_n == (uint64_t) h.ncall * h.pna * h.nkv_pages * h.kv_page_b &&
-                                                 h.kvs_n == (uint64_t) KVSC.size() * h.pna * h.nkv_pages * h.kvs_page_b);
-    if (KVC.size() != h.ncall || pna != (int) h.pna || !kv_ok ||
-        h.state_cell < -1 || h.state_cell > kv_cells) {
-        return 0;
-    }
-    const bool mtp_valid = h.mtp_n == 0 ? h.mtp_pages == 0 && !h.has_mtp :
-                           h.has_mtp && mtp.fits(h.mtp_page0, h.mtp_pages, h.mtp_page_b, h.mtp_n, h.mtp_cell,
-                                                 partial, kv_cells);
-    if (!mtp_valid) {
-        return 0;
-    }
-    const size_t need = sizeof(h) + h.kv_n + h.kvs_n + h.seq_n + h.mtp_n;
-    if (size < need) {
-        return 0;
-    }
-
-    const char * p = (const char *) src + sizeof(h);
-    if (!partial) {
-        const size_t page_n = h.nkv_pages * h.kv_page_b;
-        if (fused) {
-            for (const axera_cmm & c : KVC) {
-                for (int blk = 0; blk < KB; ++blk) {
-                    char * d = (char *) c->vir + (size_t) blk * kv_blk_b;
-                    memcpy(d, p, page_n);
-                    c->flush(d, page_n);
-                    p += page_n;
-                }
-            }
-        } else {
-            for (const axera_cmm & c : KVC) {
-                for (int j = 0; j < (int) h.pna; ++j) {
-                    char * d = (char *) c->vir + (size_t) j * kv_alloc;
-                    memcpy(d, p, page_n);
-                    c->flush(d, page_n);
-                    p += page_n;
-                }
-            }
-            const size_t scale_n = h.nkv_pages * h.kvs_page_b;
-            for (const axera_cmm & c : KVSC) {
-                for (int j = 0; j < (int) h.pna; ++j) {
-                    char * d = (char *) c->vir + (size_t) j * kvs_alloc;
-                    memcpy(d, p, scale_n);
-                    c->flush(d, scale_n);
-                    p += scale_n;
-                }
-            }
-        }
-    }
-    if (seq->read((const uint8_t *) p, h.seq_n) != h.seq_n) {
-        return 0;
-    }
-    p += h.seq_n;
-    mtp.load(h.mtp_page0, h.mtp_n, p, h.mtp_cell);
-    p += h.mtp_n;
-    state_zero = false;
-    return (size_t) (p - (const char *) src);
+    return n;
 }
 
 // prefill pages from cell c0 (a page's first): n rows x [n][H] bf16 and their M-RoPE positions p4 [n][4]; the hidden
