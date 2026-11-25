@@ -74,6 +74,11 @@ struct gdn_state {
     using gdn_pool_io = std::function<AX_ENGINE_IO_BUFFER_T(const std::string & name, int il)>;
     void bind_decode(const char * who, const manifest & man, params & prm, const std::map<std::string, ggml_tensor *> & t,
                      int L, int H, int ng, const std::vector<int> & ord, const gdn_pool_io & pool_io);
+    // one row x [H] bf16 at cell c through the decode groups (the rope / mask from the graph's views): its hidden
+    // state into h. each(group, last): called before each group's call, which then run one by one (else batched)
+    using gdn_each = std::function<void(size_t gi, bool last)>;
+    void decode(int64_t c, const uint16_t * x, float * h, int H, int ROT, int NBLK, int kv_pages,
+                const kv_view * batch_kv, const rope * batch_rope, const gdn_each & each = nullptr);
     // a verification batch of T <= 4 rows xb from cell c0 (rows row0 .. of the graph's batch): the hidden rows into h,
     // the state after each row in the other snapshot set, the current state the last row's
     ggml_status verify(int64_t c0, int row0, int T, const ggml_bf16_t * xb, float * h, int H, int ROT, int64_t context,

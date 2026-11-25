@@ -423,43 +423,16 @@ bool qwen35_whole::seq_run_pages(int64_t c0, int n, const uint16_t * x, const in
 bool qwen35_whole::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p4, int batch_row) {
     (void) p4;  // the row's M-RoPE positions come from the graph's rope view (batch_rope)
     GGML_ASSERT(batch_row == 0);
-    memcpy(A->vir, x, H * sizeof(ggml_bf16_t));
-    A->flush(A->vir, H * sizeof(ggml_bf16_t));
-    batch_rope->rows(0, 1, COS.get(), SIN.get());
-    const int nblk = batch_kv->mask_row(0, (ggml_bf16_t *) MASK->vir);
-    GGML_ASSERT(nblk > 0 && nblk <= NBLK);
-    MASK->flush(MASK->vir, (size_t) nblk * PG * sizeof(ggml_bf16_t));
-    const size_t half = (ROT / 2) * sizeof(ggml_bf16_t);
-    memcpy(CS->vir, COS->vir, half);
-    memcpy((char *) CS->vir + half, SIN->vir, half);
-    CS->flush();
-    ((int32_t *) PN->vir)[0] = (int32_t) c;
-    ((int32_t *) PN->vir)[1] = nblk;
-    ((int32_t *) PN->vir)[2] = (int32_t) ((c / PG) * 2 * PG + c % PG);
-    GGML_ASSERT(((int32_t *) PN->vir)[2] >= 0 && ((int32_t *) PN->vir)[2] < kv_pages * 2 * PG);
-    PN->flush();
-    {
-        axera_timer tl("layers (decode)");
-        if (dec_head) {  // the last group writes the logits: its head flags between the calls
-            for (size_t gi = 0; gi < dec.size(); ++gi) {
-                const bool last = gi + 1 == dec.size();
-                *(int32_t *) head.mgh->vir = last ? 1 : 0;
-                *(int32_t *) head.mgt->vir = last && head.merged_topk() ? 1 : 0;
-                head.mgh->flush(head.mgh->vir, sizeof(int32_t));
-                head.mgt->flush(head.mgt->vir, sizeof(int32_t));
-                dec[gi].k->run(dec[gi].in, dec[gi].out, "decode group");
-            }
-        } else {
-            axera_npu_batch nb;  // the groups' dependent calls, waited for once
-            for (auto & c : dec) {
-                nb.add(*c.k, c.in, c.out, "decode group");
-            }
-            nb.wait();
-        }
+    gdn_each each;
+    if (dec_head) {  // the last group writes the logits: its head flags between the calls
+        each = [&](size_t, bool last) {
+            *(int32_t *) head.mgh->vir = last ? 1 : 0;
+            *(int32_t *) head.mgt->vir = last && head.merged_topk() ? 1 : 0;
+            head.mgh->flush(head.mgh->vir, sizeof(int32_t));
+            head.mgt->flush(head.mgt->vir, sizeof(int32_t));
+        };
     }
-    A->invalidate(A->vir, H * sizeof(ggml_bf16_t));
-    ggml_bf16_to_fp32_row((const ggml_bf16_t *) A->vir, out_h, H);
-    state_zero = false;
+    decode(c, x, out_h, H, ROT, NBLK, kv_pages, batch_kv, batch_rope, each);
     return true;
 }
 

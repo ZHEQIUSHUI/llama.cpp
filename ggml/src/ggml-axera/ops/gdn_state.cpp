@@ -267,6 +267,44 @@ void gdn_state::bind_decode(const char * who, const manifest & man, params & prm
     }
 }
 
+void gdn_state::decode(int64_t c, const uint16_t * x, float * h, int H, int ROT, int NBLK, int kv_pages,
+                       const kv_view * batch_kv, const rope * batch_rope, const gdn_each & each) {
+    memcpy(A->vir, x, H * sizeof(ggml_bf16_t));
+    A->flush(A->vir, H * sizeof(ggml_bf16_t));
+    batch_rope->rows(0, 1, COS.get(), SIN.get());
+    const int nblk = batch_kv->mask_row(0, (ggml_bf16_t *) MASK->vir);
+    GGML_ASSERT(nblk > 0 && nblk <= NBLK);
+    MASK->flush(MASK->vir, (size_t) nblk * PG * sizeof(ggml_bf16_t));
+    const size_t half = (ROT / 2) * sizeof(ggml_bf16_t);
+    memcpy(CS->vir, COS->vir, half);
+    memcpy((char *) CS->vir + half, SIN->vir, half);
+    CS->flush();
+    int32_t * pn = (int32_t *) PN->vir;
+    pn[0] = (int32_t) c;
+    pn[1] = nblk;
+    pn[2] = (int32_t) ((c / PG) * 2 * PG + c % PG);
+    GGML_ASSERT(pn[2] >= 0 && pn[2] < kv_pages * 2 * PG);
+    PN->flush();
+    {
+        axera_timer tl("layers (decode)");
+        if (each) {
+            for (size_t gi = 0; gi < dec.size(); ++gi) {
+                each(gi, gi + 1 == dec.size());
+                dec[gi].k->run(dec[gi].in, dec[gi].out, "decode group");
+            }
+        } else {
+            axera_npu_batch nb;  // the groups' dependent calls, waited for once
+            for (auto & d : dec) {
+                nb.add(*d.k, d.in, d.out, "decode group");
+            }
+            nb.wait();
+        }
+    }
+    state_zero = false;
+    A->invalidate(A->vir, H * sizeof(ggml_bf16_t));
+    ggml_bf16_to_fp32_row((const ggml_bf16_t *) A->vir, h, H);
+}
+
 ggml_status gdn_state::verify(int64_t c0, int row0, int T, const ggml_bf16_t * xb, float * h, int H, int ROT,
                               int64_t context, const kv_view * batch_kv, const rope * batch_rope) {
     GGML_ASSERT(batch_kv && batch_rope && T >= 1 && T <= ver_rows);
