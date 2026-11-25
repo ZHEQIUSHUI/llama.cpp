@@ -73,7 +73,6 @@ class qwen35_whole final : public model, public seq_model, gdn_state {
     params           prm;
     graph_names      names;
     const void *     bound = nullptr;
-    int              L = 0, H = 0, ROT = 0, NBLK = 0;
     bool             fp8 = false;  // the prefill banks' projections: MXFP8 (else MXFP4), from the kernel IO shapes
     int              KH = 16, VH = 0, REP = 1;  // delta-net key / value heads (from the prefill kernels' IO)
     std::vector<int> ord;  // layer -> its index among the delta-net layers / the attention layers
@@ -85,18 +84,8 @@ class qwen35_whole final : public model, public seq_model, gdn_state {
     // default: the kernels' context): the kernels keep their declared IO size but touch only the pages up to the runtime
     // page count, so a smaller context needs only its pages (a single-block prefill kernel only: a call of several
     // layers has fixed layer strides in its KV IO)
-    int       kv_pages = 0;
-    int64_t   kv_cells = 0;
     size_t    kv_alloc = 0;  // the bytes of one layer's pool
-    std::unique_ptr<seqstate> seq;
 
-    std::vector<float>                    h_buf;      // the target graph's hidden rows
-    std::vector<ggml_bf16_t>              src_rows;
-    const ggml_bf16_t * batch_rows = nullptr;
-    const kv_view *     batch_kv   = nullptr;
-    const rope *        batch_rope = nullptr;
-    float *             out_h      = nullptr;
-    int                 last_seq_status = 0;
     gdn_mtp mtp;  // the MTP block (draft context graphs)
     std::vector<call>              pres;  // the prefill calls of a page (the kernel's blocks each)
     int                            ncall = 1;
@@ -432,31 +421,17 @@ bool qwen35_whole::seq_run_decode(int64_t c, const uint16_t * x, const int32_t *
             head.mgt->flush(head.mgt->vir, sizeof(int32_t));
         };
     }
-    decode(c, x, out_h, H, ROT, NBLK, kv_pages, batch_kv, batch_rope, each);
+    decode(c, x, out_h, each);
     return true;
 }
 
 void qwen35_whole::seq_rows(int batch_row0, int n, uint16_t * dst) {
-    if (n <= 0) {
-        return;
-    }
-    if (batch_rows) {
-        memcpy(dst, batch_rows + (size_t) batch_row0 * H, (size_t) n * H * sizeof(uint16_t));
-    } else {
-        memset(dst, 0, (size_t) n * H * sizeof(uint16_t));
-    }
+    rows(batch_row0, n, dst);
 }
 
 bool qwen35_whole::seq_run_verify(int64_t c, int n, const uint16_t * x, const int32_t * p4, int batch_row0) {
     (void) p4;  // the rows' M-RoPE positions come from the graph's rope view (batch_rope)
-    const uint16_t * xr = x;
-    if (!xr) {
-        src_rows.resize((size_t) n * H);
-        seq_rows(batch_row0, n, (uint16_t *) src_rows.data());
-        xr = (const uint16_t *) src_rows.data();
-    }
-    return verify(c, batch_row0, n, (const ggml_bf16_t *) xr, out_h, H, ROT, man.context, batch_kv, batch_rope) ==
-           GGML_STATUS_SUCCESS;
+    return verify_rows(c, n, x, batch_row0, man.context);
 }
 
 // llama.cpp's sequence state (prompt cache / context checkpoint): core/kv_state's blob of the KV pages before the
@@ -478,6 +453,7 @@ cmm_kv_pools qwen35_whole::state_pools() const {
 }
 
 size_t qwen35_whole::state_size(uint32_t flags) const {
+    mtp.wait();  // an asynchronous MTP catch-up extends the MTP cache: size and bytes must agree
     if (KVC.empty() || !ST || !seq) {
         return 0;
     }
@@ -712,62 +688,12 @@ ggml_status qwen35_whole::compute(ggml_cgraph * g) {
     } else {
         dec_head = pre_head = false;
     }
-    const ggml_tensor * k_idxs = names.find("attn_inp_k_idxs");
-    const ggml_tensor * kqm    = names.find("attn_inp_kq_mask");
-    GGML_ASSERT(k_idxs && k_idxs->type == GGML_TYPE_I64 && k_idxs->ne[0] == T && kqm);
-    axera_timer   tkv("kv view");
-    const kv_view kv(k_idxs, kqm, man.context, PG);
-    tkv.stop();
-    if (!llm_one_sequence(kv, T, "qwen35_whole")) {
+    axera_timer tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
+    int64_t     c0 = 0;
+    if (feed(names, man.context, x0, inp_pos, rope_node, T, "qwen35_whole", c0) != GGML_STATUS_SUCCESS) {
         return GGML_STATUS_FAILED;
     }
-    std::vector<int32_t> pb;
-    llm_positions(inp_pos, T, pb);
-    const rope         rp(rope_node, inp_pos, T);
-    GGML_ASSERT(rp.ROT == ROT);
-    h_buf.resize((size_t) T * H);
     std::vector<float> & h = h_buf;
-    axera_timer        tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
-    const int64_t      c0 = kv.cell_of(0);
-    std::vector<ggml_bf16_t> xb((size_t) T * H);
-    {
-        axera_timer tin("input rows");
-        axera_host_pool().run(T, [&](int64_t r) {
-            ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]), xb.data() + (size_t) r * H, H);
-        });
-    }
-    batch_rows      = xb.data();
-    batch_kv        = &kv;
-    batch_rope      = &rp;
-    out_h           = h.data();
-    last_seq_status = 0;
-    const seq_status sst = seq->feed(c0, T, (const uint16_t *) xb.data(), pb.data());
-    if (sst != SEQ_OK) {
-        last_seq_status = (int) llm_seq_log(sst, c0, *seq, "qwen35_whole");
-        return GGML_STATUS_FAILED;
-    }
-    ggml_tensor * hn = names.find("h_nextn");  // the MTP block's input: every row's final norm
-    if (hn && (hn->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-        axera_timer tn("h_nextn");
-        GGML_ASSERT(hn->type == GGML_TYPE_F32 && hn->ne[0] == H && hn->ne[1] == T);
-        float         eps;
-        const float * w = final_norm(hn, H, &eps);
-        axera_host_pool().run(T, [&](int64_t r) {
-            const float * x = h.data() + (size_t) r * H;
-            float *       y = (float *) ((char *) hn->data + r * hn->nb[1]);
-            double        ss = 0;
-            for (int i = 0; i < H; ++i) {
-                ss += (double) x[i] * x[i];
-            }
-            const float sc = 1.0f / sqrtf((float) (ss / H) + eps);
-            for (int i = 0; i < H; ++i) {
-                y[i] = x[i] * sc * w[i];
-            }
-        });
-        if (ggml_backend_buffer_is_axera(hn->buffer)) {
-            ((ggml_backend_axera_buffer_context *) hn->buffer->context)->flush(hn->data, ggml_nbytes(hn));
-        }
-    }
     if (dec_head) {  // the kernels wrote the logits (a prompt's in prefill); a decode publishes them
         if (T == 1 && strcmp(seq->path(), "decode") == 0) {  // the decode kernel's head wrote this row
             head.finish_merged_decode(g, names, h, T, logits);

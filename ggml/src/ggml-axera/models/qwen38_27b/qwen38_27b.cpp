@@ -75,7 +75,6 @@ class qwen38_27b final : public model, public seq_model, gdn_state {
     params           prm;
     graph_names      names;
     const void *     bound = nullptr;
-    int              L = 0, H = 0, ROT = 0, NBLK = 0;
     std::vector<int> ord;  // layer -> its index among the delta-net layers / the attention layers
 
     // the state pools; their sizes per layer
@@ -85,21 +84,10 @@ class qwen38_27b final : public model, public seq_model, gdn_state {
     size_t    kv_b = 0, kvs_b = 0;
     // the pages of the cache the pools hold (GGML_AXERA_KV_PAGES; default: the kernels' context): the kernels keep their
     // declared IO size but touch only the pages up to the runtime page count, so a smaller context needs only its pages
-    int       kv_pages = 0;
-    int64_t   kv_cells = 0;
     size_t    kv_alloc = 0, kvs_alloc = 0;  // the bytes of one layer's pool
     int                            dec_result = 0;
     const axera_cmm *              dec_out = nullptr;
     axera_cmm                      A2, DIN, B, C, D;
-    std::vector<float>                    h_buf;      // the target graph's hidden rows
-    std::unique_ptr<seqstate> seq;
-    int                       last_seq_status = 0;
-    // the current batch, for x == nullptr runs; the rows the kernel callbacks write the hidden states into
-    const ggml_bf16_t * batch_rows = nullptr;
-    const kv_view *     batch_kv = nullptr;
-    const rope *        batch_rope = nullptr;
-    float *             out_h = nullptr;
-    std::vector<ggml_bf16_t> src_rows;
     gdn_mtp mtp;  // the MTP block (draft context graphs)
     // the prefill kernel variants: 256 rows, and the 128 / 64-row tails that hold the last page of a prompt
     struct prefill_set {
@@ -1261,30 +1249,17 @@ bool qwen38_27b::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p
         return true;
     }
     (void) p4;  // the row's M-RoPE positions come from the graph's rope view (batch_rope)
-    decode(c, x, out_h, H, ROT, NBLK, kv_pages, batch_kv, batch_rope);
+    decode(c, x, out_h);
     return true;
 }
 
 void qwen38_27b::seq_rows(int batch_row0, int n, uint16_t * dst) {
-    if (n <= 0) {
-        return;
-    }
-    if (batch_rows) {
-        memcpy(dst, batch_rows + (size_t) batch_row0 * H, (size_t) n * H * sizeof(uint16_t));
-    } else {
-        memset(dst, 0, (size_t) n * H * sizeof(uint16_t));
-    }
+    rows(batch_row0, n, dst);
 }
 
 bool qwen38_27b::seq_run_verify(int64_t c, int n, const uint16_t * x, const int32_t * p4, int batch_row0) {
-    const uint16_t * xr = x;
-    if (!xr) {
-        src_rows.resize((size_t) n * H);
-        seq_rows(batch_row0, n, (uint16_t *) src_rows.data());
-        xr = (const uint16_t *) src_rows.data();
-    }
-    return verify(c, batch_row0, n, (const ggml_bf16_t *) xr, out_h, H, ROT, man.context, batch_kv, batch_rope) ==
-           GGML_STATUS_SUCCESS;
+    (void) p4;  // the rows' M-RoPE positions come from the graph's rope view (batch_rope)
+    return verify_rows(c, n, x, batch_row0, man.context);
 }
 
 // llama.cpp's sequence state (prompt cache / context checkpoint): core/kv_state's blob of the KV pages before the
@@ -1312,6 +1287,7 @@ cmm_kv_pools qwen38_27b::state_pools() const {
 }
 
 size_t qwen38_27b::state_size(uint32_t flags) const {
+    mtp.wait();  // an asynchronous MTP catch-up extends the MTP cache: size and bytes must agree
     if (KVC.empty() || !ST || !seq) {
         return 0;
     }
@@ -1440,65 +1416,15 @@ ggml_status qwen38_27b::compute(ggml_cgraph * g) {
         }
         bound = w0->data;
     }
-    const ggml_tensor * k_idxs = names.find("attn_inp_k_idxs");
-    const ggml_tensor * kqm    = names.find("attn_inp_kq_mask");
-    GGML_ASSERT(k_idxs && k_idxs->type == GGML_TYPE_I64 && k_idxs->ne[0] == T && kqm);
-    axera_timer   tkv("kv view");
-    const kv_view kv(k_idxs, kqm, man.context, PG);
-    tkv.stop();
-    if (!llm_one_sequence(kv, T, "qwen38_27b")) {
+    axera_timer tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
+    int64_t     c0 = 0;
+    if (feed(names, man.context, x0, inp_pos, rope_node, T, "qwen38_27b", c0) != GGML_STATUS_SUCCESS) {
         return GGML_STATUS_FAILED;
     }
-    std::vector<int32_t> pb;
-    llm_positions(inp_pos, T, pb);
-    const rope         rp(rope_node, inp_pos, T);
-    GGML_ASSERT(rp.ROT == ROT);
-    h_buf.resize((size_t) T * H);
     std::vector<float> & h = h_buf;
-    axera_timer        tm_all(T > 1 ? "graph (prompt)" : "graph (decode)");
-    const int64_t      c0 = kv.cell_of(0);
-    std::vector<ggml_bf16_t> xb((size_t) T * H);
-    {
-        axera_timer tin("input rows");
-        axera_host_pool().run(T, [&](int64_t r) {
-            ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]), xb.data() + (size_t) r * H, H);
-        });
-    }
     // common.cpp marks its warm-up batch with llama_set_dummy_batch(): its state is not needed. Drop it here, while
     // the batch is still being timed as warm-up, so the prompt's own zero state can skip the memset.
     const bool warmup = c0 == 0 && names.find("inp_mixed_slots_dummy");
-    batch_rows      = xb.data();
-    batch_kv        = &kv;
-    batch_rope      = &rp;
-    out_h           = h.data();
-    last_seq_status = 0;
-    const seq_status sst = seq->feed(c0, T, (const uint16_t *) xb.data(), pb.data());
-    if (sst != SEQ_OK) {
-        last_seq_status = (int) llm_seq_log(sst, c0, *seq, "qwen38_27b");
-        return GGML_STATUS_FAILED;
-    }
-    ggml_tensor * hn = names.find("h_nextn");  // the MTP block's input: every row's final norm
-    if (hn && (hn->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-        axera_timer tn("h_nextn");
-        GGML_ASSERT(hn->type == GGML_TYPE_F32 && hn->ne[0] == H && hn->ne[1] == T);
-        float         eps;
-        const float * w = final_norm(hn, H, &eps);
-        axera_host_pool().run(T, [&](int64_t r) {
-            const float * x = h.data() + (size_t) r * H;
-            float *       y = (float *) ((char *) hn->data + r * hn->nb[1]);
-            double        ss = 0;
-            for (int i = 0; i < H; ++i) {
-                ss += (double) x[i] * x[i];
-            }
-            const float sc = 1.0f / sqrtf((float) (ss / H) + eps);
-            for (int i = 0; i < H; ++i) {
-                y[i] = x[i] * sc * w[i];
-            }
-        });
-        if (ggml_backend_buffer_is_axera(hn->buffer)) {
-            ((ggml_backend_axera_buffer_context *) hn->buffer->context)->flush(hn->data, ggml_nbytes(hn));
-        }
-    }
     axera_timer th("output head");
     if (fused) {
         // the upstream rmsnorm_gemm head: an [8, K] bf16 tile, the final-norm weight and the NVFP4 output head.

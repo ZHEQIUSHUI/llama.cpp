@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,19 @@ namespace axera {
 
 struct gdn_state {
     int G = 0;  // the decode group's layers (3 / 4 of them delta-net layers)
+    int L = 0, H = 0, ROT = 0, NBLK = 0;  // layers, hidden size, rotary dims, the kernels' KV blocks
+    int     kv_pages = 0;  // the pages the KV caches hold
+    int64_t kv_cells = 0;
+
+    // the sequence (core/seqstate) and the graph batch it runs: its bf16 rows, KV view and rope; the hidden rows
+    std::unique_ptr<seqstate> seq;
+    int                       last_seq_status = 0;
+    std::vector<float>        h_buf;  // the target graph's hidden rows
+    std::vector<ggml_bf16_t>  src_rows;
+    const ggml_bf16_t *       batch_rows = nullptr;
+    const kv_view *           batch_kv   = nullptr;
+    const rope *              batch_rope = nullptr;
+    float *                   out_h      = nullptr;
 
     // the pools; one layer's part of each
     axera_cmm ST, CQ, CK, CV;
@@ -77,12 +91,18 @@ struct gdn_state {
     // one row x [H] bf16 at cell c through the decode groups (the rope / mask from the graph's views): its hidden
     // state into h. each(group, last): called before each group's call, which then run one by one (else batched)
     using gdn_each = std::function<void(size_t gi, bool last)>;
-    void decode(int64_t c, const uint16_t * x, float * h, int H, int ROT, int NBLK, int kv_pages,
-                const kv_view * batch_kv, const rope * batch_rope, const gdn_each & each = nullptr);
+    void decode(int64_t c, const uint16_t * x, float * h, const gdn_each & each = nullptr);
     // a verification batch of T <= 4 rows xb from cell c0 (rows row0 .. of the graph's batch): the hidden rows into h,
     // the state after each row in the other snapshot set, the current state the last row's
-    ggml_status verify(int64_t c0, int row0, int T, const ggml_bf16_t * xb, float * h, int H, int ROT, int64_t context,
-                       const kv_view * batch_kv, const rope * batch_rope);
+    ggml_status verify(int64_t c0, int row0, int T, const ggml_bf16_t * xb, float * h, int64_t context);
+
+    // the graph's batch (T rows x0, positions inp_pos, the cells of its KV inputs) through the sequence: the hidden
+    // rows in h_buf, the MTP block's h_nextn input from them; c0 the batch's first cell
+    ggml_status feed(const graph_names & names, int64_t context, const ggml_tensor * x0, const ggml_tensor * inp_pos,
+                     const ggml_tensor * rope_node, int T, const char * who, int64_t & c0);
+    // seq_model's rows of the batch (zeros without one) and its verification
+    void rows(int batch_row0, int n, uint16_t * dst) const;
+    bool verify_rows(int64_t c, int n, const uint16_t * x, int batch_row0, int64_t context);
 
   private:
     int  group_of(size_t g) const { return state_group.empty() ? (int) g / (G / 4 * 3) : state_group[g]; }

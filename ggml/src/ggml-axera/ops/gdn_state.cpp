@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 
 namespace {
@@ -267,8 +268,7 @@ void gdn_state::bind_decode(const char * who, const manifest & man, params & prm
     }
 }
 
-void gdn_state::decode(int64_t c, const uint16_t * x, float * h, int H, int ROT, int NBLK, int kv_pages,
-                       const kv_view * batch_kv, const rope * batch_rope, const gdn_each & each) {
+void gdn_state::decode(int64_t c, const uint16_t * x, float * h, const gdn_each & each) {
     memcpy(A->vir, x, H * sizeof(ggml_bf16_t));
     A->flush(A->vir, H * sizeof(ggml_bf16_t));
     batch_rope->rows(0, 1, COS.get(), SIN.get());
@@ -305,8 +305,7 @@ void gdn_state::decode(int64_t c, const uint16_t * x, float * h, int H, int ROT,
     ggml_bf16_to_fp32_row((const ggml_bf16_t *) A->vir, h, H);
 }
 
-ggml_status gdn_state::verify(int64_t c0, int row0, int T, const ggml_bf16_t * xb, float * h, int H, int ROT,
-                              int64_t context, const kv_view * batch_kv, const rope * batch_rope) {
+ggml_status gdn_state::verify(int64_t c0, int row0, int T, const ggml_bf16_t * xb, float * h, int64_t context) {
     GGML_ASSERT(batch_kv && batch_rope && T >= 1 && T <= ver_rows);
     memset(VX->vir, 0, VX->size);
     memcpy(VX->vir, xb, (size_t) T * H * sizeof(ggml_bf16_t));
@@ -350,6 +349,91 @@ ggml_status gdn_state::verify(int64_t c0, int row0, int T, const ggml_bf16_t * x
     state_at(set, T - 1);
     ver_set = set;
     return GGML_STATUS_SUCCESS;
+}
+
+ggml_status gdn_state::feed(const graph_names & names, int64_t context, const ggml_tensor * x0,
+                            const ggml_tensor * inp_pos, const ggml_tensor * rope_node, int T, const char * who,
+                            int64_t & c0) {
+    const ggml_tensor * k_idxs = names.find("attn_inp_k_idxs");
+    const ggml_tensor * kqm    = names.find("attn_inp_kq_mask");
+    GGML_ASSERT(k_idxs && k_idxs->type == GGML_TYPE_I64 && k_idxs->ne[0] == T && kqm);
+    axera_timer   tkv("kv view");
+    const kv_view kv(k_idxs, kqm, context, PG);
+    tkv.stop();
+    if (!llm_one_sequence(kv, T, who)) {
+        return GGML_STATUS_FAILED;
+    }
+    std::vector<int32_t> pb;
+    llm_positions(inp_pos, T, pb);
+    const rope rp(rope_node, inp_pos, T);
+    GGML_ASSERT(rp.ROT == ROT);
+    h_buf.resize((size_t) T * H);
+    std::vector<float> & h = h_buf;
+    c0 = kv.cell_of(0);
+    std::vector<ggml_bf16_t> xb((size_t) T * H);
+    {
+        axera_timer tin("input rows");
+        axera_host_pool().run(T, [&](int64_t r) {
+            ggml_fp32_to_bf16_row((const float *) ((const char *) x0->data + (size_t) r * x0->nb[1]), xb.data() + (size_t) r * H, H);
+        });
+    }
+    batch_rows      = xb.data();
+    batch_kv        = &kv;
+    batch_rope      = &rp;
+    out_h           = h.data();
+    last_seq_status = 0;
+    const seq_status sst = seq->feed(c0, T, (const uint16_t *) xb.data(), pb.data());
+    batch_rows = nullptr;  // the batch's rows, view and rope end here
+    batch_kv   = nullptr;
+    batch_rope = nullptr;
+    if (sst != SEQ_OK) {
+        last_seq_status = (int) llm_seq_log(sst, c0, *seq, who);
+        return GGML_STATUS_FAILED;
+    }
+    ggml_tensor * hn = names.find("h_nextn");  // the MTP block's input: every row's final norm
+    if (hn && (hn->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        axera_timer tn("h_nextn");
+        GGML_ASSERT(hn->type == GGML_TYPE_F32 && hn->ne[0] == H && hn->ne[1] == T);
+        float         eps;
+        const float * w = final_norm(hn, H, &eps);
+        axera_host_pool().run(T, [&](int64_t r) {
+            const float * x = h.data() + (size_t) r * H;
+            float *       y = (float *) ((char *) hn->data + r * hn->nb[1]);
+            double        ss = 0;
+            for (int i = 0; i < H; ++i) {
+                ss += (double) x[i] * x[i];
+            }
+            const float sc = 1.0f / sqrtf((float) (ss / H) + eps);
+            for (int i = 0; i < H; ++i) {
+                y[i] = x[i] * sc * w[i];
+            }
+        });
+        if (ggml_backend_buffer_is_axera(hn->buffer)) {
+            ((ggml_backend_axera_buffer_context *) hn->buffer->context)->flush(hn->data, ggml_nbytes(hn));
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+void gdn_state::rows(int batch_row0, int n, uint16_t * dst) const {
+    if (n <= 0) {
+        return;
+    }
+    if (batch_rows) {
+        memcpy(dst, batch_rows + (size_t) batch_row0 * H, (size_t) n * H * sizeof(uint16_t));
+    } else {
+        memset(dst, 0, (size_t) n * H * sizeof(uint16_t));
+    }
+}
+
+bool gdn_state::verify_rows(int64_t c, int n, const uint16_t * x, int batch_row0, int64_t context) {
+    const uint16_t * xr = x;
+    if (!xr) {
+        src_rows.resize((size_t) n * H);
+        rows(batch_row0, n, (uint16_t *) src_rows.data());
+        xr = (const uint16_t *) src_rows.data();
+    }
+    return verify(c, batch_row0, n, (const ggml_bf16_t *) xr, out_h, context) == GGML_STATUS_SUCCESS;
 }
 
 }  // namespace axera
