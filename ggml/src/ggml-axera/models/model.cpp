@@ -102,37 +102,54 @@ struct composite final : model {
     }
 };
 
+// Every manifest model name: its language-model adapter, the vision encoder for a one-kernel ViT (role vit) and what the
+// language-model adapter does in place of llama.cpp (model_caps; asked before the adapter is made, for the KV buffers).
+using maker = std::shared_ptr<model> (*)(const manifest &);
+
+std::shared_ptr<model> make_qwen38(const manifest & m) {
+    // the 2B / 4B packages run the upstream fused kernels (a decode kernel without decode groups), 27B its own
+    return m.has("decode") && !m.has("decode.group") ? make_qwen35_fused(m) : make_qwen38_27b(m);
+}
+
+struct adapter_row {
+    const char * name;
+    maker        llm;
+    maker        vit;  // role "vit"; none: such a package is an error
+    bool         owns_kv_cache, sched_io_only, causal_cells;
+};
+
+constexpr adapter_row adapters[] = {
+    { "qwen38_27b",     make_qwen38,         make_qwen35_vit_full,      true,  true,  true  },
+    { "qwen35_whole",   make_qwen35_whole,   make_qwen35_vit_full,      true,  false, false },
+    // the Qwen3.5-0.8B design with the head merged into its kernels
+    { "minicpm_ocr",    make_qwen35_whole,   make_minicpm_ocr_vit_full, false, false, false },
+    { "qwen35_moe_sgl", make_qwen35_moe_sgl, make_qwen35_vit_full,      true,  true,  false },
+    // the text tower is the published 35B-A3B NVFP4 stack
+    { "minicpmv4_7",    make_qwen35_moe_sgl, make_minicpmv4_7_vit_full, true,  true,  false },
+    { "hy_mt2",         make_moe_gqa,        nullptr,                   true,  true,  false },
+    { "q3vl30",         make_moe_gqa,        make_q3vl30_vit_full,      true,  true,  false },
+    { "qwen3",          make_qwen3,          nullptr,                   false, false, false },
+    { "cosyvoice3_llm", make_phase_dense,    nullptr,                   false, false, false },
+    { "cpm5",           make_cpm5,           nullptr,                   true,  false, false },
+    // the base LM is on the NPU only with its prefill kernel (else llama.cpp runs it on the CPU): see model_caps_of
+    { "voxcpm2_base",   make_phase_dense,    nullptr,                   false, false, false },
+    { "hymt",           make_hymt,           nullptr,                   true,  false, false },
+};
+
+const adapter_row & adapter_of(const manifest & m) {
+    for (const adapter_row & r : adapters) {
+        if (m.model == r.name) {
+            return r;
+        }
+    }
+    GGML_ABORT("axera: %s/manifest.json: no adapter for model %s\n", m.dir.c_str(), m.model.c_str());
+}
+
 }  // namespace
 
 static std::shared_ptr<model> make_model_of(const manifest & m) {
-    std::shared_ptr<model> llm;
-    if (m.model == "qwen38_27b" && m.has("decode") && !m.has("decode.group")) {
-        llm = make_qwen35_fused(m);  // the 2B / 4B packages on the upstream fused kernels
-    } else if (m.model == "qwen38_27b") {
-        llm = make_qwen38_27b(m);
-    } else if (m.model == "qwen35_whole") {
-        llm = make_qwen35_whole(m);
-    } else if (m.model == "minicpm_ocr") {
-        llm = make_qwen35_whole(m);  // the Qwen3.5-0.8B design with the head merged into its kernels
-    } else if (m.model == "qwen35_moe_sgl") {
-        llm = make_qwen35_moe_sgl(m);
-    } else if (m.model == "minicpmv4_7") {
-        llm = make_qwen35_moe_sgl(m);  // the text tower is the published 35B-A3B NVFP4 stack
-    } else if (m.model == "hy_mt2" || m.model == "q3vl30") {
-        llm = make_moe_gqa(m);  // Hy-MT2-30B-A3B / Qwen3-VL-30B-A3B: the GQA MoE group kernels
-    } else if (m.model == "qwen3") {
-        llm = make_qwen3(m);
-    } else if (m.model == "cosyvoice3_llm") {
-        llm = make_phase_dense(m);
-    } else if (m.model == "cpm5") {
-        llm = make_cpm5(m);
-    } else if (m.model == "voxcpm2_base") {
-        llm = make_phase_dense(m);
-    } else if (m.model == "hymt") {
-        llm = make_hymt(m);
-    } else {
-        GGML_ABORT("axera: %s/manifest.json: no adapter for model %s\n", m.dir.c_str(), m.model.c_str());
-    }
+    const adapter_row &    row = adapter_of(m);
+    std::shared_ptr<model> llm = row.llm(m);
     bool vision = false, vision1 = false, audio = false, gen = false;
     for (const auto & [role, k] : m.kernels) {
         vision  = vision || role.rfind("vit.", 0) == 0;
@@ -143,14 +160,12 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
     if (!vision && !vision1 && !audio && !gen) {
         return llm;
     }
+    if (vision1 && !row.vit) {
+        GGML_ABORT("axera: %s/manifest.json: model %s has no one-kernel vision encoder\n", m.dir.c_str(), row.name);
+    }
     auto c   = std::make_shared<composite>();
     c->llm   = llm;
-    c->vit   = vision1 ? (m.model == "minicpm_ocr" ? make_minicpm_ocr_vit_full(m) :
-                          m.model == "minicpmv4_7" ? make_minicpmv4_7_vit_full(m) : make_qwen35_vit_full(m)) :
-               vision ? make_qwen35_vit(m) : nullptr;
-    if (vision1 && m.model == "q3vl30") {
-        c->vit = make_q3vl30_vit_full(m);
-    }
+    c->vit   = vision1 ? row.vit(m) : vision ? make_qwen35_vit(m) : nullptr;
     c->audio = audio ? make_qwen3_asr(m) : nullptr;
     c->gen   = gen ? make_qwen3_tts(m) : nullptr;
     return c;
@@ -170,17 +185,13 @@ std::shared_ptr<model> make_model(const manifest & m) {
     return p;
 }
 
-// (next to the factory above: the same model names)
 model_caps model_caps_of(const manifest & m) {
-    model_caps c;
-    const std::string & n = m.model;
-    c.owns_kv_cache = n == "qwen38_27b" || n == "qwen35_whole" || n == "qwen35_moe_sgl" || n == "minicpmv4_7" ||
-                      n == "cpm5" || n == "hymt" || n == "hy_mt2" || n == "q3vl30";
-    c.sched_io_only = n == "qwen38_27b" || n == "qwen35_moe_sgl" || n == "minicpmv4_7" || n == "hy_mt2" ||
-                      n == "q3vl30";
-    c.causal_cells  = n == "qwen38_27b";
-    // VoxCPM2's base LM: on the NPU only when the manifest carries its prefill kernel (else llama.cpp runs it on the CPU)
-    if (n == "voxcpm2_base" && m.has("prefill")) {
+    const adapter_row & r = adapter_of(m);
+    model_caps          c;
+    c.owns_kv_cache = r.owns_kv_cache;
+    c.sched_io_only = r.sched_io_only;
+    c.causal_cells  = r.causal_cells;
+    if (m.model == "voxcpm2_base" && m.has("prefill")) {
         c.owns_kv_cache = c.sched_io_only = true;
     }
     return c;
