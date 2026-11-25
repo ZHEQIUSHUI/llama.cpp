@@ -87,9 +87,7 @@ class qwen35_whole final : public model, public seq_model, gdn_state {
     size_t    kv_alloc = 0;  // the bytes of one layer's pool
 
     gdn_mtp mtp;  // the MTP block (draft context graphs)
-    std::vector<call>              pres;  // the prefill calls of a page (the kernel's blocks each)
     int                            ncall = 1;
-    axera_cmm                      PX, POS, INDPTR, INDICES, LASTLEN, CLOC, VALID, POUT[2];
     output_head                    head;
     // A merged output head (the kernels have head_on / head inputs: MiniCPM-OCR's): the last prefill call and the
     // last decode group write the logits themselves; the calls then run one by one, their head flags set in between.
@@ -280,29 +278,33 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     bind_decode("qwen35_whole", man, prm, t, L, H, ng, ord, pool_io);
 
     // prefill: the weight banks (above), the pools, one page's inputs
-    PX      = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
-    POUT[0] = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
-    POUT[1] = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
-    POS     = axera_cmm_alloc(pk.in_bytes("position_ids"));
+    gdn_page_set & P = pfs[0];
+    P.k    = &pk;
+    P.rows = PG;
+    P.X      = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
+    P.OUT[0] = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
+    P.OUT[1] = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
+    P.POS     = axera_cmm_alloc(pk.in_bytes("position_ids"));
     INDPTR  = axera_cmm_alloc(2 * sizeof(int32_t));
     INDICES = axera_cmm_alloc(pk.in_bytes("indices"));
     LASTLEN = axera_cmm_alloc(sizeof(int32_t));
     CLOC    = axera_cmm_alloc(2 * sizeof(int32_t));
     VALID   = axera_cmm_alloc(sizeof(int32_t));
-    GGML_ASSERT(pk.in_bytes("x") == PX->size && pk.in_bytes("position_ids") == 3 * PG * sizeof(int32_t) &&
+    GGML_ASSERT(pk.in_bytes("x") == P.X->size && pk.in_bytes("position_ids") == 3 * PG * sizeof(int32_t) &&
                 pk.in_bytes("indices") == (size_t) NBLK * sizeof(int32_t));
     for (int i = 0; i < NBLK; ++i) {
         ((int32_t *) INDICES->vir)[i] = i;
     }
     INDICES->flush();
-    GGML_ASSERT(pk.out_bytes("output") == POUT[0]->size);
-    pres.assign(ncall, {});
+    GGML_ASSERT(pk.out_bytes("output") == P.OUT[0]->size);
+    P.calls.assign(ncall, {});
+    P.result = (ncall - 1) & 1;  // the calls alternate between OUT[0] / OUT[1]
     auto ends = [](const std::string & s, const char * suffix) {
         const size_t z = strlen(suffix);
         return s.size() >= z && s.compare(s.size() - z, z, suffix) == 0;
     };
     for (int k = 0; k < ncall; ++k) {  // call k: blocks k * pna .. of the banks, its layers of the pools
-        call & c = pres[k];
+        call & c = P.calls[k];
         c.k      = &pk;
         for (const auto & d : pk.desc->in) {
             const std::string & n = d.name;
@@ -310,7 +312,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
                 c.in.push_back(AX_ENGINE_IO_BUFFER_T{});  // a merged head's: bind_head_calls
                 continue;
             }
-            const axera_cmm *   b = n == "x" ? (k == 0 ? &PX : &POUT[(k - 1) & 1]) : n == "position_ids" ? &POS :
+            const axera_cmm *   b = n == "x" ? (k == 0 ? &P.X : &P.OUT[(k - 1) & 1]) : n == "position_ids" ? &P.POS :
                                     n == "indptr" ? &INDPTR : n == "indices" ? &INDICES : n == "last_page_len" ? &LASTLEN :
                                     n == "cache_location" ? &CLOC : n == "valid_tokens" ? &VALID : nullptr;
             size_t off = 0;
@@ -352,7 +354,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
         }
         for (const auto & d : pk.desc->out) {
             if (d.name == "output") {
-                c.out.push_back(axera_io(POUT[k & 1], d.bytes));
+                c.out.push_back(axera_io(P.OUT[k & 1], d.bytes));
             } else if (d.name == "logits" || d.name == "ids" || d.name == "top_logits") {
                 c.out.push_back(AX_ENGINE_IO_BUFFER_T{});  // a merged head's: bind_head_calls
             } else {
@@ -514,7 +516,7 @@ void qwen35_whole::bind_head_calls(ggml_tensor * logits) {
         }
     }
     const kernel & pk = man.get("prefill");
-    for (auto & c : pres) {
+    for (auto & c : pfs[0].calls) {
         for (size_t i = 0; i < pk.desc->in.size(); ++i) {
             const std::string & n = pk.desc->in[i].name;
             const axera_cmm * b = n == "head_on" ? &head.mgh : n == "nout" ? &head.mgt : n == "out_row" ? &head.mpr :
@@ -536,41 +538,20 @@ void qwen35_whole::bind_head_calls(ggml_tensor * logits) {
 
 void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
                            seq_snap * snap, ggml_tensor * logits, const std::vector<int32_t> & rows) {
-    GGML_ASSERT(c0 % PG == 0);
     GGML_ASSERT(c0 >= 0 && n >= 0 && c0 + n <= man.context);
-    GGML_ASSERT(c0 + n <= kv_cells);  // (the pools' pages)
     for (int64_t r = 0; r < n; ++r) {
         for (int s = 0; s < 4; ++s) {
             GGML_ASSERT(p4[r * 4 + s] >= 0 && p4[r * 4 + s] < man.context);
         }
     }
-    for (int r0 = 0; r0 < n; r0 += PG) {
-        const int     v    = std::min(PG, n - r0);
-        const int64_t cell = c0 + r0;
-        if (v < PG && snap && snap->cell == cell) {  // the state before the run's last (partial) page
-            seq_state_save(snap->dst);
-        }
-        memcpy(PX->vir, x + (size_t) r0 * H, (size_t) v * H * sizeof(ggml_bf16_t));
-        memset((ggml_bf16_t *) PX->vir + (size_t) v * H, 0, (size_t) (PG - v) * H * sizeof(ggml_bf16_t));
-        PX->flush();
-        auto * pp = (int32_t *) POS->vir;
-        for (int s = 0; s < 3; ++s) {
-            for (int r = 0; r < PG; ++r) {
-                pp[s * PG + r] = r < v ? p4[(size_t) (r0 + r) * 4 + s] : 0;
+    gdn_prefill_opts                     o;
+    std::vector<std::pair<int, int32_t>> page_rows;  // a merged head: (logits row, page row) of this page
+    if (pre_head) {  // the last call writes the logits: its head flags between the calls
+        o.page_begin = [&](int r0, int v) {
+            page_rows.clear();
+            if (!logits) {
+                return;
             }
-        }
-        POS->flush();
-        ((int32_t *) INDPTR->vir)[0]  = 0;
-        ((int32_t *) INDPTR->vir)[1]  = (int32_t) (cell / PG);
-        *(int32_t *) LASTLEN->vir     = PG;
-        ((int32_t *) CLOC->vir)[0]    = (int32_t) (cell / PG);
-        ((int32_t *) CLOC->vir)[1]    = 0;
-        *(int32_t *) VALID->vir       = v;
-        for (const axera_cmm * b : { &INDPTR, &LASTLEN, &CLOC, &VALID }) {
-            (*b)->flush();
-        }
-        std::vector<std::pair<int, int32_t>> page_rows;  // a merged head: (logits row, page row) of this page
-        if (pre_head && logits) {
             for (size_t j = 0; j < rows.size(); ++j) {
                 const int64_t a = (int64_t) out0 + rows[j];
                 if (a >= r0 && a < r0 + v) {
@@ -581,28 +562,17 @@ void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32
                 ((int32_t *) head.mpr->vir)[j] = page_rows[j].second;
             }
             head.mpr->flush(head.mpr->vir, page_rows.size() * sizeof(int32_t));
-        }
-        {
-            axera_timer tl("prefill (page)");
-            if (pre_head) {  // the last call writes the logits: its head flags between the calls
-                for (size_t k = 0; k < pres.size(); ++k) {
-                    const bool last_call = k + 1 == pres.size();
-                    *(int32_t *) head.mgh->vir = last_call && !page_rows.empty() ? 1 : 0;
-                    *(int32_t *) head.mgt->vir = last_call ? (int32_t) page_rows.size() : 0;
-                    head.mgh->flush(head.mgh->vir, sizeof(int32_t));
-                    head.mgt->flush(head.mgt->vir, sizeof(int32_t));
-                    pres[k].k->run(pres[k].in, pres[k].out, "prefill");
-                }
-            } else {
-                axera_npu_batch nb;  // the page's dependent calls, waited for once
-                for (auto & c : pres) {
-                    nb.add(*c.k, c.in, c.out, "prefill");
-                }
-                nb.wait();
+        };
+        o.each = [&](size_t, bool last_call) {
+            *(int32_t *) head.mgh->vir = last_call && !page_rows.empty() ? 1 : 0;
+            *(int32_t *) head.mgt->vir = last_call ? (int32_t) page_rows.size() : 0;
+            head.mgh->flush(head.mgh->vir, sizeof(int32_t));
+            head.mgt->flush(head.mgt->vir, sizeof(int32_t));
+        };
+        o.page_end = [&]() {
+            if (page_rows.empty()) {
+                return;
             }
-            state_zero = false;
-        }
-        if (!page_rows.empty()) {
             const int64_t N = logits->ne[0];
             head.mvl->invalidate(head.mvl->vir, (size_t) page_rows.size() * N * sizeof(float));
             for (size_t j = 0; j < page_rows.size(); ++j) {
@@ -615,15 +585,9 @@ void qwen35_whole::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32
                 dctx->clean_n     = (size_t) logits->ne[1] * logits->nb[1];
                 dctx->clean_epoch = axera_graph_epoch;
             }
-        }
-        axera_timer       to("prefill out rows");
-        const axera_cmm & po = POUT[(ncall - 1) & 1];
-        po->invalidate(po->vir, (size_t) v * H * sizeof(ggml_bf16_t));
-        axera_host_pool().run(v - std::max(0, out0 - r0), [&](int64_t i) {
-            const int r = std::max(0, out0 - r0) + (int) i;
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) po->vir + (size_t) r * H, h.data() + (size_t) (r0 + r - out0) * H, H);
-        });
+        };
     }
+    prefill_pages(c0, n, x, p4, h, out0, snap, o);
 }
 
 // T (2 - ver_rows) consecutive tokens from cell c0 > 0 through the verification groups, their hidden states into h at the

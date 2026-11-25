@@ -18,6 +18,26 @@
 
 namespace axera {
 
+// a prefill kernel variant: its calls of a page (its blocks each), its x / position inputs and the output rotation
+struct gdn_page_set {
+    const kernel *        k    = nullptr;
+    int                   rows = 0;
+    std::vector<npu_call> calls;
+    axera_cmm             X, POS, OUT[4];
+    int                   result = 0;  // the OUT[] buffer that holds the page's final rows
+};
+
+// how an adapter's prefill pages differ
+struct gdn_prefill_opts {
+    int  pos_pad   = 0;      // the padding rows' positions: 0 zeros, 1 the page's first row's, 2 its last valid row's
+    bool seed_out0 = false;  // OUT[0] holds the first call's input too (a rotation that starts there)
+    bool lastlen2  = false;  // last_page_len has two entries
+    // a merged head: before a page's calls (rows r0 .., v valid) / before each call (then run one by one) / after them
+    std::function<void(int r0, int v)> page_begin;
+    std::function<void(size_t k, bool last)> each;
+    std::function<void()> page_end;
+};
+
 struct gdn_state {
     int G = 0;  // the decode group's layers (3 / 4 of them delta-net layers)
     int L = 0, H = 0, ROT = 0, NBLK = 0;  // layers, hidden size, rotary dims, the kernels' KV blocks
@@ -62,7 +82,10 @@ struct gdn_state {
     std::vector<npu_call>            dec, ver;
     axera_cmm                        A, COS, SIN, CS, PN, MASK;
     axera_cmm                        VX, VCS, VPN, VMASK, VNT;
-    std::map<std::string, axera_cmm> banks;  // the prefill kernel's weight banks (inputs k_<bank> of dec / ver)
+    std::map<std::string, axera_cmm> banks;
+    // the prefill kernel's variants (rows descending; unused ones without a kernel) and their shared page inputs
+    gdn_page_set pfs[5];
+    axera_cmm    INDPTR, INDICES, LASTLEN, CLOC, VALID;  // the prefill kernel's weight banks (inputs k_<bank> of dec / ver)
     int              cur_set  = -1;  // the snapshot set holding the current state, -1: the pools
     int              ver_set  = -1;  // the snapshot set of the pending verification
     int              ver_rows = 0;
@@ -100,6 +123,11 @@ struct gdn_state {
     // rows in h_buf, the MTP block's h_nextn input from them; c0 the batch's first cell
     ggml_status feed(const graph_names & names, int64_t context, const ggml_tensor * x0, const ggml_tensor * inp_pos,
                      const ggml_tensor * rope_node, int T, const char * who, int64_t & c0);
+    // n rows x [n][H] bf16 (M-RoPE positions p4 [n][4]) from cell c0 (a page's first) through the prefill kernel,
+    // page by page in the smallest variant holding each: the hidden rows from out0 on into h; snap: the state before
+    // a last partial page
+    void prefill_pages(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
+                       seq_snap * snap, const gdn_prefill_opts & o);
     // seq_model's rows of the batch (zeros without one) and its verification
     void rows(int batch_row0, int n, uint16_t * dst) const;
     bool verify_rows(int64_t c, int n, const uint16_t * x, int batch_row0, int64_t context);

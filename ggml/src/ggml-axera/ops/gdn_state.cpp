@@ -415,6 +415,86 @@ ggml_status gdn_state::feed(const graph_names & names, int64_t context, const gg
     return GGML_STATUS_SUCCESS;
 }
 
+void gdn_state::prefill_pages(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h,
+                              int out0, seq_snap * snap, const gdn_prefill_opts & o) {
+    GGML_ASSERT(c0 % PG == 0);
+    GGML_ASSERT(c0 + n <= kv_cells);  // (the pools' pages)
+    for (int r0 = 0; r0 < n; r0 += PG) {
+        const int     v    = std::min(PG, n - r0);
+        const int64_t cell = c0 + r0;
+        if (v < PG && snap && snap->cell == cell) {  // the state before the run's last (partial) page
+            state_save(snap->dst);
+        }
+        // the smallest row variant that holds this page's valid rows (the tails save the padding work)
+        gdn_page_set * P = nullptr;
+        for (int i = 4; i >= 0; --i) {
+            if (pfs[i].k && v <= pfs[i].rows) {
+                P = &pfs[i];
+                break;
+            }
+        }
+        GGML_ASSERT(P && v <= P->rows);
+        memcpy(P->X->vir, x + (size_t) r0 * H, (size_t) v * H * sizeof(ggml_bf16_t));
+        memset((ggml_bf16_t *) P->X->vir + (size_t) v * H, 0, (size_t) (P->rows - v) * H * sizeof(ggml_bf16_t));
+        P->X->flush();
+        if (o.seed_out0) {
+            memcpy(P->OUT[0]->vir, P->X->vir, P->X->size);
+            P->OUT[0]->flush();
+        }
+        auto * pp = (int32_t *) P->POS->vir;
+        for (int s = 0; s < 3; ++s) {
+            for (int r = 0; r < P->rows; ++r) {
+                pp[s * P->rows + r] = r < v           ? p4[(size_t) (r0 + r) * 4 + s] :
+                                      o.pos_pad == 0 ? 0 :
+                                      o.pos_pad == 1 ? p4[(size_t) r0 * 4 + s] :
+                                                       p4[(size_t) (r0 + std::max(0, v - 1)) * 4 + s];
+            }
+        }
+        P->POS->flush();
+        ((int32_t *) INDPTR->vir)[0] = 0;
+        ((int32_t *) INDPTR->vir)[1] = (int32_t) (cell / PG);
+        *(int32_t *) LASTLEN->vir    = PG;
+        if (o.lastlen2) {
+            ((int32_t *) LASTLEN->vir)[1] = PG;
+        }
+        ((int32_t *) CLOC->vir)[0] = (int32_t) (cell / PG);
+        ((int32_t *) CLOC->vir)[1] = 0;
+        *(int32_t *) VALID->vir    = v;
+        for (const axera_cmm * b : { &INDPTR, &LASTLEN, &CLOC, &VALID }) {
+            (*b)->flush();
+        }
+        if (o.page_begin) {
+            o.page_begin(r0, v);
+        }
+        {
+            axera_timer tl("prefill (page)");
+            if (o.each) {
+                for (size_t k = 0; k < P->calls.size(); ++k) {
+                    o.each(k, k + 1 == P->calls.size());
+                    P->calls[k].k->run(P->calls[k].in, P->calls[k].out, "prefill");
+                }
+            } else {
+                axera_npu_batch nb;  // the page's dependent calls, waited for once
+                for (auto & cl : P->calls) {
+                    nb.add(*cl.k, cl.in, cl.out, "prefill");
+                }
+                nb.wait();
+            }
+            state_zero = false;
+        }
+        if (o.page_end) {
+            o.page_end();
+        }
+        axera_timer       to("prefill out rows");
+        const axera_cmm & po = P->OUT[P->result];
+        po->invalidate(po->vir, (size_t) v * H * sizeof(ggml_bf16_t));
+        axera_host_pool().run(v - std::max(0, out0 - r0), [&](int64_t i) {
+            const int r = std::max(0, out0 - r0) + (int) i;
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) po->vir + (size_t) r * H, h.data() + (size_t) (r0 + r - out0) * H, H);
+        });
+    }
+}
+
 void gdn_state::rows(int batch_row0, int n, uint16_t * dst) const {
     if (n <= 0) {
         return;

@@ -90,16 +90,7 @@ class qwen38_27b final : public model, public seq_model, gdn_state {
     axera_cmm                      A2, DIN, B, C, D;
     gdn_mtp mtp;  // the MTP block (draft context graphs)
     // the prefill kernel variants: 256 rows, and the 128 / 64-row tails that hold the last page of a prompt
-    struct prefill_set {
-        const kernel *    k = nullptr;
-        int               rows = 0;
-        std::vector<call> calls;  // the kernel's calls of a page (its blocks each)
-        axera_cmm         X, POS, OUT[4];
-        int               result = 0;  // the OUT[] buffer that holds the page's final rows
-    };
-    prefill_set                    pfs[5];  // the manifest's prefill variants, rows descending
     int                            ncall = 1;
-    axera_cmm                      INDPTR, INDICES, LASTLEN, CLOC, VALID;
     output_head                    head;
 
     // The upstream fused dense path (sgl_kernel_axera.models.qwen38_27b.forward_qwen38_blocks): one prefill kernel and
@@ -554,7 +545,7 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
         if (!man.has(role)) {
             return;
         }
-        prefill_set &     p = pfs[idx];
+        gdn_page_set &     p = pfs[idx];
         const kernel &    k = man.get(role);
         const int         rows = (int) (k.in_bytes("x") / (H * sizeof(ggml_bf16_t)));
         GGML_ASSERT(rows >= 2 && rows <= PG);
@@ -831,7 +822,7 @@ void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, cons
             }
         }
     };
-    prefill_set & P = pfs[0];
+    gdn_page_set & P = pfs[0];
     P.k             = &pk;
     P.rows          = PG;
     P.X             = axera_cmm_alloc(pk.in_bytes("x"));
@@ -1003,7 +994,7 @@ void qwen38_27b::init_fused_phases(const std::map<std::string, ggml_tensor *> & 
         }
     }
 
-    prefill_set & P = pfs[0];
+    gdn_page_set & P = pfs[0];
     P.k             = &kg;
     P.rows          = PG;
     P.X             = axera_cmm_alloc(kg.in_bytes("x"));
@@ -1181,7 +1172,7 @@ bool qwen38_27b::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p
     GGML_ASSERT(batch_row == 0);
     if (fused && getenv("GGML_AXERA_DECODE_PREFILL") && atoi(getenv("GGML_AXERA_DECODE_PREFILL")) != 0) {
         // Debug: run one token through the (validated) prefill kernel, one valid row, and take row 0.
-        prefill_set & P = pfs[0];
+        gdn_page_set & P = pfs[0];
         memset(P.X->vir, 0, (size_t) P.rows * H * sizeof(ggml_bf16_t));
         memcpy(P.X->vir, x, H * sizeof(ggml_bf16_t));
         P.X->flush();
@@ -1322,66 +1313,11 @@ size_t qwen38_27b::state_read(const void * src, size_t size, uint32_t flags) {
 // states of the rows from out0 on into h
 void qwen38_27b::prefill(int64_t c0, int n, const ggml_bf16_t * x, const int32_t * p4, std::vector<float> & h, int out0,
                          seq_snap * snap) {
-    GGML_ASSERT(c0 % PG == 0);
-    GGML_ASSERT(c0 + n <= kv_cells);  // (the pools' pages)
-    for (int r0 = 0; r0 < n; r0 += PG) {
-        const int     v    = std::min(PG, n - r0);
-        const int64_t cell = c0 + r0;
-        if (v < PG && snap && snap->cell == cell) {  // the state before the run's last (partial) page
-            seq_state_save(snap->dst);
-        }
-        // the smallest row variant that holds this page's valid rows (the tails save the padding work)
-        prefill_set * P = nullptr;
-        for (int i = 4; i >= 0; --i) {
-            if (pfs[i].k && v <= pfs[i].rows) {
-                P = &pfs[i];
-                break;
-            }
-        }
-        GGML_ASSERT(P && v <= P->rows);
-        memcpy(P->X->vir, x + (size_t) r0 * H, (size_t) v * H * sizeof(ggml_bf16_t));
-        memset((ggml_bf16_t *) P->X->vir + (size_t) v * H, 0, (size_t) (P->rows - v) * H * sizeof(ggml_bf16_t));
-        P->X->flush();
-        // The three-kernel rotation starts with OUT[0] as the block input.
-        memcpy(P->OUT[0]->vir, P->X->vir, P->X->size);
-        P->OUT[0]->flush();
-        auto * pp = (int32_t *) P->POS->vir;
-        for (int s = 0; s < 3; ++s) {
-            for (int r = 0; r < P->rows; ++r) {
-                const int rr = fused ? (r < v ? r : std::max(0, v - 1)) : (r < v ? r : 0);
-                pp[s * P->rows + r] = p4[(size_t) (r0 + rr) * 4 + s];
-            }
-        }
-        P->POS->flush();
-        ((int32_t *) INDPTR->vir)[0]  = 0;
-        ((int32_t *) INDPTR->vir)[1]  = (int32_t) (cell / PG);
-        *(int32_t *) LASTLEN->vir     = PG;
-        if (fused) {
-            ((int32_t *) LASTLEN->vir)[1] = PG;
-        }
-        ((int32_t *) CLOC->vir)[0]    = (int32_t) (cell / PG);
-        ((int32_t *) CLOC->vir)[1]    = 0;
-        *(int32_t *) VALID->vir       = v;
-        for (const axera_cmm * b : { &INDPTR, &LASTLEN, &CLOC, &VALID }) {
-            (*b)->flush();
-        }
-        {
-            axera_timer tl("prefill (page)");
-            axera_npu_batch nb;  // the page's dependent calls, waited for once
-            for (auto & c : P->calls) {
-                nb.add(*c.k, c.in, c.out, "prefill");
-            }
-            nb.wait();
-            state_zero = false;
-        }
-        axera_timer       to("prefill out rows");
-        const axera_cmm & po = P->OUT[P->result];
-        po->invalidate(po->vir, (size_t) v * H * sizeof(ggml_bf16_t));
-        axera_host_pool().run(v - std::max(0, out0 - r0), [&](int64_t i) {
-            const int r = std::max(0, out0 - r0) + (int) i;
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) po->vir + (size_t) r * H, h.data() + (size_t) (r0 + r - out0) * H, H);
-        });
-    }
+    gdn_prefill_opts o;
+    o.pos_pad   = fused ? 2 : 1;
+    o.seed_out0 = true;  // the three-kernel rotation starts with OUT[0] as the block input
+    o.lastlen2  = fused;
+    prefill_pages(c0, n, x, p4, h, out0, snap, o);
 }
 
 // T (2 - 4) consecutive tokens from cell c0 through the verification groups, their hidden states into h at the batch
