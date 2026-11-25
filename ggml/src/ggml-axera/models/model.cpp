@@ -106,7 +106,9 @@ struct composite final : model {
 
 static std::shared_ptr<model> make_model_of(const manifest & m) {
     std::shared_ptr<model> llm;
-    if (m.model == "qwen38_27b") {
+    if (m.model == "qwen38_27b" && m.has("decode") && !m.has("decode.group")) {
+        llm = make_qwen35_fused(m);  // the 2B / 4B packages on the upstream fused kernels
+    } else if (m.model == "qwen38_27b") {
         llm = make_qwen38_27b(m);
     } else if (m.model == "qwen35_whole") {
         llm = make_qwen35_whole(m);
