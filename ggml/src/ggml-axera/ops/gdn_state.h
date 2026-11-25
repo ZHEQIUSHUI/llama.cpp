@@ -38,8 +38,20 @@ struct gdn_prefill_opts {
     std::function<void()> page_end;
 };
 
+// a kernel's input or output named n (aborts naming the adapter `who` without one)
+const io_desc & gdn_io(const kernel & k, const std::string & n, const char * who);
+
 struct gdn_state {
     int G = 0;  // the decode group's layers (3 / 4 of them delta-net layers)
+    std::vector<int> ord;  // layer -> its index among the delta-net layers / the attention layers
+    int              ncall = 1;  // the prefill kernel's calls per page
+
+    // the KV cache: pools of kl attention layers each (a CMM allocation is < 4 GB), an int8 cache's scales (KVSC, the
+    // same split); a layer's bytes, and a pool's per layer (the runtime's pages of them)
+    std::vector<axera_cmm> KVC, KVSC;
+    int                    kl = 1;
+    size_t                 kv_b = 0, kvs_b = 0;
+    size_t                 kv_alloc = 0, kvs_alloc = 0;
     int L = 0, H = 0, ROT = 0, NBLK = 0;  // layers, hidden size, rotary dims, the kernels' KV blocks
     int     kv_pages = 0;  // the pages the KV caches hold
     int64_t kv_cells = 0;
@@ -105,6 +117,14 @@ struct gdn_state {
     // a verification's k accepted rows: the state after row k; a copy of it
     void verify_keep(int k);
     void verify_peek(int k, uint8_t * dst) const;
+
+    // the pools: npool KV pools of kl layers (kv_alloc / kvs_alloc set), the recurrent pools of ng layers (the
+    // part sizes set); a decode / verify IO's binding there (name kv<j> / kvs<j> / st / cq / ck / cv<j>, layer il)
+    void                  alloc_pools(int npool, int kl_, int ng);
+    AX_ENGINE_IO_BUFFER_T pool_io(const std::string & n, int il) const;
+    // the decode group's one-row inputs (A, COS, SIN, CS, PN, MASK; ROT from its cs) / the prefill pages' shared ones
+    void alloc_decode_io(const kernel & dk, int64_t context);
+    void alloc_page_inputs(const kernel & pk);
 
     // dec / ver bound (A, CS, PN, MASK allocated, banks filled, the pools and ord set): the groups' packs and banks,
     // their KV / state IO (pool_io(name, layer)), where[] at the pools, the snapshots and the state outputs

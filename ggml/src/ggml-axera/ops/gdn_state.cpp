@@ -130,6 +130,79 @@ void gdn_state::verify_peek(int k, uint8_t * dst) const {
     GGML_ASSERT(o == state_image_b);
 }
 
+const io_desc & gdn_io(const kernel & k, const std::string & n, const char * who) {
+    for (const auto & d : k.desc->in) {
+        if (d.name == n) {
+            return d;
+        }
+    }
+    for (const auto & d : k.desc->out) {
+        if (d.name == n) {
+            return d;
+        }
+    }
+    GGML_ABORT("axera %s: %s has no IO %s\n", who, k.desc->file.c_str(), n.c_str());
+}
+
+void gdn_state::alloc_pools(int npool, int kl_, int ng) {
+    kl = kl_;
+    KVC.resize(npool);
+    KVSC.resize(kvs_b ? npool : 0);
+    for (int k = 0; k < npool; ++k) {
+        KVC[k] = axera_cmm_alloc(kv_alloc * kl);
+        if (kvs_b) {
+            KVSC[k] = axera_cmm_alloc(kvs_alloc * kl);
+        }
+    }
+    ST = axera_cmm_alloc(st_b * ng);
+    CQ = axera_cmm_alloc(cq_b * ng);
+    CK = axera_cmm_alloc(cq_b * ng);
+    CV = axera_cmm_alloc(cv_b * ng);
+    state_image_b = ST->size + CQ->size + CK->size + CV->size;
+    GGML_ASSERT(state_image_b == st_b * ng + 2 * cq_b * ng + cv_b * ng);
+}
+
+AX_ENGINE_IO_BUFFER_T gdn_state::pool_io(const std::string & n, int il) const {
+    if (n.rfind("kvs", 0) == 0) {
+        const int a = ord[il];
+        GGML_ASSERT(kvs_b);
+        return axera_io(KVSC[a / kl].get(), (char *) KVSC[a / kl]->vir + (size_t) (a % kl) * kvs_b, (uint32_t) kvs_b);
+    }
+    if (n.rfind("kv", 0) == 0) {
+        const int a = ord[il];
+        return axera_io(KVC[a / kl].get(), (char *) KVC[a / kl]->vir + (size_t) (a % kl) * kv_b, (uint32_t) kv_b);
+    }
+    const axera_cmm & p = n[0] == 's' ? ST : n[1] == 'q' ? CQ : n[1] == 'k' ? CK : CV;
+    const size_t      b = n[0] == 's' ? st_b : n[1] == 'v' ? cv_b : cq_b;
+    return axera_io(p.get(), (char *) p->vir + ord[il] * b, (uint32_t) b);
+}
+
+// decode: x / out A, cs = cos | sin, pn = cell | blocks | the K row of the cell (page * 2 * 256 + offset)
+void gdn_state::alloc_decode_io(const kernel & dk, int64_t context) {
+    const uint32_t csb = dk.in_bytes("cs");
+    ROT  = (int) (csb / sizeof(ggml_bf16_t));
+    A    = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
+    COS  = axera_cmm_alloc(csb / 2);
+    SIN  = axera_cmm_alloc(csb / 2);
+    CS   = axera_cmm_alloc(csb);
+    PN   = axera_cmm_alloc(3 * sizeof(int32_t));
+    MASK = axera_cmm_alloc(dk.in_bytes("mask"));
+    GGML_ASSERT(dk.in_bytes("pn") == 3 * sizeof(int32_t) && dk.in_bytes("mask") == (size_t) context * sizeof(ggml_bf16_t));
+}
+
+void gdn_state::alloc_page_inputs(const kernel & pk) {
+    INDPTR  = axera_cmm_alloc(2 * sizeof(int32_t));
+    INDICES = axera_cmm_alloc(pk.in_bytes("indices"));
+    LASTLEN = axera_cmm_alloc(sizeof(int32_t));
+    CLOC    = axera_cmm_alloc(2 * sizeof(int32_t));
+    VALID   = axera_cmm_alloc(sizeof(int32_t));
+    GGML_ASSERT(pk.in_bytes("indices") == (size_t) NBLK * sizeof(int32_t));
+    for (int i = 0; i < NBLK; ++i) {
+        ((int32_t *) INDICES->vir)[i] = i;
+    }
+    INDICES->flush();
+}
+
 void gdn_state::bind_decode(const char * who, const manifest & man, params & prm,
                             const std::map<std::string, ggml_tensor *> & t, int L, int H, int ng,
                             const std::vector<int> & ord, const gdn_pool_io & pool_io) {

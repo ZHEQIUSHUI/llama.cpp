@@ -75,19 +75,14 @@ class qwen35_whole final : public model, public seq_model, gdn_state {
     const void *     bound = nullptr;
     bool             fp8 = false;  // the prefill banks' projections: MXFP8 (else MXFP4), from the kernel IO shapes
     int              KH = 16, VH = 0, REP = 1;  // delta-net key / value heads (from the prefill kernels' IO)
-    std::vector<int> ord;  // layer -> its index among the delta-net layers / the attention layers
 
     // the state pools (the base's delta-net pools): the KV cache
-    std::vector<axera_cmm> KVC;  // the KV cache: one buffer per prefill call's attention layers (a CMM allocation is < 4 GB)
-    size_t    kv_b = 0;
     // the pages of the cache the pools hold (llama.cpp's -c through the buffer type, GGML_AXERA_KV_PAGES overrides;
     // default: the kernels' context): the kernels keep their declared IO size but touch only the pages up to the runtime
     // page count, so a smaller context needs only its pages (a single-block prefill kernel only: a call of several
     // layers has fixed layer strides in its KV IO)
-    size_t    kv_alloc = 0;  // the bytes of one layer's pool
 
     gdn_mtp mtp;  // the MTP block (draft context graphs)
-    int                            ncall = 1;
     output_head                    head;
     // A merged output head (the kernels have head_on / head inputs: MiniCPM-OCR's): the last prefill call and the
     // last decode group write the logits themselves; the calls then run one by one, their head flags set in between.
@@ -130,19 +125,7 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     }
     GGML_ASSERT(G % 4 == 0 && L % G == 0);
     // the pools: sizes from the prefill kernel's (all layers), checked against the decode group's (one layer)
-    auto in_of = [&](const kernel & k, const std::string & n) -> const io_desc & {
-        for (const auto & d : k.desc->in) {
-            if (d.name == n) {
-                return d;
-            }
-        }
-        for (const auto & d : k.desc->out) {
-            if (d.name == n) {
-                return d;
-            }
-        }
-        GGML_ABORT("axera qwen35_whole: %s has no IO %s\n", k.desc->file.c_str(), n.c_str());
-    };
+    auto in_of = [&](const kernel & k, const std::string & n) -> const io_desc & { return gdn_io(k, n, "qwen35_whole"); };
     const io_desc & pkv = in_of(pk, "b3_kv"), &pst = in_of(pk, "b0_attn_state_in");
     const io_desc & pcq = in_of(pk, "b0_attn_q_conv_state_in"), &pcv = in_of(pk, "b0_attn_v_conv_state_in");
     const int pna = (int) pkv.shape[0], png = 3 * pna;  // the prefill kernel's layers per call
@@ -195,35 +178,10 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     if (kv_pages < NBLK) {
         GGML_LOG_INFO("axera qwen35_whole: the KV pools hold %d of the kernels' %d pages (%lld cells)\n", kv_pages, NBLK, (long long) kv_cells);
     }
-    KVC.resize(ncall);
-    for (int k = 0; k < ncall; ++k) {
-        KVC[k] = axera_cmm_alloc(kv_alloc * pna);
-    }
-    ST = axera_cmm_alloc((size_t) ng * st_b);
-    CQ = axera_cmm_alloc((size_t) ng * cq_b);
-    CK = axera_cmm_alloc((size_t) ng * cq_b);
-    CV = axera_cmm_alloc((size_t) ng * cv_b);
-    state_image_b = ST->size + CQ->size + CK->size + CV->size;
+    alloc_pools(ncall, pna, ng);
 
-    // decode: x / out A, cs = cos | sin, pn = cell | blocks | the K row of the cell (page * 2 * 256 + offset)
-    const uint32_t csb = dk.in_bytes("cs");
-    ROT  = (int) (csb / sizeof(ggml_bf16_t));
-    A    = axera_cmm_alloc(H * sizeof(ggml_bf16_t));
-    COS  = axera_cmm_alloc(csb / 2);
-    SIN  = axera_cmm_alloc(csb / 2);
-    CS   = axera_cmm_alloc(csb);
-    PN   = axera_cmm_alloc(3 * sizeof(int32_t));
-    MASK = axera_cmm_alloc(dk.in_bytes("mask"));
-    GGML_ASSERT(dk.in_bytes("pn") == 3 * sizeof(int32_t) && dk.in_bytes("mask") == (size_t) man.context * sizeof(ggml_bf16_t));
-    auto pool_io = [&](const std::string & n, int il) {
-        if (n.rfind("kv", 0) == 0) {
-            const int a = ord[il];
-            return axera_io(KVC[a / pna].get(), (char *) KVC[a / pna]->vir + (size_t) (a % pna) * kv_b, (uint32_t) kv_b);
-        }
-        const axera_cmm & p = n[0] == 's' ? ST : n[1] == 'q' ? CQ : n[1] == 'k' ? CK : CV;
-        const size_t      b = n[0] == 's' ? st_b : n[1] == 'v' ? cv_b : cq_b;
-        return axera_io(p.get(), (char *) p->vir + ord[il] * b, (uint32_t) b);
-    };
+    alloc_decode_io(dk, man.context);
+    auto pool_io = [&](const std::string & n, int il) { return gdn_state::pool_io(n, il); };
     // the prefill kernel's weight banks [blocks, ..] from the GGUF (first: decode and verification calls may read
     // their row-split weights from them, inputs k_<bank>: the blocks of the call's G layers)
     const rope rp(rope_node, names.find("inp_pos"), 1);
@@ -285,17 +243,8 @@ void qwen35_whole::init(const std::map<std::string, ggml_tensor *> & t, const gg
     P.OUT[0] = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
     P.OUT[1] = axera_cmm_alloc((size_t) PG * H * sizeof(ggml_bf16_t));
     P.POS     = axera_cmm_alloc(pk.in_bytes("position_ids"));
-    INDPTR  = axera_cmm_alloc(2 * sizeof(int32_t));
-    INDICES = axera_cmm_alloc(pk.in_bytes("indices"));
-    LASTLEN = axera_cmm_alloc(sizeof(int32_t));
-    CLOC    = axera_cmm_alloc(2 * sizeof(int32_t));
-    VALID   = axera_cmm_alloc(sizeof(int32_t));
-    GGML_ASSERT(pk.in_bytes("x") == P.X->size && pk.in_bytes("position_ids") == 3 * PG * sizeof(int32_t) &&
-                pk.in_bytes("indices") == (size_t) NBLK * sizeof(int32_t));
-    for (int i = 0; i < NBLK; ++i) {
-        ((int32_t *) INDICES->vir)[i] = i;
-    }
-    INDICES->flush();
+    alloc_page_inputs(pk);
+    GGML_ASSERT(pk.in_bytes("x") == P.X->size && pk.in_bytes("position_ids") == 3 * PG * sizeof(int32_t));
     GGML_ASSERT(pk.out_bytes("output") == P.OUT[0]->size);
     P.calls.assign(ncall, {});
     P.result = (ncall - 1) & 1;  // the calls alternate between OUT[0] / OUT[1]
