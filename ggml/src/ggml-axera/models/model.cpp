@@ -123,11 +123,11 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
     } else if (m.model == "qwen3") {
         llm = make_qwen3(m);
     } else if (m.model == "cosyvoice3_llm") {
-        llm = make_cosyvoice3_llm(m);
+        llm = make_phase_dense(m);
     } else if (m.model == "cpm5") {
         llm = make_cpm5(m);
     } else if (m.model == "voxcpm2_base") {
-        llm = make_voxcpm2_base(m);
+        llm = make_phase_dense(m);
     } else if (m.model == "hymt") {
         llm = make_hymt(m);
     } else {
