@@ -118,10 +118,8 @@ static std::shared_ptr<model> make_model_of(const manifest & m) {
         llm = make_qwen35_moe_sgl(m);
     } else if (m.model == "minicpmv4_7") {
         llm = make_qwen35_moe_sgl(m);  // the text tower is the published 35B-A3B NVFP4 stack
-    } else if (m.model == "hy_mt2") {
-        llm = make_hy_mt2(m);
-    } else if (m.model == "q3vl30") {
-        llm = make_q3vl30(m);
+    } else if (m.model == "hy_mt2" || m.model == "q3vl30") {
+        llm = make_moe_gqa(m);  // Hy-MT2-30B-A3B / Qwen3-VL-30B-A3B: the GQA MoE group kernels
     } else if (m.model == "qwen3") {
         llm = make_qwen3(m);
     } else if (m.model == "cosyvoice3_llm") {

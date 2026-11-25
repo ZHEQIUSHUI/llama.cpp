@@ -32,8 +32,7 @@ ggml_add_backend_library(ggml-axera
                          models/minicpm_ocr/minicpm_ocr_vit_full.cpp
                          models/minicpmv4_7/minicpmv4_7_vit.cpp
                          models/qwen35_moe_sgl/qwen35_moe_sgl.cpp
-                         models/hy_mt2/hy_mt2.cpp
-                         models/q3vl30/q3vl30.cpp
+                         models/moe_gqa/moe_gqa.cpp
                          models/qwen3/qwen3.cpp
                          models/llama_dense/llama_dense.cpp
                          models/qwen3_asr/qwen3_asr.cpp
