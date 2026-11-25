@@ -333,7 +333,6 @@ axera_cmm qwen38_27b::bank_fused(const std::map<std::string, ggml_tensor *> & t,
                 const int64_t        kh  = (int64_t) KHd * KD;
                 const int64_t        vh  = qkv->ne[1] - 2 * kh;
                 GGML_ASSERT(kh * 2 + vh == qkv->ne[1] && vh % VH == 0);
-                const bool  sc = n.size() > 6 && n.compare(n.size() - 6, 6, "_scale") == 0;
                 const char  p  = n[2];
                 if (p == 'z') {
                     const ggml_tensor * z = T(il, "attn_gate.weight");
@@ -564,6 +563,7 @@ void qwen38_27b::init(const std::map<std::string, ggml_tensor *> & t, const ggml
 // The upstream fused dense path: one prefill kernel (256 rows) and one decode kernel (1 row), their banks carrying
 // KB whole 4-layer blocks. The 2B/4B manifests use this path; the 27B manifest has decode.group and keeps init().
 void qwen38_27b::init_fused(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node, int L_, int H_) {
+    (void) rope_node;  // the fused kernels take the positions, not the rope tables
     L    = L_;
     H    = H_;
     fused = true;
@@ -815,9 +815,6 @@ seq_caps qwen38_27b::seq_get_caps() const {
     // zero rows from. Rewind to the page's restart point instead (one image load, correctness over the rare case).
     c.verify_min_keep = ver_rows > 0 ? 1 : 0;
     c.decode_at_zero  = true;  // the decode group runs cell 0 (the old path did, after a zeroed state)
-    // The upstream single-row graph has no correct one-core variant for this shape yet; a temporary switch keeps
-    // the model usable through the validated page kernel while that kernel is repaired.
-    c.decode_kernel = getenv("GGML_AXERA_NO_DECODE_KERNEL") == nullptr;
     return c;
 }
 
@@ -837,38 +834,6 @@ bool qwen38_27b::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int3
 
 bool qwen38_27b::seq_run_decode(int64_t c, const uint16_t * x, const int32_t * p4, int batch_row) {
     GGML_ASSERT(batch_row == 0);
-    if (fused && getenv("GGML_AXERA_DECODE_PREFILL") && atoi(getenv("GGML_AXERA_DECODE_PREFILL")) != 0) {
-        // Debug: run one token through the (validated) prefill kernel, one valid row, and take row 0.
-        gdn_page_set & P = pfs[0];
-        memset(P.X->vir, 0, (size_t) P.rows * H * sizeof(ggml_bf16_t));
-        memcpy(P.X->vir, x, H * sizeof(ggml_bf16_t));
-        P.X->flush();
-        int32_t * pp = (int32_t *) P.POS->vir;
-        for (int s = 0; s < 3; ++s) {
-            for (int r = 0; r < P.rows; ++r) {
-                pp[s * P.rows + r] = p4 ? p4[s] : (s < 2 ? (int32_t) c : 0);
-            }
-        }
-        P.POS->flush();
-        ((int32_t *) INDPTR->vir)[0]  = 0;
-        ((int32_t *) INDPTR->vir)[1]  = (int32_t) (c / PG);
-        ((int32_t *) LASTLEN->vir)[0] = 1;
-        ((int32_t *) LASTLEN->vir)[1] = 1;
-        ((int32_t *) CLOC->vir)[0]    = (int32_t) (c / PG);
-        ((int32_t *) CLOC->vir)[1]    = (int32_t) (c % PG);
-        *(int32_t *) VALID->vir       = 1;
-        for (const axera_cmm * b : { &INDPTR, &LASTLEN, &CLOC, &VALID }) {
-            (*b)->flush();
-        }
-        for (auto & cc : P.calls) {
-            cc.k->run(cc.in, cc.out, "dense decode via prefill");
-        }
-        state_zero = false;
-        const axera_cmm & po = P.OUT[P.result];
-        po->invalidate(po->vir, H * sizeof(ggml_bf16_t));
-        ggml_bf16_to_fp32_row((const ggml_bf16_t *) po->vir, out_h, H);
-        return true;
-    }
     if (fused) {
         // the upstream decode kernel takes the token's three M-RoPE positions, a one-page table and the cell in its
         // page; the recurrent and conv states are updated in place.
