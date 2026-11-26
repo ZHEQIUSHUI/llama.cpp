@@ -15,6 +15,7 @@
 #include "hash/hash.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <vector>
 
@@ -371,6 +372,8 @@ static void mtmd_helper_video_set_id(mtmd_helper_video * vctx, const std::string
 
 mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(const mtmd_context * ctx, const unsigned char * buf, size_t len, bool placeholder,
                                                             mtmd_helper_init_opt opt) {
+    const bool prof = getenv("GGML_AXERA_PROF") != nullptr;
+    const auto t_start = std::chrono::steady_clock::now();
     // calculate the hash if needed
     std::string id;
     mtmd_bitmap * result = nullptr;
@@ -380,6 +383,18 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(const mtmd_context *
     if (!placeholder) {
         // use sha256 to prevent cache poisoning
         id = hash_sha256_hex(buf, len);
+    }
+
+    if (!placeholder && !id.empty()) {
+        result = mtmd_bitmap_cache_get(ctx, id.c_str());
+        if (result) {
+            if (prof) {
+                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t_start).count();
+                fprintf(stderr, "mtmd prof: bitmap decode cache hit %.3f ms\n", us / 1e3);
+            }
+            return {result, nullptr};
+        }
     }
 
     if (audio_helpers::is_audio_file((const char *)buf, len)) {
@@ -405,7 +420,15 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(const mtmd_context *
         if (data) {
             result = mtmd_bitmap_init(nx, ny, placeholder ? nullptr : data);
             mtmd_bitmap_set_id(result, id.empty() ? nullptr : id.c_str());
+            if (!placeholder && !id.empty()) {
+                mtmd_bitmap_cache_put(ctx, id.c_str(), result);
+            }
             stbi_image_free(data);
+            if (prof) {
+                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t_start).count();
+                fprintf(stderr, "mtmd prof: bitmap decode miss %.3f ms\n", us / 1e3);
+            }
             return {result, nullptr};
         }
         // otherwise, fallthrough to video decoding (if supported)

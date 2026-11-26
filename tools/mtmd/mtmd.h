@@ -196,6 +196,14 @@ MTMD_API void         mtmd_bitmap_set_mergeable(mtmd_bitmap * bitmap, bool merge
 // active for models using the linear-position layout (e.g. LightNav-0)
 MTMD_API void         mtmd_bitmap_set_pool_spatial(mtmd_bitmap * bitmap, int pool_spatial);
 
+// Bounded, content-addressed cache of already decoded still-image bitmaps.  The
+// server hashes the encoded input before calling the image decoder, so repeated
+// requests can reuse the RGB buffer without running PNG/JPEG decoding again.
+// Entries are keyed by the caller-provided ID (mtmd-helper uses SHA-256 of the
+// encoded bytes).  The returned bitmap must be released with mtmd_bitmap_free().
+MTMD_API mtmd_bitmap * mtmd_bitmap_cache_get(const mtmd_context * ctx, const char * id);
+MTMD_API void          mtmd_bitmap_cache_put(const mtmd_context * ctx, const char * id, const mtmd_bitmap * bitmap);
+
 // mtmd_bitmap lazy
 //
 // this is a special bitmap that:

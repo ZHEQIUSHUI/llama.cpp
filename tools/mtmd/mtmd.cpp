@@ -570,6 +570,92 @@ struct mtmd_embd_cache {
     }
 };
 
+struct mtmd_img_preproc_cache_entry {
+    std::shared_ptr<const mtmd_image_preproc_out> data;
+    uint64_t stamp = 0;
+};
+
+// Image IDs from mtmd-helper are SHA-256 hashes of the encoded input.  Repeated navigation steps often resend
+// the same frames, so cache the decoded/resized/normalized tensors as well as the ViT embeddings.  Keep this
+// separate from the embedding cache: the latter is keyed by preprocessed pixels and still verifies identity.
+struct mtmd_img_preproc_cache {
+    mutable std::mutex mutex;
+    size_t limit_entries = 0;
+    mutable uint64_t tick = 0;
+    mutable std::unordered_map<std::string, mtmd_img_preproc_cache_entry> entries;
+
+    std::shared_ptr<const mtmd_image_preproc_out> get(const std::string & key) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = entries.find(key);
+        if (it == entries.end()) {
+            return nullptr;
+        }
+        it->second.stamp = ++tick;
+        return it->second.data;
+    }
+
+    void put(const std::string & key, const mtmd_image_preproc_out & data) const {
+        if (limit_entries == 0 || key.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        while (entries.size() >= limit_entries) {
+            auto oldest = entries.begin();
+            for (auto cur = std::next(entries.begin()); cur != entries.end(); ++cur) {
+                if (cur->second.stamp < oldest->second.stamp) {
+                    oldest = cur;
+                }
+            }
+            entries.erase(oldest);
+        }
+        auto copy = std::make_shared<mtmd_image_preproc_out>(data);
+        entries[key] = mtmd_img_preproc_cache_entry{std::move(copy), ++tick};
+    }
+};
+
+struct mtmd_img_bitmap_cache_entry {
+    std::shared_ptr<const mtmd_bitmap> data;
+    uint64_t stamp = 0;
+};
+
+// Skip the image decoder on repeated navigation requests.  The media ID is a SHA-256 of the encoded
+// bytes, so it identifies the decoded RGB buffer as well as the preprocessed tensor.  Store a deep
+// copy because mtmd owns and frees every bitmap returned by the helper.
+struct mtmd_img_bitmap_cache {
+    mutable std::mutex mutex;
+    size_t limit_entries = 0;
+    mutable uint64_t tick = 0;
+    mutable std::unordered_map<std::string, mtmd_img_bitmap_cache_entry> entries;
+
+    mtmd_bitmap * get(const std::string & key) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = entries.find(key);
+        if (it == entries.end()) {
+            return nullptr;
+        }
+        it->second.stamp = ++tick;
+        return new mtmd_bitmap(*it->second.data);
+    }
+
+    void put(const std::string & key, const mtmd_bitmap & data) const {
+        if (limit_entries == 0 || key.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        while (entries.size() >= limit_entries) {
+            auto oldest = entries.begin();
+            for (auto cur = std::next(entries.begin()); cur != entries.end(); ++cur) {
+                if (cur->second.stamp < oldest->second.stamp) {
+                    oldest = cur;
+                }
+            }
+            entries.erase(oldest);
+        }
+        auto copy = std::make_shared<mtmd_bitmap>(data);
+        entries[key] = mtmd_img_bitmap_cache_entry{std::move(copy), ++tick};
+    }
+};
+
 // slice template, used by some llava-uhd models to correctly place the special tokens around image embeddings
 // models not having it (llava-1.6) will process embeddings without any special tokens in-between
 enum mtmd_slice_tmpl {
@@ -673,6 +759,8 @@ struct mtmd_context {
     // Encoding the same image or video again is pure NPU work; media IDs are content hashes, so the result can be
     // reused safely. The cache is bounded and disabled by default on non-Axera builds to keep CPU behavior unchanged.
     mtmd_embd_cache embd_cache;
+    mtmd_img_preproc_cache img_preproc_cache;
+    mtmd_img_bitmap_cache img_bitmap_cache;
 
     // TODO @ngxson : add timings
 
@@ -695,6 +783,16 @@ struct mtmd_context {
         embd_cache.limit_bytes = cache_mib * 1024 * 1024;
         if (embd_cache.limit_bytes > 0) {
             LOG_INF("%s: embedding cache enabled, limit = %zu MiB\n", __func__, cache_mib);
+        }
+
+        const char * preproc_cache_env = getenv("LLAMA_MTMD_IMAGE_CACHE");
+        size_t preproc_cache_entries = preproc_cache_env
+            ? (size_t) std::max(0, atoi(preproc_cache_env))
+            : (ggml_backend_reg_by_name("AXERA") != nullptr ? 96 : 0);
+        img_preproc_cache.limit_entries = preproc_cache_entries;
+        img_bitmap_cache.limit_entries = preproc_cache_entries;
+        if (img_preproc_cache.limit_entries > 0) {
+            LOG_INF("%s: image preprocess cache enabled, limit = %zu entries\n", __func__, preproc_cache_entries);
         }
 
         if (ctx_params.image_marker != nullptr) {
@@ -1568,6 +1666,10 @@ struct mtmd_tokenizer {
             // TODO @ngxson : this is quite hacky because preprocessor only support batch with one single element, that need to be fixed in the future (e.g. by changing the preprocessor interface always take single input)
 
             mtmd_image_preproc_out preproc_out;
+            const bool preproc_cache_on = ctx->img_preproc_cache.limit_entries > 0;
+            const bool prof = mtmd_prof_on();
+            size_t n_preproc_hits = 0;
+            const int64_t t_pre0 = prof ? ggml_time_us() : 0;
 
             for (const auto * bmp : bitmaps) {
                 // sanity check
@@ -1586,8 +1688,32 @@ struct mtmd_tokenizer {
                     bmp->is_placeholder());
                 img_u8.cpy_buf(bmp->get_ro_buf());
 
+                std::string cache_key;
+                if (preproc_cache_on && !bmp->id.empty()) {
+                    char dims[64];
+                    snprintf(dims, sizeof(dims), ":%u:%u", bmp->nx, bmp->ny);
+                    cache_key = std::string("image-preproc:") + bmp->id + dims;
+                    auto cached = ctx->img_preproc_cache.get(cache_key);
+                    if (cached) {
+                        for (const auto & entry : cached->entries) {
+                            preproc_out.entries.push_back(entry);
+                        }
+                        if ((cached->grid_x > 0 && cached->grid_y > 0) || cached->has_overview()) {
+                            GGML_ASSERT(bitmaps.size() == 1);
+                            preproc_out.grid_x = cached->grid_x;
+                            preproc_out.grid_y = cached->grid_y;
+                            preproc_out.overview = cached->overview;
+                        }
+                        ++n_preproc_hits;
+                        continue;
+                    }
+                }
+
                 // preprocess image
                 mtmd_image_preproc_out tmp_preproc_out = ctx->image_preproc->preprocess(img_u8);
+                if (!cache_key.empty()) {
+                    ctx->img_preproc_cache.put(cache_key, tmp_preproc_out);
+                }
 
                 // move entries and grid dimensions to the "global" preproc_out
                 for (auto & entry : tmp_preproc_out.entries) {
@@ -1603,6 +1729,10 @@ struct mtmd_tokenizer {
                     preproc_out.grid_y = tmp_preproc_out.grid_y;
                     preproc_out.overview = std::move(tmp_preproc_out.overview);
                 }
+            }
+            if (prof) {
+                fprintf(stderr, "mtmd prof: image preprocess total %.3f ms cache inputs=%zu hits=%zu\n",
+                        (ggml_time_us() - t_pre0) / 1e3, bitmaps.size(), n_preproc_hits);
             }
 
             LOG_DBG("%s: preproc_out has %zu entries, grid_x = %d, grid_y = %d, has_overview = %d\n",
@@ -2522,7 +2652,16 @@ static int32_t mtmd_batch_encode_entries(
 static uint64_t mtmd_hash_bytes(uint64_t hash, const void * data, size_t size) {
     // FNV-1a: the id alone is not unique for models that split one image into several chunks (llava-uhd and similar),
     // so mix the actual preprocessed pixels into the key to avoid serving a sibling tile's embedding.
+    // Process eight bytes per round; the pixel buffers are large and a byte loop costs milliseconds per chunk.
     const unsigned char * bytes = static_cast<const unsigned char *>(data);
+    while (size >= sizeof(uint64_t)) {
+        uint64_t word;
+        memcpy(&word, bytes, sizeof(word));
+        hash ^= word;
+        hash *= 1099511628211ULL;
+        bytes += sizeof(word);
+        size  -= sizeof(word);
+    }
     for (size_t i = 0; i < size; ++i) {
         hash ^= bytes[i];
         hash *= 1099511628211ULL;
@@ -2813,6 +2952,20 @@ void mtmd_bitmap_set_mergeable(mtmd_bitmap * bitmap, bool mergeable) {
 
 void mtmd_bitmap_set_pool_spatial(mtmd_bitmap * bitmap, int pool_spatial) {
     bitmap->pool_spatial = pool_spatial > 1 ? pool_spatial : 1;
+}
+
+mtmd_bitmap * mtmd_bitmap_cache_get(const mtmd_context * ctx, const char * id) {
+    if (ctx == nullptr || id == nullptr || id[0] == '\0') {
+        return nullptr;
+    }
+    return ctx->img_bitmap_cache.get(id);
+}
+
+void mtmd_bitmap_cache_put(const mtmd_context * ctx, const char * id, const mtmd_bitmap * bitmap) {
+    if (ctx == nullptr || id == nullptr || id[0] == '\0' || bitmap == nullptr || bitmap->is_audio) {
+        return;
+    }
+    ctx->img_bitmap_cache.put(id, *bitmap);
 }
 
 mtmd_bitmap * mtmd_bitmap_init_lazy(const mtmd_context * ctx,

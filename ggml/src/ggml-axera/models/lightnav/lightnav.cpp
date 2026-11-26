@@ -1,15 +1,17 @@
-// Axera NPU backend: LightNav-0 (Qwen3-VL-4B dense text tower) on NVFP4 6-layer group kernels
+// Axera NPU backend: LightNav-0 (Qwen3-VL-4B dense text tower) on 8-bit MXFP8 or NVFP4 group kernels
 // (H 2560, 32 q / 8 kv heads of 128, dense FFN 9728, 36 layers in six groups of six).
 //
 // The manifest has two merged kernels:
 //   decode   all 36 layers statically expanded as six weight groups g0_..g5_ of six layers for one token,
-//            then the final RMSNorm and NVFP4 output head.
+//            then the final RMSNorm and quantized output head.
 //   prefill  a 256-row workspace whose graph holds one reusable 6-layer dense body.  The host launches it
 //            once per decode group, rebinding the body to that group's banks; the last call computes the
 //            head for the wanted rows.
-// The weights come from a GGUF quantized once to standard GGML NVFP4 blocks with one F32 .scale sidecar
-// per quantization slice; loading copies the codewords and the per-16-input UE4M3 scales into the kernels'
-// banks and the sidecar is the kernels' FP32 scale2.
+// The weights come from a GGUF quantized once to MXFP8 (E4M3 codes, one E8M0 scale per 32 inputs) or to
+// standard GGML NVFP4 blocks with one F32 .scale sidecar per quantization slice.  Loading converts any
+// GGUF type into the descriptor's layout: MXFP8 when the kernel asks for E4M3 codes and E8M0 scales,
+// otherwise NVFP4.  NVFP4 copies the codewords and the per-16-input UE4M3 scales and uses the sidecar as
+// the kernels' FP32 scale2.
 //
 // What the manifest's descriptors decide:
 //   KV      g<i>_kv<j>: one BF16 [pages][2][256][8][128] pool per layer, allocated from -c.
@@ -39,7 +41,7 @@ namespace axera {
 namespace {
 
 constexpr int PG = 256;
-constexpr int WP_MAX = 256;
+constexpr int WP_MAX = 1024;  // largest compiled prefill workspace (selected from the manifest's x extent)
 constexpr int H = 2560;
 constexpr int KVH = 8;
 constexpr int HD = 128;
@@ -393,7 +395,7 @@ void lightnav::init(const std::map<std::string, ggml_tensor *> & t, const ggml_t
     axera_flush_file_pages();
 
     wp = (int) (io.at("x")->size / (H * sizeof(ggml_bf16_t)));
-    GGML_ASSERT(wp == WP_MAX);
+    GGML_ASSERT(wp >= PG && wp <= WP_MAX && wp % PG == 0);
     bind_calls(pre, pk, true);
     bind_calls(dec, dk, false);
 
@@ -450,11 +452,49 @@ void lightnav::fill_bank(const std::map<std::string, ggml_tensor *> & t, const g
         GGML_ASSERT(sl != bank_slot.end());
         memset(slot(bm, n, b), 0, sl->second);
     };
-    // a whole projection into one layer slot: NVFP4 codewords and scales copied, anything else (Hy-MT2's
-    // Q8_0 output head) quantized once into the kernel's NVFP4 layout
+    // a whole projection into one layer slot, in the layout the kernel descriptor declares: MXFP8
+    // (E4M3 + per-32 E8M0) or NVFP4 (codewords + per-16 E4M3 scales + one F32 global scale).  Any GGUF
+    // source type is converted once at load; NVFP4 sources are copied without re-quantizing.
     auto put_nv_whole = [&](bmap & bm, const std::string & qn, const std::string & sn, const std::string & zn,
                             const ggml_tensor * w, int b, float s2_scale = 1.0f) {
         const int64_t K = w->ne[0], N = ggml_nrows(w);
+        if (bank_dtype.at(qn) == 11 && bank_dtype.at(sn) == 1) {  // MXFP8: E4M3 codes + E8M0 / 32 inputs
+            GGML_ASSERT(w->ne[2] == 1 && K % AXERA_MX_GROUP == 0);
+            uint8_t * q = slot(bm, qn, b);
+            uint8_t * s = slot(bm, sn, b);
+            GGML_ASSERT((size_t) N * K <= bank_slot.at(qn));
+            GGML_ASSERT((size_t) N * (K / AXERA_MX_GROUP) <= bank_slot.at(sn));
+            axera_for_rows_f32(w, [&](int64_t r, const float * row) {
+                axera_quantize_row_mxfp8_f32(row, q + r * K, s + r * (K / AXERA_MX_GROUP), K);
+            });
+            fill_f32(bm, zn, b, s2_scale);
+            return;
+        }
+        if (bank_dtype.at(qn) == 1 && bank_dtype.at(sn) == 3) {  // W8A16: int8 codes + F32 scale / 32 inputs
+            GGML_ASSERT(w->ne[2] == 1 && K % 32 == 0);
+            int8_t * q = (int8_t *) slot(bm, qn, b);
+            float * s = (float *) slot(bm, sn, b);
+            GGML_ASSERT((size_t) N * K <= bank_slot.at(qn));
+            GGML_ASSERT((size_t) N * (K / 32) * sizeof(float) <= bank_slot.at(sn));
+            axera_for_rows_f32(w, [&](int64_t r, const float * row) {
+                int8_t * qr = q + r * K;
+                float * sr = s + r * (K / 32);
+                for (int64_t g = 0; g < K / 32; ++g) {
+                    float amax = 0.0f;
+                    for (int64_t i = 0; i < 32; ++i) {
+                        amax = std::max(amax, std::fabs(row[g * 32 + i]));
+                    }
+                    const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+                    sr[g] = scale;
+                    for (int64_t i = 0; i < 32; ++i) {
+                        const long v = std::lrint(row[g * 32 + i] / scale);
+                        qr[g * 32 + i] = (int8_t) std::max(-127L, std::min(127L, v));
+                    }
+                }
+            });
+            fill_f32(bm, zn, b, s2_scale);
+            return;
+        }
         GGML_ASSERT(w->ne[2] == 1 && K % 64 == 0);
         uint8_t * q = slot(bm, qn, b);
         uint8_t * s = slot(bm, sn, b);
@@ -707,6 +747,7 @@ static void mrope_cache(float * cs, float * sn, const int32_t * p) {
 
 void lightnav::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const int32_t * p4, int64_t batch_cell0,
                                bool need_head) {
+    axera_timer tpage("prefill (page)");
     GGML_ASSERT(cell % PG == 0 && rows > 0 && rows <= wp);
     axera_cmm & xi = io.at("x");
     auto dsi = io.find("deepstack");
@@ -715,6 +756,7 @@ void lightnav::run_prefill_page(int64_t cell, int rows, const uint16_t * x, cons
     // to the same eight experts).
     uint16_t * xb = (uint16_t *) xi->vir;
     uint16_t * db = dsi != io.end() ? (uint16_t *) dsi->second->vir : nullptr;
+    axera_timer tinput("prefill (input host)");
     axera_host_pool().run(wp, [&](int64_t r) {
         const int64_t s = r < rows ? r : r % rows;
         memcpy(xb + (size_t) r * H, x + (size_t) s * IN, (size_t) H * sizeof(uint16_t));
@@ -724,6 +766,8 @@ void lightnav::run_prefill_page(int64_t cell, int rows, const uint16_t * x, cons
         }
     });
 
+    tinput.stop();
+    axera_timer ttables("prefill (tables host)");
     // Padded rows continue the position sequence so their K/V land past the valid tail (masked for valid
     // queries and beyond last_page_len for the later decode), not over slot 0.
     int32_t * pos = (int32_t *) io.at("position_ids")->vir;
@@ -763,6 +807,7 @@ void lightnav::run_prefill_page(int64_t cell, int rows, const uint16_t * x, cons
     if (db) {
         dsi->second->flush();
     }
+    ttables.stop();
 
     // batch_cell0 is the cell of the caller's batch row 0.  A replayed page prefix is part of the kernel's
     // rows but its logits are not wanted: the head takes the caller's last rows.
@@ -793,7 +838,10 @@ void lightnav::run_prefill_page(int64_t cell, int rows, const uint16_t * x, cons
             *(int32_t *) head_run->second->vir = need_head && ci + 1 == (int) pre.size() ? 1 : 0;
             head_run->second->flush();
         }
-        pre[ci].k->run(pre[ci].in, pre[ci].out, "prefill");
+        {
+            axera_timer tgroup("prefill (layer group)");
+            pre[ci].k->run(pre[ci].in, pre[ci].out, "prefill");
+        }
         // the deepstack planes belong to the first call's layers 1..3 only
         if (ci == 0 && db && pre.size() > 1) {
             memset(dsi->second->vir, 0, dsi->second->size);
@@ -809,7 +857,9 @@ void lightnav::run_prefill_page(int64_t cell, int rows, const uint16_t * x, cons
 }
 
 void lightnav::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4) {
+    axera_timer trow("decode (row)");
     // the IO buffers are sized for a prefill page; a decode row writes a few bytes of each and cleans only those
+    axera_timer tpack("decode (pack host)");
     auto put = [&](const char * n, const void * v, size_t bytes) {
         axera_cmm & c = io.at(n);
         memcpy(c->vir, v, bytes);
@@ -850,7 +900,12 @@ void lightnav::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * 
         }
     }
     GGML_ASSERT(dec.size() == 1);
-    dec[0].k->run(dec[0].in, dec[0].out, "decode");
+    tpack.stop();
+    {
+        axera_timer tnpu("decode (npu)");
+        dec[0].k->run(dec[0].in, dec[0].out, "decode");
+    }
+    axera_timer tgather("decode (gather)");
     axera_cmm & hl = io.at("head_logits");
     hl->invalidate(hl->vir, VOCAB * sizeof(float));
     head_first = 0;  // the decode batch is one row: its logits row is batch row 0
@@ -910,6 +965,7 @@ void lightnav::seq_rows(int batch_row0, int n, uint16_t * dst) {
 }
 
 void lightnav::publish_logits(ggml_cgraph * g, ggml_tensor * logits, int T) {
+    axera_timer thost("output head (copy)");
     GGML_ASSERT(logits && logits->type == GGML_TYPE_F32 && logits->ne[0] == VOCAB);
     const int n_out = (int) logits->ne[1];
     if (n_out == 0) {
