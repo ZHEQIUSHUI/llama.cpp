@@ -1,15 +1,17 @@
-// Axera NPU backend: LightNav-0 (Qwen3-VL-4B dense text tower) on NVFP4 6-layer group kernels
+// Axera NPU backend: LightNav-0 (Qwen3-VL-4B dense text tower) on 8-bit MXFP8 or NVFP4 group kernels
 // (H 2560, 32 q / 8 kv heads of 128, dense FFN 9728, 36 layers in six groups of six).
 //
 // The manifest has two merged kernels:
 //   decode   all 36 layers statically expanded as six weight groups g0_..g5_ of six layers for one token,
-//            then the final RMSNorm and NVFP4 output head.
+//            then the final RMSNorm and quantized output head.
 //   prefill  a 256-row workspace whose graph holds one reusable 6-layer dense body.  The host launches it
 //            once per decode group, rebinding the body to that group's banks; the last call computes the
 //            head for the wanted rows.
-// The weights come from a GGUF quantized once to standard GGML NVFP4 blocks with one F32 .scale sidecar
-// per quantization slice; loading copies the codewords and the per-16-input UE4M3 scales into the kernels'
-// banks and the sidecar is the kernels' FP32 scale2.
+// The weights come from a GGUF quantized once to MXFP8 (E4M3 codes, one E8M0 scale per 32 inputs) or to
+// standard GGML NVFP4 blocks with one F32 .scale sidecar per quantization slice.  Loading converts any
+// GGUF type into the descriptor's layout: MXFP8 when the kernel asks for E4M3 codes and E8M0 scales,
+// otherwise NVFP4.  NVFP4 copies the codewords and the per-16-input UE4M3 scales and uses the sidecar as
+// the kernels' FP32 scale2.
 //
 // What the manifest's descriptors decide:
 //   KV      g<i>_kv<j>: one BF16 [pages][2][256][8][128] pool per layer, allocated from -c.
@@ -450,11 +452,24 @@ void lightnav::fill_bank(const std::map<std::string, ggml_tensor *> & t, const g
         GGML_ASSERT(sl != bank_slot.end());
         memset(slot(bm, n, b), 0, sl->second);
     };
-    // a whole projection into one layer slot: NVFP4 codewords and scales copied, anything else (Hy-MT2's
-    // Q8_0 output head) quantized once into the kernel's NVFP4 layout
+    // a whole projection into one layer slot, in the layout the kernel descriptor declares: MXFP8
+    // (E4M3 + per-32 E8M0) or NVFP4 (codewords + per-16 E4M3 scales + one F32 global scale).  Any GGUF
+    // source type is converted once at load; NVFP4 sources are copied without re-quantizing.
     auto put_nv_whole = [&](bmap & bm, const std::string & qn, const std::string & sn, const std::string & zn,
                             const ggml_tensor * w, int b, float s2_scale = 1.0f) {
         const int64_t K = w->ne[0], N = ggml_nrows(w);
+        if (bank_dtype.at(qn) == 11 && bank_dtype.at(sn) == 1) {  // MXFP8: E4M3 codes + E8M0 / 32 inputs
+            GGML_ASSERT(w->ne[2] == 1 && K % AXERA_MX_GROUP == 0);
+            uint8_t * q = slot(bm, qn, b);
+            uint8_t * s = slot(bm, sn, b);
+            GGML_ASSERT((size_t) N * K <= bank_slot.at(qn));
+            GGML_ASSERT((size_t) N * (K / AXERA_MX_GROUP) <= bank_slot.at(sn));
+            axera_for_rows_f32(w, [&](int64_t r, const float * row) {
+                axera_quantize_row_mxfp8_f32(row, q + r * K, s + r * (K / AXERA_MX_GROUP), K);
+            });
+            fill_f32(bm, zn, b, s2_scale);
+            return;
+        }
         GGML_ASSERT(w->ne[2] == 1 && K % 64 == 0);
         uint8_t * q = slot(bm, qn, b);
         uint8_t * s = slot(bm, sn, b);
