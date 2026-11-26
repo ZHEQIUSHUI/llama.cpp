@@ -14,13 +14,19 @@
 namespace axera {
 namespace {
 
-// a graph is the vision encoder's if it reads the first ViT layer's qkv weight
+// a graph is the vision encoder's if any of its tensors is one of the mmproj's v.* weights.  Clip graphs name the
+// layer weights directly; the whole-model ViT adapters (q3vl30, lightnav) read them by name, so check both the node
+// names and their sources and accept any layer / patch / position tensor rather than one exact spelling.
 bool vit_graph(const ggml_cgraph * g) {
+    auto vit_name = [](const char * n) {
+        return strstr(n, "v.blk.") || strstr(n, "v.patch_embd") || strstr(n, "v.position_embd");
+    };
     for (int i = 0; i < g->n_nodes; i++) {
+        if (vit_name(g->nodes[i]->name)) {
+            return true;
+        }
         for (int s = 0; s < GGML_MAX_SRC && g->nodes[i]->src[s]; ++s) {
-            const char * n = g->nodes[i]->src[s]->name;
-            const char * a = strchr(n, '#');  // the scheduler's copies "<backend>#<name>#<copy>"
-            if (strncmp(a ? a + 1 : n, "v.blk.0.attn_qkv.weight", 23) == 0) {
+            if (vit_name(g->nodes[i]->src[s]->name)) {
                 return true;
             }
         }
@@ -56,10 +62,22 @@ struct composite final : model {
     size_t next = 0;
 
     model * select(const ggml_cgraph * g) {
-        return vit && (vit_graph(g) || minicpm_ocr_vit_graph(g)) ? vit.get() :
-               audio && qwen3_asr_graph(g)         ? audio.get() :
-               gen && !llm_graph(g)                ? gen.get() :
-                                                     llm.get();
+        if (vit && (vit_graph(g) || minicpm_ocr_vit_graph(g))) {
+            return vit.get();
+        }
+        if (audio && qwen3_asr_graph(g)) {
+            return audio.get();
+        }
+        if (gen && !llm_graph(g)) {
+            return gen.get();
+        }
+        // A package with a whole-model vision encoder and no audio / generation graphs has exactly two kinds of
+        // graph: the language model's and the vision encoder's.  Clip may rename or fold the v.* weights, so the
+        // name check above can miss it; the absence of the language model's result nodes is unambiguous.
+        if (vit && !audio && !gen && !llm_graph(g)) {
+            return vit.get();
+        }
+        return llm.get();
     }
 
     ggml_status compute(ggml_cgraph * g) override {
@@ -128,6 +146,7 @@ constexpr adapter_row adapters[] = {
     { "minicpmv4_7",    make_qwen35_moe_sgl, make_minicpmv4_7_vit_full, true,  true,  false },
     { "hy_mt2",         make_moe_gqa,        nullptr,                   true,  true,  false },
     { "q3vl30",         make_moe_gqa,        make_q3vl30_vit_full,      true,  true,  false },
+    { "lightnav",       make_lightnav,      make_lightnav_vit_full,    true,  true,  false },
     { "qwen3",          make_qwen3,          nullptr,                   false, false, false },
     { "cosyvoice3_llm", make_phase_dense,    nullptr,                   false, false, false },
     { "cpm5",           make_cpm5,           nullptr,                   true,  false, false },

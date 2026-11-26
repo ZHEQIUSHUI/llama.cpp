@@ -617,6 +617,7 @@ static double sec(std::chrono::steady_clock::time_point a, std::chrono::steady_c
 // stores BF16 tensors but exposes FP32 engine inputs; HiFT exposes BF16
 // directly.  Conversion is done in one whole-tensor pass, never element by
 // element into CMM.
+#ifdef COSY_TTS_HAVE_AXERA
 static bool upload_weight_bank(npu_model & m, gguf_asset_file & bank, const char * tag,
                                const std::string & layout_path = std::string(),
                                double * read_s = nullptr, double * conv_s = nullptr, double * up_s = nullptr) {
@@ -799,6 +800,9 @@ static bool upload_weight_bank(npu_model & m, gguf_asset_file & bank, const char
     if (up_s) *up_s = total_s;
     return n > 0;
 }
+#else
+static bool upload_weight_bank(npu_model &, gguf_asset_file &, const char *, const std::string & = {}, double * = nullptr, double * = nullptr, double * = nullptr) { return false; }
+#endif
 
 static std::string kernel_tensor_name(const std::string & name) {
     std::string out = name;
@@ -810,6 +814,7 @@ static std::string kernel_tensor_name(const std::string & name) {
 // final byte order, so loading is one whole-tensor copy per input.  This is
 // the release path; the legacy layout conversion below remains available for
 // source checkpoints.
+#ifdef COSY_TTS_HAVE_AXERA
 static bool upload_front_bank(npu_model & m, gguf_asset_file & assets) {
     const auto t0 = std::chrono::steady_clock::now();
     int n = 0;
@@ -983,6 +988,11 @@ static bool upload_front_weights(npu_model & m, gguf_asset_file & assets) {
 }
 
 
+#else
+static bool upload_front_bank(npu_model &, gguf_asset_file &) { return false; }
+static bool upload_front_weights(npu_model &, gguf_asset_file &) { return false; }
+#endif
+
 // Fixed 30 s reference-audio window: 3000 Whisper mel frames -> 750 language
 // model tokens.  Padding is zero (the same value the official feature
 // extractor uses for silence); anything longer is truncated like the official
@@ -1031,7 +1041,6 @@ static bool front_tokenize(npu_model & m, const std::vector<float> & wmel, int f
     tokens.assign(result, result + ntok);
     return true;
 }
-
 struct hift_native {
     struct layer {
         int out_c, in_c, k;

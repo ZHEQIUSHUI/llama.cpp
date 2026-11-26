@@ -1931,6 +1931,7 @@ private:
             mparams.warmup           = params_base.warmup;
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
+            mparams.force_linear_pos  = params_base.mmproj_linear_pos;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
             mparams.media_marker     = get_media_marker();
             // progress callback
@@ -6310,7 +6311,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task_response_type res_type,
             const common_chat_session & chat_session,
             int64_t perf_http_us,
-            int64_t perf_template_us) {
+            int64_t perf_template_us,
+            const std::vector<bool> * mergeable,
+            const std::vector<int> * pool_spatial) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     auto res = create_response();
@@ -6345,7 +6348,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files,
-                                                 ctx_server.init_opt, false, ctx_server.vocab));
+                                                 ctx_server.init_opt, false, ctx_server.vocab, mergeable, pool_spatial));
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
@@ -7023,6 +7026,8 @@ void server_routes::init_routes() {
         auto res = create_response();
         const int64_t perf_http_us = ggml_time_us();
         std::vector<raw_buffer> files;
+        std::vector<bool> mergeable;
+        std::vector<int> pool_spatial;
         json body = json::parse(req.body);
         common_chat_session session;
         json body_parsed = oaicompat_chat_params_parse(
@@ -7030,7 +7035,9 @@ void server_routes::init_routes() {
             body,
             meta->chat_params,
             files,
-            session);
+            session,
+            &mergeable,
+            &pool_spatial);
         const int64_t perf_template_us = ggml_time_us();
         return handle_completions_impl(
             req,
@@ -7040,7 +7047,9 @@ void server_routes::init_routes() {
             TASK_RESPONSE_TYPE_OAI_CHAT,
             session,
             perf_http_us,
-            perf_template_us);
+            perf_template_us,
+            &mergeable,
+            &pool_spatial);
     };
 
     this->post_chat_completions_tok = [this](const server_http_req & req) {

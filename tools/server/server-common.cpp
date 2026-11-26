@@ -1179,7 +1179,9 @@ server_tokens process_mtmd_prompt(
         const std::vector<raw_buffer> & files,
         const mtmd_helper_init_opt & init_opt,
         bool is_placeholder,
-        const llama_vocab * vocab) {
+        const llama_vocab * vocab,
+        const std::vector<bool> * mergeable,
+        const std::vector<int> * pool_spatial) {
     static const bool perf1112 = getenv("PERF1112_PROF") != nullptr;
     const int64_t perf_t0 = perf1112 ? ggml_time_us() : 0;
     if (files.empty() && !is_placeholder && vocab && prompt.find(mtmd_default_marker()) == std::string::npos) {
@@ -1191,10 +1193,17 @@ server_tokens process_mtmd_prompt(
     // these will be freed upon going out of scope
     mtmd::bitmaps bitmaps;
     std::vector<mtmd_helper::video_ptr> videos;
-    for (auto & file : files) {
+    for (size_t i = 0; i < files.size(); ++i) {
+        auto & file = files[i];
         auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
         if (!out.bitmap) {
             throw std::runtime_error("Failed to load image or audio file");
+        }
+        if (mergeable && i < mergeable->size() && (*mergeable)[i]) {
+            mtmd_bitmap_set_mergeable(out.bitmap, true);
+        }
+        if (pool_spatial && i < pool_spatial->size() && (*pool_spatial)[i] > 1) {
+            mtmd_bitmap_set_pool_spatial(out.bitmap, (*pool_spatial)[i]);
         }
         bitmaps.entries.emplace_back(out.bitmap);
         if (out.video_ctx) {
@@ -1412,7 +1421,25 @@ void handle_media(
 }
 
 // load media files from an OAI content array, then replace each media part with a media marker text part
-static void oaicompat_content_load_media(json & content, const server_chat_params & opt, std::vector<raw_buffer> & out_files) {
+static void oaicompat_content_load_media(json & content, const server_chat_params & opt, std::vector<raw_buffer> & out_files,
+                                         std::vector<bool> * out_mergeable = nullptr,
+                                         std::vector<int> * out_pool_spatial = nullptr) {
+    auto note_mergeable = [&](bool mergeable) {
+        if (out_mergeable) {
+            out_mergeable->resize(out_files.size(), false);
+            if (!out_mergeable->empty()) {
+                (*out_mergeable)[out_files.size() - 1] = mergeable;
+            }
+        }
+    };
+    auto note_pool_spatial = [&](int pool_spatial) {
+        if (out_pool_spatial) {
+            out_pool_spatial->resize(out_files.size(), 1);
+            if (!out_pool_spatial->empty()) {
+                (*out_pool_spatial)[out_files.size() - 1] = pool_spatial > 1 ? pool_spatial : 1;
+            }
+        }
+    };
     for (auto & p : content) {
         std::string type = json_value(p, "type", std::string());
         if (type == "image_url") {
@@ -1423,6 +1450,8 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
             json image_url = json_value(p, "image_url", json::object());
             std::string url = json_value(image_url, "url", std::string());
             handle_media(out_files, url, opt.media_path);
+            note_mergeable(json_value(p, "mergeable", false));
+            note_pool_spatial(json_value(p, "pool_spatial", 1));
 
             p["type"] = "media_marker";
             p["text"] = get_media_marker();
@@ -1438,6 +1467,8 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
             std::string url  = json_value(input_audio, "data",
                                     json_value(input_audio, "url", std::string()));
             handle_media(out_files, url, opt.media_path);
+            note_mergeable(false);
+            note_pool_spatial(1);
 
             p["type"] = "media_marker";
             p["text"] = get_media_marker();
@@ -1453,6 +1484,7 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
             std::string url  = json_value(input_video, "data",
                                     json_value(input_video, "url", std::string()));
             handle_media(out_files, url, opt.media_path);
+            note_mergeable(false);
 
             p["type"] = "media_marker";
             p["text"] = get_media_marker();
@@ -1490,7 +1522,9 @@ json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
     std::vector<raw_buffer> & out_files,
-    common_chat_session & out_session)
+    common_chat_session & out_session,
+    std::vector<bool> * out_mergeable,
+    std::vector<int> * out_pool_spatial)
 {
     static const bool perf1112 = getenv("PERF1112_PROF") != nullptr;
     const int64_t perf_t0 = perf1112 ? ggml_time_us() : 0;
@@ -1606,7 +1640,7 @@ json oaicompat_chat_params_parse(
             throw std::invalid_argument("Expected 'content' to be a string or an array");
         }
 
-        oaicompat_content_load_media(content, opt, out_files);
+        oaicompat_content_load_media(content, opt, out_files, out_mergeable, out_pool_spatial);
     }
 
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());

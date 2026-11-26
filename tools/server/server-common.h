@@ -298,7 +298,12 @@ server_tokens process_mtmd_prompt(
                                         const std::vector<raw_buffer> & files,
                                         const mtmd_helper_init_opt & init_opt,
                                         bool is_placeholder = false,
-                                        const llama_vocab * vocab = nullptr);
+                                        const llama_vocab * vocab = nullptr,
+                                        // optional, one flag per file: a frame that can be temporally merged with
+                                        // the next file (Qwen3-VL video). The navigation client sends tubelet pairs.
+                                        const std::vector<bool> * mergeable = nullptr,
+                                        // optional, one factor per file: post-ViT spatial pooling factor
+                                        const std::vector<int> * pool_spatial = nullptr);
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
@@ -360,7 +365,9 @@ json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
     std::vector<raw_buffer> & out_files,
-    common_chat_session & out_session);
+    common_chat_session & out_session,
+    std::vector<bool> * out_mergeable = nullptr,
+    std::vector<int> * out_pool_spatial = nullptr);
 
 // used by /embeddings endpoint, content has the same format as a chat message content array
 server_tokens tokenize_oai_content_array(

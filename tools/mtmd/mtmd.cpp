@@ -41,10 +41,10 @@ static bool mtmd_prof_on() {
 }
 
 // remember to bump this if the serialization format changes
-#define MTMD_SERIALIZATION_VERSION 3
+#define MTMD_SERIALIZATION_VERSION 4
 
 // oldest compat version that can be loaded
-#define MTMD_SERIALIZATION_VERSION_MIN 2
+#define MTMD_SERIALIZATION_VERSION_MIN 4
 
 struct mtmd_serialization {
     // note: using 64-bit here for future-proofing
@@ -186,6 +186,7 @@ struct mtmd_bitmap {
     std::string id; // optional user-defined id, for ex: can be set to image hash, useful for KV cache tracking
     bool is_audio = false; // true if the bitmap is audio
     bool mergeable = false; // [QWEN_VIDEO] set only on frames of the same video
+    int  pool_spatial = 1;  // optional post-ViT spatial pooling factor (1 = disabled)
 
     // lazy-loaded bitmap
     mtmd_bitmap_lazy_callback lazy_callback = nullptr;
@@ -238,6 +239,7 @@ enum mtmd_pos_type {
     MTMD_POS_TYPE_MROPE,     // qwen-vl mrope style, each image takes max(t,h,w) position indexes
     MTMD_POS_TYPE_HUNYUANVL, // HunyuanVL mrope + BOI/EOI/newline layout with XD-RoPE dim-3
     MTMD_POS_TYPE_CANVAS,    // MiniCPM-V 4.7: overview + slices in one chunk, sharing one 2D canvas (see mtmd_image_tokens::canvas_tile_grid)
+    MTMD_POS_TYPE_LINEAR,    // 4-section mRoPE layout but every section advances linearly (reference uses plain RoPE)
     MTMD_POS_TYPE_COUNT,     // for validation
 };
 
@@ -248,6 +250,36 @@ struct mtmd_image_tokens {
     mtmd_pos_type pos = MTMD_POS_TYPE_NORMAL;
     uint32_t image_idx = 0; // 0-based position of this image among image chunks in the prompt(used by pos == MTMD_POS_TYPE_HUNYUANVL)
     uint32_t n_temporal_merge = 1; // for qwen-vl style temporal merge
+    int      pool_spatial = 1; // optional post-ViT spatial pooling factor
+
+    uint32_t n_slices() const {
+        uint32_t nz = batch_f32.entries.size();
+        if (n_temporal_merge > 1) {
+            if (nz % n_temporal_merge != 0) {
+                nz = nz / n_temporal_merge + 1;
+            } else {
+                nz = nz / n_temporal_merge;
+            }
+        }
+        return nz;
+    }
+
+    // token count produced by the vision encoder (before optional pooling)
+    uint32_t n_tokens_full() const {
+        if (pos == MTMD_POS_TYPE_HUNYUANVL) {
+            return (nx + 1) * ny + 2;
+        }
+        if (pos == MTMD_POS_TYPE_CANVAS) {
+            uint32_t n = 0;
+            for (size_t k = 0; k < batch_f32.entries.size(); ++k) {
+                const auto [gw, gh] = canvas_tile_grid(k);
+                n += gw * gh + (uint32_t) clip_suffix_rows(batch_f32.entries[k].suffix_type).size();
+            }
+            return n;
+        }
+        return nx * ny * n_slices();
+    }
+
     uint32_t n_tokens() const {
         if (pos == MTMD_POS_TYPE_HUNYUANVL) {
             // [BOI] [row0 tokens + newline] ... [row(ny-1) tokens + newline] [EOI]
@@ -261,15 +293,11 @@ struct mtmd_image_tokens {
             }
             return n;
         }
-        uint32_t nz = batch_f32.entries.size();
-        if (n_temporal_merge > 1) {
-            // [QWEN_VIDEO] this logic is quite ugly, it's mostly to make qwen-vl temporal merge work, can be improved in the future
-            // TODO: simplify this by repeating the last frame until it fits the temporal merge
-            if (nz % n_temporal_merge != 0) {
-                nz = nz / n_temporal_merge + 1;
-            } else {
-                nz = nz / n_temporal_merge;
-            }
+        uint32_t nz = n_slices();
+        if (pool_spatial > 1 && pos == MTMD_POS_TYPE_LINEAR) {
+            const uint32_t py = (ny + pool_spatial - 1) / pool_spatial;
+            const uint32_t px = (nx + pool_spatial - 1) / pool_spatial;
+            return px * py * nz;
         }
         return nx * ny * nz;
     }
@@ -295,6 +323,10 @@ struct mtmd_image_tokens {
     }
 
     bool can_batch_with(const mtmd_image_tokens & other) {
+        // pooled chunks have per-chunk output sizes; encode them one at a time
+        if (pool_spatial > 1 || other.pool_spatial > 1) {
+            return false;
+        }
         // a canvas chunk holds a whole image group, its layout is not given by nx/ny alone
         return nx == other.nx && ny == other.ny && pos == other.pos && pos != MTMD_POS_TYPE_CANVAS;
     }
@@ -306,6 +338,7 @@ struct mtmd_image_tokens {
             pos,
             image_idx,
             n_temporal_merge,
+            pool_spatial,
             batch_f32.clone(),
             id
         };
@@ -318,6 +351,7 @@ struct mtmd_image_tokens {
         ser.write((uint32_t)pos);
         ser.write(image_idx);
         ser.write(n_temporal_merge);
+        ser.write((int32_t)pool_spatial);
         ser.write(id);
         batch_f32.serialize(ser);
     }
@@ -331,6 +365,7 @@ struct mtmd_image_tokens {
         pos = (mtmd_pos_type)pos_raw;
         image_idx = ser.read<uint32_t>();
         n_temporal_merge = ser.read<uint32_t>();
+        pool_spatial = (int)ser.read<int32_t>();
         id = ser.read<std::string>();
         batch_f32.deserialize(ser);
     }
@@ -577,6 +612,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* force_linear_pos  */ false,
     };
     return params;
 }
@@ -685,6 +721,10 @@ struct mtmd_context {
                     } break;
                 default:
                     throw std::runtime_error(string_format("unsupported decoder rope type: %d\n", decoder_rope_type));
+            }
+            if (ctx_params.force_linear_pos && pos_type == MTMD_POS_TYPE_MROPE) {
+                LOG_INF("%s: force_linear_pos enabled, using linear positions with the mrope section layout\n", __func__);
+                pos_type = MTMD_POS_TYPE_LINEAR;
             }
         }
 
@@ -1696,6 +1736,7 @@ struct mtmd_tokenizer {
                     image_tokens->nx = n_tokens;
                     image_tokens->ny = 1;
                 }
+                image_tokens->pool_spatial = bitmaps[0]->pool_spatial;
                 image_tokens->pos = ctx->pos_type;
                 // HunyuanVL wraps the image grid with BOI/EOI and adds one newline per row,
                 // and uses XD-RoPE (dim-3 = image index). Override the position type so that
@@ -2015,6 +2056,38 @@ int32_t mtmd_tokenize_from_parts(const mtmd_context * ctx,
     }
 }
 
+// adaptive_avg_pool2d over the spatial grid of every temporal slice, matching
+// the reference implementation's post-ViT spatial pooling.
+static void mtmd_pool_embd(const float * in, float * out, int nz, int ny, int nx, int factor, int n_embd) {
+    const int ny_p = (ny + factor - 1) / factor;
+    const int nx_p = (nx + factor - 1) / factor;
+    for (int t = 0; t < nz; ++t) {
+        for (int oy = 0; oy < ny_p; ++oy) {
+            const int y0 = oy * ny / ny_p;
+            const int y1 = ((oy + 1) * ny + ny_p - 1) / ny_p;
+            for (int ox = 0; ox < nx_p; ++ox) {
+                const int x0 = ox * nx / nx_p;
+                const int x1 = ((ox + 1) * nx + nx_p - 1) / nx_p;
+                const int cnt = (y1 - y0) * (x1 - x0);
+                const float inv = 1.0f / (float) cnt;
+                float * ob = out + (((size_t)(t * ny_p + oy) * nx_p + ox) * n_embd);
+                std::fill(ob, ob + n_embd, 0.0f);
+                for (int y = y0; y < y1; ++y) {
+                    for (int x = x0; x < x1; ++x) {
+                        const float * ib = in + (((size_t)(t * ny + y) * nx + x) * n_embd);
+                        for (int d = 0; d < n_embd; ++d) {
+                            ob[d] += ib[d];
+                        }
+                    }
+                }
+                for (int d = 0; d < n_embd; ++d) {
+                    ob[d] *= inv;
+                }
+            }
+        }
+    }
+}
+
 static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * image_tokens, std::vector<float> & out_embd) {
     clip_ctx * ctx_clip = ctx->ctx_v;
     if (!ctx_clip) {
@@ -2046,6 +2119,19 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
             offset += embd.size();
         }
         GGML_ASSERT(offset == out_embd.size());
+        return 0;
+    }
+
+    if (image_tokens->pool_spatial > 1 && image_tokens->pos == MTMD_POS_TYPE_LINEAR) {
+        const uint32_t n_tokens_full = image_tokens->n_tokens_full();
+        const uint32_t nz = image_tokens->n_slices();
+        std::vector<float> full((size_t) n_embd_out * n_tokens_full);
+        if (!clip_image_batch_encode(ctx_clip, ctx->n_threads, &image_tokens->batch_f32, full)) {
+            return 1;
+        }
+        GGML_ASSERT(out_embd.size() == (size_t) n_embd_out * n_tokens_out);
+        mtmd_pool_embd(full.data(), out_embd.data(), (int) nz, (int) image_tokens->ny,
+                       (int) image_tokens->nx, image_tokens->pool_spatial, n_embd_out);
         return 0;
     }
 
@@ -2638,7 +2724,7 @@ bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk
 }
 
 bool mtmd_decode_use_mrope(const mtmd_context * ctx) {
-    return ctx->pos_type == MTMD_POS_TYPE_MROPE;
+    return ctx->pos_type == MTMD_POS_TYPE_MROPE || ctx->pos_type == MTMD_POS_TYPE_LINEAR;
 }
 
 bool mtmd_support_vision(const mtmd_context * ctx) {
@@ -2723,6 +2809,10 @@ void mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id) {
 
 void mtmd_bitmap_set_mergeable(mtmd_bitmap * bitmap, bool mergeable) {
     bitmap->mergeable = mergeable;
+}
+
+void mtmd_bitmap_set_pool_spatial(mtmd_bitmap * bitmap, int pool_spatial) {
+    bitmap->pool_spatial = pool_spatial > 1 ? pool_spatial : 1;
 }
 
 mtmd_bitmap * mtmd_bitmap_init_lazy(const mtmd_context * ctx,
@@ -2986,6 +3076,13 @@ mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * ima
                 pos.y = pos_0 + (i / image_tokens->nx);
                 pos.z = 0; // unused for now
             } break;
+        case MTMD_POS_TYPE_LINEAR:
+            {
+                pos.t = pos_0 + i;
+                pos.x = pos_0 + i;
+                pos.y = pos_0 + i;
+                pos.z = pos_0 + i;
+            } break;
         case MTMD_POS_TYPE_NORMAL:
             {
                 pos.t = pos_0 + i;
@@ -3043,6 +3140,8 @@ llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
     switch (image_tokens->pos) {
         case MTMD_POS_TYPE_MROPE:
             return std::max(image_tokens->nx, image_tokens->ny);
+        case MTMD_POS_TYPE_LINEAR:
+            return image_tokens->n_tokens();
         case MTMD_POS_TYPE_NORMAL:
             return image_tokens->n_tokens();
         case MTMD_POS_TYPE_HUNYUANVL:

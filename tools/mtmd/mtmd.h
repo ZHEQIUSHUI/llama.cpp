@@ -122,6 +122,12 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // Optional: use sequential (1-D) decoder positions for models whose
+    // reference implementation expects plain RoPE instead of mRoPE. This only
+    // affects vision chunks (they advance by their token count instead of
+    // max(nx, ny)); plain text is unaffected. Default false.
+    bool force_linear_pos;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -186,6 +192,9 @@ MTMD_API const char * mtmd_bitmap_get_id(const mtmd_bitmap * bitmap);
 MTMD_API void         mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id);
 // if true, this bitmap can be merged (temporal merge) with an adjacent mergeable bitmap by certain video input models
 MTMD_API void         mtmd_bitmap_set_mergeable(mtmd_bitmap * bitmap, bool mergeable);
+// optional post-ViT spatial pooling factor for this image (1 = disabled); only
+// active for models using the linear-position layout (e.g. LightNav-0)
+MTMD_API void         mtmd_bitmap_set_pool_spatial(mtmd_bitmap * bitmap, int pool_spatial);
 
 // mtmd_bitmap lazy
 //

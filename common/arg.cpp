@@ -2662,6 +2662,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TOKENS"));
     add_opt(common_arg(
+        {"--mmproj-linear-pos"},
+        "use sequential (1-D) decoder positions for vision chunks instead of mRoPE (for models whose reference uses plain RoPE)",
+        [](common_params & params) {
+            params.mmproj_linear_pos = true;
+        }
+    ).set_examples(mmproj_examples));
+    add_opt(common_arg(
         {"--mtmd-batch-max-tokens"}, "N",
         string_format("maximum number of image tokens per batch when encoding images (default: %d)", params.mtmd_batch_max_tokens),
         [](common_params & params, int value) {

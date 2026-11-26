@@ -66,6 +66,7 @@ std::shared_ptr<model> make_qwen38_27b(const manifest & m);  // Qwen3.8-27B: the
 std::shared_ptr<model> make_qwen35_whole(const manifest & m);  // Qwen3.5 dense (and MiniCPM-OCR's text decoder)
 std::shared_ptr<model> make_qwen35_moe_sgl(const manifest & m);  // Qwen3.5/3.6-35B-A3B with the sgl NVFP4 kernels
 std::shared_ptr<model> make_moe_gqa(const manifest & m);  // the 48-layer GQA MoE models (hy_mt2, q3vl30): one prefill page and one decode row
+std::shared_ptr<model> make_lightnav(const manifest & m);  // LightNav-0 / Qwen3-VL-4B dense text tower: six NVFP4 groups over shared KV
 std::shared_ptr<model> make_qwen3(const manifest & m);  // Qwen3 text decoders (Embedding, ASR text, TTS talker)
 // the plain dense Llama-family decoders, one whole-backbone prefill and decode kernel (models/llama_dense)
 std::shared_ptr<model> make_cpm5(const manifest & m);  // MiniCPM5-2B
@@ -73,6 +74,7 @@ std::shared_ptr<model> make_hymt(const manifest & m);  // Hy-MT2-1.8B (HunYuan d
 std::shared_ptr<model> make_qwen35_vit(const manifest & m);  // the mmproj vision encoder (roles vit.*)
 std::shared_ptr<model> make_qwen35_vit_full(const manifest & m);  // the same in one call (role vit)
 std::shared_ptr<model> make_q3vl30_vit_full(const manifest & m);  // Qwen3-VL vision encoder with three deepstack mergers (role vit)
+std::shared_ptr<model> make_lightnav_vit_full(const manifest & m);  // LightNav-0 Qwen3-VL-4B vision tower (NVFP4, deepstack 5/11/17)
 std::shared_ptr<model> make_minicpm_ocr_vit_full(const manifest & m);  // MiniCPM-OCR SigLIP tower (role vit)
 std::shared_ptr<model> make_minicpmv4_7_vit_full(const manifest & m);  // MiniCPM-V 4.7 SigLIP + window merger (role vit)
 bool minicpm_ocr_vit_graph(const ggml_cgraph * g);

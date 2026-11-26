@@ -43,6 +43,8 @@ ggml_add_backend_library(ggml-axera
                          models/qwen35_vit/qwen35_vit.cpp
                          models/qwen35_vit/qwen35_vit_full.cpp
                          models/q3vl30/q3vl30_vit_full.cpp
+                         models/lightnav/lightnav.cpp
+                         models/lightnav/lightnav_vit_full.cpp
                          ggml-axera-buffer.cpp
                         )
 
