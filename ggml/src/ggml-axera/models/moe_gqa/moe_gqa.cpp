@@ -136,16 +136,19 @@ class moe_gqa final : public model, public seq_model {
     std::vector<std::pair<const axera_cmm *, size_t>> kv_layer;  // each layer's KV: pool or bank, offset
     int                     kv_pages = 0;
     size_t                  kv_page_b = 0;
-    bmap                    io;
+    bmap                    io;        // 4096-row prefill and decode IO
+    bmap                    io_small;  // optional 1024-row prefill IO
+    bmap *                  active_io = &io;  // buffers holding the latest head
     std::map<std::string, uint32_t> bank_n, bank_dtype, bank_slot;
     std::vector<group_info> groups;   // decode / weight groups
     std::vector<group_info> pgroups;  // prefill graph groups
     int                     pre_calls = 1;
     int                     body0 = 0;  // the first decode group the prefill body maps to
     int                     wp = WP_MAX;
+    int                     wp_small = 0;
 
-    std::vector<call>      pre, dec;
-    std::vector<axera_cmm> route_cmm;  // the kernels' top-k expert ids
+    std::vector<call>      pre, pre_small, dec;
+    std::vector<axera_cmm> route_cmm;  // the kernels' top-k expert ids: 0 big, 1 small
 
     std::vector<uint16_t>     xbuf;
     std::vector<int32_t>      pbuf;
@@ -172,9 +175,10 @@ class moe_gqa final : public model, public seq_model {
               const ggml_tensor * inp_pos);
     void fill_bank(const std::map<std::string, ggml_tensor *> & t, const ggml_tensor * rope_node,
                    const ggml_tensor * inp_pos);
-    void bind_calls(std::vector<call> & calls, const kernel & k, bool prefill);
+    void bind_calls(std::vector<call> & calls, const kernel & k, bool prefill, bmap & bufs,
+                    axera_cmm * route);
     void run_prefill_page(int64_t cell, int rows, const uint16_t * x, const int32_t * p4, int64_t batch_cell0,
-                          bool need_head);
+                          bool need_head, bool small);
     void run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4);
     void publish_logits(ggml_cgraph * g, ggml_tensor * logits, int T);
     kv_state_format state_format() const;
@@ -227,6 +231,7 @@ void moe_gqa::init(const std::map<std::string, ggml_tensor *> & t, const ggml_te
                    const ggml_tensor * inp_pos) {
     const kernel & pk = man.get("prefill");
     const kernel & dk = man.get("decode");
+    const kernel * pks = man.has("prefill_small") ? &man.get("prefill_small") : nullptr;
 
     const io_desc * hl = find_io(dk.desc->in, "head_logits");
     const io_desc * phr = find_io(pk.desc->in, "head_rows");
@@ -254,6 +259,10 @@ void moe_gqa::init(const std::map<std::string, ggml_tensor *> & t, const ggml_te
     };
     scan_groups(pk, pgroups);
     scan_groups(dk, groups);
+    std::vector<group_info> sgroups;
+    if (pks) {
+        scan_groups(*pks, sgroups);
+    }
     int grouped = 0;
     for (size_t gi = 0; gi < groups.size(); ++gi) {
         GGML_ASSERT(groups[gi].layers > 0 && (!groups[gi].dense || gi == 0));
@@ -268,6 +277,16 @@ void moe_gqa::init(const std::map<std::string, ggml_tensor *> & t, const ggml_te
     pre_calls = (int) groups.size() - body0;
     for (int gi = body0; gi < (int) groups.size(); ++gi) {
         GGML_ASSERT(groups[gi].layers <= body.layers);
+    }
+    if (pks) {
+        GGML_ASSERT(sgroups.size() == pgroups.size());
+        for (size_t gi = 0; gi < pgroups.size(); ++gi) {
+            GGML_ASSERT(sgroups[gi].first == pgroups[gi].first && sgroups[gi].layers == pgroups[gi].layers &&
+                        sgroups[gi].dense == pgroups[gi].dense && sgroups[gi].pre == pgroups[gi].pre);
+        }
+        GGML_ASSERT(find_io(pks->desc->in, "head_rows")->bytes == phr->bytes);
+        GGML_ASSERT((find_io(pks->desc->in, "deepstack") != nullptr) ==
+                    (find_io(pk.desc->in, "deepstack") != nullptr));
     }
     auto pre_group = [&](int c, const std::string & n) {  // the decode group call c binds a prefill bank to
         const int pg = group_of(n);
@@ -296,16 +315,21 @@ void moe_gqa::init(const std::map<std::string, ggml_tensor *> & t, const ggml_te
     }
     std::map<std::string, uint32_t> pre_dtype;  // by decode name
     for (int c = 0; c < pre_calls; ++c) {
-        for (const auto & d : pk.desc->in) {
-            const int gi = pre_group(c, d.name);
-            if (gi < 0 || io_name(d.name) || pool_kv(d.name) >= 0) {
+        for (const kernel * p : { &pk, pks }) {
+            if (!p) {
                 continue;
             }
-            const std::string mapped = groups[(size_t) gi].pre + d.name.substr(3);
-            auto it = cbytes[(size_t) gi].find(mapped);
-            if (it != cbytes[(size_t) gi].end()) {
-                it->second = std::max(it->second, d.bytes);
-                pre_dtype[mapped] = d.dtype;
+            for (const auto & d : p->desc->in) {
+                const int gi = pre_group(c, d.name);
+                if (gi < 0 || io_name(d.name) || pool_kv(d.name) >= 0) {
+                    continue;
+                }
+                const std::string mapped = groups[(size_t) gi].pre + d.name.substr(3);
+                auto it = cbytes[(size_t) gi].find(mapped);
+                if (it != cbytes[(size_t) gi].end()) {
+                    it->second = std::max(it->second, d.bytes);
+                    pre_dtype[mapped] = d.dtype;
+                }
             }
         }
     }
@@ -323,17 +347,17 @@ void moe_gqa::init(const std::map<std::string, ggml_tensor *> & t, const ggml_te
     GGML_ASSERT(gbank.count("head_w") && gbank.count("head_s") && gbank.count("head_norm"));
     GGML_ASSERT(rope_table == (gbank.count("cos") && gbank.count("sin")));
 
-    auto alloc_io = [&](const io_desc & d) {
-        auto it = io.find(d.name);
-        if (it == io.end() || it->second->size < d.bytes) {
-            io[d.name] = axera_cmm_alloc(d.bytes);
+    auto alloc_io = [](bmap & bufs, const io_desc & d) {
+        auto it = bufs.find(d.name);
+        if (it == bufs.end() || it->second->size < d.bytes) {
+            bufs[d.name] = axera_cmm_alloc(d.bytes);
         }
     };
     size_t route_bytes = 0, hidden_b = (size_t) WP_MAX * H * sizeof(ggml_bf16_t);
     for (const auto * desc : { pk.desc, dk.desc }) {
         for (const auto & d : desc->in) {
             if (io_name(d.name)) {
-                alloc_io(d);
+                alloc_io(io, d);
             }
         }
         for (const auto & d : desc->out) {
@@ -342,7 +366,7 @@ void moe_gqa::init(const std::map<std::string, ggml_tensor *> & t, const ggml_te
             } else if (d.name == "output") {
                 hidden_b = std::max(hidden_b, d.bytes);
             } else if (io_name(d.name)) {
-                alloc_io(d);
+                alloc_io(io, d);
             }
         }
     }
@@ -350,6 +374,29 @@ void moe_gqa::init(const std::map<std::string, ggml_tensor *> & t, const ggml_te
     io["hidden2"] = axera_cmm_alloc(hidden_b);
     if (route_bytes) {
         route_cmm.push_back(axera_cmm_alloc(route_bytes));
+    }
+    size_t route_bytes_small = 0, hidden_b_small = 0;
+    if (pks) {
+        for (const auto & d : pks->desc->in) {
+            if (io_name(d.name)) {
+                alloc_io(io_small, d);
+            }
+        }
+        for (const auto & d : pks->desc->out) {
+            if (d.name == "route_ids") {
+                route_bytes_small = std::max(route_bytes_small, d.bytes);
+            } else if (d.name == "output") {
+                hidden_b_small = std::max(hidden_b_small, d.bytes);
+            } else if (io_name(d.name)) {
+                alloc_io(io_small, d);
+            }
+        }
+        GGML_ASSERT(hidden_b_small > 0);
+        io_small["output"]  = axera_cmm_alloc(hidden_b_small);
+        io_small["hidden2"] = axera_cmm_alloc(hidden_b_small);
+        if (route_bytes_small) {
+            route_cmm.push_back(axera_cmm_alloc(route_bytes_small));
+        }
     }
 
     kv_page_b = (size_t) 2 * PG * KVH * HD * sizeof(ggml_bf16_t);
@@ -403,8 +450,17 @@ void moe_gqa::init(const std::map<std::string, ggml_tensor *> & t, const ggml_te
 
     wp = (int) (io.at("x")->size / (H * sizeof(ggml_bf16_t)));
     GGML_ASSERT(wp == WP_MAX);
-    bind_calls(pre, pk, true);
-    bind_calls(dec, dk, false);
+    if (pks) {
+        wp_small = (int) (io_small.at("x")->size / (H * sizeof(ggml_bf16_t)));
+        GGML_ASSERT(wp_small > 0 && wp_small <= wp && wp_small % PG == 0);
+    }
+    axera_cmm * route_big   = route_cmm.empty() ? nullptr : &route_cmm[0];
+    axera_cmm * route_small = route_cmm.size() > 1 ? &route_cmm[1] : nullptr;
+    bind_calls(pre, pk, true, io, route_big);
+    if (pks) {
+        bind_calls(pre_small, *pks, true, io_small, route_small);
+    }
+    bind_calls(dec, dk, false, io, route_big);
 
     seq = std::make_unique<seqstate>(*this, seq_config_env(1));
     size_t bytes = 0;
@@ -412,9 +468,11 @@ void moe_gqa::init(const std::map<std::string, ggml_tensor *> & t, const ggml_te
     for (const auto & c : chunks) {
         for (const auto & [n, b] : c) bytes += b->size;
     }
-    GGML_LOG_INFO("%s: %d layers, %d groups, %d prefill calls, KV %d of %d pages, banks %.2f GiB, cells %lld\n",
-                  tag.c_str(), LAYERS, (int) groups.size(), pre_calls, kv_pages, NP, bytes / 1073741824.0,
-                  (long long) cells);
+    GGML_LOG_INFO("%s: %d layers, %d groups, %d prefill calls, prefill rows %d%s, KV %d of %d pages, "
+                  "banks %.2f GiB, cells %lld\n",
+                  tag.c_str(), LAYERS, (int) groups.size(), pre_calls, wp,
+                  pks ? ("/" + std::to_string(wp_small)).c_str() : "", kv_pages, NP,
+                  bytes / 1073741824.0, (long long) cells);
     inited = true;
 }
 
@@ -642,7 +700,8 @@ void moe_gqa::fill_bank(const std::map<std::string, ggml_tensor *> & t, const gg
     }
 }
 
-void moe_gqa::bind_calls(std::vector<call> & calls, const kernel & k, bool prefill) {
+void moe_gqa::bind_calls(std::vector<call> & calls, const kernel & k, bool prefill, bmap & bufs,
+                         axera_cmm * route) {
     const char * what = prefill ? "prefill" : "decode";
     const int count = prefill ? pre_calls : 1;
     calls.assign((size_t) count, {});
@@ -650,8 +709,8 @@ void moe_gqa::bind_calls(std::vector<call> & calls, const kernel & k, bool prefi
         call & cl = calls[c];
         cl.k      = &k;
         // prefill alternates the two hidden buffers across its calls; decode is one call over every group
-        axera_cmm & src = !prefill || c == 0 ? io.at("x") : (c % 2 ? io.at("output") : io.at("hidden2"));
-        axera_cmm & dst = !prefill || c % 2 == 0 ? io.at("output") : io.at("hidden2");
+        axera_cmm & src = !prefill || c == 0 ? bufs.at("x") : (c % 2 ? bufs.at("output") : bufs.at("hidden2"));
+        axera_cmm & dst = !prefill || c % 2 == 0 ? bufs.at("output") : bufs.at("hidden2");
         cl.in.resize(k.desc->in.size());
         for (size_t i = 0; i < k.desc->in.size(); ++i) {
             const io_desc & d = k.desc->in[i];
@@ -661,11 +720,12 @@ void moe_gqa::bind_calls(std::vector<call> & calls, const kernel & k, bool prefi
                 b = &src;
             } else if (d.name == "output") {
                 b = &dst;  // an in-place graph input
-            } else if (d.name == "route_ids" && !route_cmm.empty()) {
-                b = &route_cmm[0];
+            } else if (d.name == "route_ids") {
+                GGML_ASSERT(route != nullptr);
+                b = route;
             } else if (io_name(d.name)) {
-                auto it = io.find(d.name);
-                if (it == io.end()) {
+                auto it = bufs.find(d.name);
+                if (it == bufs.end()) {
                     GGML_ABORT("%s: %s: no buffer for input %s\n", tag.c_str(), what, d.name.c_str());
                 }
                 b = &it->second;
@@ -693,11 +753,12 @@ void moe_gqa::bind_calls(std::vector<call> & calls, const kernel & k, bool prefi
             const io_desc & d = k.desc->out[i];
             if (d.name == "output") {
                 cl.out[i] = axera_io(dst, d.bytes);
-            } else if (d.name == "route_ids" && !route_cmm.empty()) {
-                cl.out[i] = axera_io(route_cmm[0], d.bytes);
+            } else if (d.name == "route_ids") {
+                GGML_ASSERT(route != nullptr);
+                cl.out[i] = axera_io(*route, d.bytes);
             } else {
-                auto it = io.find(d.name);
-                if (it == io.end()) {
+                auto it = bufs.find(d.name);
+                if (it == bufs.end()) {
                     GGML_ABORT("%s: %s: no buffer for output %s\n", tag.c_str(), what, d.name.c_str());
                 }
                 cl.out[i] = axera_io(it->second, d.bytes);
@@ -732,63 +793,67 @@ static void mrope_cache(float * cs, float * sn, const int32_t * p) {
 }
 
 void moe_gqa::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const int32_t * p4, int64_t batch_cell0,
-                               bool need_head) {
-    GGML_ASSERT(cell % PG == 0 && rows > 0 && rows <= wp);
-    axera_cmm & xi = io.at("x");
-    auto dsi = io.find("deepstack");
+                               bool need_head, bool small) {
+    bmap & bufs = small ? io_small : io;
+    const int wr = small ? wp_small : wp;
+    std::vector<call> & calls = small ? pre_small : pre;
+    GGML_ASSERT(cell % PG == 0 && rows > 0 && rows <= wr && !calls.empty());
+    active_io = &bufs;
+    axera_cmm & xi = bufs.at("x");
+    auto dsi = bufs.find("deepstack");
     // The padding rows past `rows` are never seen by a valid query (attention is causal) or read by the head.
     // Cycling real rows through them keeps them out of the all-zero router bucket (every zero row would go
     // to the same eight experts).
     uint16_t * xb = (uint16_t *) xi->vir;
-    uint16_t * db = dsi != io.end() ? (uint16_t *) dsi->second->vir : nullptr;
-    axera_host_pool().run(wp, [&](int64_t r) {
+    uint16_t * db = dsi != bufs.end() ? (uint16_t *) dsi->second->vir : nullptr;
+    axera_host_pool().run(wr, [&](int64_t r) {
         const int64_t s = r < rows ? r : r % rows;
         memcpy(xb + (size_t) r * H, x + (size_t) s * IN, (size_t) H * sizeof(uint16_t));
         for (int p = 0; db && p < PLANES; ++p) {
-            memcpy(db + ((size_t) p * wp + r) * H, x + (size_t) s * IN + (size_t) (p + 1) * H,
+            memcpy(db + ((size_t) p * wr + r) * H, x + (size_t) s * IN + (size_t) (p + 1) * H,
                    (size_t) H * sizeof(uint16_t));
         }
     });
 
     // Padded rows continue the position sequence so their K/V land past the valid tail (masked for valid
     // queries and beyond last_page_len for the later decode), not over slot 0.
-    int32_t * pos = (int32_t *) io.at("position_ids")->vir;
+    int32_t * pos = (int32_t *) bufs.at("position_ids")->vir;
     if (rope_table) {
-        for (int r = 0; r < wp; ++r) pos[r] = r < rows ? p4[(size_t) r * 4] : (int32_t) (cell + r);
+        for (int r = 0; r < wr; ++r) pos[r] = r < rows ? p4[(size_t) r * 4] : (int32_t) (cell + r);
     } else {
-        for (int r = 0; r < wp; ++r) pos[r] = r;
-        std::vector<int32_t> pp((size_t) wp * 4, 0);
+        for (int r = 0; r < wr; ++r) pos[r] = r;
+        std::vector<int32_t> pp((size_t) wr * 4, 0);
         memcpy(pp.data(), p4, (size_t) rows * 4 * sizeof(int32_t));
-        for (int r = rows; r < wp; ++r) pp[(size_t) r * 4] = (int32_t) (cell + r);
-        float * cs = (float *) io.at("cos")->vir;
-        float * sn = (float *) io.at("sin")->vir;
-        axera_host_pool().run(wp, [&](int64_t r) {
+        for (int r = rows; r < wr; ++r) pp[(size_t) r * 4] = (int32_t) (cell + r);
+        float * cs = (float *) bufs.at("cos")->vir;
+        float * sn = (float *) bufs.at("sin")->vir;
+        axera_host_pool().run(wr, [&](int64_t r) {
             mrope_cache(cs + (size_t) r * (HD / 2), sn + (size_t) r * (HD / 2), pp.data() + (size_t) r * 4);
         });
-        io.at("cos")->flush();
-        io.at("sin")->flush();
+        bufs.at("cos")->flush();
+        bufs.at("sin")->flush();
     }
     // the attention takes indptr as the history page range; the page being written is cache_location
     const int page = (int) (cell / PG);
-    int32_t * ind = (int32_t *) io.at("indptr")->vir;
+    int32_t * ind = (int32_t *) bufs.at("indptr")->vir;
     ind[0] = 0;
     ind[1] = page;
-    axera_cmm & idx = io.at("indices");
-    GGML_ASSERT((size_t) (page + wp / PG) * sizeof(int32_t) <= idx->size);
+    axera_cmm & idx = bufs.at("indices");
+    GGML_ASSERT((size_t) (page + wr / PG) * sizeof(int32_t) <= idx->size);
     int32_t * ix = (int32_t *) idx->vir;
-    for (int i = 0; i <= page + wp / PG; ++i) ix[i] = i;
-    *(int32_t *) io.at("last_page_len")->vir = 0;  // the prefill graph does not read it
-    int32_t * cl = (int32_t *) io.at("cache_location")->vir;
+    for (int i = 0; i <= page + wr / PG; ++i) ix[i] = i;
+    *(int32_t *) bufs.at("last_page_len")->vir = 0;  // the prefill graph does not read it
+    int32_t * cl = (int32_t *) bufs.at("cache_location")->vir;
     cl[0] = page;
     cl[1] = 0;
-    *(int32_t *) io.at("valid_tokens")->vir = rows;
-    if (auto dsr = io.find("ds_run"); dsr != io.end()) {
+    *(int32_t *) bufs.at("valid_tokens")->vir = rows;
+    if (auto dsr = bufs.find("ds_run"); dsr != bufs.end()) {
         *(uint16_t *) dsr->second->vir = 0x3f80;  // bf16 1.0
         dsr->second->flush();
     }
     for (const char * n : { "x", "position_ids", "indptr", "indices", "last_page_len", "cache_location",
                             "valid_tokens" }) {
-        io.at(n)->flush();
+        bufs.at(n)->flush();
     }
     if (db) {
         dsi->second->flush();
@@ -801,31 +866,31 @@ void moe_gqa::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const
     GGML_ASSERT(want > 0 && want <= rows);
     const int take = std::min(head_rows_n, want);
     const int hr0  = rows - take;
-    axera_cmm & hx = io.at("head_x");
+    axera_cmm & hx = bufs.at("head_x");
     memset(hx->vir, 0, hx->size);
-    int32_t * hrb = (int32_t *) io.at("head_rows")->vir;
+    int32_t * hrb = (int32_t *) bufs.at("head_rows")->vir;
     for (int r = 0; r < head_rows_n; ++r) hrb[r] = r < take ? hr0 + r : hr0;
-    io.at("head_rows")->flush();
+    bufs.at("head_rows")->flush();
 
-    auto head_run = io.find("head_run"), layer0_run = io.find("layer0_run"), body_run = io.find("body_run");
-    for (int ci = 0; ci < (int) pre.size(); ++ci) {
+    auto head_run = bufs.find("head_run"), layer0_run = bufs.find("layer0_run"), body_run = bufs.find("body_run");
+    for (int ci = 0; ci < (int) calls.size(); ++ci) {
         // Hy-MT2's graph runs layer 0 on the first call only, and its 12-layer body runs the last group's
         // 11 layers
-        if (layer0_run != io.end()) {
+        if (layer0_run != bufs.end()) {
             *(int32_t *) layer0_run->second->vir = ci == 0 ? 1 : 0;
             layer0_run->second->flush();
         }
-        if (body_run != io.end()) {
+        if (body_run != bufs.end()) {
             *(int32_t *) body_run->second->vir = groups[(size_t) (body0 + ci)].layers;
             body_run->second->flush();
         }
-        if (head_run != io.end()) {
-            *(int32_t *) head_run->second->vir = need_head && ci + 1 == (int) pre.size() ? 1 : 0;
+        if (head_run != bufs.end()) {
+            *(int32_t *) head_run->second->vir = need_head && ci + 1 == (int) calls.size() ? 1 : 0;
             head_run->second->flush();
         }
-        pre[ci].k->run(pre[ci].in, pre[ci].out, "prefill");
+        calls[ci].k->run(calls[ci].in, calls[ci].out, "prefill");
         // the deepstack planes belong to the first call's layers 1..3 only
-        if (ci == 0 && db && pre.size() > 1) {
+        if (ci == 0 && db && calls.size() > 1) {
             memset(dsi->second->vir, 0, dsi->second->size);
             dsi->second->flush();
         }
@@ -834,12 +899,13 @@ void moe_gqa::run_prefill_page(int64_t cell, int rows, const uint16_t * x, const
     head_first = (int) (cell + hr0 - batch_cell0);
     head_n     = take;
     small_head = false;
-    axera_cmm & hl = io.at("head_logits");
+    axera_cmm & hl = bufs.at("head_logits");
     hl->invalidate(hl->vir, (size_t) head_rows_n * VOCAB * sizeof(float));
 }
 
 void moe_gqa::run_decode_row(int64_t cell, const uint16_t * x, const int32_t * p4) {
     // the IO buffers are sized for a prefill page; a decode row writes a few bytes of each and cleans only those
+    active_io = &io;
     auto put = [&](const char * n, const void * v, size_t bytes) {
         axera_cmm & c = io.at(n);
         memcpy(c->vir, v, bytes);
@@ -917,9 +983,13 @@ bool moe_gqa::seq_run_pages(int64_t c0, int n, const uint16_t * x, const int32_t
         small_head = true;
         return true;
     }
-    for (int off = 0; off < n; off += wp) {
-        const int rows = std::min(wp, n - off);
-        run_prefill_page(c0 + off, rows, xr + (size_t) off * IN, p4 + (size_t) off * 4, c0 + batch0, off + wp >= n);
+    for (int off = 0; off < n;) {
+        const int rem   = n - off;
+        const bool sml  = wp_small > 0 && rem <= wp_small;
+        const int rows  = std::min(sml ? wp_small : wp, rem);
+        run_prefill_page(c0 + off, rows, xr + (size_t) off * IN, p4 + (size_t) off * 4, c0 + batch0,
+                         off + rows >= n, sml);
+        off += rows;
     }
     return true;
 }
@@ -966,7 +1036,7 @@ void moe_gqa::publish_logits(ggml_cgraph * g, ggml_tensor * logits, int T) {
     if (n_out < T && !out_ids) {
         GGML_ABORT("%s: %d of %d output rows without row indices\n", tag.c_str(), n_out, T);
     }
-    const float * head_src = small_head ? small_logits.data() : (const float *) io.at("head_logits")->vir;
+    const float * head_src = small_head ? small_logits.data() : (const float *) active_io->at("head_logits")->vir;
     // The scheduler may place result_output in the lazy host buffer instead of CMM; host memory needs no
     // cache maintenance, only a CMM output does.
     auto * dctx = ggml_backend_buffer_is_axera(logits->buffer)
