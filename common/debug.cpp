@@ -4,6 +4,8 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 #include <regex>
 #include <string>
 #include <vector>
@@ -179,6 +181,24 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         auto n_bytes = ggml_nbytes(t);
         pimpl->data.resize(n_bytes);
         ggml_backend_tensor_get(t, pimpl->data.data(), 0, n_bytes);
+    }
+
+    if (matches_filter) {
+        const char * dump_dir = std::getenv("LLAMA_TENSOR_DUMP_DIR");
+        if (dump_dir && dump_dir[0] != '\0') {
+            const uint8_t * data = is_host ? (const uint8_t *) t->data : pimpl->data.data();
+            const std::string base = std::string(dump_dir) + "/" + t->name;
+            std::ofstream f(base + ".bin", std::ios::binary);
+            f.write(reinterpret_cast<const char *>(data), ggml_nbytes(t));
+            std::ofstream m(base + ".meta");
+            m << ggml_type_name(t->type) << "\n";
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                m << t->ne[i] << (i + 1 < GGML_MAX_DIMS ? " " : "\n");
+            }
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                m << t->nb[i] << (i + 1 < GGML_MAX_DIMS ? " " : "\n");
+            }
+        }
     }
 
     if (!ggml_is_quantized(t->type) && matches_filter) {

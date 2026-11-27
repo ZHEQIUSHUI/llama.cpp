@@ -133,6 +133,8 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "HunYuanMoEV1ForCausalLM": "hunyuan",
     "HunYuanVLForConditionalGeneration": "hunyuan",
     "HrmTextForCausalLM": "hrm_text",
+    "Inkling2LoopForCausalLM": "inkling2_loop",
+    "Inkling2LoopForConditionalGeneration": "inkling2_loop",
     "HYV3ForCausalLM": "hunyuan",
     "HYV4ForCausalLM": "hy_v4",
     "IQuestCoderForCausalLM": "llama",

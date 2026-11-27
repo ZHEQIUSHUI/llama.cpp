@@ -227,6 +227,23 @@ struct llama_hparams {
     uint32_t n_hrm_l_cycles = 0;
     bool     hrm_prefix_lm = false;
 
+    // inkling2_loop
+    uint32_t n_loop_start      = 0;   // first looped layer (core_start)
+    uint32_t n_loop_end        = 0;   // one past the last looped layer (core_end)
+    uint32_t n_loop_passes     = 1;   // number of applications of the looped block
+    uint32_t n_loop_gate_rank  = 0;   // message-gate rank
+    uint32_t n_sconv_kernel    = 0;   // short-conv kernel size (4)
+    uint32_t n_attn_res_block  = 0;   // layers per block-attention-residual block (6)
+    uint32_t n_rel_dim         = 0;   // d_rel (16)
+    uint32_t n_rel_extent      = 0;   // number of relative-distance bias columns (1024)
+    uint32_t log_scale_floor   = 0;   // log-scaling n_floor (8192)
+    float    f_rel_clip        = 0.0f;
+    float    f_qk_clip         = 0.0f;
+    float    f_log_scale_alpha = 0.0f;
+    float    f_mlp_gate_softcap = 0.0f;
+    float    f_mlp_up_softcap   = 0.0f;
+    uint32_t n_embd_r_total    = 0;   // total conv-state width per slot (19968)
+
     bool ssm_dt_b_c_rms = false;
 
     float f_clamp_kqv      = 0.0f;

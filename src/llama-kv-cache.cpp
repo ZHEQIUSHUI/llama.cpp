@@ -1939,6 +1939,28 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
     }
 }
 
+void llama_kv_cache::set_input_pos_dist(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t sentinel) const {
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
+    const auto & cells = v_cells[0];
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    // positions are per-token, so equal-length sequences (incl. single-seq decode) are fine
+
+    int32_t * data = (int32_t *) dst->data;
+
+    const int32_t n_kv = dst->ne[0];
+
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const llama_pos p0 = cells.is_empty(j) ? -1 : cells.pos_get(j);
+            const llama_pos d  = ubatch->pos[i] - p0;
+            data[i*n_kv + j] = (p0 < 0 || d < 0 || d >= sentinel) ? sentinel : d;
+        }
+    }
+}
+
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
@@ -3071,6 +3093,10 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_pos_bucket(dst, ubatch);
+}
+
+void llama_kv_cache_context::set_input_pos_dist(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t sentinel) const {
+    kv->set_input_pos_dist(dst, ubatch, sentinel);
 }
 
 void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {

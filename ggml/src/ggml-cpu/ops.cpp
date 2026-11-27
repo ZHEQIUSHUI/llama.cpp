@@ -6025,8 +6025,10 @@ static void ggml_compute_forward_soft_max_f32(
 
     const bool use_f16 = (src1 && src1->type == GGML_TYPE_F16);
 
-    // sinks
+    // sinks (ne0 = n_head; ne1 > 1 means one sink per query token, inkling2_loop)
     const float * sk = src2 ? (float *)((char *) src2->data) : nullptr;
+    const bool sk_per_tok = src2 && src2->ne[1] > 1;
+    const int64_t sk_head_stride = sk_per_tok ? ne02 : 0;
 
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
@@ -6072,14 +6074,14 @@ static void ggml_compute_forward_soft_max_f32(
 
                 // if we have sinks, make a correction as if they were included in the softmax
                 if (sk) {
-                    max = MAX(max, sk[i02]);
+                    max = MAX(max, sk[i02 + sk_head_stride*i01]);
                 }
 
                 ggml_float sum = ggml_vec_soft_max_f32(ne00, dp, wp, max);
                 assert(sum > 0.0);
 
                 if (sk) {
-                    sum += (ggml_float) expf(sk[i02] - max);
+                    sum += (ggml_float) expf(sk[i02 + sk_head_stride*i01] - max);
                 }
 
                 sum = 1.0/sum;

@@ -166,6 +166,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_POCKETTTS,        "pockettts"        },
     { LLM_ARCH_K2_HORIZON,       "k2-horizon"       },
     { LLM_ARCH_BEAM,             "beam"             },
+    { LLM_ARCH_INKLING2_LOOP,    "inkling2_loop"    },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -795,6 +796,30 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_LILICORR_IN_HEAD,                       "lilicorr.in_head" },
     { LLM_TENSOR_LILICORR_ANCHOR_OUT_HEAD,               "lilicorr.anchor_out_head" },
     { LLM_TENSOR_ATTN_V_GATE,                            "blk.%d.attn_v_gate" },
+    { LLM_TENSOR_INKLING_EMBED_NORM, "embed_norm" },
+    { LLM_TENSOR_INKLING_ATTN_REL_LINEAR, "blk.%d.attn_rel_linear" },
+    { LLM_TENSOR_INKLING_ATTN_REL_PROJ, "blk.%d.attn_rel_proj" },
+    { LLM_TENSOR_INKLING_ATTN_REL_SCALE, "blk.%d.attn_rel_scale" },
+    { LLM_TENSOR_INKLING_ATTN_Q_SCALE, "blk.%d.attn_q_scale" },
+    { LLM_TENSOR_INKLING_ATTN_SINK_PROJ, "blk.%d.attn_sink_proj" },
+    { LLM_TENSOR_INKLING_ATTN_Q_NORM, "blk.%d.attn_q_input_norm" },
+    { LLM_TENSOR_INKLING_ATTN_K_NORM, "blk.%d.attn_k_input_norm" },
+    { LLM_TENSOR_INKLING_ATTN_V_NORM, "blk.%d.attn_v_input_norm" },
+    { LLM_TENSOR_INKLING_ATTN_CONV, "blk.%d.attn_conv" },
+    { LLM_TENSOR_INKLING_MLP_CONV, "blk.%d.mlp_conv" },
+    { LLM_TENSOR_INKLING_K_CONV, "blk.%d.k_conv" },
+    { LLM_TENSOR_INKLING_V_CONV, "blk.%d.v_conv" },
+    { LLM_TENSOR_INKLING_K_CONV_STATIC, "blk.%d.k_conv_static" },
+    { LLM_TENSOR_INKLING_V_CONV_STATIC, "blk.%d.v_conv_static" },
+    { LLM_TENSOR_INKLING_K_CONV_PROJ, "blk.%d.k_conv_proj" },
+    { LLM_TENSOR_INKLING_V_CONV_PROJ, "blk.%d.v_conv_proj" },
+    { LLM_TENSOR_INKLING_ATTN_INPUT_Q, "blk.%d.attn_input_q" },
+    { LLM_TENSOR_INKLING_MLP_INPUT_Q, "blk.%d.mlp_input_q" },
+    { LLM_TENSOR_INKLING_MSG_DOWN, "blk.%d.msg_down" },
+    { LLM_TENSOR_INKLING_MSG_FORGET, "blk.%d.msg_forget" },
+    { LLM_TENSOR_INKLING_MSG_GAIN, "blk.%d.msg_gain" },
+    { LLM_TENSOR_INKLING_FINAL_Q, "attn_res_final_q" },
+    { LLM_TENSOR_INKLING_MSG_INPUT_Q, "message_input_q" },
     { LLM_TENSOR_ATTN_V_EXPS,                            "blk.%d.attn_v_exps" },
 };
 
@@ -1135,6 +1160,30 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
 
     {LLM_TENSOR_ATTN_V_GATE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_V_EXPS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+    {LLM_TENSOR_INKLING_EMBED_NORM, {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL}},
+    {LLM_TENSOR_INKLING_ATTN_REL_SCALE, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INKLING_ATTN_Q_SCALE, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INKLING_ATTN_Q_NORM, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INKLING_ATTN_K_NORM, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INKLING_ATTN_V_NORM, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INKLING_ATTN_INPUT_Q, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INKLING_MLP_INPUT_Q, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INKLING_MSG_FORGET, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INKLING_MSG_GAIN, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INKLING_FINAL_Q,    {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INKLING_MSG_INPUT_Q,{LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INKLING_ATTN_REL_LINEAR, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INKLING_ATTN_REL_PROJ, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INKLING_ATTN_SINK_PROJ, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INKLING_ATTN_CONV, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INKLING_MLP_CONV, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INKLING_K_CONV, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INKLING_V_CONV, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INKLING_K_CONV_STATIC, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INKLING_V_CONV_STATIC, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INKLING_K_CONV_PROJ, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INKLING_V_CONV_PROJ, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INKLING_MSG_DOWN, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
@@ -1232,6 +1281,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_MINIMAX_01:
+        case LLM_ARCH_INKLING2_LOOP:
             return true;
         default:
             return false;

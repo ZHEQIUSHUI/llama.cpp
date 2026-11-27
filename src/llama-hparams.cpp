@@ -206,6 +206,11 @@ uint32_t llama_hparams::n_embd_v_gqa_max() const {
 }
 
 uint32_t llama_hparams::n_embd_r() const {
+    if (n_embd_r_total != 0) {
+        // inkling2_loop: k/v/post-attn/post-mlp short-conv histories, 3 taps each
+        return n_embd_r_total;
+    }
+
     if (wkv_head_size != 0) {
         // for RWKV models
         return token_shift_count * n_embd;

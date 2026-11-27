@@ -235,6 +235,7 @@ public:
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_pos_dist  (ggml_tensor * dst, const llama_ubatch * ubatch, int32_t sentinel) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -427,6 +428,9 @@ public:
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+
+    // per-(token, kv-cell) relative distance, sentinel for empty / out-of-range
+    void set_input_pos_dist(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t sentinel) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;

@@ -2125,6 +2125,10 @@ class TextModel(ModelBase):
         if chkhsh == "51447ac49e5bc244d9e249baff15cafa378c4e0ef1e6ecb056fcf384dbb68034":
             # Fun-CosyVoice3: Qwen2 BPE plus the model-specific special-token table
             res = "qwen2"
+        if chkhsh == "5635e1c8d621dff7b4825f41f2f97b6ceb39bcf2d5c541db28577080d6efd5e5":
+            # thinkingmachines/Inkling-2-Mini: GPT-4o style CamelCase split + ByteLevel
+            res = "gpt-4o"
+
 
         if res is None:
             logger.warning("\n")

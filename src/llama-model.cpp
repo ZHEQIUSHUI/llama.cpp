@@ -322,6 +322,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_minimax_m3(params);
         case LLM_ARCH_HRM_TEXT:
             return new llama_model_hrm_text(params);
+        case LLM_ARCH_INKLING2_LOOP:
+            return new llama_model_inkling2_loop(params);
         case LLM_ARCH_BEAM:
             return new llama_model_beam(params);
         case LLM_ARCH_COGVLM:
@@ -3127,7 +3129,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // a null filter_idx means the GGUF has no indexer tensors
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
-                    if (arch == LLM_ARCH_FALCON_H1) {
+                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2_LOOP) {
+                        // every layer carries both attention KV and a short-conv state row
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {

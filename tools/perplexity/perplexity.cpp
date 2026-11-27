@@ -452,7 +452,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    const bool add_bos = llama_vocab_get_add_bos(vocab);
+    // LLAMA_PPL_FULL matches the HF reference: no BOS, score every next-token prediction
+    const bool ppl_full = getenv("LLAMA_PPL_FULL") != nullptr;
+    const bool add_bos = !ppl_full && llama_vocab_get_add_bos(vocab);
     GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
 
     std::ofstream logits_stream;
@@ -470,7 +472,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     auto tim1 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenizing the input ..\n", __func__);
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
+    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, !ppl_full);
 
     auto tim2 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
@@ -537,7 +539,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     // Example, we have a context window of 512, we will compute perplexity for each of the
     // last 256 tokens.  Then, we split the input up into context window size chunks to
     // process the entire prompt.
-    const int first = n_ctx/2;
+    const int first = ppl_full ? 0 : n_ctx/2;
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;

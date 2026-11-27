@@ -316,6 +316,29 @@ struct llama_layer {
     struct ggml_tensor * attn_v_gate_b = nullptr;
     struct ggml_tensor * attn_v_exps   = nullptr;
 
+    // inkling2_loop
+    struct ggml_tensor * inkling_attn_rel_linear = nullptr;
+    struct ggml_tensor * inkling_attn_rel_proj   = nullptr;
+    struct ggml_tensor * inkling_attn_rel_scale  = nullptr;
+    struct ggml_tensor * inkling_attn_q_scale    = nullptr;
+    struct ggml_tensor * inkling_attn_sink_proj  = nullptr;
+    struct ggml_tensor * inkling_attn_q_norm     = nullptr;
+    struct ggml_tensor * inkling_attn_k_norm     = nullptr;
+    struct ggml_tensor * inkling_attn_v_norm     = nullptr;
+    struct ggml_tensor * inkling_attn_conv       = nullptr;
+    struct ggml_tensor * inkling_mlp_conv        = nullptr;
+    struct ggml_tensor * inkling_k_conv          = nullptr;
+    struct ggml_tensor * inkling_v_conv          = nullptr;
+    struct ggml_tensor * inkling_k_conv_static   = nullptr;
+    struct ggml_tensor * inkling_v_conv_static   = nullptr;
+    struct ggml_tensor * inkling_k_conv_proj     = nullptr;
+    struct ggml_tensor * inkling_v_conv_proj     = nullptr;
+    struct ggml_tensor * inkling_attn_input_q    = nullptr;
+    struct ggml_tensor * inkling_mlp_input_q     = nullptr;
+    struct ggml_tensor * inkling_msg_down        = nullptr;
+    struct ggml_tensor * inkling_msg_forget      = nullptr;
+    struct ggml_tensor * inkling_msg_gain        = nullptr;
+
     // relative position bias
     struct ggml_tensor * attn_rel_b       = nullptr;
     struct ggml_tensor * attn_rel_b_enc   = nullptr;
@@ -748,6 +771,11 @@ struct llama_model {
 
     // hrm-text initial low-cycle state
     struct ggml_tensor * hrm_z_l_init = nullptr;
+
+    // inkling2_loop
+    struct ggml_tensor * inkling_embed_norm  = nullptr;
+    struct ggml_tensor * inkling_final_q     = nullptr;
+    struct ggml_tensor * inkling_msg_input_q = nullptr;
 
     // DeepSeek-V4
     struct ggml_tensor * hc_head_fn    = nullptr;

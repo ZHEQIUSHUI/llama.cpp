@@ -685,6 +685,7 @@ class MODEL_ARCH(IntEnum):
     MISTRAL3         = auto()
     EAGLE3           = auto()
     DFLASH           = auto()
+    INKLING2_LOOP    = auto()
     MISTRAL4         = auto()
     PADDLEOCR        = auto()
     MIMO2            = auto()
@@ -1308,6 +1309,30 @@ class MODEL_TENSOR(IntEnum):
     DFLASH_SELECTOR_PREV   = auto()
     DFLASH_SELECTOR_NEXT   = auto()
     DFLASH_SELECTOR_HIDDEN = auto()
+    INKLING_EMBED_NORM      = auto()
+    INKLING_ATTN_REL_LINEAR = auto()
+    INKLING_ATTN_REL_PROJ   = auto()
+    INKLING_ATTN_REL_SCALE  = auto()
+    INKLING_ATTN_Q_SCALE    = auto()
+    INKLING_ATTN_SINK_PROJ  = auto()
+    INKLING_ATTN_Q_NORM     = auto()
+    INKLING_ATTN_K_NORM     = auto()
+    INKLING_ATTN_V_NORM     = auto()
+    INKLING_ATTN_CONV       = auto()
+    INKLING_MLP_CONV        = auto()
+    INKLING_K_CONV          = auto()
+    INKLING_V_CONV          = auto()
+    INKLING_K_CONV_STATIC   = auto()
+    INKLING_V_CONV_STATIC   = auto()
+    INKLING_K_CONV_PROJ     = auto()
+    INKLING_V_CONV_PROJ     = auto()
+    INKLING_ATTN_INPUT_Q    = auto()
+    INKLING_MLP_INPUT_Q     = auto()
+    INKLING_MSG_DOWN        = auto()
+    INKLING_MSG_FORGET      = auto()
+    INKLING_MSG_GAIN        = auto()
+    INKLING_FINAL_Q         = auto()
+    INKLING_MSG_INPUT_Q     = auto()
     LILICORR_TOKEN_PROJ           = auto()
     LILICORR_PASS_HIDDEN_PROJ     = auto()
     LILICORR_SLOT_EMBD            = auto()
@@ -1502,6 +1527,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.MISTRAL3:         "mistral3",
     MODEL_ARCH.EAGLE3:           "eagle3",
     MODEL_ARCH.DFLASH:           "dflash",
+    MODEL_ARCH.INKLING2_LOOP:    "inkling2_loop",
     MODEL_ARCH.MISTRAL4:         "mistral4",
     MODEL_ARCH.PADDLEOCR:        "paddleocr",
     MODEL_ARCH.MIMO2:            "mimo2",
@@ -2148,6 +2174,30 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_PREV:      "selector_predecessor",
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
+    MODEL_TENSOR.INKLING_EMBED_NORM:        "embed_norm",
+    MODEL_TENSOR.INKLING_ATTN_REL_LINEAR:   "blk.{bid}.attn_rel_linear",
+    MODEL_TENSOR.INKLING_ATTN_REL_PROJ:     "blk.{bid}.attn_rel_proj",
+    MODEL_TENSOR.INKLING_ATTN_REL_SCALE:    "blk.{bid}.attn_rel_scale",
+    MODEL_TENSOR.INKLING_ATTN_Q_SCALE:      "blk.{bid}.attn_q_scale",
+    MODEL_TENSOR.INKLING_ATTN_SINK_PROJ:    "blk.{bid}.attn_sink_proj",
+    MODEL_TENSOR.INKLING_ATTN_Q_NORM:       "blk.{bid}.attn_q_input_norm",
+    MODEL_TENSOR.INKLING_ATTN_K_NORM:       "blk.{bid}.attn_k_input_norm",
+    MODEL_TENSOR.INKLING_ATTN_V_NORM:       "blk.{bid}.attn_v_input_norm",
+    MODEL_TENSOR.INKLING_ATTN_CONV:         "blk.{bid}.attn_conv",
+    MODEL_TENSOR.INKLING_MLP_CONV:          "blk.{bid}.mlp_conv",
+    MODEL_TENSOR.INKLING_K_CONV:            "blk.{bid}.k_conv",
+    MODEL_TENSOR.INKLING_V_CONV:            "blk.{bid}.v_conv",
+    MODEL_TENSOR.INKLING_K_CONV_STATIC:     "blk.{bid}.k_conv_static",
+    MODEL_TENSOR.INKLING_V_CONV_STATIC:     "blk.{bid}.v_conv_static",
+    MODEL_TENSOR.INKLING_K_CONV_PROJ:       "blk.{bid}.k_conv_proj",
+    MODEL_TENSOR.INKLING_V_CONV_PROJ:       "blk.{bid}.v_conv_proj",
+    MODEL_TENSOR.INKLING_ATTN_INPUT_Q:      "blk.{bid}.attn_input_q",
+    MODEL_TENSOR.INKLING_MLP_INPUT_Q:       "blk.{bid}.mlp_input_q",
+    MODEL_TENSOR.INKLING_MSG_DOWN:          "blk.{bid}.msg_down",
+    MODEL_TENSOR.INKLING_MSG_FORGET:        "blk.{bid}.msg_forget",
+    MODEL_TENSOR.INKLING_MSG_GAIN:          "blk.{bid}.msg_gain",
+    MODEL_TENSOR.INKLING_FINAL_Q:           "attn_res_final_q",
+    MODEL_TENSOR.INKLING_MSG_INPUT_Q:       "message_input_q",
     MODEL_TENSOR.LILICORR_TOKEN_PROJ:                   "lilicorr.token_proj",
     MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ:             "lilicorr.pass_hidden_proj",
     MODEL_TENSOR.LILICORR_SLOT_EMBD:                    "lilicorr.slot_embedding",
@@ -5614,6 +5664,47 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ENC_OUTPUT_NORM,
         MODEL_TENSOR.D2T,
     ],
+    MODEL_ARCH.INKLING2_LOOP: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.INKLING_EMBED_NORM,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.INKLING_ATTN_Q_NORM,
+        MODEL_TENSOR.INKLING_ATTN_K_NORM,
+        MODEL_TENSOR.INKLING_ATTN_V_NORM,
+        MODEL_TENSOR.INKLING_ATTN_REL_LINEAR,
+        MODEL_TENSOR.INKLING_ATTN_REL_PROJ,
+        MODEL_TENSOR.INKLING_ATTN_REL_SCALE,
+        MODEL_TENSOR.INKLING_ATTN_Q_SCALE,
+        MODEL_TENSOR.INKLING_ATTN_SINK_PROJ,
+        MODEL_TENSOR.INKLING_ATTN_CONV,
+        MODEL_TENSOR.INKLING_MLP_CONV,
+        MODEL_TENSOR.INKLING_K_CONV,
+        MODEL_TENSOR.INKLING_V_CONV,
+        MODEL_TENSOR.INKLING_K_CONV_STATIC,
+        MODEL_TENSOR.INKLING_V_CONV_STATIC,
+        MODEL_TENSOR.INKLING_K_CONV_PROJ,
+        MODEL_TENSOR.INKLING_V_CONV_PROJ,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_UP_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.INKLING_ATTN_INPUT_Q,
+        MODEL_TENSOR.INKLING_MLP_INPUT_Q,
+        MODEL_TENSOR.INKLING_MSG_DOWN,
+        MODEL_TENSOR.INKLING_MSG_FORGET,
+        MODEL_TENSOR.INKLING_MSG_GAIN,
+        MODEL_TENSOR.INKLING_FINAL_Q,
+        MODEL_TENSOR.INKLING_MSG_INPUT_Q,
+    ],
+
     MODEL_ARCH.DFLASH: [
         MODEL_TENSOR.ATTN_POST_NORM,
         MODEL_TENSOR.FFN_POST_NORM,

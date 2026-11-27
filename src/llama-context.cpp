@@ -2966,6 +2966,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
         // the 128-slot looped graph needs roughly one stack per token budget
         res = std::max<uint32_t>(n_tokens * 80, 64u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_INKLING2_LOOP) {
+        // 48 loop expansions, and every layer runs block-attention residuals over
+        // a growing set of blocks (plus 4-tap dynamic k/v convs on the full layers)
+        res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_BAILINGMOE3 ||

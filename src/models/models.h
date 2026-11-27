@@ -1944,6 +1944,71 @@ struct llama_model_hrm_text : public llama_model_base {
 };
 
 
+struct llama_model_inkling2_loop : public llama_model_base {
+    llama_model_inkling2_loop(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        const llama_model & model;
+
+        // one decoder layer application in cache slot `slot`.
+        //   blocks:  [n_embd, n_tokens, n_blocks]  (may be nullptr when n_blocks == 0)
+        //   messages: [n_embd, 4, n_tokens]         (nullptr on loop pass 1)
+        ggml_tensor * build_layer(
+                llm_graph_input_attn_kv_iswa * inp_attn,
+                llm_graph_input_rs          * inp_rs,
+                        ggml_tensor * inp_pos,
+                        ggml_tensor * rel_idx_base,
+                        ggml_tensor * rel_idx_swa,
+                        ggml_tensor * cur,
+                        ggml_tensor *& blocks,
+                        ggml_tensor * messages,
+                        int           slot,
+                        int           loop_layer,   // -1 outside the looped block
+                        bool          is_swa_arch);
+
+        ggml_tensor * block_attn_res(
+                ggml_tensor * blocks,   // [n_embd, n_tokens, n_blocks]
+                ggml_tensor * partial,  // [n_embd, n_tokens]
+                ggml_tensor * query,    // [n_embd, n_q] or [n_embd]
+                        int   n_q,
+                        int   il);
+
+        ggml_tensor * message_gate(
+                ggml_tensor * hidden,
+                ggml_tensor * message,
+                ggml_tensor * down,
+                ggml_tensor * forget,
+                ggml_tensor * gain,
+                        int   il);
+
+        ggml_tensor * short_conv(
+                ggml_tensor * pre,       // [n_channels, n_tokens]
+                ggml_tensor * weight,    // [n_channels, k] static taps (nullptr => dynamic)
+                ggml_tensor * static_w,  // [n_channels, k]
+                ggml_tensor * wproj,     // [n_embd, n_head*k]
+                ggml_tensor * dyn_input,
+                        int   n_channels,
+                        int   conv_idx,
+                        int   slot,
+                        ggml_tensor * r_l,       // cache row, for writing back
+                        ggml_tensor * state_cur, // per-seq state gathered by build_rs, for reading
+                        int32_t      head,
+                        float        denom);
+
+        ggml_tensor * l2_clip(ggml_tensor * x, float threshold, int il);
+        ggml_tensor * rel_bias(ggml_tensor * q_hidden, ggml_tensor * proj, ggml_tensor * idx,
+                               bool log_scaling, ggml_tensor * inp_pos, int il, int64_t n_stream);
+        ggml_tensor * log_scale(ggml_tensor * x, ggml_tensor * inp_pos);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_bailingmoe : public llama_model_base {
     llama_model_bailingmoe(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
