@@ -221,6 +221,16 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
         create_tensor_gate_up_exps(layer, bid, n_embd, n_ff_exp, n_expert, 0);
         layer.ffn_down_exps  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", bid),
                                              { n_ff_exp, n_embd, n_expert }, 0);
+        // NVFP4 global-scale sidecars (one per expert). Created here, before the
+        // loop slots alias these layers, so the aliases inherit the pointers.
+        if (layer.ffn_gate_up_exps) {
+            layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", bid),
+                                                { n_expert }, TENSOR_NOT_REQUIRED);
+        }
+        if (layer.ffn_down_exps) {
+            layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", bid),
+                                                  { n_expert }, TENSOR_NOT_REQUIRED);
+        }
     }
 
     // expanded cache slots reuse the loop weight bank (no weight copies)
@@ -479,6 +489,7 @@ ggml_tensor * llama_model_inkling2_loop::graph::build_layer(
     const int nl = le - ls;
     const int ps = ls + nl * int(hparams.n_loop_passes);
     const int u_layer = slot < ls + nl ? slot : (slot < ps ? ls + (slot - (ls + nl)) % nl : le + (slot - ps));
+    const auto & bank = model.layers[u_layer];
     const bool has_attn_input = u_layer > 0;
     const bool boundary = (u_layer % int(hparams.n_attn_res_block)) == 0;
 
@@ -558,7 +569,7 @@ ggml_tensor * llama_model_inkling2_loop::graph::build_layer(
     }
 
     // Q/K/V projections
-    ggml_tensor * qlin = build_lora_mm(layer.wq, q_in); // [n_head*hd, T]
+    ggml_tensor * qlin = build_lora_mm(layer.wq, q_in, bank.wq_s); // [n_head*hd, T]
     qlin = ggml_reshape_3d(ctx0, qlin, hparams.n_embd_head_k(), hparams.n_head(), T);
     qlin = ggml_mul(ctx0, qlin, layer.inkling_attn_q_scale);
     qlin = l2_clip(qlin, hparams.f_qk_clip, slot);
@@ -573,7 +584,7 @@ ggml_tensor * llama_model_inkling2_loop::graph::build_layer(
     // gather this sequence's state rows (also makes the rs_s_copy input live)
     ggml_tensor * rs_cur = build_rs(inp_rs, r_l, hparams.n_embd_r(), ubatch.n_seqs);
 
-    ggml_tensor * kpre = build_lora_mm(layer.wk, k_in);
+    ggml_tensor * kpre = build_lora_mm(layer.wk, k_in, bank.wk_s);
     const float kv_denom = full ? sqrtf(float(2 * int(hparams.n_sconv_kernel) + 1))
                                 : sqrtf(float(    int(hparams.n_sconv_kernel) + 1));
     ggml_tensor * kcv  = short_conv(kpre, full ? nullptr : layer.inkling_k_conv,
@@ -586,7 +597,7 @@ ggml_tensor * llama_model_inkling2_loop::graph::build_layer(
     Kcur = l2_clip(Kcur, hparams.f_qk_clip, slot);
     cb(Kcur, "Kcur", slot);
 
-    ggml_tensor * vpre = build_lora_mm(layer.wv, v_in);
+    ggml_tensor * vpre = build_lora_mm(layer.wv, v_in, bank.wv_s);
     ggml_tensor * vcv  = short_conv(vpre, full ? nullptr : layer.inkling_v_conv,
                                     full ? layer.inkling_v_conv_static : nullptr,
                                     full ? layer.inkling_v_conv_proj : nullptr,
@@ -613,9 +624,9 @@ ggml_tensor * llama_model_inkling2_loop::graph::build_layer(
                                     1.0f, slot);
     cb(attn, "attn_raw", slot);
 
-    ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, q_in));
+    ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, q_in, bank.wqkv_gate_s));
     ggml_tensor * gated = ggml_mul(ctx0, attn, gate);
-    gated = build_lora_mm(layer.wo, gated);
+    gated = build_lora_mm(layer.wo, gated, bank.wo_s);
     cb(gated, "attn_out", slot);
 
     ggml_tensor * post_attn = short_conv(gated, layer.inkling_attn_conv, nullptr, nullptr, nullptr,
@@ -650,7 +661,8 @@ ggml_tensor * llama_model_inkling2_loop::graph::build_layer(
                                       hparams.n_expert, hparams.n_expert_used(),
                                       LLM_FFN_SITU, true, hparams.expert_weights_scale,
                                       LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, slot,
-                                      nullptr, layer.ffn_gate_up_exps);
+                                      nullptr, layer.ffn_gate_up_exps,
+                                      layer.ffn_up_exps_s, nullptr, layer.ffn_down_exps_s);
     cb(moe, "ffn_moe_out", slot);
 
     ggml_tensor * post_mlp = short_conv(moe, layer.inkling_mlp_conv, nullptr, nullptr, nullptr,
@@ -775,7 +787,7 @@ llama_model_inkling2_loop::graph::graph(const llama_model & model, const llm_gra
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur);
+    cur = build_lora_mm(model.output, cur, model.output_s);
     if (hparams.f_final_logit_softcapping > 0.0f) {
         cur = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping)),
                          hparams.f_final_logit_softcapping);
