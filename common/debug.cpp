@@ -4,6 +4,10 @@
 #include "log.h"
 
 #include <cmath>
+#include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <regex>
 #include <string>
 #include <vector>
@@ -130,6 +134,45 @@ static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int6
     }
 }
 
+static void common_debug_dump_tensor(const ggml_tensor * t, const std::vector<uint8_t> & data) {
+    const char * dir = std::getenv("LLAMA_DEBUG_DUMP_DIR");
+    if (!dir || !*dir || ggml_is_quantized(t->type)) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        LOG_ERR("%s: cannot create %s: %s\n", __func__, dir, ec.message().c_str());
+        return;
+    }
+
+    std::string name = t->name;
+    for (char & c : name) {
+        if (!std::isalnum((unsigned char) c) && c != '-' && c != '_' && c != '.') {
+            c = '_';
+        }
+    }
+    const std::filesystem::path base = std::filesystem::path(dir) / name;
+
+    const bool is_host = ggml_backend_buffer_is_host(t->buffer);
+    const uint8_t * src = is_host ? static_cast<const uint8_t *>(t->data) : data.data();
+    if (!src) {
+        return;
+    }
+
+    std::ofstream bin(base.string() + ".bin", std::ios::binary | std::ios::trunc);
+    bin.write(reinterpret_cast<const char *>(src), ggml_nbytes(t));
+
+    std::ofstream meta(base.string() + ".json", std::ios::trunc);
+    meta << "{\n";
+    meta << "  \"name\": \"" << t->name << "\",\n";
+    meta << "  \"type\": \"" << ggml_type_name(t->type) << "\",\n";
+    meta << "  \"ne\": [" << t->ne[0] << ", " << t->ne[1] << ", " << t->ne[2] << ", " << t->ne[3] << "],\n";
+    meta << "  \"nb\": [" << t->nb[0] << ", " << t->nb[1] << ", " << t->nb[2] << ", " << t->nb[3] << "],\n";
+    meta << "  \"nbytes\": " << ggml_nbytes(t) << "\n";
+    meta << "}\n";
+}
+
 /**
  * GGML operations callback during the graph execution.
  *
@@ -183,6 +226,7 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
 
     if (!ggml_is_quantized(t->type) && matches_filter) {
         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
+        common_debug_dump_tensor(t, pimpl->data);
         common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
     }
 

@@ -27,6 +27,10 @@ static bool run(llama_context * ctx, const common_params & params) {
     }
 
     common_batch batch = common_batch_get_one(ctx, tokens);
+    // Request activations for every prompt token, not just the last one.
+    for (int32_t i = 0; i < (int32_t) tokens.size(); ++i) {
+        batch.set_output(i, true);
+    }
     if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         LOG_ERR("%s : failed to eval\n", __func__);
         return false;
@@ -38,23 +42,24 @@ static bool run(llama_context * ctx, const common_params & params) {
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
-    common_debug_cb_user_data cb_data;
-
     common_params params;
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_DEBUG)) {
         return 1;
     }
 
     llama_backend_init();
     llama_numa_init(params.numa);
 
+    // Emit every prompt token's activations (not just the last), so per-layer
+    // and final-layer dumps are full-length and comparable to a reference.
+    params.n_outputs_max_per_seq = 0;
+
     // pass the callback to the backend scheduler
     // it will be executed for each node during the graph computation
-    params.cb_eval = common_debug_cb_eval;
-    params.cb_eval_user_data = &cb_data;
+    common_debug_cb_user_data cb_data(params, params.tensor_filter);
     params.warmup = false;
 
     // init

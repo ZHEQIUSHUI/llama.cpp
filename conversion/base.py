@@ -1660,6 +1660,9 @@ class TextModel(ModelBase):
             elif rope_type == "dynamic":
                 # HunYuan, handled in model class
                 pass
+            elif rope_type == "default":
+                # plain RoPE: no scaling metadata is needed
+                pass
             elif rope_type.lower() == "llama3":
                 # Handled in generate_extra_tensors
                 pass
