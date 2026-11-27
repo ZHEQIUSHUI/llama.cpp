@@ -134,13 +134,25 @@ class lightnav_vit_pulsar final : public model {
         ggml_tensor * pe  = graph_tensor(g, "v.position_embd.weight");
         ggml_tensor * pwe = graph_tensor(g, "v.patch_embd.weight");
         ggml_tensor * out = g->nodes[g->n_nodes - 1];
-        GGML_ASSERT(raw && pe && pwe && "axera lightnav_vit_pulsar: expected tensors in the clip graph");
+        if (!raw || !pe || !pwe || !out) {
+            GGML_LOG_ERROR("axera lightnav_vit_pulsar: missing tensors in the clip graph\n");
+            return GGML_STATUS_FAILED;
+        }
         const int     PS  = (int) pwe->ne[0];
         const int     W   = (int) raw->ne[0], HI = (int) raw->ne[1];
         const int     gw  = W / PS, gh = HI / PS, n = gw * gh;
-        GGML_ASSERT(raw->type == GGML_TYPE_F32 && raw->ne[3] == 2 && PS == 16 && gw % 2 == 0 && gh % 2 == 0);
-        GGML_ASSERT(pe->ne[0] == 1024 && n == NP && "axera lightnav_vit_pulsar: the kernel holds one 448-patch tubelet");
-        GGML_ASSERT(out->type == GGML_TYPE_F32 && out->ne[0] == 10240 && out->ne[1] == n / 4);
+        const int     frames = (int) raw->ne[3];
+        if (raw->type != GGML_TYPE_F32 || (frames != 1 && frames != 2) || PS != 16 || W <= 0 || HI <= 0 ||
+            gw % 2 != 0 || gh % 2 != 0) {
+            GGML_LOG_ERROR("axera lightnav_vit_pulsar: unsupported image graph %dx%d, %d frame(s), patch %d\n",
+                           W, HI, frames, PS);
+            return GGML_STATUS_FAILED;
+        }
+        if (pe->ne[0] != 1024 || n != NP || out->type != GGML_TYPE_F32 || out->ne[0] != 10240 || out->ne[1] != n / 4) {
+            GGML_LOG_ERROR("axera lightnav_vit_pulsar: geometry %dx%d (%d patches) does not match the fixed kernel\n",
+                           W, HI, n);
+            return GGML_STATUS_FAILED;
+        }
 
         {
             axera_timer tm("vit pulsar pack (cpu, frame pairs)");
@@ -149,7 +161,7 @@ class lightnav_vit_pulsar final : public model {
             auto *        px  = (float *) pixel_->vir;
             int32_t n_raw = 0;
             const ggml_axera_raw_frame * raw_frames = ggml_backend_axera_raw_frames(&n_raw);
-            bool raw_hwc = n_raw == 2;
+            bool raw_hwc = n_raw == 1 || n_raw == 2;
             for (int i = 0; i < n_raw && raw_hwc; ++i) {
                 raw_hwc = raw_frames[i].data && raw_frames[i].width == W && raw_frames[i].height == HI;
             }
@@ -161,12 +173,12 @@ class lightnav_vit_pulsar final : public model {
                 float *       d  = px + i * 1536;
                 if (raw_hwc) {
                     const uint8_t * row0 = raw_frames[0].data + ((size_t) (py * PS) * W + pxp * PS) * 3;
-                    const uint8_t * row1 = raw_frames[1].data + ((size_t) (py * PS) * W + pxp * PS) * 3;
+                    const uint8_t * row1 = raw_frames[n_raw > 1 ? 1 : 0].data + ((size_t) (py * PS) * W + pxp * PS) * 3;
                     store_norm_patch(row0, row1, (size_t) W * 3, d);
                 } else {
                     for (int c = 0; c < 3; ++c) {
                         for (int f = 0; f < 2; ++f) {
-                            const float * plane = img + f * fsz + (size_t) c * W * HI;
+                            const float * plane = img + (frames == 1 ? 0 : f) * fsz + (size_t) c * W * HI;
                             for (int ky = 0; ky < PS; ++ky) {
                                 memcpy(d, plane + (size_t) (py * PS + ky) * W + pxp * PS, PS * sizeof(float));
                                 d += PS;
@@ -241,19 +253,31 @@ class lightnav_vit_pulsar_u8 final : public model {
         ggml_tensor * pe  = graph_tensor(g, "v.position_embd.weight");
         ggml_tensor * pwe = graph_tensor(g, "v.patch_embd.weight");
         ggml_tensor * out = g->nodes[g->n_nodes - 1];
-        GGML_ASSERT(raw && pe && pwe && "axera lightnav_vit_pulsar_u8: expected tensors in the clip graph");
+        if (!raw || !pe || !pwe || !out) {
+            GGML_LOG_ERROR("axera lightnav_vit_pulsar_u8: missing tensors in the clip graph\n");
+            return GGML_STATUS_FAILED;
+        }
         const int PS = (int) pwe->ne[0];
         const int W  = (int) raw->ne[0], HI = (int) raw->ne[1];
         const int gw = W / PS, gh = HI / PS, n = gw * gh;
-        GGML_ASSERT(raw->type == GGML_TYPE_F32 && raw->ne[3] == 2 && PS == 16 && gw % 2 == 0 && gh % 2 == 0);
-        GGML_ASSERT(pe->ne[0] == 1024 && n == NP && W == FW && HI == FH &&
-                    "axera lightnav_vit_pulsar_u8: the kernel holds one 448x256 two-frame tubelet");
+        const int frames = (int) raw->ne[3];
+        if (raw->type != GGML_TYPE_F32 || (frames != 1 && frames != 2) || PS != 16 || gw % 2 != 0 || gh % 2 != 0) {
+            GGML_LOG_ERROR("axera lightnav_vit_pulsar_u8: unsupported image graph %dx%d, %d frame(s), patch %d\n",
+                           W, HI, frames, PS);
+            return GGML_STATUS_FAILED;
+        }
+        if (pe->ne[0] != 1024 || n != NP || W != FW || HI != FH || out->type != GGML_TYPE_F32 ||
+            out->ne[0] != 10240 || out->ne[1] != n / 4) {
+            GGML_LOG_ERROR("axera lightnav_vit_pulsar_u8: geometry %dx%d (%d patches) does not match the fixed kernel\n",
+                           W, HI, n);
+            return GGML_STATUS_FAILED;
+        }
 
         auto *       dst = (uint8_t *) frames_->vir;
         const size_t frame_bytes = (size_t) FW * FH * 3;
         int32_t n_raw = 0;
         const ggml_axera_raw_frame * raw_frames = ggml_backend_axera_raw_frames(&n_raw);
-        bool packed = n_raw == 2;
+        bool packed = n_raw == 1 || n_raw == 2;
         for (int i = 0; i < n_raw && packed; ++i) {
             packed = raw_frames[i].data && raw_frames[i].width == FW && raw_frames[i].height == FH;
         }
@@ -261,13 +285,14 @@ class lightnav_vit_pulsar_u8 final : public model {
             axera_timer tm(packed ? "vit pulsar u8 pack (cpu, raw frames)" : "vit pulsar u8 pack (cpu, fallback)");
             if (packed) {
                 memcpy(dst, raw_frames[0].data, frame_bytes);
-                memcpy(dst + frame_bytes, raw_frames[1].data, frame_bytes);
+                memcpy(dst + frame_bytes, raw_frames[n_raw > 1 ? 1 : 0].data, frame_bytes);
             } else {
                 const int64_t fsz = (int64_t) W * HI;
                 const float * img = (const float *) raw->data;
                 for (int f = 0; f < 2; ++f) {
+                    const int sf = frames == 1 ? 0 : f;
                     for (int c = 0; c < 3; ++c) {
-                        const float * plane = img + f * 3 * fsz + (size_t) c * fsz;
+                        const float * plane = img + sf * 3 * fsz + (size_t) c * fsz;
                         for (int y = 0; y < HI; ++y) {
                             uint8_t * row = dst + f * frame_bytes + ((size_t) y * W) * 3 + c;
                             const float * src = plane + (size_t) y * W;

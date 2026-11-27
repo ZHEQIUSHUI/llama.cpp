@@ -42,6 +42,51 @@ bool ggml_backend_axera_vit_raw_u8(void) {
     return false;
 }
 
+bool ggml_backend_axera_vit_fixed_geometry(int32_t * width, int32_t * height, int32_t * frames) {
+    if (width)  *width  = 0;
+    if (height) *height = 0;
+    if (frames) *frames = 0;
+
+    const axera::manifest * m = axera::kernels();
+    if (!m || !m->has("vit")) {
+        return false;
+    }
+    const axera::kernel & k = m->get("vit");
+    const int feat = k.find_output("feat");
+    if (feat < 0) {
+        return false;
+    }
+    const AX_ENGINE_IOMETA_T & fm = k.info->pOutputs[feat];
+    if (fm.eDataType != AX_ENGINE_DT_FLOAT32 || fm.nShapeSize != 2 || fm.pShape[0] != 112 || fm.pShape[1] != 10240) {
+        return false;
+    }
+
+    const int raw = k.find_input("frames");
+    if (raw >= 0) {
+        const AX_ENGINE_IOMETA_T & mt = k.info->pInputs[raw];
+        if (mt.eDataType == AX_ENGINE_DT_UINT8 && mt.nShapeSize == 4 && mt.pShape[0] == 2 &&
+            mt.pShape[1] == 256 && mt.pShape[2] == 448 && mt.pShape[3] == 3) {
+            if (width)  *width  = 448;
+            if (height) *height = 256;
+            if (frames) *frames = 2;
+            return true;
+        }
+    }
+
+    const int pixel = k.find_input("pixel");
+    if (pixel >= 0) {
+        const AX_ENGINE_IOMETA_T & mt = k.info->pInputs[pixel];
+        if (mt.eDataType == AX_ENGINE_DT_FLOAT32 && mt.nShapeSize == 2 && mt.pShape[0] == 448 &&
+            mt.pShape[1] == 1536) {
+            if (width)  *width  = 448;
+            if (height) *height = 256;
+            if (frames) *frames = 2;
+            return true;
+        }
+    }
+    return false;
+}
+
 void ggml_backend_axera_set_raw_frames(const ggml_axera_raw_frame * frames, int32_t n) {
     g_raw_frames.clear();
     if (frames && n > 0) {
@@ -675,6 +720,9 @@ static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_axera_vit_raw_u8") == 0) {
         return (void *) ggml_backend_axera_vit_raw_u8;
+    }
+    if (strcmp(name, "ggml_backend_axera_vit_fixed_geometry") == 0) {
+        return (void *) ggml_backend_axera_vit_fixed_geometry;
     }
     if (strcmp(name, "ggml_backend_axera_set_raw_frames") == 0) {
         return (void *) ggml_backend_axera_set_raw_frames;

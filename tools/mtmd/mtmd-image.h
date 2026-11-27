@@ -30,8 +30,13 @@ struct mtmd_image_preproc_out {
 struct mtmd_image_preprocessor {
     const clip_hparams & hparams;
     const bool           raw_u8;
+    int                  fixed_width  = 0;
+    int                  fixed_height = 0;
+    int                  fixed_frames = 0;
 
-    explicit mtmd_image_preprocessor(const clip_ctx * ctx): hparams(*clip_get_hparams(ctx)), raw_u8(clip_model_uses_raw_frames(ctx)) {}
+    explicit mtmd_image_preprocessor(const clip_ctx * ctx): hparams(*clip_get_hparams(ctx)), raw_u8(clip_model_uses_raw_frames(ctx)) {
+        clip_model_vit_fixed_geometry(ctx, &fixed_width, &fixed_height, &fixed_frames);
+    }
 
     virtual ~mtmd_image_preprocessor() = default;
     virtual mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const = 0;

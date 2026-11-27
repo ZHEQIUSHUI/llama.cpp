@@ -805,6 +805,24 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
     GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
     clip_image_u8 resized_image;
     const clip_image_size original_size = img.get_size();
+
+    // A pulsar ViT advertises one fixed two-frame tubelet through its IO.  Every still image, regardless of its source
+    // size or aspect ratio, enters that tubelet at the kernel's exact geometry.  Navigation frames already arrive at
+    // this size and keep their bytes untouched.  Direct bilinear resize matches the navigation client's cv2.resize;
+    // the static image's second temporal frame is supplied by the adapter (the same frame twice, as Qwen3-VL does for
+    // a still image).
+    if (raw_u8 && fixed_frames == 2 && fixed_width > 0 && fixed_height > 0) {
+        const clip_image_size target_size = { fixed_width, fixed_height };
+        mtmd_image_preproc_out output;
+        if (original_size.width == target_size.width && original_size.height == target_size.height) {
+            output.append(hparams, img, true, true);
+        } else {
+            img_tool::resize(img, resized_image, target_size, RESIZE_ALGO_BILINEAR, PAD_NONE);
+            output.append(hparams, resized_image, true, true);
+        }
+        return output;
+    }
+
     // the original pixtral model doesn't have n_merge
     const int cur_merge = hparams.n_merge;
     const clip_image_size target_size = img_tool::calc_size_preserved_ratio(

@@ -94,6 +94,8 @@ bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct 
 // true when the loaded backend's ViT adapter consumes raw U8 frames, so preprocessing can retain the source bytes
 // instead of materializing a normalized F32 image.
 bool clip_model_uses_raw_frames(const struct clip_ctx * ctx);
+// Fixed [width, height, frames] of a pulsar one-kernel ViT, or false when the backend's ViT is not fixed geometry.
+bool clip_model_vit_fixed_geometry(const struct clip_ctx * ctx, int32_t * width, int32_t * height, int32_t * frames);
 
 enum clip_gen_process_type {
     CLIP_GEN_PROCESS_GEN_UNKNOWN,

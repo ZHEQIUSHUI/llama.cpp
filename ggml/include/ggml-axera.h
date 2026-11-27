@@ -76,6 +76,9 @@ typedef struct ggml_axera_raw_frame {
 // 1 when the loaded manifest's ViT role can consume the raw RGB frames: either U8 `frames` directly, or the F32
 // `pixel` kernel whose adapter normalizes while packing.  Other adapters still use the normalized graph input.
 GGML_BACKEND_API bool ggml_backend_axera_vit_raw_u8(void);
+// The fixed input geometry of the loaded one-kernel pulsar ViT, derived from its IO shape, or 0 when the manifest's
+// ViT has no such fixed tubelet.  mtmd uses this to resize arbitrary still images before the adapter sees them.
+GGML_BACKEND_API bool ggml_backend_axera_vit_fixed_geometry(int32_t * width, int32_t * height, int32_t * frames);
 // The frames of the next vision compute (thread-local; the caller clears with n = 0).
 GGML_BACKEND_API void ggml_backend_axera_set_raw_frames(const ggml_axera_raw_frame * frames, int32_t n);
 GGML_BACKEND_API const ggml_axera_raw_frame * ggml_backend_axera_raw_frames(int32_t * n);

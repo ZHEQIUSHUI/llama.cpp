@@ -5234,7 +5234,7 @@ private:
 
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
-                            send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                            send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_INVALID_REQUEST);
                             slot.release();
                             return; // the slot is done, skip it entirely
                         }
@@ -5286,7 +5286,7 @@ private:
                                 SLT_ERR(slot, "%s", "failed to process mtmd chunk\n");
                                 // the batch must not keep the entries of a released slot
                                 batch.truncate(n_tokens_prev);
-                                send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                                send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_INVALID_REQUEST);
                                 slot.release();
                                 return;
                             }
@@ -5498,7 +5498,7 @@ private:
                 SLT_ERR(slot, "%s", "failed to process mtmd chunk\n");
                 // the batch must not keep the entries of a released slot
                 batch.truncate(n_tokens_prev);
-                send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_INVALID_REQUEST);
                 slot.release();
                 return false;
             }

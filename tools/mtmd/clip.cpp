@@ -51,6 +51,12 @@ static bool (*clip_axera_vit_raw_u8_proc(void))() {
     return reg ? (bool (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_axera_vit_raw_u8") : nullptr;
 }
 
+static bool (*clip_axera_vit_fixed_geometry_proc(void))(int32_t *, int32_t *, int32_t *) {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name(GGML_AXERA_NAME);
+    return reg ? (bool (*)(int32_t *, int32_t *, int32_t *))
+                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_axera_vit_fixed_geometry") : nullptr;
+}
+
 static void (*clip_axera_set_raw_frames_proc(void))(const ggml_axera_raw_frame *, int32_t) {
     ggml_backend_reg_t reg = ggml_backend_reg_by_name(GGML_AXERA_NAME);
     return reg ? (void (*)(const ggml_axera_raw_frame *, int32_t))
@@ -293,6 +299,17 @@ bool clip_model_uses_raw_frames(const struct clip_ctx * ctx) {
     }
     auto proc = clip_axera_vit_raw_u8_proc();
     return proc && proc();
+}
+
+bool clip_model_vit_fixed_geometry(const struct clip_ctx * ctx, int32_t * width, int32_t * height, int32_t * frames) {
+    if (width)  *width  = 0;
+    if (height) *height = 0;
+    if (frames) *frames = 0;
+    if (!ctx || !ctx->backend || std::string(ggml_backend_name(ctx->backend)) != GGML_AXERA_NAME) {
+        return false;
+    }
+    auto proc = clip_axera_vit_fixed_geometry_proc();
+    return proc && proc(width, height, frames);
 }
 
 //
@@ -5164,9 +5181,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 }
                 raw_frames.push_back({ img.get_raw_u8().data(), img.nx(), img.ny() });
             }
-            // The LightNav pulsar2 adapters consume exactly one two-frame tubelet per graph.  Other batch sizes keep
-            // the generic F32 path below.
-            if (all_raw && raw_frames.size() == 2) {
+            // The LightNav pulsar2 adapters consume one two-frame tubelet per graph.  A still image is one raw frame;
+            // the adapter supplies it as both temporal frames.  Other batch sizes keep the generic F32 path below.
+            if (all_raw && (raw_frames.size() == 1 || raw_frames.size() == 2)) {
                 raw_guard.set(raw_frames.data(), (int32_t) raw_frames.size());
                 raw_guard.active = true;
                 if (clip_prof_on()) {
@@ -5206,7 +5223,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 float * batch_entry = inp_raw.data() + b * (3*n);
                 if (img.has_raw_u8()) {
                     const auto & raw = img.get_raw_u8();
-                    GGML_ASSERT(raw.size() == (size_t) 3*n);
+                    if (raw.size() != (size_t) 3*n) {
+                        LOG_ERR("%s: raw image %d has %zu bytes, expected %zu\n", __func__, b, raw.size(), (size_t) 3*n);
+                        return false;
+                    }
                     for (int y = 0; y < ny; y++) {
                         for (int x = 0; x < nx; x++) {
                             const size_t base_src = 3*(y * nx + x);
@@ -6513,7 +6533,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         const int expected_n_tokens_out = clip_n_output_tokens(ctx, &imgs.entries[0]);
         if (n_tokens_out != expected_n_tokens_out) {
             LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
-            GGML_ABORT("Invalid number of output tokens");
+            return false;
         }
 
         LOG_DBG("%s: output embedding shape [%d, %d, %d]\n", __func__,
@@ -6525,7 +6545,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         if (!out_batch_embd.empty()) {
             if (out_batch_embd.size() != (size_t)ggml_nelements(embeddings)) {
                 LOG_ERR("%s: output buffer has %zu elements but expected %zu\n", __func__, out_batch_embd.size(), (size_t)ggml_nelements(embeddings));
-                GGML_ABORT("Output buffer size mismatch");
+                return false;
             }
             ggml_backend_tensor_get(embeddings, out_batch_embd.data(), 0, ggml_nbytes(embeddings));
         } else {
