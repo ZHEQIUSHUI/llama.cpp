@@ -65,6 +65,21 @@ typedef struct ggml_axera_argmax {
     int  (*chain_take)(int32_t * ids, float * logits, int max_n);
 } ggml_axera_argmax;
 
+// One RGB HWC frame supplied by the host without a normalized F32 copy.  A vision kernel whose manifest input is
+// U8 `frames` [2, H, W, 3] consumes these directly; other adapters ignore them.
+typedef struct ggml_axera_raw_frame {
+    const uint8_t * data;
+    int32_t         width;
+    int32_t         height;
+} ggml_axera_raw_frame;
+
+// 1 when the loaded manifest's ViT role can consume the raw RGB frames: either U8 `frames` directly, or the F32
+// `pixel` kernel whose adapter normalizes while packing.  Other adapters still use the normalized graph input.
+GGML_BACKEND_API bool ggml_backend_axera_vit_raw_u8(void);
+// The frames of the next vision compute (thread-local; the caller clears with n = 0).
+GGML_BACKEND_API void ggml_backend_axera_set_raw_frames(const ggml_axera_raw_frame * frames, int32_t n);
+GGML_BACKEND_API const ggml_axera_raw_frame * ggml_backend_axera_raw_frames(int32_t * n);
+
 #ifdef  __cplusplus
 }
 #endif

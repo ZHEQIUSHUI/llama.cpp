@@ -16,7 +16,7 @@ struct mtmd_image_preproc_out {
     int grid_x = 0;
     int grid_y = 0;
 
-    void append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized = true);
+    void append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized = true, bool raw_u8 = false);
     void append(const clip_hparams & hparams, const std::vector<clip_image_u8> & imgs, bool normalized = true);
     void append(const clip_hparams & hparams, clip_image_f32 & img, bool normalized = true);
 
@@ -29,8 +29,9 @@ struct mtmd_image_preproc_out {
 // base class, models must inherit from this class
 struct mtmd_image_preprocessor {
     const clip_hparams & hparams;
+    const bool           raw_u8;
 
-    mtmd_image_preprocessor(const clip_ctx * ctx): hparams(*clip_get_hparams(ctx)) {}
+    explicit mtmd_image_preprocessor(const clip_ctx * ctx): hparams(*clip_get_hparams(ctx)), raw_u8(clip_model_uses_raw_frames(ctx)) {}
 
     virtual ~mtmd_image_preprocessor() = default;
     virtual mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const = 0;

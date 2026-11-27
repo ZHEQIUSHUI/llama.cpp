@@ -13,6 +13,46 @@
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
+
+// The clip graph hands the u8 ViT its source frames without materializing a normalized F32 image.  The scheduler runs
+// the adapter on this thread immediately after the setter, so a thread-local keeps concurrent servers independent.
+static thread_local std::vector<ggml_axera_raw_frame> g_raw_frames;
+
+bool ggml_backend_axera_vit_raw_u8(void) {
+    const axera::manifest * m = axera::kernels();
+    if (!m || !m->has("vit")) {
+        return false;
+    }
+    const axera::kernel & k = m->get("vit");
+    const int frames = k.find_input("frames");
+    if (frames >= 0) {
+        const AX_ENGINE_IOMETA_T & mt = k.info->pInputs[frames];
+        return mt.eDataType == AX_ENGINE_DT_UINT8 && mt.nShapeSize == 4 && mt.pShape[0] == 2 &&
+               mt.pShape[1] == 256 && mt.pShape[2] == 448 && mt.pShape[3] == 3;
+    }
+    // The F32-input U16 kernel has the same one-tubelet geometry.  Its adapter also accepts the raw frames and does
+    // the normalization while packing the patch rows, so mtmd does not need to materialize a normalized F32 image.
+    const int pixel = k.find_input("pixel");
+    if (pixel >= 0) {
+        const AX_ENGINE_IOMETA_T & mt = k.info->pInputs[pixel];
+        return mt.eDataType == AX_ENGINE_DT_FLOAT32 && mt.nShapeSize == 2 && mt.pShape[0] == 448 &&
+               mt.pShape[1] == 1536;
+    }
+    return false;
+}
+
+void ggml_backend_axera_set_raw_frames(const ggml_axera_raw_frame * frames, int32_t n) {
+    g_raw_frames.clear();
+    if (frames && n > 0) {
+        g_raw_frames.assign(frames, frames + n);
+    }
+}
+
+const ggml_axera_raw_frame * ggml_backend_axera_raw_frames(int32_t * n) {
+    *n = (int32_t) g_raw_frames.size();
+    return g_raw_frames.data();
+}
 
 static const char * ggml_backend_axera_get_name(ggml_backend_t backend) {
     return GGML_AXERA_NAME;
@@ -632,6 +672,12 @@ static void * ggml_backend_axera_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_mmproj_host_weights") == 0) {
         return (void *) ggml_backend_axera_mmproj_host_weights;
+    }
+    if (strcmp(name, "ggml_backend_axera_vit_raw_u8") == 0) {
+        return (void *) ggml_backend_axera_vit_raw_u8;
+    }
+    if (strcmp(name, "ggml_backend_axera_set_raw_frames") == 0) {
+        return (void *) ggml_backend_axera_set_raw_frames;
     }
     if (strcmp(name, "ggml_backend_kq_mask_unused") == 0) {
         return (void *) ggml_backend_axera_kq_mask_unused;

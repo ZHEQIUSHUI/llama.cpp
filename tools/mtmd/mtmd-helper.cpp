@@ -364,6 +364,42 @@ static bool is_webp_file(const unsigned char * buf, size_t len) {
     return len >= 12 && memcmp(buf, "RIFF", 4) == 0 && memcmp(buf + 8, "WEBP", 4) == 0;
 }
 
+// LightNav shared-memory RGB frame: 8-byte magic, u32 width, u32 height, u32 channels, u32 id_bytes,
+// then `id_bytes` of the client's content digest, followed by RGB HWC.  The original 24-byte form
+// (id_bytes == 0) remains readable.
+static constexpr unsigned char LN_RAW_MAGIC[8] = { 'L', 'N', 'R', 'G', 'B', 'R', '7', '\0' };
+static constexpr size_t          LN_RAW_HEADER  = 24;
+static constexpr size_t          LN_RAW_ID_MAX  = 32;
+
+static bool is_lightnav_raw_rgb(const unsigned char * buf, size_t len, int * nx, int * ny,
+                                size_t * data_offset, std::string * id) {
+    if (len < LN_RAW_HEADER || memcmp(buf, LN_RAW_MAGIC, sizeof(LN_RAW_MAGIC)) != 0) {
+        return false;
+    }
+    uint32_t w, h, c, id_bytes;
+    memcpy(&w, buf + 8, sizeof(w));
+    memcpy(&h, buf + 12, sizeof(h));
+    memcpy(&c, buf + 16, sizeof(c));
+    memcpy(&id_bytes, buf + 20, sizeof(id_bytes));
+    if (w == 0 || h == 0 || c != 3 || id_bytes > LN_RAW_ID_MAX ||
+        (uint64_t) w * h * 3 + LN_RAW_HEADER + id_bytes != len) {
+        return false;
+    }
+    *nx = (int) w;
+    *ny = (int) h;
+    *data_offset = LN_RAW_HEADER + id_bytes;
+    if (id_bytes > 0) {
+        static const char hex[] = "0123456789abcdef";
+        id->resize(id_bytes * 2);
+        for (uint32_t i = 0; i < id_bytes; ++i) {
+            const unsigned char v = buf[LN_RAW_HEADER + i];
+            (*id)[2 * i]     = hex[v >> 4];
+            (*id)[2 * i + 1] = hex[v & 15];
+        }
+    }
+    return true;
+}
+
 #ifdef MTMD_VIDEO
 static mtmd_bitmap * decode_webp_with_ffmpeg(const mtmd_context * mctx, const unsigned char * buf, size_t len, bool placeholder,
                                              const mtmd_helper_video_init_params & params);
@@ -374,13 +410,17 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(const mtmd_context *
                                                             mtmd_helper_init_opt opt) {
     const bool prof = getenv("GGML_AXERA_PROF") != nullptr;
     const auto t_start = std::chrono::steady_clock::now();
-    // calculate the hash if needed
+    int raw_nx = 0, raw_ny = 0;
+    size_t raw_offset = 0;
     std::string id;
+    const bool raw_rgb = !placeholder && is_lightnav_raw_rgb(buf, len, &raw_nx, &raw_ny, &raw_offset, &id);
+    // Raw frames carry the client's content digest, so even a cache-enabled closed loop never hashes the 15.8 MB
+    // payload again.  Keep SHA-256 for other formats to prevent cache poisoning.
     mtmd_bitmap * result = nullptr;
 
     GGML_UNUSED(opt); // only used by video code paths
 
-    if (!placeholder) {
+    if (!placeholder && (!raw_rgb || id.empty())) {
         // use sha256 to prevent cache poisoning
         id = hash_sha256_hex(buf, len);
     }
@@ -395,6 +435,20 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(const mtmd_context *
             }
             return {result, nullptr};
         }
+    }
+
+    if (raw_rgb) {
+        result = mtmd_bitmap_init(raw_nx, raw_ny, buf + raw_offset);
+        mtmd_bitmap_set_id(result, id.empty() ? nullptr : id.c_str());
+        if (!id.empty()) {
+            mtmd_bitmap_cache_put(ctx, id.c_str(), result);
+        }
+        if (prof) {
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t_start).count();
+            fprintf(stderr, "mtmd prof: raw rgb %dx%d decode %.3f ms\n", raw_nx, raw_ny, us / 1e3);
+        }
+        return {result, nullptr};
     }
 
     if (audio_helpers::is_audio_file((const char *)buf, len)) {

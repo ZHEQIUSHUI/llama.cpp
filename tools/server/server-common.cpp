@@ -1356,7 +1356,32 @@ void handle_media(
         GGML_ASSERT(media_path.back() == DIRECTORY_SEPARATOR);
     }
 
-    if (string_starts_with(url, "http")) {
+    if (string_starts_with(url, "shm://")) {
+        // LightNav raw-frame transport: the client writes a header-prefixed RGB frame into /dev/shm and sends only its
+        // name.  No base64, JSON-sized image payload or PNG decode is involved; file:// remains the general path.
+        const std::string name = url.substr(6);
+        if (!fs_validate_filename(name, false)) {
+            throw std::invalid_argument("invalid shared-frame name: " + name);
+        }
+        const char * env_dir = getenv("LIGHTNAV_RAW_DIR");
+        const std::string dir = env_dir && *env_dir ? env_dir : "/dev/shm/lightnav_frames";
+        const std::string path = dir + "/" + name;
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file) {
+            throw std::invalid_argument("shared frame does not exist or cannot be opened: " + path);
+        }
+        const std::streamoff size = file.tellg();
+        if (size <= 0 || size > 64 * 1024 * 1024) {
+            throw std::invalid_argument("invalid shared frame size: " + path);
+        }
+        raw_buffer data((size_t) size);
+        file.seekg(0);
+        if (!file.read((char *) data.data(), size)) {
+            throw std::runtime_error("failed to read shared frame: " + path);
+        }
+        out_files.push_back(std::move(data));
+
+    } else if (string_starts_with(url, "http")) {
         // download remote image
         // TODO @ngxson : maybe make these params configurable
         common_remote_params params;

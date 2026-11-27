@@ -91,6 +91,10 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx);
 bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, const clip_image_f32 * img, std::vector<float> & out_vec);
 bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct clip_image_f32_batch * imgs, std::vector<float> & out_batch_embd);
 
+// true when the loaded backend's ViT adapter consumes raw U8 frames, so preprocessing can retain the source bytes
+// instead of materializing a normalized F32 image.
+bool clip_model_uses_raw_frames(const struct clip_ctx * ctx);
+
 enum clip_gen_process_type {
     CLIP_GEN_PROCESS_GEN_UNKNOWN,
     CLIP_GEN_PROCESS_GEN_CODE, // h_state to codes

@@ -19,12 +19,17 @@
 #include "../model.h"
 #include "../../ops/ops.h"
 #include "../../core/patch_embed.h"
+#include "ggml-axera.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string_view>
 #include <thread>
+
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 namespace axera {
 namespace {
@@ -33,6 +38,52 @@ static std::string_view graph_base_name(const char * name) {
     const char * a = strchr(name, '#');
     const char * b = a ? strrchr(name, '#') : nullptr;
     return a && b > a ? std::string_view(a + 1, b - a - 1) : std::string_view(name);
+}
+
+// Normalize one 16x16 patch from both frames in kernel order: all rows of c0/f0, then c0/f1, c1/f0, ...
+// Qwen2-VL uses mean = std = 0.5, i.e. x / 127.5 - 1.  Keeping the two IEEE operations (rather than a fused fma)
+// preserves the exact values the R6 accuracy gate was measured with.
+static inline void store_norm_patch(const uint8_t * row0, const uint8_t * row1, size_t stride, float * dst) {
+#if defined(__ARM_NEON)
+    const float32x4_t q255 = vdupq_n_f32(255.0f);
+    const float32x4_t half = vdupq_n_f32(0.5f);
+    const float32x4_t two  = vdupq_n_f32(2.0f);
+    for (int c = 0; c < 3; ++c) {
+        for (int f = 0; f < 2; ++f) {
+            const uint8_t * src = f ? row1 : row0;
+            for (int ky = 0; ky < 16; ++ky) {
+                uint8x16x3_t rgb = vld3q_u8(src + ky * stride);
+                uint8x16_t v = rgb.val[c];
+                uint16x8_t lo16 = vmovl_u8(vget_low_u8(v));
+                uint16x8_t hi16 = vmovl_u8(vget_high_u8(v));
+                float32x4_t x0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16)));
+                float32x4_t x1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo16)));
+                float32x4_t x2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16)));
+                float32x4_t x3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi16)));
+                x0 = vmulq_f32(vsubq_f32(vdivq_f32(x0, q255), half), two);
+                x1 = vmulq_f32(vsubq_f32(vdivq_f32(x1, q255), half), two);
+                x2 = vmulq_f32(vsubq_f32(vdivq_f32(x2, q255), half), two);
+                x3 = vmulq_f32(vsubq_f32(vdivq_f32(x3, q255), half), two);
+                vst1q_f32(dst, x0);
+                vst1q_f32(dst + 4, x1);
+                vst1q_f32(dst + 8, x2);
+                vst1q_f32(dst + 12, x3);
+                dst += 16;
+            }
+        }
+    }
+#else
+    for (int c = 0; c < 3; ++c) {
+        for (int f = 0; f < 2; ++f) {
+            const uint8_t * s = f ? row1 : row0;
+            for (int ky = 0; ky < 16; ++ky) {
+                for (int x = 0; x < 16; ++x) {
+                    *dst++ = ((float) s[ky * stride + x * 3 + c] / 255.0f - 0.5f) / 0.5f;
+                }
+            }
+        }
+    }
+#endif
 }
 
 // The clip graph is rebuilt for every tubelet. Its full name map costs ~3.7 ms, but this adapter needs four tensors.
@@ -96,33 +147,56 @@ class lightnav_vit_pulsar final : public model {
             const float * img = (const float *) raw->data;
             const size_t  fsz = (size_t) W * HI * 3;
             auto *        px  = (float *) pixel_->vir;
+            int32_t n_raw = 0;
+            const ggml_axera_raw_frame * raw_frames = ggml_backend_axera_raw_frames(&n_raw);
+            bool raw_hwc = n_raw == 2;
+            for (int i = 0; i < n_raw && raw_hwc; ++i) {
+                raw_hwc = raw_frames[i].data && raw_frames[i].width == W && raw_frames[i].height == HI;
+            }
             // the same 2 x 2 merge order as the DSL adapter's tables(): block row, block column, then the four patches
             axera_host_pool().run(n, [&](int64_t i) {
                 const int64_t blk = i / 4;
                 const int     py  = (int) ((blk / (gw / 2)) * 2 + (i % 4) / 2);
                 const int     pxp = (int) ((blk % (gw / 2)) * 2 + (i % 4) % 2);
                 float *       d  = px + i * 1536;
-                for (int c = 0; c < 3; ++c) {
-                    for (int f = 0; f < 2; ++f) {
-                        const float * plane = img + f * fsz + (size_t) c * W * HI;
-                        for (int ky = 0; ky < PS; ++ky) {
-                            memcpy(d, plane + (size_t) (py * PS + ky) * W + pxp * PS, PS * sizeof(float));
-                            d += PS;
+                if (raw_hwc) {
+                    const uint8_t * row0 = raw_frames[0].data + ((size_t) (py * PS) * W + pxp * PS) * 3;
+                    const uint8_t * row1 = raw_frames[1].data + ((size_t) (py * PS) * W + pxp * PS) * 3;
+                    store_norm_patch(row0, row1, (size_t) W * 3, d);
+                } else {
+                    for (int c = 0; c < 3; ++c) {
+                        for (int f = 0; f < 2; ++f) {
+                            const float * plane = img + f * fsz + (size_t) c * W * HI;
+                            for (int ky = 0; ky < PS; ++ky) {
+                                memcpy(d, plane + (size_t) (py * PS + ky) * W + pxp * PS, PS * sizeof(float));
+                                d += PS;
+                            }
                         }
                     }
                 }
             });
             pixel_->flush();
         }
-        {
-            axera_timer tm("vit pulsar (one call)");
-            k.run(in_, out_, "vit");
-        }
         const size_t bytes = (size_t) (n / 4) * 10240 * sizeof(float);
-        feat_->invalidate(feat_->vir, bytes);
-        memcpy(out->data, feat_->vir, bytes);
-        if (ggml_backend_buffer_is_axera(out->buffer)) {
-            ((ggml_backend_axera_buffer_context *) out->buffer->context)->flush(out->data, bytes);
+        std::vector<AX_ENGINE_IO_BUFFER_T> out_call;
+        const bool direct_out = ggml_backend_buffer_is_axera(out->buffer) && out->data && ggml_nbytes(out) == bytes;
+        if (direct_out) {
+            out_call.push_back(axera_io((ggml_backend_axera_buffer_context *) out->buffer->context, out->data, bytes));
+        } else {
+            out_call = out_;
+        }
+        {
+            axera_timer tm(direct_out ? "vit pulsar (one call, direct CMM output)" :
+                                        "vit pulsar (one call, buffered output)");
+            k.run(in_, out_call, "vit");
+        }
+        if (!direct_out) {
+            axera_timer tm("vit pulsar output readback");
+            feat_->invalidate(feat_->vir, bytes);
+            memcpy(out->data, feat_->vir, bytes);
+            if (ggml_backend_buffer_is_axera(out->buffer)) {
+                ((ggml_backend_axera_buffer_context *) out->buffer->context)->flush(out->data, bytes);
+            }
         }
         return GGML_STATUS_SUCCESS;
     }
@@ -138,6 +212,110 @@ class lightnav_vit_pulsar final : public model {
     axera_cmm                         pixel_, feat_;
     std::vector<AX_ENGINE_IO_BUFFER_T> in_, out_;
     int                               NP = 0;
+};
+
+// The same pulsar2 tower compiled with a U8 RGB input and in-kernel normalization / Qwen2-VL patch reordering:
+// frames [2, H, W, 3] -> feat [N / 4, 4 * H].  mtmd retains the source HWC bytes for this path, so no normalized
+// F32 image is materialized or uploaded.  The graph's `inp_raw` stays an unused placeholder.
+class lightnav_vit_pulsar_u8 final : public model {
+  public:
+    explicit lightnav_vit_pulsar_u8(const manifest & m) :
+        man(m), k(m.get("vit")) {
+        GGML_ASSERT(k.find_input("frames") >= 0 && k.find_output("feat") >= 0 &&
+                    "axera lightnav_vit_pulsar_u8: expected frames -> feat IO");
+        const AX_ENGINE_IOMETA_T & fm = k.info->pInputs[k.input("frames")];
+        GGML_ASSERT(fm.eDataType == AX_ENGINE_DT_UINT8 && fm.nShapeSize == 4 && fm.pShape[0] == 2 &&
+                    fm.pShape[1] == 256 && fm.pShape[2] == 448 && fm.pShape[3] == 3 &&
+                    "axera lightnav_vit_pulsar_u8: expected frames U8 [2,256,448,3]");
+        frames_ = axera_cmm_alloc(k.in_bytes("frames"));
+        feat_   = axera_cmm_alloc(k.out_bytes("feat"));
+        in_.push_back(axera_io(frames_));
+        out_.push_back(axera_io(feat_));
+        FH = fm.pShape[1];
+        FW = fm.pShape[2];
+        NP = (int) ((int64_t) FW / 16 * (FH / 16));
+    }
+
+    ggml_status compute(ggml_cgraph * g) override {
+        ggml_tensor * raw = graph_tensor(g, "inp_raw");  // [W, H, 3, 2] f32 in the reference graph
+        ggml_tensor * pe  = graph_tensor(g, "v.position_embd.weight");
+        ggml_tensor * pwe = graph_tensor(g, "v.patch_embd.weight");
+        ggml_tensor * out = g->nodes[g->n_nodes - 1];
+        GGML_ASSERT(raw && pe && pwe && "axera lightnav_vit_pulsar_u8: expected tensors in the clip graph");
+        const int PS = (int) pwe->ne[0];
+        const int W  = (int) raw->ne[0], HI = (int) raw->ne[1];
+        const int gw = W / PS, gh = HI / PS, n = gw * gh;
+        GGML_ASSERT(raw->type == GGML_TYPE_F32 && raw->ne[3] == 2 && PS == 16 && gw % 2 == 0 && gh % 2 == 0);
+        GGML_ASSERT(pe->ne[0] == 1024 && n == NP && W == FW && HI == FH &&
+                    "axera lightnav_vit_pulsar_u8: the kernel holds one 448x256 two-frame tubelet");
+
+        auto *       dst = (uint8_t *) frames_->vir;
+        const size_t frame_bytes = (size_t) FW * FH * 3;
+        int32_t n_raw = 0;
+        const ggml_axera_raw_frame * raw_frames = ggml_backend_axera_raw_frames(&n_raw);
+        bool packed = n_raw == 2;
+        for (int i = 0; i < n_raw && packed; ++i) {
+            packed = raw_frames[i].data && raw_frames[i].width == FW && raw_frames[i].height == FH;
+        }
+        {
+            axera_timer tm(packed ? "vit pulsar u8 pack (cpu, raw frames)" : "vit pulsar u8 pack (cpu, fallback)");
+            if (packed) {
+                memcpy(dst, raw_frames[0].data, frame_bytes);
+                memcpy(dst + frame_bytes, raw_frames[1].data, frame_bytes);
+            } else {
+                const int64_t fsz = (int64_t) W * HI;
+                const float * img = (const float *) raw->data;
+                for (int f = 0; f < 2; ++f) {
+                    for (int c = 0; c < 3; ++c) {
+                        const float * plane = img + f * 3 * fsz + (size_t) c * fsz;
+                        for (int y = 0; y < HI; ++y) {
+                            uint8_t * row = dst + f * frame_bytes + ((size_t) y * W) * 3 + c;
+                            const float * src = plane + (size_t) y * W;
+                            for (int x = 0; x < W; ++x) {
+                                row[x * 3] = (uint8_t) std::max(0, std::min(255, (int) lrintf(src[x] * 127.5f + 127.5f)));
+                            }
+                        }
+                    }
+                }
+            }
+            frames_->flush();
+        }
+
+        const size_t bytes = (size_t) (n / 4) * 10240 * sizeof(float);
+        std::vector<AX_ENGINE_IO_BUFFER_T> out_call;
+        const bool direct_out = ggml_backend_buffer_is_axera(out->buffer) && out->data && ggml_nbytes(out) == bytes;
+        if (direct_out) {
+            out_call.push_back(axera_io((ggml_backend_axera_buffer_context *) out->buffer->context, out->data, bytes));
+        } else {
+            out_call = out_;
+        }
+        {
+            axera_timer tm(direct_out ? "vit pulsar u8 (one call, direct CMM output)" :
+                                        "vit pulsar u8 (one call, buffered output)");
+            k.run(in_, out_call, "vit");
+        }
+        if (!direct_out) {
+            // the CPU fallback: one copy when the graph's output is not CMM
+            axera_timer tm("vit pulsar u8 output readback");
+            feat_->invalidate(feat_->vir, bytes);
+            memcpy(out->data, feat_->vir, bytes);
+            if (ggml_backend_buffer_is_axera(out->buffer)) {
+                ((ggml_backend_axera_buffer_context *) out->buffer->context)->flush(out->data, bytes);
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
+    void prewarm(ggml_cgraph * g) override {
+        GGML_UNUSED(g);
+    }
+
+  private:
+    const manifest &                  man;
+    const kernel &                    k;
+    axera_cmm                         frames_, feat_;
+    std::vector<AX_ENGINE_IO_BUFFER_T> in_, out_;
+    int                               FW = 0, FH = 0, NP = 0;
 };
 
 class lightnav_vit_full final : public model {
@@ -786,6 +964,9 @@ ggml_status lightnav_vit_full::compute(ggml_cgraph * g) {
 std::shared_ptr<model> make_lightnav_vit_full(const manifest & m) {
     if (m.get("vit").find_input("pixel") >= 0) {
         return std::make_shared<lightnav_vit_pulsar>(m);
+    }
+    if (m.get("vit").find_input("frames") >= 0) {
+        return std::make_shared<lightnav_vit_pulsar_u8>(m);
     }
     return std::make_shared<lightnav_vit_full>(m);
 }

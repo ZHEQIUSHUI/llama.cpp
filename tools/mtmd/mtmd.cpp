@@ -1551,6 +1551,8 @@ struct mtmd_tokenizer {
 
     int32_t tokenize(mtmd_input_chunks * output) {
         cur.entries.clear();
+        int64_t text_us = 0, media_us = 0;
+        int n_text_calls = 0, n_media_calls = 0;
 
         // [QWEN_VIDEO] handle frame merging for models that support it (i.e. qwen-vl)
         int n_merge_frames = 1;
@@ -1570,12 +1572,18 @@ struct mtmd_tokenizer {
                     return 1;
                 }
                 auto bmps = merged_bitmaps[i_bm++];
+                const int64_t t_add = ggml_time_us();
                 int32_t res = add_media(bmps);
+                media_us += ggml_time_us() - t_add;
+                ++n_media_calls;
                 if (res != 0) {
                     return res;
                 }
             } else {
+                const int64_t t_add = ggml_time_us();
                 add_text(p.text, p.parse_special);
+                text_us += ggml_time_us() - t_add;
+                ++n_text_calls;
             }
         }
 
@@ -1611,6 +1619,11 @@ struct mtmd_tokenizer {
         }
 
         *output = std::move(cur);
+
+        if (getenv("PERF1112_PROF")) {
+            fprintf(stderr, "PERF1112 mtmd tokenize parts: text %.2f ms (%d), media %.2f ms (%d)\n",
+                    text_us / 1e3, n_text_calls, media_us / 1e3, n_media_calls);
+        }
 
         return 0;
     }

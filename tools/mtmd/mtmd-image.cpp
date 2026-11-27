@@ -12,17 +12,22 @@ static bool mtmd_image_prof_on() {
     return on;
 }
 
-void mtmd_image_preproc_out::append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized) {
+void mtmd_image_preproc_out::append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized, bool raw_u8) {
     const int64_t t0 = ggml_time_us();
     clip_image_f32 dst;
-    dst.from_u8(img);
+    if (raw_u8) {
+        dst.from_u8_raw(img);
+    } else {
+        dst.from_u8(img);
+    }
     const int64_t t1 = ggml_time_us();
-    if (normalized) {
+    if (normalized && !raw_u8) {
         dst.normalize(hparams.image_mean, hparams.image_std);
     }
     if (mtmd_image_prof_on()) {
-        fprintf(stderr, "mtmd image prof: append %dx%d from_u8 %.3f ms normalize %.3f ms\n",
-                img.get_size().width, img.get_size().height, (t1 - t0) / 1e3, (ggml_time_us() - t1) / 1e3);
+        fprintf(stderr, "mtmd image prof: append %dx%d %s %.3f ms normalize %.3f ms\n",
+                img.get_size().width, img.get_size().height, raw_u8 ? "raw_u8" : "from_u8",
+                (t1 - t0) / 1e3, raw_u8 ? 0.0 : (ggml_time_us() - t1) / 1e3);
     }
     entries.push_back(std::move(dst));
 }
@@ -788,7 +793,7 @@ mtmd_image_preproc_out mtmd_image_preprocessor_fixed_size::preprocess(const clip
                         hparams.image_resize_pad,
                         hparams.image_pad_color);
     mtmd_image_preproc_out output;
-    output.append(hparams, resized_image, true);
+    output.append(hparams, resized_image, true, raw_u8);
     return output;
 }
 
@@ -810,12 +815,19 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
             /* max_pixels   */ hparams.image_max_pixels,
             /* longest_edge */ 0,
         });
+    if (raw_u8 && original_size.width == target_size.width && original_size.height == target_size.height) {
+        // The navigation renderer already emits the model's 448x256 RGB.  Keep those bytes for the backend adapter
+        // instead of resizing them to an identical image and then converting to normalized F32.
+        mtmd_image_preproc_out output;
+        output.append(hparams, img, true, true);
+        return output;
+    }
     img_tool::resize(img, resized_image, target_size,
                         hparams.image_resize_algo,
                         hparams.image_resize_pad,
                         hparams.image_pad_color);
     mtmd_image_preproc_out output;
-    output.append(hparams, resized_image, true);
+    output.append(hparams, resized_image, true, raw_u8);
     return output;
 }
 

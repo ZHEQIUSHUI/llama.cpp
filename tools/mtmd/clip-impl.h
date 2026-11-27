@@ -786,6 +786,7 @@ struct clip_image_f32 {
     void set_size(clip_image_size size, bool is_placeholder, bool is_audio) {
         nx_ = size.width;
         ny_ = size.height;
+        raw_u8.clear();
         if (is_placeholder) {
             buf.clear();
         } else {
@@ -798,6 +799,7 @@ struct clip_image_f32 {
     }
 
     void cpy_buf(const std::vector<float> & new_buf) {
+        raw_u8.clear();
         buf = new_buf;
     }
 
@@ -805,6 +807,7 @@ struct clip_image_f32 {
         auto size = img.get_size();
         nx_ = size.width;
         ny_ = size.height;
+        raw_u8.clear();
         if (img.is_placeholder()) {
             buf.clear();
             return; // no-op
@@ -814,6 +817,21 @@ struct clip_image_f32 {
         for (size_t i = 0; i < img.n_elements(); ++i) {
             buf[i] = (float) u8_buf[i] / 255.0f;
         }
+    }
+
+    // Keep the source RGB HWC bytes for backends that consume raw frames (a u8-input kernel, or a F32 kernel whose
+    // adapter normalizes while packing).  The graph still has an `inp_raw` placeholder, but clip_encode() leaves it
+    // untouched and hands this buffer to the adapter instead.
+    void from_u8_raw(const clip_image_u8 & img) {
+        const auto size = img.get_size();
+        nx_ = size.width;
+        ny_ = size.height;
+        buf.clear();
+        if (img.is_placeholder()) {
+            raw_u8.clear();
+            return;
+        }
+        raw_u8 = img.get_ro_buf();
     }
 
     size_t n_elements() const {
@@ -838,10 +856,18 @@ struct clip_image_f32 {
         return buf;
     }
 
+    const std::vector<uint8_t> & get_raw_u8() const {
+        return raw_u8;
+    }
+
+    bool has_raw_u8() const {
+        return !raw_u8.empty();
+    }
+
     // note to contributors: NEVER add a get_rw_buf(), it is a DANGEROUS pattern
 
     bool is_placeholder() const {
-        return buf.empty();
+        return buf.empty() && raw_u8.empty();
     }
 
     void serialize(struct mtmd_serialization & ser) const;
@@ -849,6 +875,7 @@ struct clip_image_f32 {
 
   private:
     std::vector<float> buf;
+    std::vector<uint8_t> raw_u8;
     int nx_ = 0;
     int ny_ = 0;
 

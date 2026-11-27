@@ -8,6 +8,7 @@
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-axera.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -44,6 +45,28 @@ static bool clip_prof_on() {
 static int64_t clip_prof_us() {
     return ggml_time_us();
 }
+
+static bool (*clip_axera_vit_raw_u8_proc(void))() {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name(GGML_AXERA_NAME);
+    return reg ? (bool (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_axera_vit_raw_u8") : nullptr;
+}
+
+static void (*clip_axera_set_raw_frames_proc(void))(const ggml_axera_raw_frame *, int32_t) {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name(GGML_AXERA_NAME);
+    return reg ? (void (*)(const ggml_axera_raw_frame *, int32_t))
+                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_axera_set_raw_frames") : nullptr;
+}
+
+struct clip_raw_frames_guard {
+    void (*set)(const ggml_axera_raw_frame *, int32_t) = nullptr;
+    bool active = false;
+    explicit clip_raw_frames_guard(void (*fn)(const ggml_axera_raw_frame *, int32_t)) : set(fn) {}
+    ~clip_raw_frames_guard() {
+        if (active) {
+            set(nullptr, 0);
+        }
+    }
+};
 
 //#define CLIP_DEBUG_FUNCTIONS
 
@@ -263,6 +286,14 @@ struct clip_ctx {
         return model.proj_type;
     }
 };
+
+bool clip_model_uses_raw_frames(const struct clip_ctx * ctx) {
+    if (!ctx || !ctx->backend || std::string(ggml_backend_name(ctx->backend)) != GGML_AXERA_NAME) {
+        return false;
+    }
+    auto proc = clip_axera_vit_raw_u8_proc();
+    return proc && proc();
+}
 
 //
 // clip_graph
@@ -4976,6 +5007,7 @@ void clip_enc_state_free(clip_enc_state * state) {
 
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     const int64_t t_call0 = clip_prof_us();
+    clip_raw_frames_guard raw_guard(clip_axera_set_raw_frames_proc());
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
@@ -5121,50 +5153,88 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // set input pixel values
     if (!imgs.is_audio) {
         const int64_t t_raw0 = clip_prof_us();
-        size_t nelem = 0;
-        for (const auto & img : imgs.entries) {
-            nelem += img.nx() * img.ny() * 3;
+        std::vector<ggml_axera_raw_frame> raw_frames;
+        if (std::string(ggml_backend_name(ctx->backend)) == GGML_AXERA_NAME && clip_model_uses_raw_frames(ctx) && raw_guard.set) {
+            bool all_raw = true;
+            raw_frames.reserve(imgs.entries.size());
+            for (const auto & img : imgs.entries) {
+                if (!img.has_raw_u8() || img.get_raw_u8().size() != (size_t) img.nx() * img.ny() * 3) {
+                    all_raw = false;
+                    break;
+                }
+                raw_frames.push_back({ img.get_raw_u8().data(), img.nx(), img.ny() });
+            }
+            // The LightNav pulsar2 adapters consume exactly one two-frame tubelet per graph.  Other batch sizes keep
+            // the generic F32 path below.
+            if (all_raw && raw_frames.size() == 2) {
+                raw_guard.set(raw_frames.data(), (int32_t) raw_frames.size());
+                raw_guard.active = true;
+                if (clip_prof_on()) {
+                    fprintf(stderr, "clip prof: raw_u8 frames=%zu total %.3f ms\n",
+                            raw_frames.size(), (clip_prof_us() - t_raw0) / 1e3);
+                }
+            }
         }
-        std::vector<float> inp_raw(nelem);
 
-        // layout of data (note: the channel dim is unrolled to better visualize the layout):
-        //
-        // ┌──W──┐
-        // │     H │  channel = R
-        // ├─────┤ │
-        // │     H │  channel = G
-        // ├─────┤ │
-        // │     H │  channel = B
-        // └─────┘ │
-        //   ──────┘ x B
+        if (!raw_guard.active) {
+            size_t nelem = 0;
+            for (const auto & img : imgs.entries) {
+                nelem += img.nx() * img.ny() * 3;
+            }
+            std::vector<float> inp_raw(nelem);
 
-        // IMPORTANT: [QWEN_VIDEO] the batch dim is currently used for temporal dim in Qwen-VL models
-        // All entries must have the same spatial size (enforced by can_batch_with() during merging)
-        {
+            // layout of data (note: the channel dim is unrolled to better visualize the layout):
+            //
+            // ┌──W──┐
+            // │     H │  channel = R
+            // ├─────┤ │
+            // │     H │  channel = G
+            // ├─────┤ │
+            // │     H │  channel = B
+            // └─────┘ │
+            //   ──────┘ x B
+
+            // IMPORTANT: [QWEN_VIDEO] the batch dim is currently used for temporal dim in Qwen-VL models
+            // All entries must have the same spatial size (enforced by can_batch_with() during merging)
             const int nx = imgs.entries[0].nx();
             const int ny = imgs.entries[0].ny();
             const int n  = nx * ny;
 
             for (int b = 0; b < n_batch_cur; b++) {
                 LOG_DBG("%s: copying image %d/%d to input buffer (nx=%d, ny=%d)\n", __func__, b+1, n_batch_cur, nx, ny);
-                const auto & buf = imgs.entries[b].get_ro_buf();
+                const auto & img = imgs.entries[b];
                 float * batch_entry = inp_raw.data() + b * (3*n);
-                for (int y = 0; y < ny; y++) {
-                    for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x);
-                        size_t base_dst =    y * nx + x;
-                        batch_entry[      base_dst] = buf[base_src    ];
-                        batch_entry[1*n + base_dst] = buf[base_src + 1];
-                        batch_entry[2*n + base_dst] = buf[base_src + 2];
+                if (img.has_raw_u8()) {
+                    const auto & raw = img.get_raw_u8();
+                    GGML_ASSERT(raw.size() == (size_t) 3*n);
+                    for (int y = 0; y < ny; y++) {
+                        for (int x = 0; x < nx; x++) {
+                            const size_t base_src = 3*(y * nx + x);
+                            const size_t base_dst =    y * nx + x;
+                            batch_entry[      base_dst] = raw[base_src    ] / 127.5f - 1.0f;
+                            batch_entry[1*n + base_dst] = raw[base_src + 1] / 127.5f - 1.0f;
+                            batch_entry[2*n + base_dst] = raw[base_src + 2] / 127.5f - 1.0f;
+                        }
+                    }
+                } else {
+                    const auto & buf = img.get_ro_buf();
+                    for (int y = 0; y < ny; y++) {
+                        for (int x = 0; x < nx; x++) {
+                            const size_t base_src = 3*(y * nx + x);
+                            const size_t base_dst =    y * nx + x;
+                            batch_entry[      base_dst] = buf[base_src    ];
+                            batch_entry[1*n + base_dst] = buf[base_src + 1];
+                            batch_entry[2*n + base_dst] = buf[base_src + 2];
+                        }
                     }
                 }
             }
-        }
-        const int64_t t_raw1 = clip_prof_us();
-        set_input_f32("inp_raw", inp_raw);
-        if (clip_prof_on()) {
-            fprintf(stderr, "clip prof: inp_raw layout %.3f ms upload %.3f ms (%zu floats)\n",
-                    (t_raw1 - t_raw0) / 1e3, (clip_prof_us() - t_raw1) / 1e3, nelem);
+            const int64_t t_raw1 = clip_prof_us();
+            set_input_f32("inp_raw", inp_raw);
+            if (clip_prof_on()) {
+                fprintf(stderr, "clip prof: inp_raw layout %.3f ms upload %.3f ms (%zu floats)\n",
+                        (t_raw1 - t_raw0) / 1e3, (clip_prof_us() - t_raw1) / 1e3, nelem);
+            }
         }
 
     } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV) {
