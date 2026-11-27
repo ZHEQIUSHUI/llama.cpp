@@ -75,6 +75,7 @@ std::shared_ptr<model> make_qwen35_vit(const manifest & m);  // the mmproj visio
 std::shared_ptr<model> make_qwen35_vit_full(const manifest & m);  // the same in one call (role vit)
 std::shared_ptr<model> make_q3vl30_vit_full(const manifest & m);  // Qwen3-VL vision encoder with three deepstack mergers (role vit)
 std::shared_ptr<model> make_lightnav_vit_full(const manifest & m);  // LightNav-0 Qwen3-VL-4B vision tower (NVFP4, deepstack 5/11/17)
+std::shared_ptr<model> make_inkling2(const manifest & m);  // Inkling-2-Mini: 48 slot applications, loop layer banks, one prefill + one decode kernel
 std::shared_ptr<model> make_minicpm_ocr_vit_full(const manifest & m);  // MiniCPM-OCR SigLIP tower (role vit)
 std::shared_ptr<model> make_minicpmv4_7_vit_full(const manifest & m);  // MiniCPM-V 4.7 SigLIP + window merger (role vit)
 bool minicpm_ocr_vit_graph(const ggml_cgraph * g);

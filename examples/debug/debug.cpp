@@ -187,7 +187,26 @@ static bool run(llama_context * ctx, const common_params & params) {
 
     const bool add_bos = llama_vocab_get_add_bos(vocab);
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos, /*parse_special=*/true);
+    std::vector<llama_token> tokens;
+    const char * tokens_file = std::getenv("LLAMA_PROMPT_TOKENS_FILE");
+    if (tokens_file && tokens_file[0] != '\0') {
+        std::ifstream f(tokens_file, std::ios::binary);
+        if (!f) {
+            LOG_ERR("%s : cannot open %s\n", __func__, tokens_file);
+            return false;
+        }
+        std::vector<int32_t> ids;
+        f.seekg(0, std::ios::end);
+        const size_t n_bytes = size_t(f.tellg());
+        f.seekg(0, std::ios::beg);
+        ids.resize(n_bytes / sizeof(int32_t));
+        f.read(reinterpret_cast<char *>(ids.data()), n_bytes);
+        for (int32_t id : ids) {
+            tokens.push_back(llama_token(id));
+        }
+    } else {
+        tokens = common_tokenize(ctx, params.prompt, add_bos, /*parse_special=*/true);
+    }
 
     if (tokens.empty()) {
         LOG_ERR("%s : there are not input tokens to process - (try to provide a prompt with '-p')\n", __func__);

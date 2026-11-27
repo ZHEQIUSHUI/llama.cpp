@@ -147,6 +147,7 @@ constexpr adapter_row adapters[] = {
     { "hy_mt2",         make_moe_gqa,        nullptr,                   true,  true,  false },
     { "q3vl30",         make_moe_gqa,        make_q3vl30_vit_full,      true,  true,  false },
     { "lightnav",       make_lightnav,      make_lightnav_vit_full,    true,  true,  false },
+    { "inkling2",       make_inkling2,       nullptr,                   true,  true,  true  },
     { "qwen3",          make_qwen3,          nullptr,                   false, false, false },
     { "cosyvoice3_llm", make_phase_dense,    nullptr,                   false, false, false },
     { "cpm5",           make_cpm5,           nullptr,                   true,  false, false },

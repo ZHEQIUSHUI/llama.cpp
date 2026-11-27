@@ -45,6 +45,7 @@ ggml_add_backend_library(ggml-axera
                          models/q3vl30/q3vl30_vit_full.cpp
                          models/lightnav/lightnav.cpp
                          models/lightnav/lightnav_vit_full.cpp
+                         models/inkling2/inkling2.cpp
                          ggml-axera-buffer.cpp
                         )
 
