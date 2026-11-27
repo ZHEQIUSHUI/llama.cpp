@@ -28,6 +28,29 @@ E2M1 = np.asarray(
 )
 
 
+class LazyChunkedTensor:
+    """A uint8 tensor produced chunk-by-chunk at write time.
+
+    Keeps the Q8_0 embedding tables out of RAM during conversion; only the
+    gguf writer's ``tofile`` materialises one chunk at a time.
+    """
+
+    def __init__(self, chunks, shape, dtype):
+        self._chunks = chunks
+        self.shape = tuple(shape)
+        self.dtype = np.dtype(dtype)
+        self.nbytes = int(np.prod(self.shape)) * self.dtype.itemsize
+
+    def tofile(self, fp):
+        written = 0
+        for make in self._chunks:
+            arr = np.ascontiguousarray(make(), dtype=self.dtype)
+            arr.tofile(fp)
+            written += arr.nbytes
+        if written != self.nbytes:
+            raise ValueError(f"lazy tensor wrote {written} bytes, expected {self.nbytes}")
+
+
 def bf16_bytes_to_f32(raw: np.ndarray) -> np.ndarray:
     u = np.asarray(raw).view("<u2")
     return (u.astype(np.uint32) << 16).view(np.float32)
@@ -121,7 +144,7 @@ def add_embedding(w: gguf.GGUFWriter, t: gguf.ReaderTensor, chunk_rows: int) -> 
     rows = int(t.data.shape[0])
     width = int(t.data.shape[1]) // 2
     chunks = q8_chunks(t.data, rows, chunk_rows)
-    out = gguf.LazyChunkedTensor(
+    out = LazyChunkedTensor(
         chunks,
         shape=(rows, width // 32 * 34),
         dtype=np.uint8,
