@@ -20,6 +20,8 @@
 #include <thread>
 #include <mutex>
 #include <algorithm>
+#include <array>
+#include <string_view>
 
 #ifdef _WIN32
 // windows.h defines min and max as macros, which breaks std::min and std::max
@@ -267,64 +269,41 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
 // base64 utils (TODO: use the base64::decode from base64.hpp)
 //
 
-static const std::string base64_chars =
-             "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-             "abcdefghijklmnopqrstuvwxyz"
-             "0123456789+/";
-
-static inline bool is_base64(uint8_t c) {
-    return (isalnum(c) || (c == '+') || (c == '/'));
-}
-
-static inline raw_buffer base64_decode(const std::string & encoded_string) {
-    int i = 0;
-    int j = 0;
-    int in_ = 0;
-
-    int in_len = encoded_string.size();
-
-    uint8_t char_array_4[4];
-    uint8_t char_array_3[3];
+static inline raw_buffer base64_decode(std::string_view encoded) {
+    static const std::array<int8_t, 256> table = [] {
+        std::array<int8_t, 256> t{};
+        t.fill(-1);
+        const char * alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; ++i) {
+            t[(uint8_t) alphabet[i]] = (int8_t) i;
+        }
+        return t;
+    }();
 
     raw_buffer ret;
-
-    while (in_len-- && (encoded_string[in_] != '=') && is_base64(encoded_string[in_])) {
-        char_array_4[i++] = encoded_string[in_]; in_++;
-        if (i == 4) {
-            for (i = 0; i < 4; i++) {
-                char_array_4[i] = base64_chars.find(char_array_4[i]);
-            }
-
-            char_array_3[0] = ((char_array_4[0]      ) << 2) + ((char_array_4[1] & 0x30) >> 4);
-            char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
-            char_array_3[2] = ((char_array_4[2] & 0x3) << 6) +   char_array_4[3];
-
-            for (i = 0; (i < 3); i++) {
-                ret.push_back(char_array_3[i]);
-            }
-
-            i = 0;
+    ret.reserve(encoded.size() / 4 * 3 + 3);
+    uint32_t acc = 0;
+    int      n   = 0;
+    for (unsigned char c : encoded) {
+        const int8_t v = table[c];
+        if (v < 0) {
+            break; // '=' padding or the first invalid byte ends the payload, as before
+        }
+        acc = (acc << 6) | (uint32_t) v;
+        if (++n == 4) {
+            ret.push_back((uint8_t) (acc >> 16));
+            ret.push_back((uint8_t) (acc >> 8));
+            ret.push_back((uint8_t) acc);
+            acc = 0;
+            n   = 0;
         }
     }
-
-    if (i) {
-        for (j = i; j < 4; j++) {
-            char_array_4[j] = 0;
-        }
-
-        for (j = 0; j < 4; j++) {
-            char_array_4[j] = base64_chars.find(char_array_4[j]);
-        }
-
-        char_array_3[0] = ((char_array_4[0]      ) << 2) + ((char_array_4[1] & 0x30) >> 4);
-        char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
-        char_array_3[2] = ((char_array_4[2] & 0x3) << 6) +   char_array_4[3];
-
-        for (j = 0; j < i - 1; j++) {
-            ret.push_back(char_array_3[j]);
-        }
+    if (n == 2) {
+        ret.push_back((uint8_t) (acc >> 4));
+    } else if (n == 3) {
+        ret.push_back((uint8_t) (acc >> 10));
+        ret.push_back((uint8_t) (acc >> 2));
     }
-
     return ret;
 }
 
@@ -1291,7 +1270,7 @@ server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_context *
             // JSON object with prompt and multimodal key.
             std::vector<raw_buffer> files;
             for (const auto & entry : json_prompt.at(JSON_MTMD_DATA_KEY)) {
-                files.push_back(base64_decode(entry));
+                files.push_back(base64_decode(entry.get<std::string>()));
             }
             return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files, init_opt, false, vocab);
         } else {
@@ -1413,21 +1392,23 @@ void handle_media(
         out_files.push_back(data);
 
     } else if (string_starts_with(url, "data:")) {
-        // try to decode base64 image, video, or audio
-        std::vector<std::string> parts = string_split<std::string>(url, /*separator*/ ',');
-        if (parts.size() != 2) {
+        // try to decode base64 image, video, or audio without copying the data URL twice
+        const size_t comma = url.find(',');
+        if (comma == std::string::npos) {
             throw std::invalid_argument("Invalid uri-encoded base64 value");
-        } else if (!string_starts_with(parts[0], "data:image/")
-                && !string_starts_with(parts[0], "data:video/")
-                && !string_starts_with(parts[0], "data:audio/")) {
-            throw std::invalid_argument("Invalid uri format: " + parts[0]);
-        } else if (!string_ends_with(parts[0], "base64")) {
-            throw std::invalid_argument("uri must be base64 encoded");
-        } else {
-            auto base64_data = parts[1];
-            auto decoded_data = base64_decode(base64_data);
-            out_files.push_back(decoded_data);
         }
+        const std::string_view header(url.data(), comma);
+        const bool image = header.size() >= 11 && header.compare(0, 11, "data:image/") == 0;
+        const bool video = header.size() >= 11 && header.compare(0, 11, "data:video/") == 0;
+        const bool audio = header.size() >= 11 && header.compare(0, 11, "data:audio/") == 0;
+        if (!image && !video && !audio) {
+            throw std::invalid_argument("Invalid uri format: " + std::string(header));
+        }
+        if (header.size() < 6 || header.compare(header.size() - 6, 6, "base64") != 0) {
+            throw std::invalid_argument("uri must be base64 encoded");
+        }
+        auto decoded_data = base64_decode(std::string_view(url).substr(comma + 1));
+        out_files.push_back(std::move(decoded_data));
 
     } else {
         // try as raw base64 string
@@ -1466,8 +1447,11 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
                 throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
             }
 
-            json image_url = json_value(p, "image_url", json::object());
-            std::string url = json_value(image_url, "url", std::string());
+            std::string url;
+            if (p.contains("image_url") && p.at("image_url").is_object() &&
+                p.at("image_url").contains("url") && p.at("image_url").at("url").is_string()) {
+                url = p.at("image_url").at("url").get<std::string>();
+            }
             handle_media(out_files, url, opt.media_path);
             note_mergeable(json_value(p, "mergeable", false));
             note_pool_spatial(json_value(p, "pool_spatial", 1));
