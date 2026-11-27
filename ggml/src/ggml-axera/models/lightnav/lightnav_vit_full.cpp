@@ -22,10 +22,123 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <string_view>
 #include <thread>
 
 namespace axera {
 namespace {
+
+static std::string_view graph_base_name(const char * name) {
+    const char * a = strchr(name, '#');
+    const char * b = a ? strrchr(name, '#') : nullptr;
+    return a && b > a ? std::string_view(a + 1, b - a - 1) : std::string_view(name);
+}
+
+// The clip graph is rebuilt for every tubelet. Its full name map costs ~3.7 ms, but this adapter needs four tensors.
+// Scan the node sources once per name and stop at the first match; no persistent pointer is kept.
+static ggml_tensor * graph_tensor(const ggml_cgraph * g, const char * want) {
+    const std::string_view w(want);
+    for (int i = 0; i < g->n_nodes; ++i) {
+        ggml_tensor * node = g->nodes[i];
+        if (graph_base_name(node->name) == w) {
+            return node;
+        }
+        for (int src = 0; src < GGML_MAX_SRC && node->src[src]; ++src) {
+            if (graph_base_name(node->src[src]->name) == w) {
+                return node->src[src];
+            }
+            for (ggml_tensor * v = node->src[src]->view_src; v; v = v->view_src) {
+                if (graph_base_name(v->name) == w) {
+                    return v;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+// A pulsar2-compiled vision tower (one two-frame tubelet, role vit). The axmodel carries the whole tower and
+// the main merger plus deepstack 5/11/17; its IO is pixel F32 [N, 2 * 3 * PS * PS] and feat F32 [N / 4, 4 * H].
+// The host only packs HF's patch rows (channel, temporal, patch rows, patch columns) from mtmd's normalized
+// frames [W, H, 3, 2]; no weight conversion or separate patch projection is involved.
+class lightnav_vit_pulsar final : public model {
+  public:
+    explicit lightnav_vit_pulsar(const manifest & m) :
+        man(m), k(m.get("vit")) {
+        GGML_ASSERT(k.find_input("pixel") >= 0 && k.find_output("feat") >= 0 &&
+                    "axera lightnav_vit_pulsar: expected pixel -> feat IO");
+        pixel_ = axera_cmm_alloc(k.in_bytes("pixel"));
+        feat_  = axera_cmm_alloc(k.out_bytes("feat"));
+        in_.push_back(axera_io(pixel_));
+        out_.push_back(axera_io(feat_));
+        const AX_ENGINE_IOMETA_T & pm = k.info->pInputs[k.input("pixel")];
+        GGML_ASSERT(pm.nShapeSize == 2 && pm.pShape[1] == 1536 && "axera lightnav_vit_pulsar: pixel row width");
+        NP = (int) pm.pShape[0];
+        GGML_ASSERT(k.out_bytes("feat") == (size_t) (NP / 4) * 10240 * sizeof(float));
+    }
+
+    ggml_status compute(ggml_cgraph * g) override {
+        ggml_tensor * raw = graph_tensor(g, "inp_raw");  // [W, H, 3, 2] f32, normalized
+        ggml_tensor * pe  = graph_tensor(g, "v.position_embd.weight");
+        ggml_tensor * pwe = graph_tensor(g, "v.patch_embd.weight");
+        ggml_tensor * out = g->nodes[g->n_nodes - 1];
+        GGML_ASSERT(raw && pe && pwe && "axera lightnav_vit_pulsar: expected tensors in the clip graph");
+        const int     PS  = (int) pwe->ne[0];
+        const int     W   = (int) raw->ne[0], HI = (int) raw->ne[1];
+        const int     gw  = W / PS, gh = HI / PS, n = gw * gh;
+        GGML_ASSERT(raw->type == GGML_TYPE_F32 && raw->ne[3] == 2 && PS == 16 && gw % 2 == 0 && gh % 2 == 0);
+        GGML_ASSERT(pe->ne[0] == 1024 && n == NP && "axera lightnav_vit_pulsar: the kernel holds one 448-patch tubelet");
+        GGML_ASSERT(out->type == GGML_TYPE_F32 && out->ne[0] == 10240 && out->ne[1] == n / 4);
+
+        {
+            axera_timer tm("vit pulsar pack (cpu, frame pairs)");
+            const float * img = (const float *) raw->data;
+            const size_t  fsz = (size_t) W * HI * 3;
+            auto *        px  = (float *) pixel_->vir;
+            // the same 2 x 2 merge order as the DSL adapter's tables(): block row, block column, then the four patches
+            axera_host_pool().run(n, [&](int64_t i) {
+                const int64_t blk = i / 4;
+                const int     py  = (int) ((blk / (gw / 2)) * 2 + (i % 4) / 2);
+                const int     pxp = (int) ((blk % (gw / 2)) * 2 + (i % 4) % 2);
+                float *       d  = px + i * 1536;
+                for (int c = 0; c < 3; ++c) {
+                    for (int f = 0; f < 2; ++f) {
+                        const float * plane = img + f * fsz + (size_t) c * W * HI;
+                        for (int ky = 0; ky < PS; ++ky) {
+                            memcpy(d, plane + (size_t) (py * PS + ky) * W + pxp * PS, PS * sizeof(float));
+                            d += PS;
+                        }
+                    }
+                }
+            });
+            pixel_->flush();
+        }
+        {
+            axera_timer tm("vit pulsar (one call)");
+            k.run(in_, out_, "vit");
+        }
+        const size_t bytes = (size_t) (n / 4) * 10240 * sizeof(float);
+        feat_->invalidate(feat_->vir, bytes);
+        memcpy(out->data, feat_->vir, bytes);
+        if (ggml_backend_buffer_is_axera(out->buffer)) {
+            ((ggml_backend_axera_buffer_context *) out->buffer->context)->flush(out->data, bytes);
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
+    void prewarm(ggml_cgraph * g) override {
+        // the axmodel's weights are loaded with its handle; the pixel / feat buffers are already allocated
+        GGML_UNUSED(g);
+    }
+
+  private:
+    const manifest &                  man;
+    const kernel &                    k;
+    axera_cmm                         pixel_, feat_;
+    std::vector<AX_ENGINE_IO_BUFFER_T> in_, out_;
+    int                               NP = 0;
+};
 
 class lightnav_vit_full final : public model {
   public:
@@ -671,6 +784,9 @@ ggml_status lightnav_vit_full::compute(ggml_cgraph * g) {
 }  // namespace
 
 std::shared_ptr<model> make_lightnav_vit_full(const manifest & m) {
+    if (m.get("vit").find_input("pixel") >= 0) {
+        return std::make_shared<lightnav_vit_pulsar>(m);
+    }
     return std::make_shared<lightnav_vit_full>(m);
 }
 

@@ -16,6 +16,7 @@
 #include <cstring>
 #include <type_traits>
 #include <chrono>
+#include <atomic>
 #include <thread>
 #include <mutex>
 #include <algorithm>
@@ -1193,9 +1194,27 @@ server_tokens process_mtmd_prompt(
     // these will be freed upon going out of scope
     mtmd::bitmaps bitmaps;
     std::vector<mtmd_helper::video_ptr> videos;
+    std::vector<mtmd_helper_bitmap_wrapper> decoded(files.size(), { nullptr, nullptr });
+    {
+        std::atomic<size_t> next{ 0 };
+        const size_t workers = std::min<size_t>(4, std::max<size_t>(1, std::max(1u, std::thread::hardware_concurrency())));
+        auto one = [&] {
+            for (size_t i; (i = next.fetch_add(1)) < files.size();) {
+                auto & file = files[i];
+                decoded[i] = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
+            }
+        };
+        std::vector<std::thread> threads;
+        for (size_t t = 1; t < workers && t < files.size(); ++t) {
+            threads.emplace_back(one);
+        }
+        one();
+        for (auto & t : threads) {
+            t.join();
+        }
+    }
     for (size_t i = 0; i < files.size(); ++i) {
-        auto & file = files[i];
-        auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
+        auto & out = decoded[i];
         if (!out.bitmap) {
             throw std::runtime_error("Failed to load image or audio file");
         }
