@@ -493,7 +493,9 @@ static bool ggml_backend_axera_offload_input_layer() {
 // a shape only
 static bool ggml_backend_axera_kq_mask_unused() {
     const axera::manifest * m = axera::kernels();
-    return m && axera::model_caps_of(*m).causal_cells && !axera::kq_mask_check();
+    if (!m) return false;
+    const axera::model_caps c = axera::model_caps_of(*m);
+    return c.causal_cells && !c.kq_mask_rows && !axera::kq_mask_check();
 }
 
 static bool ggml_backend_axera_host_visible_output() {

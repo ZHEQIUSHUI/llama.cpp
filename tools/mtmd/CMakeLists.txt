@@ -44,6 +44,7 @@ add_library(mtmd
             models/granite-speech.cpp
             models/granite4-vision.cpp
             models/hunyuanvl.cpp
+            models/inkling2.cpp
             models/internvl.cpp
             models/kimivl.cpp
             models/kimik25.cpp

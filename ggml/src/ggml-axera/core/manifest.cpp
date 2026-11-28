@@ -272,6 +272,17 @@ void kernel::run(std::vector<AX_ENGINE_IO_BUFFER_T> & in, std::vector<AX_ENGINE_
     io.nInputSize  = (uint32_t) in.size();
     io.pOutputs    = out.data();
     io.nOutputSize = (uint32_t) out.size();
+    // Some graphs write a state output in place (one CMM buffer is bound to an input and an output).  The runtime
+    // rejects physical overlaps unless the caller opts in with AX_ENGINE_IO_FLAG_ALLOW_INPLACE (u64Reserved[0] bit 0).
+    for (const auto & o : out) {
+        for (const auto & i : in) {
+            if (o.phyAddr != 0 && o.phyAddr == i.phyAddr) {
+                io.u64Reserved[0] |= 1u;
+                goto inplace_checked;
+            }
+        }
+    }
+inplace_checked:
     // debug: GGML_AXERA_DUMP_ROLE=<role> GGML_AXERA_DUMP_DIR=<dir>: the role's first call's inputs as <dir>/<input>.bin,
     // then exit before running it (to replay it alone)
     static const char * dump_role = getenv("GGML_AXERA_DUMP_ROLE");

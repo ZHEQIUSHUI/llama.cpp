@@ -1039,6 +1039,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_qwen3vl>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_INKLING2:
+            {
+                builder = std::make_unique<clip_graph_inkling2>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_LING3VL:
             {
                 builder = std::make_unique<clip_graph_ling3vl>(ctx, img);
@@ -1871,6 +1875,14 @@ struct clip_model_loader {
                         // MiniMax-M3: max_pixels 451584 (=672^2) -> 576 merged tokens (image_seq_length)
                         hparams.set_limit_image_tokens(8, 576);
                         hparams.set_warmup_n_tokens(16*16);
+                    } break;
+                case PROJECTOR_TYPE_INKLING2:
+                    {
+                        hparams.n_merge = 2;
+                        hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
+                        hparams.image_resize_pad  = PAD_NONE;
+                        hparams.rope_theta = 10000.0f;
+                        hparams.set_warmup_n_tokens(16);  // 4 x 4 image tokens
                     } break;
                 case PROJECTOR_TYPE_MUSE_SPARK_AUDIO:
                     {
@@ -3082,6 +3094,12 @@ struct clip_model_loader {
                     model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"), false);
                     model.mm_input_norm_w   = get_tensor(TN_MM_INP_NORM, false);
                     model.mm_patch_merger_w = get_tensor(string_format(TN_MM_PATCH_MERGER, "weight"), false);
+                } break;
+            case PROJECTOR_TYPE_INKLING2:
+                {
+                    // bias-free 2-layer merger: 4 * n_embd -> mm.0 -> GELU -> mm.2
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
                 } break;
             case PROJECTOR_TYPE_DOTS_OCR:
             case PROJECTOR_TYPE_DOTS3NOTE_V:
@@ -4471,6 +4489,7 @@ int clip_n_output_tokens_x(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_HUNYUANVL:
         case PROJECTOR_TYPE_YOUTUVL:
         case PROJECTOR_TYPE_MUSE_GLIMMER:
+        case PROJECTOR_TYPE_INKLING2:
             return (img->nx() / params.patch_size) / 2;
         case PROJECTOR_TYPE_STEP3VL:
         case PROJECTOR_TYPE_MINICPMV4_6:
@@ -4501,6 +4520,7 @@ int clip_n_output_tokens_y(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_HUNYUANVL:
         case PROJECTOR_TYPE_YOUTUVL:
         case PROJECTOR_TYPE_MUSE_GLIMMER:
+        case PROJECTOR_TYPE_INKLING2:
             return (img->ny() / params.patch_size) / 2;
         case PROJECTOR_TYPE_STEP3VL:
         case PROJECTOR_TYPE_MINICPMV4_6:
@@ -4585,6 +4605,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_GLM5V:
         case PROJECTOR_TYPE_YOUTUVL:
         case PROJECTOR_TYPE_MUSE_GLIMMER:
+        case PROJECTOR_TYPE_INKLING2:
             {
                 // dynamic size (2 conv, so double patch size)
                 int x_patch = img->nx() / (params.patch_size * 2);
@@ -5429,6 +5450,29 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 set_input_i32("merger_ds_idx_1", m_ds_1);
                 set_input_i32("merger_ds_idx_2", m_ds_2);
                 set_input_i32("merger_ds_idx_3", m_ds_3);
+            } break;
+        case PROJECTOR_TYPE_INKLING2:
+            {
+                const int pw = image_size_width  / patch_size;
+                const int ph = image_size_height / patch_size;
+                const int blocks_w = pw / 2;
+                std::vector<int32_t> midx(num_patches), pos_w(n_pos), pos_h(n_pos);
+                for (int by = 0; by < ph / 2; by++) {
+                    for (int bx = 0; bx < blocks_w; bx++) {
+                        for (int ir = 0; ir < 2; ir++) {
+                            for (int ic = 0; ic < 2; ic++) {
+                                const int j = ((by * blocks_w + bx) * 2 + ir) * 2 + ic;
+                                midx[j] = (by * 2 + ir) * pw + (bx * 2 + ic);
+                                pos_w[j + 1] = bx * 2 + ic + 1;
+                                pos_h[j + 1] = by * 2 + ir + 1;
+                            }
+                        }
+                    }
+                }
+                pos_w[0] = pos_h[0] = 0;  // class token
+                set_input_i32("merge_idx", midx);
+                set_input_i32("pos_w", pos_w);
+                set_input_i32("pos_h", pos_h);
             } break;
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN3VL:
@@ -6638,6 +6682,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_MINIMAX_M3:
             return ctx->model.mm_merger_fc2_b->ne[0];
         case PROJECTOR_TYPE_MUSE_GLIMMER:
+        case PROJECTOR_TYPE_INKLING2:
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:

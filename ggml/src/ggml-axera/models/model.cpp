@@ -133,27 +133,27 @@ struct adapter_row {
     const char * name;
     maker        llm;
     maker        vit;  // role "vit"; none: such a package is an error
-    bool         owns_kv_cache, sched_io_only, causal_cells;
+    bool         owns_kv_cache, sched_io_only, causal_cells, kq_mask_rows;
 };
 
 constexpr adapter_row adapters[] = {
-    { "qwen38_27b",     make_qwen38,         make_qwen35_vit_full,      true,  true,  true  },
-    { "qwen35_whole",   make_qwen35_whole,   make_qwen35_vit_full,      true,  false, false },
+    { "qwen38_27b",     make_qwen38,         make_qwen35_vit_full,      true,  true,  true, false },
+    { "qwen35_whole",   make_qwen35_whole,   make_qwen35_vit_full,      true,  false, false, false },
     // the Qwen3.5-0.8B design with the head merged into its kernels
-    { "minicpm_ocr",    make_qwen35_whole,   make_minicpm_ocr_vit_full, false, false, false },
-    { "qwen35_moe_sgl", make_qwen35_moe_sgl, make_qwen35_vit_full,      true,  true,  false },
+    { "minicpm_ocr",    make_qwen35_whole,   make_minicpm_ocr_vit_full, false, false, false, false },
+    { "qwen35_moe_sgl", make_qwen35_moe_sgl, make_qwen35_vit_full,      true,  true,  false, false },
     // the text tower is the published 35B-A3B NVFP4 stack
-    { "minicpmv4_7",    make_qwen35_moe_sgl, make_minicpmv4_7_vit_full, true,  true,  false },
-    { "hy_mt2",         make_moe_gqa,        nullptr,                   true,  true,  false },
-    { "q3vl30",         make_moe_gqa,        make_q3vl30_vit_full,      true,  true,  false },
-    { "lightnav",       make_lightnav,      make_lightnav_vit_full,    true,  true,  false },
-    { "inkling2",       make_inkling2,       nullptr,                   true,  true,  true  },
-    { "qwen3",          make_qwen3,          nullptr,                   false, false, false },
-    { "cosyvoice3_llm", make_phase_dense,    nullptr,                   false, false, false },
-    { "cpm5",           make_cpm5,           nullptr,                   true,  false, false },
+    { "minicpmv4_7",    make_qwen35_moe_sgl, make_minicpmv4_7_vit_full, true,  true,  false, false },
+    { "hy_mt2",         make_moe_gqa,        nullptr,                   true,  true,  false, false },
+    { "q3vl30",         make_moe_gqa,        make_q3vl30_vit_full,      true,  true,  false, false },
+    { "lightnav",       make_lightnav,      make_lightnav_vit_full,    true,  true,  false, false },
+    { "inkling2",       make_inkling2,       make_inkling2_vit_full,    true,  true,  true,  true  },
+    { "qwen3",          make_qwen3,          nullptr,                   false, false, false, false },
+    { "cosyvoice3_llm", make_phase_dense,    nullptr,                   false, false, false, false },
+    { "cpm5",           make_cpm5,           nullptr,                   true,  false, false, false },
     // the base LM is on the NPU only with its prefill kernel (else llama.cpp runs it on the CPU): see model_caps_of
-    { "voxcpm2_base",   make_phase_dense,    nullptr,                   false, false, false },
-    { "hymt",           make_hymt,           nullptr,                   true,  false, false },
+    { "voxcpm2_base",   make_phase_dense,    nullptr,                   false, false, false, false },
+    { "hymt",           make_hymt,           nullptr,                   true,  false, false, false },
 };
 
 const adapter_row & adapter_of(const manifest & m) {
@@ -211,6 +211,7 @@ model_caps model_caps_of(const manifest & m) {
     c.owns_kv_cache = r.owns_kv_cache;
     c.sched_io_only = r.sched_io_only;
     c.causal_cells  = r.causal_cells;
+    c.kq_mask_rows  = r.kq_mask_rows;
     if (m.model == "voxcpm2_base" && m.has("prefill")) {
         c.owns_kv_cache = c.sched_io_only = true;
     }

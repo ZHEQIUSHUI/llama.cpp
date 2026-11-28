@@ -46,10 +46,13 @@ std::shared_ptr<model> make_model(const manifest & m);
 //   causal_cells   every sequence it runs fills its cells in order from cell 0 (core/seqstate): a token sees exactly
 //                  the cells up to its own, so llama.cpp need not fill the KQ mask (n_kv x n_ubatch values per batch,
 //                  and that much scheduler memory). GGML_AXERA_KQ_MASK_CHECK=1 keeps the mask and compares every row.
+//   kq_mask_rows   the adapter builds a graph whose softmax reads the mask rows (a per-token softmax sink cannot use
+//                  the single broadcast row): llama.cpp must fill them even when causal_cells holds
 struct model_caps {
     bool owns_kv_cache = false;
     bool sched_io_only = false;
     bool causal_cells  = false;
+    bool kq_mask_rows  = false;
 };
 model_caps model_caps_of(const manifest & m);
 // GGML_AXERA_KQ_MASK_CHECK=1: llama.cpp fills the KQ mask also for a causal_cells adapter, and every row taken from it
@@ -75,6 +78,7 @@ std::shared_ptr<model> make_qwen35_vit(const manifest & m);  // the mmproj visio
 std::shared_ptr<model> make_qwen35_vit_full(const manifest & m);  // the same in one call (role vit)
 std::shared_ptr<model> make_q3vl30_vit_full(const manifest & m);  // Qwen3-VL vision encoder with three deepstack mergers (role vit)
 std::shared_ptr<model> make_lightnav_vit_full(const manifest & m);  // LightNav-0 Qwen3-VL-4B vision tower (NVFP4, deepstack 5/11/17)
+std::shared_ptr<model> make_inkling2_vit_full(const manifest & m);  // Inkling-2-Mini vision tower (role vit)
 std::shared_ptr<model> make_inkling2(const manifest & m);  // Inkling-2-Mini: 48 slot applications, loop layer banks, one prefill + one decode kernel
 std::shared_ptr<model> make_minicpm_ocr_vit_full(const manifest & m);  // MiniCPM-OCR SigLIP tower (role vit)
 std::shared_ptr<model> make_minicpmv4_7_vit_full(const manifest & m);  // MiniCPM-V 4.7 SigLIP + window merger (role vit)

@@ -615,7 +615,172 @@ static wchar_t * ggml_mbstowcs(const char * mbs) {
 }
 #endif
 
+
+#if !defined(_WIN32) && defined(_GNU_SOURCE) && defined(__linux__)
+//
+// read-only "tcp://host:port/path" files: a small streaming client for a GGUF served by a remote read-only file
+// server.  The loader keeps one FILE* and reads tensors on demand (-lm none), so the file never has to exist on the
+// local filesystem.  Protocol: a hello {u32 path_len, path}, an u64 size back, then {u64 offset, u32 length} ->
+// {u32 nread, bytes}; reads are served through a 4 MiB readahead window.
+//
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
+#include <unistd.h>
+
+#define GGML_TCP_CHUNK (4u << 20)
+
+struct ggml_tcp_file {
+    int       fd;
+    int64_t   size;
+    int64_t   pos;
+    int64_t   buf_off;
+    size_t    buf_len;
+    uint8_t * buf;
+};
+
+static bool ggml_io_all(int fd, void * p, size_t n, bool wr) {
+    uint8_t * b = p;
+    while (n > 0) {
+        ssize_t r = wr ? send(fd, b, n, 0) : recv(fd, b, n, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (r == 0) return false;
+        b += (size_t) r;
+        n -= (size_t) r;
+    }
+    return true;
+}
+
+static bool ggml_tcp_fetch(struct ggml_tcp_file * t, int64_t off) {
+    uint64_t o = (uint64_t) off;
+    int64_t  rem = t->size - off;
+    uint32_t n = (uint32_t) (rem > (int64_t) GGML_TCP_CHUNK ? (int64_t) GGML_TCP_CHUNK : rem);
+    uint8_t hdr[12];
+    memcpy(hdr, &o, 8);
+    memcpy(hdr + 8, &n, 4);
+    if (!ggml_io_all(t->fd, hdr, sizeof(hdr), true)) return false;
+    uint32_t got = 0;
+    if (!ggml_io_all(t->fd, &got, sizeof(got), false)) return false;
+    if (got == 0 || got > n) return false;
+    if (!ggml_io_all(t->fd, t->buf, got, false)) return false;
+    t->buf_off = off;
+    t->buf_len = got;
+    return true;
+}
+
+static ssize_t ggml_tcp_read_cb(void * cookie, char * out, size_t n) {
+    struct ggml_tcp_file * t = (struct ggml_tcp_file *) cookie;
+    if (t->pos >= t->size) return 0;
+    size_t done = 0;
+    while (done < n && t->pos < t->size) {
+        if (t->pos < t->buf_off || t->pos >= t->buf_off + (int64_t) t->buf_len) {
+            if (!ggml_tcp_fetch(t, t->pos)) { errno = EIO; return -1; }
+        }
+        const int64_t avail = t->buf_off + (int64_t) t->buf_len - t->pos;
+        size_t m = n - done;
+        if ((int64_t) m > avail) m = (size_t) avail;
+        memcpy(out + done, t->buf + (t->pos - t->buf_off), m);
+        done += m;
+        t->pos += (int64_t) m;
+    }
+    return (ssize_t) done;
+}
+
+static int ggml_tcp_seek_cb(void * cookie, off64_t * off, int whence) {
+    struct ggml_tcp_file * t = (struct ggml_tcp_file *) cookie;
+    int64_t p = *off;
+    if (whence == SEEK_CUR) p += t->pos;
+    else if (whence == SEEK_END) p += t->size;
+    else if (whence != SEEK_SET) return -1;
+    if (p < 0) return -1;
+    t->pos = p;
+    *off = (off64_t) p;
+    return 0;
+}
+
+static int ggml_tcp_close_cb(void * cookie) {
+    struct ggml_tcp_file * t = (struct ggml_tcp_file *) cookie;
+    if (t->fd >= 0) close(t->fd);
+    GGML_FREE(t->buf);
+    GGML_FREE(t);
+    return 0;
+}
+
+static FILE * ggml_tcp_fopen(const char * spec) {
+    // spec: host:port/path
+    const char * slash = strchr(spec, '/');
+    if (!slash || slash == spec) return NULL;
+    char host[256];
+    const size_t hn = (size_t) (slash - spec);
+    if (hn >= sizeof(host)) return NULL;
+    memcpy(host, spec, hn);
+    host[hn] = 0;
+    const char * port = strrchr(host, ':');
+    if (!port) return NULL;
+    int pnum = atoi(port + 1);
+    ((char *) port)[0] = 0;
+    if (pnum <= 0 || pnum > 65535) return NULL;
+    const char * path = slash;
+
+    char ps[16];
+    struct addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    snprintf(ps, sizeof(ps), "%d", pnum);
+    struct addrinfo * res = NULL;
+    if (getaddrinfo(host, ps, &hints, &res) != 0) return NULL;
+    int fd = -1;
+    for (struct addrinfo * ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) return NULL;
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    const uint32_t plen = (uint32_t) strlen(path);
+    if (!ggml_io_all(fd, (void *) &plen, sizeof(plen), true)) { close(fd); return NULL; }
+    if (!ggml_io_all(fd, (void *) path, plen, true)) { close(fd); return NULL; }
+    uint64_t size = 0;
+    if (!ggml_io_all(fd, &size, sizeof(size), false) || size == UINT64_MAX) { close(fd); return NULL; }
+
+    struct ggml_tcp_file * t = (struct ggml_tcp_file *) GGML_MALLOC(sizeof(*t));
+    if (!t) { close(fd); return NULL; }
+    t->fd = fd;
+    t->size = (int64_t) size;
+    t->pos = 0;
+    t->buf_off = 0;
+    t->buf_len = 0;
+    t->buf = (uint8_t *) GGML_MALLOC(GGML_TCP_CHUNK);
+    if (!t->buf) { close(fd); GGML_FREE(t); return NULL; }
+
+    cookie_io_functions_t io = {};
+    io.read  = ggml_tcp_read_cb;
+    io.seek  = ggml_tcp_seek_cb;
+    io.close = ggml_tcp_close_cb;
+    FILE * fp = fopencookie(t, "rb", io);
+    if (!fp) { ggml_tcp_close_cb(t); return NULL; }
+    return fp;
+}
+#endif
+
 FILE * ggml_fopen(const char * fname, const char * mode) {
+#if !defined(_WIN32) && defined(_GNU_SOURCE) && defined(__linux__)
+    if (strncmp(fname, "tcp://", 6) == 0 && mode && mode[0] == 'r') {
+        FILE * fp = ggml_tcp_fopen(fname + 6);
+        if (fp) return fp;
+        errno = EIO;
+        return NULL;
+    }
+#endif
 #ifdef _WIN32
     FILE * file = NULL;
 

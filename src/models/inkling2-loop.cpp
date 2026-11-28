@@ -276,8 +276,8 @@ ggml_tensor * llama_model_inkling2_loop::graph::block_attn_res(
     ggml_tensor * q = query;
     if (q->ne[0] != H || ggml_n_dims(q) < 2) {
         q = ggml_reshape_2d(ctx0, q, H, n_q);
+        cb(q, "bar_q", il);  // only the view: renaming the weight itself hides it from name-based loaders
     }
-    cb(q, "bar_q", il);
 
     ggml_tensor * scores = nullptr;
     for (int64_t n = 0; n < nb; ++n) {
@@ -677,8 +677,12 @@ ggml_tensor * llama_model_inkling2_loop::graph::build_layer(
 llama_model_inkling2_loop::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params), model(model) {
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
-    cur = rms_w(ctx0, cur, model.inkling_embed_norm, hparams.f_norm_rms_eps);
-    cb(cur, "embed_norm", -1);
+    // the text model normalizes token embeddings; image embeddings from mtmd replace the embedding
+    // table's output (Inkling2Model passes them as inputs_embeds, after embed_norm)
+    if (!ubatch.embd) {
+        cur = rms_w(ctx0, cur, model.inkling_embed_norm, hparams.f_norm_rms_eps);
+        cb(cur, "embed_norm", -1);
+    }
 
     ggml_tensor * inp_pos = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();

@@ -134,6 +134,13 @@ struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };
 
+// Inkling-2: pad the image to whole 40 x 40 cells (20 px patches, 2 x 2 merge) with -1/255 and
+// normalize with mean/std 0.5; no resize.
+struct mtmd_image_preprocessor_inkling2 : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_inkling2(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+};
+
 // GLM 5.3 flash, similar to dyn_size, but each edge is aligned up to patch_size*n_merge, and max budget is met by a search over the height with the width scaled proportionally
 struct mtmd_image_preprocessor_glm5v : mtmd_image_preprocessor {
     mtmd_image_preprocessor_glm5v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}

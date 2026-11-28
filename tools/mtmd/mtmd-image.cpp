@@ -820,6 +820,35 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
 }
 
 //
+// mtmd_image_preprocessor_inkling2
+//
+
+mtmd_image_preproc_out mtmd_image_preprocessor_inkling2::preprocess(const clip_image_u8 & img) const {
+    const int cell = hparams.patch_size * hparams.n_merge;
+    const auto sz = img.get_size();
+    const int rows = (sz.height + cell - 1) / cell;
+    const int cols = (sz.width  + cell - 1) / cell;
+    const int W = cols * cell, H = rows * cell;
+    const float pad = (-1.0f / 255.0f - 0.5f) / 0.5f;
+    std::vector<float> v((size_t) W * H * 3, pad);
+    const auto & src = img.get_ro_buf();
+    for (int y = 0; y < sz.height; y++) {
+        for (int x = 0; x < sz.width; x++) {
+            const size_t s = 3 * ((size_t) y * sz.width + x);
+            const size_t d = 3 * ((size_t) y * W + x);
+            for (int c = 0; c < 3; c++) {
+                v[d + c] = ((float) src[s + c] / 255.0f - 0.5f) / 0.5f;
+            }
+        }
+    }
+    clip_image_f32 out_img;
+    out_img.set_size({W, H}, false, false);
+    out_img.cpy_buf(v);
+    mtmd_image_preproc_out out;
+    out.append(hparams, out_img, false);
+    return out;
+}
+
 // mtmd_image_preprocessor_glm5v
 //
 

@@ -11,6 +11,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -1830,7 +1831,11 @@ bool llama_context::graph_prebuild_decode(const llama_memory_context_i * mctx, u
     // builder. Snapshot the recurrent metadata and remove the dummy KV cell afterwards so the real decode sees
     // exactly the memory state it would have without this prebuild.
     auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
-    auto * mem_recr   = mem_hybrid ? mem_hybrid->get_mem_recr() : nullptr;
+    // hybrid + SWA (llama_memory_hybrid_iswa) has the same recurrent sidecar; without restoring it, the dummy
+    // prebuild cell at pos_max+1 stays in the recurrent allocator and the sequence skips one position.
+    auto * mem_hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get());
+    auto * mem_recr   = mem_hybrid ? mem_hybrid->get_mem_recr()
+                       : mem_hybrid_iswa ? mem_hybrid_iswa->get_mem_recr() : nullptr;
     std::vector<llama_memory_recurrent::mem_cell> recr_cells;
     std::vector<uint32_t>                         recr_rs_idx;
     uint32_t recr_head = 0, recr_used = 0, recr_n = 0;
@@ -1889,6 +1894,8 @@ bool llama_context::graph_prebuild_decode(const llama_memory_context_i * mctx, u
     // KV cell. The recurrent metadata is restored wholesale below, so only the attention cache needs the removal.
     if (mem_hybrid) {
         mem_hybrid->get_mem_attn()->seq_rm(0, pos, pos + n_tokens);
+    } else if (mem_hybrid_iswa) {
+        mem_hybrid_iswa->get_mem_attn()->seq_rm(0, pos, pos + n_tokens);
     } else {
         memory->seq_rm(0, pos, pos + n_tokens);
     }

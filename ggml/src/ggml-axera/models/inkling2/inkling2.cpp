@@ -2,11 +2,11 @@
 // restart from the pre-loop hidden / block state and reuse the same weight banks).
 //
 // The manifest has two merged kernels:
-//   prefill  the whole model for 256 rows (48 slot applications, block/message residuals, final norm and the
-//            NVFP4 output head in one AXModel).
+//   prefill  the whole model for WP rows (48 slot applications, block/message residuals, final norm and the
+//            NVFP4 output head in one AXModel); the host runs a batch as consecutive WP-row calls.
 //   decode   the whole model for one row.
-// KV: the kernel takes a linear, 2048-entry history per slot and appends the batch's own K/V inside the graph; the
-// host commits the returned K/V at the write cursor.  Local slots mask everything older than 1024 tokens, global
+// KV: both kernels take a linear, 2048-entry history per slot (row j is absolute position j) and append the call's
+// own K/V inside the graph; the host commits the returned rows at the write cursor.  Local slots mask everything older than 1024 tokens, global
 // slots keep the whole 2048.  The rel index / attention mask inputs are built on the host per call.
 // State: the KV history, the four short-convolution tails per slot and the write cursor live in the adapter's CMM;
 // they are what state_write / state_read carry.
@@ -32,7 +32,7 @@ constexpr int NQ    = 24;
 constexpr int NKV   = 8;
 constexpr int HD    = 128;
 constexpr int C     = 2048;  // KV history the kernels take
-constexpr int WP    = 256;   // prefill rows
+constexpr int WP    = 8;     // prefill rows per kernel call (the host runs a batch in WP-row chunks; must equal the prefill AXModel INK_T)
 constexpr int LAYERS = 24;
 constexpr int SLOTS = 48;
 constexpr int KVCH  = NKV * HD;
@@ -58,10 +58,6 @@ bool is_full(int u) {
 const char * RUNTIME_IN[14] = {"x", "pos", "rel_idx_l", "rel_idx_g", "mask_l", "mask_g",
                                "keys_l", "values_l", "keys_g", "values_g",
                                "kconv", "vconv", "paconv", "pmconv"};
-const char * RUNTIME_OUT[13] = {"apps_out", "blocks_out", "logits", "token_id", "final_hidden",
-                                "new_keys_l", "new_values_l", "new_keys_g", "new_values_g",
-                                "new_kconv", "new_vconv", "new_paconv", "new_pmconv"};
-
 bool is_runtime_in(const std::string & n) {
     for (const char * s : RUNTIME_IN) {
         if (n == s) return true;
@@ -97,7 +93,7 @@ class inkling2 final : public model {
     std::map<std::string, iobank> wbank;    // weight inputs, shared by both kernels
     std::map<std::string, iobank> pin, pout, din, dout;
 
-    axera_cmm kvk_l, kvv_l, kvk_g, kvv_g;   // [40][8][C][128] / [8][8][C][128] bf16
+    axera_cmm kvk_l, kvv_l, kvk_g, kvv_g;   // [slot][cell][8][128] bf16 (token-major)
     axera_cmm kc, vc, pca, pmc;             // prefill tails [48][3][1024] / [48][3][H] f32
     axera_cmm kc4, vc4, pca4, pmc4;         // decode tails [48][4][1024] / [48][4][H] f32
     int64_t   n_past = 0;
@@ -106,7 +102,8 @@ class inkling2 final : public model {
 
     void init(const std::map<std::string, ggml_tensor *> & t);
     void fill_weights(const std::map<std::string, ggml_tensor *> & t);
-    void fill_one(const std::string & name, const io_desc & d, const std::map<std::string, ggml_tensor *> & t);
+    void fill_one(const std::string & name, size_t bytes, uint8_t * dst,
+                  const std::map<std::string, ggml_tensor *> & t);
     void clear_state();
     void run_call(const kernel & k, std::map<std::string, iobank> & in, std::map<std::string, iobank> & out,
                   const std::vector<std::string> & in_names, const std::vector<std::string> & out_names,
@@ -156,11 +153,10 @@ static std::string layer_gguf(int u, const std::string & key) {
 }
 
 // fill one weight input bank from the GGUF mapping
-void inkling2::fill_one(const std::string & name, const io_desc & d, const std::map<std::string, ggml_tensor *> & t) {
-    auto bank = wbank.find(name);
-    GGML_ASSERT(bank != wbank.end() && bank->second.c->size >= d.bytes);
-    uint8_t * dst = (uint8_t *) bank->second.c->vir;
-    memset(dst, 0, bank->second.c->size);
+// Write one kernel-form weight (the form the manifest's pack member names) into dst.  The caller zeroes and owns
+// the enclosing CMM bank, so this is the same conversion for an unpacked bank and for a member of a pack.
+void inkling2::fill_one(const std::string & name, size_t bytes, uint8_t * dst,
+                        const std::map<std::string, ggml_tensor *> & t) {
 
     auto tensor = [&](const std::string & n) -> ggml_tensor * {
         auto it = t.find(n);
@@ -176,14 +172,14 @@ void inkling2::fill_one(const std::string & name, const io_desc & d, const std::
             {"attn_res_final_q", "attn_res_final_q.weight"},
             {"output_norm", "output_norm.weight"}};
         ggml_tensor * w = tensor(g.at(name));
-        GGML_ASSERT(ggml_nbytes(w) == d.bytes && w->type == GGML_TYPE_F32);
-        memcpy(dst, w->data, d.bytes);
+        GGML_ASSERT(ggml_nbytes(w) == bytes && w->type == GGML_TYPE_F32);
+        memcpy(dst, w->data, bytes);
         return;
     }
     if (name == "head_w" || name == "head_s" || name == "head_s2") {
         ggml_tensor * w = tensor("output.weight");
         if (name == "head_s2") {
-            ggml_tensor * s = tensor("output.weight.scale");
+            ggml_tensor * s = tensor("output.scale");
             GGML_ASSERT(s->type == GGML_TYPE_F32);
             memcpy(dst, s->data, sizeof(float));
             return;
@@ -191,10 +187,9 @@ void inkling2::fill_one(const std::string & name, const io_desc & d, const std::
         const int64_t K = w->ne[0], N = ggml_nrows(w);
         GGML_ASSERT(w->type == GGML_TYPE_NVFP4);
         if (name == "head_w") {
-            axera_copy_nvfp4_slice(w, 0, N, dst, K / 2, (uint8_t *) dst + (size_t) N * (K / 16), K / 16);
+            axera_copy_nvfp4_slice(w, 0, N, dst, K / 2, nullptr, 0);
         } else {
-            std::vector<uint8_t> q((size_t) N * (K / 2));
-            axera_copy_nvfp4_slice(w, 0, N, q.data(), K / 2, dst, K / 16);
+            axera_copy_nvfp4_slice(w, 0, N, nullptr, 0, dst, K / 16);
         }
         return;
     }
@@ -212,6 +207,9 @@ void inkling2::fill_one(const std::string & name, const io_desc & d, const std::
         key.resize(key.size() - 2);
         scales = true;
     }
+    if (key == "attn_input_q" && u == 0) {
+        return;  // layer 0 has no block states, so the reference never uses its query: the bank stays zero
+    }
     ggml_tensor * w = tensor(layer_gguf(u, key));
 
     if (key == "wq" || key == "wk" || key == "wv" || key == "wo" || key == "attn_gate") {
@@ -220,13 +218,12 @@ void inkling2::fill_one(const std::string & name, const io_desc & d, const std::
         const std::string gname = layer_gguf(u, key);
         if (scale2) {
             ggml_tensor * s = tensor(gname.substr(0, gname.size() - 7) + ".scale");
-            GGML_ASSERT(s->type == GGML_TYPE_F32 && ggml_nelements(s) == 1 && d.bytes == sizeof(float));
+            GGML_ASSERT(s->type == GGML_TYPE_F32 && ggml_nelements(s) == 1 && bytes == sizeof(float));
             memcpy(dst, s->data, sizeof(float));
         } else if (scales) {
-            std::vector<uint8_t> q((size_t) N * (K / 2));
-            axera_copy_nvfp4_slice(w, 0, N, q.data(), K / 2, dst, K / 16);
+            axera_copy_nvfp4_slice(w, 0, N, nullptr, 0, dst, K / 16);
         } else {
-            axera_copy_nvfp4_slice(w, 0, N, dst, K / 2, (uint8_t *) dst + (size_t) N * (K / 2), K / 16);
+            axera_copy_nvfp4_slice(w, 0, N, dst, K / 2, nullptr, 0);
         }
         return;
     }
@@ -237,18 +234,17 @@ void inkling2::fill_one(const std::string & name, const io_desc & d, const std::
             const std::string gname = key == "wup" ? "blk." + std::to_string(u) + ".ffn_up_exps.scale"
                                                    : "blk." + std::to_string(u) + ".ffn_down_exps.scale";
             ggml_tensor * s = tensor(gname);
-            GGML_ASSERT(s->type == GGML_TYPE_F32 && ggml_nbytes(s) == d.bytes);
-            memcpy(dst, s->data, d.bytes);
+            GGML_ASSERT(s->type == GGML_TYPE_F32 && ggml_nbytes(s) == bytes);
+            memcpy(dst, s->data, bytes);
         } else if (scales) {
-            std::vector<uint8_t> q((size_t) N * (K / 2));
-            axera_copy_nvfp4_slice(w, 0, N, q.data(), K / 2, dst, K / 16);
+            axera_copy_nvfp4_slice(w, 0, N, nullptr, 0, dst, K / 16);
         } else {
-            axera_copy_nvfp4_slice(w, 0, N, dst, K / 2, (uint8_t *) dst + (size_t) N * (K / 16), K / 16);
+            axera_copy_nvfp4_slice(w, 0, N, dst, K / 2, nullptr, 0);
         }
         return;
     }
     if (key == "router_w") {
-        GGML_ASSERT(w->type == GGML_TYPE_F32 && (size_t) ggml_nelements(w) * 2 == d.bytes);
+        GGML_ASSERT(w->type == GGML_TYPE_F32 && (size_t) ggml_nelements(w) * 2 == bytes);
         const float * f = (const float *) w->data;
         ggml_fp32_to_bf16_row(f, (ggml_bf16_t *) dst, ggml_nelements(w));
         return;
@@ -257,7 +253,7 @@ void inkling2::fill_one(const std::string & name, const io_desc & d, const std::
         key == "k_conv_static" || key == "v_conv_static") {
         // GGUF [taps, channels] -> the kernel's [channels, taps] transposed view
         const int64_t taps = w->ne[0], ch = w->ne[1];
-        GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_nbytes(w) == d.bytes);
+        GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_nbytes(w) == bytes);
         const float * f = (const float *) w->data;
         float * o = (float *) dst;
         for (int64_t r = 0; r < ch; ++r) {
@@ -267,25 +263,75 @@ void inkling2::fill_one(const std::string & name, const io_desc & d, const std::
         }
         return;
     }
-    if (key == "attn_input_q" && u == 0) {
-        return;  // layer 0 reads no block states: the input is a zero bank
-    }
     // small f32 tensors copied as they are (mlp_input_q / attn_input_q may be reshaped by shape only)
-    GGML_ASSERT(ggml_nbytes(w) == d.bytes && w->type == GGML_TYPE_F32);
-    memcpy(dst, w->data, d.bytes);
+    GGML_ASSERT(ggml_nbytes(w) == bytes && w->type == GGML_TYPE_F32);
+    memcpy(dst, w->data, bytes);
+}
+
+// the GGUF tensor a weight bank reads ("" when the reference does not use the bank and it stays zero), mirroring
+// fill_one
+static std::string source_of(const std::string & name) {
+    if (name == "message_input_q") return "message_input_q.weight";
+    if (name == "attn_res_final_q") return "attn_res_final_q.weight";
+    if (name == "output_norm")     return "output_norm.weight";
+    if (name == "head_w" || name == "head_s") return "output.weight";
+    if (name == "head_s2")         return "output.scale";
+
+    const size_t us = name.find('_');
+    const int    u  = std::atoi(name.substr(1, us - 1).c_str());
+    std::string key = name.substr(us + 1);
+    bool scale2 = false;
+    if (key.size() > 3 && key.compare(key.size() - 3, 3, "_s2") == 0) {
+        key.resize(key.size() - 3);
+        scale2 = true;
+    } else if (key.size() > 2 && key.compare(key.size() - 2, 2, "_s") == 0) {
+        key.resize(key.size() - 2);
+    }
+    if (key == "attn_input_q" && u == 0) return "";
+    if (scale2) {
+        if (key == "wup") return "blk." + std::to_string(u) + ".ffn_up_exps.scale";
+        if (key == "wdn") return "blk." + std::to_string(u) + ".ffn_down_exps.scale";
+        std::string g = layer_gguf(u, key);
+        return g.substr(0, g.size() - 7) + ".scale";
+    }
+    return layer_gguf(u, key);
 }
 
 void inkling2::fill_weights(const std::map<std::string, ggml_tensor *> & t) {
-    std::map<std::string, const io_desc *> desc;
-    for (const io_desc & d : pk->desc->in) {
-        if (!is_runtime_in(d.name)) desc[d.name] = &d;
+    // one pass that lists every weight the graph does not expose, instead of aborting on the first
+    std::vector<std::string> miss;
+    std::set<std::string>    seen;
+    for (const kernel_desc * kd : {pk->desc, dk->desc}) {
+        for (const pack_member & m : kd->members) {
+            const std::string g = source_of(m.param);
+            if (!g.empty() && !t.count(g) && seen.insert(m.param).second) {
+                miss.push_back(m.param + " -> " + g);
+            }
+        }
     }
-    for (const io_desc & d : dk->desc->in) {
-        if (!is_runtime_in(d.name)) desc[d.name] = &d;
+    if (!miss.empty()) {
+        for (const std::string & m : miss) GGML_LOG_ERROR("%s: graph lacks %s\n", tag.c_str(), m.c_str());
+        GGML_ABORT("axera inkling2: %zu weight tensors are not in the graph\n", miss.size());
     }
-    for (const auto & [name, d] : desc) {
-        fill_one(name, *d, t);
-        wbank.at(name).c->flush();
+    for (const auto & [name, bytes] : pk->desc->packs) {
+        iobank & b = wbank.at(name);
+        GGML_ASSERT(b.c->size >= bytes);
+        memset(b.c->vir, 0, b.c->size);
+        for (const pack_member & m : pk->desc->members) {
+            if (m.pack != name) continue;
+            fill_one(m.param, m.bytes, (uint8_t *) b.c->vir + m.offset, t);
+        }
+        b.c->flush();
+        if (const char * hf = std::getenv("INKLING2_PACK_HASH")) {  // compare against the Python pack builder
+            GGML_ASSERT(bytes % 4 == 0);
+            const uint32_t * p = (const uint32_t *) b.c->vir;
+            uint64_t h = 0;
+            for (size_t i = 0; i < bytes / 4; ++i) h += p[i];
+            if (FILE * f = fopen(hf, "a")) {
+                fprintf(f, "pack %s %zu %016llx\n", name.c_str(), bytes, (unsigned long long) h);
+                fclose(f);
+            }
+        }
     }
 }
 
@@ -297,17 +343,20 @@ void inkling2::init(const std::map<std::string, ggml_tensor *> & t) {
     GGML_ASSERT(lg && lg->shape.size() == 2);
     VOCAB = (int) lg->shape[1];
 
+    // Every non-runtime input is a pack, shared by both kernels (prefill and decode see the same layout).
+    for (const auto & [name, bytes] : pk->desc->packs) {
+        size_t want = bytes;
+        if (dk->desc->packs.count(name)) want = std::max(want, dk->desc->packs.at(name));
+        wbank[name] = {axera_cmm_alloc_bank(want)};
+    }
+    for (const auto & [name, bytes] : dk->desc->packs) {
+        GGML_ASSERT(wbank.count(name) && wbank.at(name).c->size >= bytes);
+    }
     for (const io_desc & d : pk->desc->in) {
-        if (is_runtime_in(d.name)) continue;
-        if (!wbank.count(d.name)) {
-            wbank[d.name] = {axera_cmm_alloc_bank(d.bytes)};
-        } else {
-            GGML_ASSERT(wbank.at(d.name).c->size == d.bytes);
-        }
+        if (!is_runtime_in(d.name)) GGML_ASSERT(pk->desc->packs.count(d.name));
     }
     for (const io_desc & d : dk->desc->in) {
-        if (is_runtime_in(d.name)) continue;
-        GGML_ASSERT(wbank.count(d.name) && wbank.at(d.name).c->size == d.bytes);
+        if (!is_runtime_in(d.name)) GGML_ASSERT(dk->desc->packs.count(d.name));
     }
 
     auto alloc_io = [](std::map<std::string, iobank> & m, const io_desc & d) {
@@ -327,7 +376,8 @@ void inkling2::init(const std::map<std::string, ggml_tensor *> & t) {
     }
     for (const io_desc & d : dk->desc->out) alloc_io(dout, d);
 
-    // the KV history is shared by both kernels: [slots][heads][C][HD] bf16
+    // the KV history is shared by both kernels: [slots][cells][heads][HD] bf16.  Token-major keeps each
+    // history row contiguous on AX8860; head-major history loads are mis-lowered on the board.
     kvk_l = axera_cmm_alloc_bank((size_t) 40 * KVCH * C * sizeof(ggml_bf16_t));
     kvv_l = axera_cmm_alloc_bank((size_t) 40 * KVCH * C * sizeof(ggml_bf16_t));
     kvk_g = axera_cmm_alloc_bank((size_t) 8 * KVCH * C * sizeof(ggml_bf16_t));
@@ -425,13 +475,15 @@ static void collect_names(const std::vector<io_desc> & v, std::vector<std::strin
 void inkling2::build_mask_prefill(std::vector<int32_t> & ridx, std::vector<float> & mask, const int32_t * pos, int n,
                                   bool full) {
     const int W = C + n;
-    ridx.assign((size_t) n * NQ * W, 1024);
-    mask.assign((size_t) n * NQ * W, -INFINITY);
+    const char * ne = std::getenv("INKLING2_MASK_NEG");
+    const float neg = ne ? (float) atof(ne) : -INFINITY;
+    ridx.assign((size_t) n * W, 1024);
+    mask.assign((size_t) n * W, neg);
     const int64_t base = n_past;
     for (int i = 0; i < n; ++i) {
         const int64_t pt = base + i;
-        int32_t * ri = ridx.data() + (size_t) i * NQ * W;
-        float *   mk = mask.data() + (size_t) i * NQ * W;
+        int32_t * ri = ridx.data() + (size_t) i * W;
+        float *   mk = mask.data() + (size_t) i * W;
         for (int64_t j = 0; j < base; ++j) {
             const int64_t dist = pt - j;
             if (dist < 0 || (!full && dist >= 1024)) continue;
@@ -443,19 +495,15 @@ void inkling2::build_mask_prefill(std::vector<int32_t> & ridx, std::vector<float
             ri[C + t] = (int32_t) dist;
             mk[C + t] = 0.0f;
         }
-        if (NQ > 1) {
-            for (int q = 1; q < NQ; ++q) {
-                memcpy(ri + (size_t) q * W, ri, sizeof(int32_t) * W);
-                memcpy(mk + (size_t) q * W, mk, sizeof(float) * W);
-            }
-        }
     }
 }
 
 void inkling2::build_mask_decode(std::vector<int32_t> & ridx, std::vector<float> & mask, int32_t pos, bool full) {
     const int W = C + 1;
+    const char * ne = std::getenv("INKLING2_MASK_NEG");
+    const float neg = ne ? (float) atof(ne) : -INFINITY;
     ridx.assign(W, 1024);
-    mask.assign(W, -INFINITY);
+    mask.assign(W, neg);
     for (int64_t j = 0; j < n_past; ++j) {
         const int64_t dist = pos - j;
         if (dist < 0 || (!full && dist >= 1024)) continue;
@@ -469,12 +517,17 @@ void inkling2::build_mask_decode(std::vector<int32_t> & ridx, std::vector<float>
 void inkling2::commit(bool pre, int n) {
     auto copy_kv = [&](axera_cmm & bank, const std::string & name, int nslot, bool is_key) {
         (void) is_key;
-        auto * src = (const ggml_bf16_t *) (pre ? pout : dout).at(name).c->vir;
+        iobank & ob = (pre ? pout : dout).at(name);
+        ob.c->invalidate(ob.c->vir, ob.c->size);  // NPU writes are only visible to the CPU after an invalidate
+        auto * src = (const ggml_bf16_t *) ob.c->vir;
         auto * dst = (ggml_bf16_t *) bank->vir;
         for (int s = 0; s < nslot; ++s) {
-            for (int h = 0; h < NKV; ++h) {
-                memcpy(dst + ((size_t) s * KVCH + h * C + n_past) * HD,
-                       src + ((size_t) s * NKV + h) * n * HD, (size_t) n * HD * sizeof(ggml_bf16_t));
+            for (int t = 0; t < n; ++t) {
+                for (int h = 0; h < NKV; ++h) {
+                    memcpy(dst + ((size_t) s * C + n_past + t) * KVCH + h * HD,
+                           src + ((size_t) s * n + t) * KVCH + h * HD,
+                           HD * sizeof(ggml_bf16_t));
+                }
             }
         }
         bank->flush(bank->vir, bank->size);
@@ -483,12 +536,39 @@ void inkling2::commit(bool pre, int n) {
     copy_kv(kvv_l, "new_values_l", 40, false);
     copy_kv(kvk_g, "new_keys_g", 8, true);
     copy_kv(kvv_g, "new_values_g", 8, false);
+    if (const char * kf = std::getenv("INKLING2_KV_HASH")) {
+        FILE * f = (n_past == 0 && !pre) ? fopen(kf, "a") : nullptr;
+        if (f) {
+            auto h32 = [](const uint8_t * p, size_t n) {
+                GGML_ASSERT(n % 4 == 0);
+                const uint32_t * q = (const uint32_t *) p;
+                uint64_t h = 0;
+                for (size_t i = 0; i < n / 4; ++i) h += q[i];
+                return (unsigned long long) h;
+            };
+            for (const char * nm : {"new_keys_l", "new_values_l", "new_keys_g", "new_values_g",
+                                    "new_kconv", "new_vconv", "new_paconv", "new_pmconv"}) {
+                iobank & ob = dout.at(nm);
+                ob.c->invalidate(ob.c->vir, ob.c->size);
+                const std::string name(nm);
+                const size_t nsl = (name == "new_keys_l" || name == "new_values_l") ? 40
+                                   : (name == "new_keys_g" || name == "new_values_g") ? 8 : SLOTS;
+                const size_t per = ob.c->size / nsl;
+                for (size_t s = 0; s < nsl; ++s) {
+                    fprintf(f, "%s %zu %016llx\n", nm, s,
+                            h32((const uint8_t *) ob.c->vir + s * per, per));
+                }
+            }
+            fclose(f);
+        }
+    }
 
     if (pre) {
         // the prefill kernel's tails are the 3-row history itself
         auto move_state = [&](axera_cmm & dst, const std::string & name) {
             iobank & src = pout.at(name);
             GGML_ASSERT(src.c->size == dst->size);
+            src.c->invalidate(src.c->vir, src.c->size);
             memcpy(dst->vir, src.c->vir, dst->size);
             dst->flush(dst->vir, dst->size);
         };
@@ -501,6 +581,7 @@ void inkling2::commit(bool pre, int n) {
         auto move_state = [&](axera_cmm & dst3, axera_cmm & src4, const std::string & name, size_t row_b) {
             iobank & src = dout.at(name);
             GGML_ASSERT(src.c->size == src4->size);
+            src.c->invalidate(src.c->vir, src.c->size);
             for (int s = 0; s < SLOTS; ++s) {
                 memcpy((uint8_t *) dst3->vir + (size_t) s * 3 * row_b,
                        (const uint8_t *) src.c->vir + (size_t) s * 4 * row_b + row_b, 3 * row_b);
@@ -526,8 +607,13 @@ bool inkling2::run_prefill(const uint16_t * x, const int32_t * pos, int n) {
     std::vector<float>   ml, mg;
     build_mask_prefill(rl, ml, pos, n, false);
     build_mask_prefill(rg, mg, pos, n, true);
-    GGML_ASSERT((size_t) rl.size() * sizeof(int32_t) == pin["rel_idx_l"].c->size);
-    GGML_ASSERT((size_t) ml.size() * sizeof(float) == pin["mask_l"].c->size);
+    auto desc_bytes = [&](const char * nm) {
+        const io_desc * d = find_io(pk->desc->in, nm);
+        GGML_ASSERT(d);
+        return (size_t) d->bytes;
+    };
+    GGML_ASSERT((size_t) rl.size() * sizeof(int32_t) == desc_bytes("rel_idx_l"));
+    GGML_ASSERT((size_t) ml.size() * sizeof(float) == desc_bytes("mask_l"));
     memcpy(pin["rel_idx_l"].c->vir, rl.data(), rl.size() * sizeof(int32_t));
     memcpy(pin["rel_idx_g"].c->vir, rg.data(), rg.size() * sizeof(int32_t));
     memcpy(pin["mask_l"].c->vir, ml.data(), ml.size() * sizeof(float));
@@ -556,8 +642,14 @@ bool inkling2::run_decode_row(const uint16_t * x, int32_t pos) {
     std::vector<float>   ml, mg;
     build_mask_decode(rl, ml, pos, false);
     build_mask_decode(rg, mg, pos, true);
-    GGML_ASSERT((size_t) rl.size() * sizeof(int32_t) == din["rel_idx_l"].c->size);
-    GGML_ASSERT((size_t) ml.size() * sizeof(float) == din["mask_l"].c->size);
+    // CMM allocations are padded to AXERA_ALIGNMENT: compare with the kernel's declared bytes, not the bank size
+    auto desc_bytes = [&](const char * n) {
+        const io_desc * d = find_io(dk->desc->in, n);
+        GGML_ASSERT(d);
+        return (size_t) d->bytes;
+    };
+    GGML_ASSERT((size_t) rl.size() * sizeof(int32_t) == desc_bytes("rel_idx_l"));
+    GGML_ASSERT((size_t) ml.size() * sizeof(float) == desc_bytes("mask_l"));
     memcpy(din["rel_idx_l"].c->vir, rl.data(), rl.size() * sizeof(int32_t));
     memcpy(din["rel_idx_g"].c->vir, rg.data(), rg.size() * sizeof(int32_t));
     memcpy(din["mask_l"].c->vir, ml.data(), ml.size() * sizeof(float));
@@ -580,7 +672,54 @@ bool inkling2::run_decode_row(const uint16_t * x, int32_t pos) {
     collect_names(dk->desc->in, inn);
     collect_names(dk->desc->out, outn);
     run_call(*dk, din, dout, inn, outn, "inkling2 decode");
+    if (const char * sd = std::getenv("INKLING2_DUMP_STATE")) {
+        for (const char * nm : {"new_keys_l", "new_values_l", "new_keys_g", "new_values_g",
+                                "new_kconv", "new_vconv", "new_paconv", "new_pmconv"}) {
+            iobank & ob = dout.at(nm);
+            ob.c->invalidate(ob.c->vir, ob.c->size);
+            char name[512];
+            snprintf(name, sizeof(name), "%s/pos_%d_%s.bin", sd, pos, nm);
+            if (FILE * f = fopen(name, "wb")) {
+                fwrite(ob.c->vir, 1, ob.c->size, f);
+                fclose(f);
+            } else {
+                GGML_LOG_ERROR("%s: cannot write %s\n", tag.c_str(), name);
+            }
+        }
+    }
+    if (const char * dd = std::getenv("INKLING2_DUMP_DEBUG")) {
+        for (auto & kv : dout) {
+            if (kv.first.rfind("dbg_", 0) != 0) continue;
+            iobank & ob = kv.second;
+            ob.c->invalidate(ob.c->vir, ob.c->size);
+            char name[512];
+            snprintf(name, sizeof(name), "%s/pos_%d_%s.bin", dd, pos, kv.first.c_str());
+            if (FILE * f = fopen(name, "wb")) {
+                fwrite(ob.c->vir, 1, ob.c->size, f);
+                fclose(f);
+            }
+        }
+    }
     commit(false, 1);
+    if (const char * dp = std::getenv("INKLING2_DUMP_LOGITS")) {
+        auto & lg = dout.at("logits");
+        lg.c->invalidate(lg.c->vir, (size_t) VOCAB * sizeof(float));
+        char name[512];
+        snprintf(name, sizeof(name), "%s/pos_%d.bin", dp, pos);
+        if (FILE * f = fopen(name, "wb")) {
+            fwrite(lg.c->vir, 1, (size_t) VOCAB * sizeof(float), f);
+            fclose(f);
+        } else {
+            GGML_LOG_ERROR("%s: cannot write %s\n", tag.c_str(), name);
+        }
+        auto & ap = dout.at("apps_out");
+        ap.c->invalidate(ap.c->vir, ap.c->size);
+        snprintf(name, sizeof(name), "%s/pos_%d_apps.bin", dp, pos);
+        if (FILE * f = fopen(name, "wb")) {
+            fwrite(ap.c->vir, 1, (size_t) SLOTS * H * sizeof(ggml_bf16_t), f);
+            fclose(f);
+        }
+    }
     return true;
 }
 
@@ -607,7 +746,8 @@ void inkling2::publish_logits(ggml_cgraph * g, ggml_tensor * logits, int T, int 
                       ? (ggml_backend_axera_buffer_context *) logits->buffer->context : nullptr;
     for (int r = 0; r < n_out; ++r) {
         const int row = out_ids ? ((const int32_t *) out_ids->data)[r] : r;
-        GGML_ASSERT(row >= first_row && row < first_row + T);
+        // a chunk publishes only the wanted rows it owns (a batch runs as several WP-row prefills)
+        if (row < first_row || row >= first_row + T) continue;
         float * o = (float *) ((char *) logits->data + (size_t) r * logits->nb[1]);
         memcpy(o, src + (size_t) (row - first_row) * VOCAB, VOCAB * sizeof(float));
         if (dctx) {
@@ -621,23 +761,33 @@ void inkling2::publish_logits(ggml_cgraph * g, ggml_tensor * logits, int T, int 
 
 ggml_status inkling2::compute(ggml_cgraph * g) {
     const auto & t = names.of(g);
-    ggml_tensor * norm0  = names.find("attn_norm-0");
-    ggml_tensor * logits = names.find("result_output");
+    // the kernels take the model input: the token embedding after its RMS norm.  Layer 0 is a full layer, so there is
+    // no "attn_norm-0" (the dense adapters' entry); "embed_norm" is the node the layers start from.
+    ggml_tensor * embed   = names.find("embed_norm");
+    ggml_tensor * logits  = names.find("result_output");
     ggml_tensor * inp_pos = names.find("inp_pos");
-    if (!norm0 || !logits || !inp_pos) {
-        GGML_LOG_ERROR("%s: a graph of %d nodes that is not the whole model (-ngl 99)\n", tag.c_str(), g->n_nodes);
+    if (!embed || !logits || !inp_pos) {
+        GGML_LOG_ERROR("%s: a graph of %d nodes that is not the whole model (-ngl 99): %s%s%s\n", tag.c_str(), g->n_nodes,
+                       embed ? "" : "embed_norm ", logits ? "" : "result_output ", inp_pos ? "" : "inp_pos");
         return GGML_STATUS_FAILED;
     }
-    ggml_tensor * x0 = llm_input(g, norm0, true);
+    // the embedding and its norm are the only nodes before the first layer: compute them on the host, as the dense
+    // adapters do through llm_input
+    int n_in = 0;
+    while (n_in < g->n_nodes && g->nodes[n_in] != embed) {
+        ++n_in;
+    }
+    GGML_ASSERT(n_in < g->n_nodes);
+    cpu_compute(g, g->nodes, n_in + 1, "input (cpu)");
+    ggml_tensor * x0 = embed;
     const int T = (int) x0->ne[1];
-    const ggml_tensor * w0 = t.at("blk.0.attn_norm.weight");
+    const ggml_tensor * w0 = t.at("blk.0.ffn_norm.weight");
     if (bound != w0->data) {
         init(t);
         bound = w0->data;
     }
-    if (T < 1 || T > WP) {
-        GGML_LOG_ERROR("%s: %d rows in one call (the prefill kernel takes at most %d, keep -ub <= %d)\n",
-                       tag.c_str(), T, WP, WP);
+    if (T < 1 || T > 8192) {
+        GGML_LOG_ERROR("%s: %d rows in one call\n", tag.c_str(), T);
         return GGML_STATUS_FAILED;
     }
     const ggml_tensor * k_idxs = names.find("attn_inp_k_idxs");
@@ -645,6 +795,12 @@ ggml_status inkling2::compute(ggml_cgraph * g) {
     GGML_ASSERT(k_idxs && k_idxs->type == GGML_TYPE_I64 && k_idxs->ne[0] == T && kqm);
     const kv_view kv(k_idxs, kqm, C, WP);
     const int64_t c0 = kv.cell_of(0);
+    if (n_past + T > C) {
+        // the kernels keep C = 2048 cells; a longer context needs a bigger build (the adapter cannot see a shift)
+        GGML_LOG_ERROR("%s: context would reach %lld cells, the kernels hold %d\n", tag.c_str(),
+                       (long long) (n_past + T), C);
+        return GGML_STATUS_FAILED;
+    }
     if (c0 != n_past) {
         if (c0 == 0) {
             clear_state();
@@ -665,30 +821,35 @@ ggml_status inkling2::compute(ggml_cgraph * g) {
                               xb.data() + (size_t) r * H, H);
     });
 
-    if (T == WP) {
-        if (!run_prefill((const uint16_t *) xb.data(), pbuf.data(), T)) return GGML_STATUS_FAILED;
-        publish_logits(g, logits, T, 0);
-    } else {
-        // a short batch replays through the decode kernel, row by row
-        const int n_out = (int) logits->ne[1];
-        for (int i = 0; i < T; ++i) {
-            if (!run_decode_row((const uint16_t *) (xb.data() + (size_t) i * H), pbuf[(size_t) i * 4])) {
-                return GGML_STATUS_FAILED;
-            }
-            const bool wanted = n_out > 0 && i >= T - n_out;
-            if (wanted) {
-                const float * src = (const float *) dout.at("logits").c->vir;
-                dout.at("logits").c->invalidate(dout.at("logits").c->vir, (size_t) VOCAB * sizeof(float));
-                auto * dctx = ggml_backend_buffer_is_axera(logits->buffer)
-                                  ? (ggml_backend_axera_buffer_context *) logits->buffer->context : nullptr;
-                float * o = (float *) ((char *) logits->data + (size_t) (i - (T - n_out)) * logits->nb[1]);
-                memcpy(o, src, (size_t) VOCAB * sizeof(float));
-                if (dctx) {
-                    dctx->flush(o, VOCAB * sizeof(float));
-                    dctx->clean_p     = o;
-                    dctx->clean_n     = VOCAB * sizeof(float);
-                    dctx->clean_epoch = axera_graph_epoch;
-                }
+    // A batch runs as WP-row prefills; the rows that do not fill a chunk (and a 1-row batch) replay through the
+    // decode kernel one row at a time.  Every chunk publishes its own logits rows, so a perplexity batch gets all of
+    // them and a one-token generation batch gets the last one.
+    int c = 0;
+    for (; T - c >= WP; c += WP) {
+        if (!run_prefill((const uint16_t *) (xb.data() + (size_t) c * H),
+                         pbuf.data() + (size_t) c * 4, WP)) {
+            return GGML_STATUS_FAILED;
+        }
+        publish_logits(g, logits, WP, c);
+    }
+    const int n_out = (int) logits->ne[1];
+    for (int i = c; i < T; ++i) {
+        if (!run_decode_row((const uint16_t *) (xb.data() + (size_t) i * H), pbuf[(size_t) i * 4])) {
+            return GGML_STATUS_FAILED;
+        }
+        const bool wanted = n_out > 0 && i >= T - n_out;
+        if (wanted) {
+            const float * src = (const float *) dout.at("logits").c->vir;
+            dout.at("logits").c->invalidate(dout.at("logits").c->vir, (size_t) VOCAB * sizeof(float));
+            auto * dctx = ggml_backend_buffer_is_axera(logits->buffer)
+                              ? (ggml_backend_axera_buffer_context *) logits->buffer->context : nullptr;
+            float * o = (float *) ((char *) logits->data + (size_t) (i - (T - n_out)) * logits->nb[1]);
+            memcpy(o, src, (size_t) VOCAB * sizeof(float));
+            if (dctx) {
+                dctx->flush(o, VOCAB * sizeof(float));
+                dctx->clean_p     = o;
+                dctx->clean_n     = VOCAB * sizeof(float);
+                dctx->clean_epoch = axera_graph_epoch;
             }
         }
     }
